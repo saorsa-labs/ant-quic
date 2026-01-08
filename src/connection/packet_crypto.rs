@@ -193,6 +193,9 @@ mod tests {
     use crate::transport_error::Code;
     use crate::{ConnectionId, Instant};
 
+    /// Realistic sample size for AES-GCM header protection (16 bytes)
+    const REALISTIC_SAMPLE_SIZE: usize = 16;
+
     struct TestHeaderKey;
 
     impl HeaderKey for TestHeaderKey {
@@ -201,7 +204,7 @@ mod tests {
         fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
 
         fn sample_size(&self) -> usize {
-            0
+            REALISTIC_SAMPLE_SIZE
         }
     }
 
@@ -256,11 +259,19 @@ mod tests {
         spaces
     }
 
+    /// Build short packet bytes with sufficient padding for header protection.
+    /// Header protection requires at least sample_size (16) bytes after pn_offset + 4.
     fn short_packet_bytes(first_byte: u8, packet_number: u8, payload: &[u8]) -> BytesMut {
         let mut bytes = Vec::with_capacity(2 + payload.len());
         bytes.push(first_byte);
         bytes.push(packet_number);
         bytes.extend_from_slice(payload);
+        // Ensure minimum size for header protection sampling
+        // pn_offset is 1 (after first byte), need 4 + sample_size bytes after that
+        let min_size = 1 + 4 + REALISTIC_SAMPLE_SIZE;
+        while bytes.len() < min_size {
+            bytes.push(0x00);
+        }
         BytesMut::from(bytes.as_slice())
     }
 
@@ -400,5 +411,37 @@ mod tests {
         assert_eq!(result.number, 1);
         assert!(!result.outgoing_key_update_acked);
         assert!(!result.incoming_key_update);
+    }
+
+    #[test]
+    fn unprotect_header_rejects_too_short_packet() {
+        // Test that packets too short for header protection sampling are rejected.
+        // With REALISTIC_SAMPLE_SIZE = 16, need at least pn_offset + 4 + 16 = 21 bytes
+        // for a packet with 1-byte pn_offset (short header, no DCID).
+        let spaces = spaces_with_crypto();
+
+        // Create a packet that's too short (only 10 bytes)
+        // This is shorter than pn_offset (1) + 4 + sample_size (16) = 21 bytes
+        let too_short = BytesMut::from(&[0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..]);
+
+        let supported_versions = crate::DEFAULT_SUPPORTED_VERSIONS.to_vec();
+        let partial_result = PartialDecode::new(
+            too_short,
+            &FixedLengthConnectionIdParser::new(0),
+            &supported_versions,
+            false,
+        );
+
+        // PartialDecode::new may succeed (it just parses the header structure)
+        // The sample_size check happens in finish() when header protection is applied
+        if let Ok((partial, _)) = partial_result {
+            // Now try to unprotect - this should fail due to insufficient bytes for sampling
+            let result = unprotect_header(partial, &spaces, None, None);
+            assert!(
+                result.is_none(),
+                "Packet too short for header protection should be rejected during unprotect"
+            );
+        }
+        // If PartialDecode::new itself fails, that's also acceptable
     }
 }
