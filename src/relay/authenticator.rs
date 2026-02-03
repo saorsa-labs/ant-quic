@@ -286,6 +286,7 @@ impl RelayAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;
 
