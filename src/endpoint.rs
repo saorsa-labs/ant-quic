@@ -43,7 +43,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
     },
-    token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
+    token::{IncomingToken, InvalidRetryTokenError},
     transport_parameters::{PreferredAddress, TransportParameters},
 };
 
@@ -1364,9 +1364,6 @@ impl Endpoint {
             return Err(RetryError::incoming(incoming));
         };
 
-        self.clean_up_incoming(&incoming);
-        incoming.improper_drop_warner.dismiss();
-
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
         // looked up separately from Handshake/Data DCIDs, so there is no risk of collision
@@ -1375,12 +1372,22 @@ impl Endpoint {
         // retried by the application layer.
         let loc_cid = self.local_cid_generator.generate_cid();
 
-        let payload = TokenPayload::Retry {
-            address: incoming.addresses.remote,
-            orig_dst_cid: incoming.packet.header.dst_cid,
-            issued: server_config_arc.time_source.now(),
+        let token = match crate::token_v2::encode_retry_token_with_rng(
+            &server_config_arc.token_key,
+            incoming.addresses.remote,
+            &incoming.packet.header.dst_cid,
+            server_config_arc.time_source.now(),
+            &mut self.rng,
+        ) {
+            Ok(token) => token,
+            Err(err) => {
+                error!(?err, "failed to encode retry token");
+                return Err(RetryError::incoming(incoming));
+            }
         };
-        let token = Token::new(payload, &mut self.rng).encode(&*server_config_arc.token_key);
+
+        self.clean_up_incoming(&incoming);
+        incoming.improper_drop_warner.dismiss();
 
         let header = Header::Retry {
             src_cid: loc_cid,

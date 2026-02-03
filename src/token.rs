@@ -5,22 +5,13 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
-use std::{
-    fmt,
-    mem::size_of,
-    net::{IpAddr, SocketAddr},
-};
+use std::{fmt, net::SocketAddr};
 
-use bytes::{Buf, BufMut, Bytes};
-use rand::Rng;
+use bytes::Bytes;
 
 use crate::{
-    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
-    coding::{BufExt, BufMutExt},
-    crypto::{HandshakeTokenKey, HmacKey},
-    packet::InitialHeader,
+    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, crypto::HmacKey, packet::InitialHeader,
     shared::ConnectionId,
-    token_v2::{TokenKey, decode_retry_token},
 };
 
 /// Responsible for limiting clients' ability to reuse validation tokens
@@ -148,48 +139,33 @@ impl IncomingToken {
         // > If the token is invalid, then the server SHOULD proceed as if the client did not have
         // > a validated address, including potentially sending a Retry packet.
 
-        // Try legacy token format first
-        let Some(retry) = Token::decode(server_config.token_key.as_ref(), &header.token) else {
-            // If legacy decode fails, try v2 token format
-            if let Some(_v2_token) =
-                try_decode_v2_token(&header.token, server_config.token_key.as_ref())
-            {
-                // For v2 tokens, we need to validate the peer ID and CID match expectations
-                // For now, we treat v2 tokens as validated if they decode successfully
-                return Ok(Self {
-                    retry_src_cid: Some(header.dst_cid),
-                    orig_dst_cid: header.dst_cid,
-                    validated: true,
-                });
-            }
+        let Some(decoded) = crate::token_v2::decode_token(&server_config.token_key, &header.token)
+        else {
             return Ok(unvalidated);
         };
 
-        // Validate token, then convert into Self
-        match retry.payload {
-            TokenPayload::Retry {
-                address,
-                orig_dst_cid,
-                issued,
-            } => {
-                if address != remote_address {
+        match decoded {
+            crate::token_v2::DecodedToken::Retry(retry) => {
+                if retry.address != remote_address {
                     return Err(InvalidRetryTokenError);
                 }
-                if issued + server_config.retry_token_lifetime < server_config.time_source.now() {
+                if retry.issued + server_config.retry_token_lifetime
+                    < server_config.time_source.now()
+                {
                     return Err(InvalidRetryTokenError);
                 }
 
                 Ok(Self {
                     retry_src_cid: Some(header.dst_cid),
-                    orig_dst_cid,
+                    orig_dst_cid: retry.orig_dst_cid,
                     validated: true,
                 })
             }
-            TokenPayload::Validation { ip, issued } => {
-                if ip != remote_address.ip() {
+            crate::token_v2::DecodedToken::Validation(validation) => {
+                if validation.ip != remote_address.ip() {
                     return Ok(unvalidated);
                 }
-                if issued + server_config.validation_token.lifetime
+                if validation.issued + server_config.validation_token.lifetime
                     < server_config.time_source.now()
                 {
                     return Ok(unvalidated);
@@ -197,7 +173,11 @@ impl IncomingToken {
                 if server_config
                     .validation_token
                     .log
-                    .check_and_insert(retry.nonce, issued, server_config.validation_token.lifetime)
+                    .check_and_insert(
+                        validation.nonce,
+                        validation.issued,
+                        server_config.validation_token.lifetime,
+                    )
                     .is_err()
                 {
                     return Ok(unvalidated);
@@ -209,6 +189,7 @@ impl IncomingToken {
                     validated: true,
                 })
             }
+            crate::token_v2::DecodedToken::Binding(_) => Ok(unvalidated),
         }
     }
 }
@@ -217,189 +198,6 @@ impl IncomingToken {
 ///
 /// The connection cannot be established.
 pub(crate) struct InvalidRetryTokenError;
-
-/// Retry or validation token
-pub(crate) struct Token {
-    /// Content that is encrypted from the client
-    pub(crate) payload: TokenPayload,
-    /// Randomly generated value, which must be unique, and is visible to the client
-    nonce: u128,
-}
-
-impl Token {
-    /// Construct with newly sampled randomness
-    pub(crate) fn new(payload: TokenPayload, rng: &mut impl Rng) -> Self {
-        Self {
-            nonce: rng.r#gen(),
-            payload,
-        }
-    }
-
-    /// Encode and encrypt
-    pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        // Encode payload
-        match self.payload {
-            TokenPayload::Retry {
-                address,
-                orig_dst_cid,
-                issued,
-            } => {
-                buf.put_u8(TokenType::Retry as u8);
-                encode_addr(&mut buf, address);
-                orig_dst_cid.encode_long(&mut buf);
-                encode_unix_secs(&mut buf, issued);
-            }
-            TokenPayload::Validation { ip, issued } => {
-                buf.put_u8(TokenType::Validation as u8);
-                encode_ip(&mut buf, ip);
-                encode_unix_secs(&mut buf, issued);
-            }
-        }
-
-        // Encrypt
-        let aead_key = key.aead_from_hkdf(&self.nonce.to_le_bytes());
-        if aead_key.seal(&mut buf, &[]).is_err() {
-            // Encryption failure: return empty token to signal no-op to the receiver
-            return Vec::new();
-        }
-        buf.extend(&self.nonce.to_le_bytes());
-
-        buf
-    }
-
-    /// Decode and decrypt
-    fn decode(key: &dyn HandshakeTokenKey, raw_token_bytes: &[u8]) -> Option<Self> {
-        // Decrypt
-
-        // MSRV: split_at_checked requires 1.80.0
-        let nonce_slice_start = raw_token_bytes.len().checked_sub(size_of::<u128>())?;
-        let (sealed_token, nonce_bytes) = raw_token_bytes.split_at(nonce_slice_start);
-
-        let nonce = u128::from_le_bytes(nonce_bytes.try_into().ok()?);
-
-        let aead_key = key.aead_from_hkdf(nonce_bytes);
-        let mut sealed_token = sealed_token.to_vec();
-        let data = aead_key.open(&mut sealed_token, &[]).ok()?;
-
-        // Decode payload
-        let mut reader = &data[..];
-        let payload = match TokenType::from_byte((&mut reader).get::<u8>().ok()?)? {
-            TokenType::Retry => TokenPayload::Retry {
-                address: decode_addr(&mut reader)?,
-                orig_dst_cid: ConnectionId::decode_long(&mut reader)?,
-                issued: decode_unix_secs(&mut reader)?,
-            },
-            TokenType::Validation => TokenPayload::Validation {
-                ip: decode_ip(&mut reader)?,
-                issued: decode_unix_secs(&mut reader)?,
-            },
-        };
-
-        if !reader.is_empty() {
-            // Consider extra bytes a decoding error (it may be from an incompatible endpoint)
-            return None;
-        }
-
-        Some(Self { nonce, payload })
-    }
-}
-
-/// Content of a [`Token`] that is encrypted from the client
-pub(crate) enum TokenPayload {
-    /// Token originating from a Retry packet
-    Retry {
-        /// The client's address
-        address: SocketAddr,
-        /// The destination connection ID set in the very first packet from the client
-        orig_dst_cid: ConnectionId,
-        /// The time at which this token was issued
-        issued: SystemTime,
-    },
-    /// Token originating from a NEW_TOKEN frame
-    Validation {
-        /// The client's IP address (its port is likely to change between sessions)
-        ip: IpAddr,
-        /// The time at which this token was issued
-        issued: SystemTime,
-    },
-}
-
-/// Variant tag for a [`TokenPayload`]
-#[derive(Copy, Clone)]
-#[repr(u8)]
-enum TokenType {
-    Retry = 0,
-    Validation = 1,
-}
-
-impl TokenType {
-    fn from_byte(n: u8) -> Option<Self> {
-        use TokenType::*;
-        [Retry, Validation].into_iter().find(|ty| *ty as u8 == n)
-    }
-}
-
-fn encode_addr(buf: &mut Vec<u8>, address: SocketAddr) {
-    encode_ip(buf, address.ip());
-    buf.put_u16(address.port());
-}
-
-fn decode_addr<B: Buf>(buf: &mut B) -> Option<SocketAddr> {
-    let ip = decode_ip(buf)?;
-    let port = buf.get().ok()?;
-    Some(SocketAddr::new(ip, port))
-}
-
-fn encode_ip(buf: &mut Vec<u8>, ip: IpAddr) {
-    match ip {
-        IpAddr::V4(x) => {
-            buf.put_u8(0);
-            buf.put_slice(&x.octets());
-        }
-        IpAddr::V6(x) => {
-            buf.put_u8(1);
-            buf.put_slice(&x.octets());
-        }
-    }
-}
-
-fn decode_ip<B: Buf>(buf: &mut B) -> Option<IpAddr> {
-    match buf.get::<u8>().ok()? {
-        0 => buf.get().ok().map(IpAddr::V4),
-        1 => buf.get().ok().map(IpAddr::V6),
-        _ => None,
-    }
-}
-
-fn encode_unix_secs(buf: &mut Vec<u8>, time: SystemTime) {
-    buf.write::<u64>(
-        time.duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    );
-}
-
-fn decode_unix_secs<B: Buf>(buf: &mut B) -> Option<SystemTime> {
-    Some(UNIX_EPOCH + Duration::from_secs(buf.get::<u64>().ok()?))
-}
-
-/// Try to decode a v2 token format.
-/// Returns Some(RetryTokenDecoded) if the token decodes successfully, None otherwise.
-/// Note: This is a temporary implementation that uses a fallback key for v2 token decoding.
-/// In production, proper key management integration would be needed.
-fn try_decode_v2_token(
-    token_bytes: &[u8],
-    _token_key: &dyn HandshakeTokenKey,
-) -> Option<crate::token_v2::RetryTokenDecoded> {
-    // For now, use a deterministic key for v2 token decoding
-    // This allows v2 tokens to be decoded even when the legacy system is in use
-    // TODO: Integrate proper key management between legacy and v2 token systems
-    let fallback_key = TokenKey([0u8; 32]); // This should be replaced with proper key derivation
-
-    decode_retry_token(&fallback_key, token_bytes)
-}
 
 /// Stateless reset token
 ///
@@ -453,20 +251,7 @@ impl fmt::Display for ResetToken {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use super::*;
-    use aws_lc_rs::hkdf;
     use rand::prelude::*;
-
-    fn token_round_trip(payload: TokenPayload) -> TokenPayload {
-        let rng = &mut rand::thread_rng();
-        let token = Token::new(payload, rng);
-        let mut master_key = [0; 64];
-        rng.fill_bytes(&mut master_key);
-        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
-        let encoded = token.encode(&prk);
-        let decoded = Token::decode(&prk, &encoded).expect("token didn't decrypt / decode");
-        assert_eq!(token.nonce, decoded.nonce);
-        decoded.payload
-    }
 
     #[test]
     fn retry_token_sanity() {
@@ -476,26 +261,24 @@ mod test {
 
         use std::net::Ipv6Addr;
 
+        let mut rng = rand::thread_rng();
+        let key = crate::token_v2::test_key_from_rng(&mut rng);
         let address_1 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4433);
         let orig_dst_cid_1 = RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid();
         let issued_1 = UNIX_EPOCH + Duration::from_secs(42); // Fractional seconds would be lost
-        let payload_1 = TokenPayload::Retry {
-            address: address_1,
-            orig_dst_cid: orig_dst_cid_1,
-            issued: issued_1,
-        };
-        let TokenPayload::Retry {
-            address: address_2,
-            orig_dst_cid: orig_dst_cid_2,
-            issued: issued_2,
-        } = token_round_trip(payload_1)
-        else {
-            panic!("token decoded as wrong variant");
-        };
+        let token = crate::token_v2::encode_retry_token_with_rng(
+            &key,
+            address_1,
+            &orig_dst_cid_1,
+            issued_1,
+            &mut rng,
+        )
+        .expect("encode retry token");
+        let decoded = crate::token_v2::decode_retry_token(&key, &token).expect("decode retry");
 
-        assert_eq!(address_1, address_2);
-        assert_eq!(orig_dst_cid_1, orig_dst_cid_2);
-        assert_eq!(issued_1, issued_2);
+        assert_eq!(address_1, decoded.address);
+        assert_eq!(orig_dst_cid_1, decoded.orig_dst_cid);
+        assert_eq!(issued_1, decoded.issued);
     }
 
     #[test]
@@ -504,36 +287,26 @@ mod test {
 
         use std::net::Ipv6Addr;
 
+        let mut rng = rand::thread_rng();
+        let key = crate::token_v2::test_key_from_rng(&mut rng);
         let ip_1 = Ipv6Addr::LOCALHOST.into();
         let issued_1 = UNIX_EPOCH + Duration::from_secs(42); // Fractional seconds would be lost
+        let token =
+            crate::token_v2::encode_validation_token_with_rng(&key, ip_1, issued_1, &mut rng)
+                .expect("encode validation token");
+        let decoded = crate::token_v2::decode_validation_token(&key, &token)
+            .expect("decode validation token");
 
-        let payload_1 = TokenPayload::Validation {
-            ip: ip_1,
-            issued: issued_1,
-        };
-        let TokenPayload::Validation {
-            ip: ip_2,
-            issued: issued_2,
-        } = token_round_trip(payload_1)
-        else {
-            panic!("token decoded as wrong variant");
-        };
-
-        assert_eq!(ip_1, ip_2);
-        assert_eq!(issued_1, issued_2);
+        assert_eq!(ip_1, decoded.ip);
+        assert_eq!(issued_1, decoded.issued);
     }
 
     #[test]
     fn invalid_token_returns_err() {
-        use super::*;
         use rand::RngCore;
 
-        let rng = &mut rand::thread_rng();
-
-        let mut master_key = [0; 64];
-        rng.fill_bytes(&mut master_key);
-
-        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
+        let mut rng = rand::thread_rng();
+        let key = crate::token_v2::test_key_from_rng(&mut rng);
 
         let mut invalid_token = Vec::new();
 
@@ -542,6 +315,6 @@ mod test {
         invalid_token.put_slice(&random_data);
 
         // Assert: garbage sealed data returns err
-        assert!(Token::decode(&prk, &invalid_token).is_none());
+        assert!(crate::token_v2::decode_token(&key, &invalid_token).is_none());
     }
 }

@@ -22,8 +22,9 @@ use crate::{
     DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
-    crypto::{self, HandshakeTokenKey, HmacKey},
+    crypto::{self, HmacKey},
     shared::ConnectionId,
+    token_v2::TokenKey,
 };
 
 mod transport;
@@ -350,12 +351,8 @@ pub struct ServerConfig {
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
-    /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
-
-    /// Key material for Token v2 address-validation tokens. When present, NEW_TOKEN frames will
-    /// emit AES-GCM protected tokens bound to peer identity and connection ID.
-    pub(crate) token_v2_key: Option<crate::token_v2::TokenKey>,
+    /// Key material for AEAD-protected address-validation tokens.
+    pub(crate) token_key: TokenKey,
 
     /// Duration after a retry token was issued for which it's considered valid
     pub(crate) retry_token_lifetime: Duration,
@@ -378,16 +375,12 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Create a default config with a particular handshake token key
-    pub fn new(
-        crypto: Arc<dyn crypto::ServerConfig>,
-        token_key: Arc<dyn HandshakeTokenKey>,
-    ) -> Self {
+    pub fn new(crypto: Arc<dyn crypto::ServerConfig>, token_key: TokenKey) -> Self {
         Self {
             transport: Arc::new(TransportConfig::default()),
             crypto,
 
             token_key,
-            token_v2_key: None,
             retry_token_lifetime: Duration::from_secs(15),
 
             migration: true,
@@ -420,16 +413,9 @@ impl ServerConfig {
         self
     }
 
-    /// Private key used to authenticate data included in handshake tokens
-    pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
+    /// Key used to encrypt address-validation tokens (Retry and NEW_TOKEN)
+    pub fn token_key(&mut self, value: TokenKey) -> &mut Self {
         self.token_key = value;
-        self
-    }
-
-    /// Configure the key used for Token v2 address-validation tokens. When unset, the server will
-    /// continue issuing legacy validation tokens.
-    pub fn token_v2_key(&mut self, key: Option<crate::token_v2::TokenKey>) -> &mut Self {
-        self.token_v2_key = key;
         self
     }
 
@@ -544,17 +530,15 @@ impl ServerConfig {
 
     /// Create a server config with the given [`crypto::ServerConfig`]
     ///
-    /// Uses a randomized handshake token key.
+    /// Uses a randomized token key.
     pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
-        use aws_lc_rs::hkdf;
         use rand::RngCore;
 
         let rng = &mut rand::thread_rng();
-        let mut master_key = [0u8; 64];
-        rng.fill_bytes(&mut master_key);
-        let master_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
+        let mut token_key = [0u8; 32];
+        rng.fill_bytes(&mut token_key);
 
-        Self::new(crypto, Arc::new(master_key))
+        Self::new(crypto, TokenKey(token_key))
     }
 }
 

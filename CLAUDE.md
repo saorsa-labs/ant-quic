@@ -24,6 +24,40 @@ ant-quic is a QUIC transport protocol implementation with advanced NAT traversal
 - **No Roles**: No Client/Server/Bootstrap distinction - all nodes are symmetric peers
 - **Known Peers**: Uses `known_peers` terminology instead of "bootstrap nodes"
 
+## 🤖 MANDATORY SUBAGENT USAGE
+
+**ALWAYS USE SUBAGENTS. THIS IS NOT OPTIONAL.**
+
+Subagents (via the `Task` tool) MUST be used whenever possible. They provide:
+- **Fresh context** - Each subagent starts clean, preventing context pollution
+- **Parallel execution** - Multiple agents can work simultaneously
+- **Specialization** - Purpose-built agents for specific tasks
+- **Unbounded execution** - No context limits when chaining agents
+
+### When to Spawn Subagents
+
+| Task Type | Action |
+|-----------|--------|
+| Code exploration/search | Spawn `Explore` agent |
+| Code review | Spawn review agents in parallel |
+| Bug fixes | Spawn `code-fixer` agent |
+| Test execution | Spawn `test-runner` agent |
+| Build validation | Spawn `build-validator` agent |
+| Security scanning | Spawn `security-scanner` agent |
+| Documentation audit | Spawn `documentation-auditor` agent |
+| Multi-step tasks | Spawn `dev-agent` or `general-purpose` agent |
+| Complex research | Spawn `Explore` or `general-purpose` agent |
+
+### Subagent Rules
+
+1. **PREFER subagents over doing work directly** - Even for "simple" tasks
+2. **PARALLELIZE when possible** - Spawn multiple agents in a single message
+3. **Use background agents** for long-running tasks (`run_in_background: true`)
+4. **Chain agents** for complex workflows - Output of one feeds the next
+5. **Never accumulate context** - Delegate to fresh agents instead
+
+**IF YOU CAN USE A SUBAGENT, YOU MUST USE A SUBAGENT.**
+
 ## Key Technical Decisions
 
 ### Authentication: Pure PQC with Raw Public Keys (v0.2)

@@ -11,7 +11,6 @@ use ant_quic as quic;
 use ant_quic::crypto::raw_public_keys::pqc::{
     create_subject_public_key_info, generate_ml_dsa_keypair,
 };
-use ant_quic::nat_traversal_api::PeerId;
 use ant_quic::{
     TokenStore,
     config::{ClientConfig, ServerConfig},
@@ -35,14 +34,22 @@ fn mk_client_config(chain: &[CertificateDer<'static>]) -> ClientConfig {
     ClientConfig::with_root_certificates(Arc::new(roots)).expect("client cfg")
 }
 
-async fn mk_server() -> (Endpoint, std::net::SocketAddr, Vec<CertificateDer<'static>>) {
+async fn mk_server() -> (
+    Endpoint,
+    std::net::SocketAddr,
+    Vec<CertificateDer<'static>>,
+    quic::token_v2::TokenKey,
+) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let (chain, key) = gen_self_signed_cert();
-    let server_cfg = ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
+    let mut rng = rand::thread_rng();
+    let token_key = quic::token_v2::test_key_from_rng(&mut rng);
+    let mut server_cfg = ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
+    server_cfg.token_key(token_key);
     let ep = Endpoint::server(server_cfg, ([127, 0, 0, 1], 0).into()).expect("server ep");
     let addr = ep.local_addr().expect("server addr");
-    (ep, addr, chain)
+    (ep, addr, chain, token_key)
 }
 
 #[derive(Clone, Default)]
@@ -58,7 +65,7 @@ impl TokenStore for CollectingTokenStore {
 
 #[tokio::test]
 async fn auto_binding_emits_new_token_v2() {
-    let (server, server_addr, chain) = mk_server().await;
+    let (server, server_addr, chain, token_key) = mk_server().await;
 
     // Prepare client identity (ML-DSA-65) and trust runtime
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keygen");
@@ -119,19 +126,13 @@ async fn auto_binding_emits_new_token_v2() {
         "binding should be verified"
     );
 
-    // Verify a NEW_TOKEN was received and decodes as token_v2 (contains PeerId)
+    // Verify a NEW_TOKEN was received and decodes with the server token key
     let tokens = collector.0.lock().unwrap().clone();
     assert!(!tokens.is_empty(), "expected at least one NEW_TOKEN");
     let tok = &tokens[0];
 
-    let dec = quic::token_v2::decode_retry_token(
-        &quic::token_v2::test_key_from_rng(&mut rand::thread_rng()),
-        tok,
-    )
-    .expect("decode v2");
-    // PeerId in token should equal the pinned client's id
-    let expected_peer = PeerId(dec.peer_id.0); // round-trip proof already present
-    assert_eq!(dec.peer_id, expected_peer);
+    let dec = quic::token_v2::decode_validation_token(&token_key, tok).expect("decode v2");
+    assert_eq!(dec.ip, server_addr.ip());
 
     // Clean up
     conn.close(0u32.into(), b"done");
@@ -140,7 +141,7 @@ async fn auto_binding_emits_new_token_v2() {
 
 #[tokio::test]
 async fn auto_binding_rejects_on_mismatch() {
-    let (server, server_addr, chain) = mk_server().await;
+    let (server, server_addr, chain, _token_key) = mk_server().await;
 
     // Prepare client identity (ML-DSA-65)
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keygen");

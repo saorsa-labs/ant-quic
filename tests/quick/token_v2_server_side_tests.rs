@@ -11,8 +11,10 @@ fn server_accepts_matching_peer_and_cid() {
     let peer = PeerId([1u8; 32]);
     let cid = ConnectionId::new(&[7u8; 8]);
 
-    let tok = ant_quic::token_v2::encode_retry_token(&key, &peer, &cid).unwrap();
-    assert!(ant_quic::token_v2::validate_token(&key, &tok, &peer, &cid));
+    let tok = ant_quic::token_v2::encode_binding_token(&key, &peer, &cid).unwrap();
+    assert!(ant_quic::token_v2::validate_binding_token(
+        &key, &tok, &peer, &cid
+    ));
 }
 
 #[test]
@@ -22,8 +24,8 @@ fn server_rejects_mismatch_peer() {
     let peer_ok = PeerId([2u8; 32]);
     let peer_bad = PeerId([3u8; 32]);
     let cid = ConnectionId::new(&[9u8; 8]);
-    let tok = ant_quic::token_v2::encode_retry_token(&key, &peer_ok, &cid).unwrap();
-    assert!(!ant_quic::token_v2::validate_token(
+    let tok = ant_quic::token_v2::encode_binding_token(&key, &peer_ok, &cid).unwrap();
+    assert!(!ant_quic::token_v2::validate_binding_token(
         &key, &tok, &peer_bad, &cid
     ));
 }
@@ -35,8 +37,8 @@ fn server_rejects_mismatch_cid() {
     let peer = PeerId([4u8; 32]);
     let cid_ok = ConnectionId::new(&[5u8; 8]);
     let cid_bad = ConnectionId::new(&[6u8; 8]);
-    let tok = ant_quic::token_v2::encode_retry_token(&key, &peer, &cid_ok).unwrap();
-    assert!(!ant_quic::token_v2::validate_token(
+    let tok = ant_quic::token_v2::encode_binding_token(&key, &peer, &cid_ok).unwrap();
+    assert!(!ant_quic::token_v2::validate_binding_token(
         &key, &tok, &peer, &cid_bad
     ));
 }

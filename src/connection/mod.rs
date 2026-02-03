@@ -44,7 +44,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
     },
-    token::{ResetToken, Token, TokenPayload},
+    token::ResetToken,
     transport_parameters::TransportParameters,
 };
 
@@ -279,10 +279,9 @@ pub struct Connection {
     #[cfg(feature = "__qlog")]
     qlog_streamer: Option<Box<dyn std::io::Write + Send + Sync>>,
 
-    /// Optional bound peer identity for NEW_TOKEN v2 issuance
+    /// Optional bound peer identity (set after channel binding)
     peer_id_for_tokens: Option<PeerId>,
-    /// When true, NEW_TOKEN frames are delayed until channel binding
-    /// sets `peer_id_for_tokens`, avoiding legacy tokens in v2 mode.
+    /// When true, NEW_TOKEN frames are delayed until channel binding completes.
     delay_new_token_until_binding: bool,
 }
 
@@ -3997,32 +3996,20 @@ impl Connection {
                 break;
             }
 
-            // Issue token v2 if we have a bound peer id; otherwise fall back to legacy
-            let new_token = if let Some(pid) = self.peer_id_for_tokens {
-                // Compose token_v2: pt = peer_id[32] || cid_len[1] || cid[..] || nonce16
-                // token = pt || nonce12_suffix (last 12 bytes of nonce)
-                let nonce_u128: u128 = self.rng.r#gen();
-                let nonce = nonce_u128.to_le_bytes();
-                let cid = self.rem_cids.active();
-                let mut pt = Vec::with_capacity(32 + 1 + cid.len() + 16);
-                pt.extend_from_slice(&pid.0);
-                pt.push(cid.len() as u8);
-                pt.extend_from_slice(&cid[..]);
-                pt.extend_from_slice(&nonce);
-                let mut tok = pt;
-                tok.extend_from_slice(&nonce[..12]);
-                NewToken { token: tok.into() }
-            } else {
-                let token = Token::new(
-                    TokenPayload::Validation {
-                        ip: remote_addr.ip(),
-                        issued: server_config.time_source.now(),
-                    },
-                    &mut self.rng,
-                );
-                NewToken {
-                    token: token.encode(&*server_config.token_key).into(),
+            let token = match crate::token_v2::encode_validation_token_with_rng(
+                &server_config.token_key,
+                remote_addr.ip(),
+                server_config.time_source.now(),
+                &mut self.rng,
+            ) {
+                Ok(token) => token,
+                Err(err) => {
+                    error!(?err, "failed to encode validation token");
+                    continue;
                 }
+            };
+            let new_token = NewToken {
+                token: token.into(),
             };
 
             if buf.len() + new_token.size() >= max_size {

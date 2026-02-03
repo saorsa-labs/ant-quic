@@ -132,10 +132,10 @@ fn token_binding_uses_peerid_cid_nonce() {
     let token_key = quic::token_v2::test_key_from_rng(&mut rng);
 
     // Act: encode
-    let token = quic::token_v2::encode_retry_token(&token_key, &peer_id, &cid).unwrap();
+    let token = quic::token_v2::encode_binding_token(&token_key, &peer_id, &cid).unwrap();
 
     // Assert: decode and verify binding
-    let decoded = quic::token_v2::decode_retry_token(&token_key, &token).expect("decodes");
+    let decoded = quic::token_v2::decode_binding_token(&token_key, &token).expect("decodes");
     assert_eq!(decoded.peer_id, peer_id);
     assert_eq!(decoded.cid, cid);
 }

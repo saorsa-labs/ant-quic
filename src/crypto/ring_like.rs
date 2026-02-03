@@ -5,7 +5,7 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
-use aws_lc_rs::{aead, error, hkdf, hmac};
+use aws_lc_rs::{error, hmac};
 
 use crate::crypto::{self, CryptoError};
 
@@ -20,42 +20,6 @@ impl crypto::HmacKey for hmac::Key {
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
         Ok(hmac::verify(self, data, signature)?)
-    }
-}
-
-impl crypto::HandshakeTokenKey for hkdf::Prk {
-    #[allow(clippy::panic)]
-    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn crypto::AeadKey> {
-        let mut key_buffer = [0u8; 32];
-        let info = [random_bytes];
-        let okm = self
-            .expand(&info, hkdf::HKDF_SHA256)
-            .unwrap_or_else(|_| panic!("HKDF expand should succeed with valid parameters"));
-
-        okm.fill(&mut key_buffer)
-            .unwrap_or_else(|_| panic!("OKM fill should succeed"));
-
-        let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_buffer)
-            .unwrap_or_else(|_| panic!("AES key creation should succeed with valid key material"));
-        Box::new(aead::LessSafeKey::new(key))
-    }
-}
-
-impl crypto::AeadKey for aead::LessSafeKey {
-    fn seal(&self, data: &mut Vec<u8>, additional_data: &[u8]) -> Result<(), CryptoError> {
-        let aad = aead::Aad::from(additional_data);
-        let zero_nonce = aead::Nonce::assume_unique_for_key([0u8; 12]);
-        Ok(self.seal_in_place_append_tag(zero_nonce, aad, data)?)
-    }
-
-    fn open<'a>(
-        &self,
-        data: &'a mut [u8],
-        additional_data: &[u8],
-    ) -> Result<&'a mut [u8], CryptoError> {
-        let aad = aead::Aad::from(additional_data);
-        let zero_nonce = aead::Nonce::assume_unique_for_key([0u8; 12]);
-        Ok(self.open_in_place(zero_nonce, aad, data)?)
     }
 }
 
