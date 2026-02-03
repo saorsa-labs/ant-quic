@@ -54,14 +54,21 @@ async fn test_pqc_config_builder() {
 }
 
 #[tokio::test]
-async fn test_pqc_config_requires_algorithms() {
-    // v0.13.0+: Must have at least one PQC algorithm
+async fn test_pqc_always_enabled() {
+    // v0.13.0+: Legacy toggles are ignored - both algorithms always enabled
     let result = PqcConfigBuilder::default()
         .ml_kem(false)
         .ml_dsa(false)
         .build();
 
-    assert!(result.is_err(), "Config without algorithms should fail");
+    // Should succeed - toggles are ignored in 100% PQC mode
+    assert!(
+        result.is_ok(),
+        "Config should succeed - toggles are ignored in v0.13.0+"
+    );
+    let config = result.unwrap();
+    assert!(config.ml_kem_enabled, "ML-KEM must always be enabled");
+    assert!(config.ml_dsa_enabled, "ML-DSA must always be enabled");
 }
 
 #[tokio::test]

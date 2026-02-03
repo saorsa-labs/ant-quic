@@ -15,8 +15,11 @@ use std::{
 use tracing::{Level, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-/// Set up test logging
+/// Set up test logging and crypto provider
 fn init_logging() {
+    // Install the crypto provider (required for rustls)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let _ = tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env().add_directive(Level::INFO.into()))

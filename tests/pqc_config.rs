@@ -94,16 +94,23 @@ fn test_pqc_config_builder_chaining() {
 }
 
 #[test]
-fn test_pqc_config_requires_at_least_one_algorithm() {
-    // v0.13.0+: Must have at least one PQC algorithm enabled
-    let result = PqcConfig::builder().ml_kem(false).ml_dsa(false).build();
+fn test_pqc_always_enabled_regardless_of_toggles() {
+    // v0.13.0+: Legacy toggles are ignored - both algorithms always enabled
+    let config = PqcConfig::builder().ml_kem(false).ml_dsa(false).build();
 
-    assert!(result.is_err(), "Config without algorithms should fail");
+    // Should succeed - toggles are ignored in 100% PQC mode
+    assert!(
+        config.is_ok(),
+        "Config should succeed - toggles are ignored in v0.13.0+"
+    );
+    let config = config.unwrap();
+    assert!(config.ml_kem_enabled, "ML-KEM must always be enabled");
+    assert!(config.ml_dsa_enabled, "ML-DSA must always be enabled");
 }
 
 #[test]
-fn test_ml_kem_only_configuration() {
-    // Enable only ML-KEM for key exchange
+fn test_legacy_ml_kem_toggle_ignored() {
+    // v0.13.0+: Even if we try to disable ML-DSA, it stays enabled
     let config = PqcConfig::builder()
         .ml_kem(true)
         .ml_dsa(false)
@@ -111,19 +118,25 @@ fn test_ml_kem_only_configuration() {
         .unwrap();
 
     assert!(config.ml_kem_enabled);
-    assert!(!config.ml_dsa_enabled);
+    assert!(
+        config.ml_dsa_enabled,
+        "ML-DSA stays enabled (100% PQC mandate)"
+    );
 }
 
 #[test]
-fn test_ml_dsa_only_configuration() {
-    // Enable only ML-DSA for signatures
+fn test_legacy_ml_dsa_toggle_ignored() {
+    // v0.13.0+: Even if we try to disable ML-KEM, it stays enabled
     let config = PqcConfig::builder()
         .ml_kem(false)
         .ml_dsa(true)
         .build()
         .unwrap();
 
-    assert!(!config.ml_kem_enabled);
+    assert!(
+        config.ml_kem_enabled,
+        "ML-KEM stays enabled (100% PQC mandate)"
+    );
     assert!(config.ml_dsa_enabled);
 }
 

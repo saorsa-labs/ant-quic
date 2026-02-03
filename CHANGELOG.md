@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.
 - Token v2 helpers now distinguish binding tokens (`encode_binding_token`/`decode_binding_token`) from address-validation tokens (Retry/NEW_TOKEN).
 
+## [0.21.1] - 2026-02-03
+
+### Changed
+
+- **Updated saorsa-pqc to v0.4**: Removed bincode dependency from the dependency tree
+  - saorsa-pqc v0.4+ now uses postcard instead of bincode for serialization
+  - Removed RUSTSEC-2025-0141 advisory ignore from deny.toml (bincode unmaintained)
+
+### Fixed
+
+- **Test suite compatibility**: Updated PQC configuration tests to match v0.13.0+ 100% PQC mandate
+  - Legacy algorithm toggle methods are now correctly documented as ignored (both ML-KEM and ML-DSA always enabled)
+  - Fixed `nat_traversal_mixed_format` tests to install rustls CryptoProvider
+  - Marked interop tests requiring Docker infrastructure as ignored
+
 ## [0.21.0] - 2026-02-01
 
 ### Breaking Changes

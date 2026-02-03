@@ -1,7 +1,8 @@
 //! Basic integration tests for PQC implementation
 //!
 //! v0.13.0+: PQC is always enabled (100% PQC, no classical crypto).
-//! This test suite performs basic validation of PQC functionality.
+//! Both ML-KEM-768 and ML-DSA-65 are mandatory on every connection.
+//! The legacy toggle methods are ignored - PQC cannot be disabled.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -22,37 +23,26 @@ fn test_pqc_config_builder() {
 }
 
 #[test]
-fn test_pqc_config_with_algorithms() {
-    // Test ML-KEM only
-    let ml_kem_config = PqcConfigBuilder::default()
+fn test_pqc_always_enabled() {
+    // v0.13.0+: Both algorithms are always enabled, toggle methods are legacy and ignored
+    let config = PqcConfigBuilder::default()
         .ml_kem(true)
-        .ml_dsa(false)
-        .build()
-        .expect("Failed to build ML-KEM only config");
-
-    assert!(ml_kem_config.ml_kem_enabled);
-    assert!(!ml_kem_config.ml_dsa_enabled);
-
-    // Test ML-DSA only
-    let ml_dsa_config = PqcConfigBuilder::default()
-        .ml_kem(false)
         .ml_dsa(true)
         .build()
-        .expect("Failed to build ML-DSA only config");
+        .expect("Failed to build config");
 
-    assert!(!ml_dsa_config.ml_kem_enabled);
-    assert!(ml_dsa_config.ml_dsa_enabled);
-}
+    assert!(config.ml_kem_enabled);
+    assert!(config.ml_dsa_enabled);
 
-#[test]
-fn test_pqc_requires_at_least_one_algorithm() {
-    // v0.13.0+: Must have at least one PQC algorithm
-    let result = PqcConfigBuilder::default()
+    // Even if we try to disable them, they remain enabled (100% PQC mandate)
+    let config = PqcConfigBuilder::default()
         .ml_kem(false)
         .ml_dsa(false)
-        .build();
+        .build()
+        .expect("Config should succeed - toggles are ignored in v0.13.0+");
 
-    assert!(result.is_err(), "Config without algorithms should fail");
+    assert!(config.ml_kem_enabled, "ML-KEM must always be enabled");
+    assert!(config.ml_dsa_enabled, "ML-DSA must always be enabled");
 }
 
 #[test]
@@ -69,29 +59,6 @@ fn test_memory_pool_configuration() {
     let result = PqcConfigBuilder::default().memory_pool_size(0).build();
 
     assert!(result.is_err());
-}
-
-#[test]
-fn test_algorithm_selection() {
-    // Test disabling ML-KEM
-    let config = PqcConfigBuilder::default()
-        .ml_kem(false)
-        .ml_dsa(true)
-        .build()
-        .expect("Failed to build config");
-
-    assert!(!config.ml_kem_enabled);
-    assert!(config.ml_dsa_enabled);
-
-    // Test disabling ML-DSA
-    let config = PqcConfigBuilder::default()
-        .ml_kem(true)
-        .ml_dsa(false)
-        .build()
-        .expect("Failed to build config");
-
-    assert!(config.ml_kem_enabled);
-    assert!(!config.ml_dsa_enabled);
 }
 
 #[test]
@@ -177,23 +144,25 @@ fn test_release_criteria() {
         config.handshake_timeout_multiplier
     );
 
-    // Verify algorithm selection
-    let ml_kem_only = PqcConfigBuilder::default()
-        .ml_kem(true)
+    // v0.13.0+: Both algorithms must always be enabled (100% PQC)
+    assert!(config.ml_kem_enabled, "ML-KEM must be enabled");
+    assert!(config.ml_dsa_enabled, "ML-DSA must be enabled");
+
+    // Verify legacy toggles are ignored
+    let legacy_off = PqcConfigBuilder::default()
+        .ml_kem(false)
         .ml_dsa(false)
         .build()
         .unwrap();
-    assert!(ml_kem_only.ml_kem_enabled);
-    assert!(!ml_kem_only.ml_dsa_enabled);
-
-    let ml_dsa_only = PqcConfigBuilder::default()
-        .ml_kem(false)
-        .ml_dsa(true)
-        .build()
-        .unwrap();
-    assert!(!ml_dsa_only.ml_kem_enabled);
-    assert!(ml_dsa_only.ml_dsa_enabled);
-    println!("\nAlgorithm selection validated");
+    assert!(
+        legacy_off.ml_kem_enabled,
+        "ML-KEM stays enabled even with legacy toggle"
+    );
+    assert!(
+        legacy_off.ml_dsa_enabled,
+        "ML-DSA stays enabled even with legacy toggle"
+    );
+    println!("\n100% PQC mandate verified - toggles are ignored");
 
     // Verify performance tuning
     let perf_config = PqcConfigBuilder::default()
@@ -208,7 +177,7 @@ fn test_release_criteria() {
     println!("\n=== v0.13.0+ Basic PQC Integration Complete ===");
     println!("  - Configuration validated");
     println!("  - Error types available");
-    println!("  - PQC always enabled");
+    println!("  - PQC always enabled (100% mandate)");
 
     println!("\n=== Tests Passed ===\n");
 }
