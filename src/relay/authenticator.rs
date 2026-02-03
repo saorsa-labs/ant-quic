@@ -222,13 +222,19 @@ impl RelayAuthenticator {
         }
 
         // Check for replay attack
-        // SAFETY: Handle mutex poisoning gracefully - clear the poisoned state
-        // and continue with an empty set (safer than crashing the relay)
+        // SECURITY: Mutex poisoning indicates a panic occurred while holding the lock,
+        // which may have left the nonce set in an inconsistent state. Continuing with
+        // corrupted state could enable replay attacks. Fail authentication instead.
         let mut used_nonces = match self.used_nonces.lock() {
             Ok(guard) => guard,
-            Err(poisoned) => {
-                tracing::warn!("Mutex was poisoned in relay authenticator, recovering");
-                poisoned.into_inner()
+            Err(_poisoned) => {
+                tracing::error!(
+                    "Mutex poisoned in relay authenticator - potential security compromise, \
+                     failing authentication to prevent replay attacks"
+                );
+                return Err(RelayError::AuthenticationFailed {
+                    reason: "Internal security state compromised".to_string(),
+                });
             }
         };
 

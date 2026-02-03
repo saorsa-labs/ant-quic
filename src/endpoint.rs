@@ -538,9 +538,7 @@ impl Endpoint {
         self.relay_stats.current_queue_size = self.relay_queue.len();
 
         if processed > 0 {
-            debug!(
-                "Processed {processed} queued relay requests for peer {peer_id:?}"
-            );
+            debug!("Processed {processed} queued relay requests for peer {peer_id:?}");
         }
     }
 
