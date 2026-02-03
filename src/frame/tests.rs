@@ -89,14 +89,14 @@ fn test_observed_address_malformed() {
     
     // Truncated IPv4 address
     let mut buf = BytesMut::new();
-    crate::coding::BufMutExt::write_var(&mut buf, 1); // sequence number
+    crate::coding::BufMutExt::write_var_or_debug_assert(&mut buf, 1); // sequence number
     buf.put_slice(&[192, 168]); // Only 2 bytes instead of 4
     let mut reader = &buf[..];
     assert!(ObservedAddress::decode(&mut reader, false).is_err());
     
     // Truncated IPv6 address
     let mut buf = BytesMut::new();
-    crate::coding::BufMutExt::write_var(&mut buf, 1); // sequence number
+    crate::coding::BufMutExt::write_var_or_debug_assert(&mut buf, 1); // sequence number
     buf.put_slice(&[0; 8]); // Only 8 bytes instead of 16
     let mut reader = &buf[..];
     assert!(ObservedAddress::decode(&mut reader, true).is_err());

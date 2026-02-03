@@ -510,62 +510,62 @@ impl TransportParameters {
                 }
                 TransportParameterId::StatelessResetToken => {
                     if let Some(ref x) = self.stateless_reset_token {
-                        w.write_var(id as u64);
-                        w.write_var(16);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(16);
                         w.put_slice(x);
                     }
                 }
                 TransportParameterId::DisableActiveMigration => {
                     if self.disable_active_migration {
-                        w.write_var(id as u64);
-                        w.write_var(0);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(0);
                     }
                 }
                 TransportParameterId::MaxDatagramFrameSize => {
                     if let Some(x) = self.max_datagram_frame_size {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(x.size() as u64);
                         w.write(x);
                     }
                 }
                 TransportParameterId::PreferredAddress => {
                     if let Some(ref x) = self.preferred_address {
-                        w.write_var(id as u64);
-                        w.write_var(x.wire_size() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(x.wire_size() as u64);
                         x.write(w);
                     }
                 }
                 TransportParameterId::OriginalDestinationConnectionId => {
                     if let Some(ref cid) = self.original_dst_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::InitialSourceConnectionId => {
                     if let Some(ref cid) = self.initial_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::RetrySourceConnectionId => {
                     if let Some(ref cid) = self.retry_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::GreaseQuicBit => {
                     if self.grease_quic_bit {
-                        w.write_var(id as u64);
-                        w.write_var(0);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(0);
                     }
                 }
                 TransportParameterId::MinAckDelayDraft07 => {
                     if let Some(x) = self.min_ack_delay {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(x.size() as u64);
                         w.write(x);
                     }
                 }
@@ -577,36 +577,36 @@ impl TransportParameters {
                         match config {
                             NatTraversalConfig::ClientSupport => {
                                 // Client sends empty value
-                                w.write_var(id as u64);
-                                w.write_var(0); // Empty value
+                                w.write_var_or_debug_assert(id as u64);
+                                w.write_var_or_debug_assert(0); // Empty value
                             }
                             NatTraversalConfig::ServerSupport { concurrency_limit } => {
                                 // Server sends concurrency limit as VarInt
-                                w.write_var(id as u64);
-                                w.write_var(concurrency_limit.size() as u64);
-                                w.write_var(concurrency_limit.0);
+                                w.write_var_or_debug_assert(id as u64);
+                                w.write_var_or_debug_assert(concurrency_limit.size() as u64);
+                                w.write_var_or_debug_assert(concurrency_limit.0);
                             }
                         }
                     }
                 }
                 TransportParameterId::AddressDiscovery => {
                     if let Some(ref config) = self.address_discovery {
-                        w.write_var(id as u64);
+                        w.write_var_or_debug_assert(id as u64);
                         let value = config.to_value();
-                        w.write_var(value.size() as u64);
-                        w.write_var(value.into_inner());
+                        w.write_var_or_debug_assert(value.size() as u64);
+                        w.write_var_or_debug_assert(value.into_inner());
                     }
                 }
                 TransportParameterId::RfcNatTraversal => {
                     if self.rfc_nat_traversal {
                         // Send empty parameter to indicate support
-                        w.write_var(id as u64);
-                        w.write_var(0); // Empty value
+                        w.write_var_or_debug_assert(id as u64);
+                        w.write_var_or_debug_assert(0); // Empty value
                     }
                 }
                 TransportParameterId::PqcAlgorithms => {
                     if let Some(ref algorithms) = self.pqc_algorithms {
-                        w.write_var(id as u64);
+                        w.write_var_or_debug_assert(id as u64);
                         // Encode as bit field: 2 bits for pure PQC algorithms (v0.2)
                         let mut value = 0u8;
                         if algorithms.ml_kem_768 {
@@ -616,7 +616,7 @@ impl TransportParameters {
                             value |= 1 << 1;
                         }
                         // v0.2: Bits 2-3 reserved (hybrid removed)
-                        w.write_var(1u64); // Length is always 1 byte
+                        w.write_var_or_debug_assert(1u64); // Length is always 1 byte
                         w.write(value);
                     }
                 }
@@ -626,7 +626,7 @@ impl TransportParameters {
                             match id {
                                 $(TransportParameterId::$id => {
                                     if self.$name.0 != $default {
-                                        w.write_var(id as u64);
+                                        w.write_var_or_debug_assert(id as u64);
                                         let size = VarInt::try_from(self.$name.size())
                                             .map_err(|_| Error::Internal)?;
                                         w.write(size);
@@ -1033,8 +1033,8 @@ impl ReservedTransportParameter {
     }
 
     fn write(&self, w: &mut impl BufMut) {
-        w.write_var(self.id.0);
-        w.write_var(self.payload_len as u64);
+        w.write_var_or_debug_assert(self.id.0);
+        w.write_var_or_debug_assert(self.payload_len as u64);
         w.put_slice(&self.payload[..self.payload_len]);
     }
 
@@ -1376,8 +1376,8 @@ mod test {
     fn test_nat_traversal_draft_compliant_decoding() {
         // Test 1: Decode empty value from client
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(0); // Empty value
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(0); // Empty value
 
         let params = TransportParameters::read(Side::Server, &mut buf.as_slice())
             .expect("Failed to decode transport parameters");
@@ -1389,8 +1389,8 @@ mod test {
 
         // Test 2: Decode 1-byte concurrency limit from server
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(1); // 1-byte value
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(1); // 1-byte value
         buf.put_u8(7); // Concurrency limit of 7
 
         let params = TransportParameters::read(Side::Client, &mut buf.as_slice())
@@ -1406,8 +1406,8 @@ mod test {
 
         // Test 3: Invalid length should fail
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(2); // Invalid 2-byte value
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(2); // Invalid 2-byte value
         buf.put_u8(7);
         buf.put_u8(8);
 
@@ -1496,8 +1496,8 @@ mod test {
     fn test_nat_traversal_role_validation() {
         // Test client role validation - should fail when received by client
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(0); // Empty value (client role)
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(0); // Empty value (client role)
 
         // P2P: Client receiving client role should succeed (symmetric P2P connection)
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
@@ -1515,8 +1515,8 @@ mod test {
 
         // Test server role validation
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(1); // 1-byte value (server role)
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(1); // 1-byte value (server role)
         buf.put_u8(5); // Concurrency limit
 
         // P2P: Server receiving server role should succeed (symmetric P2P connection)
@@ -2114,9 +2114,9 @@ mod test {
         // Test that invalid values are rejected
 
         let mut encoded = Vec::new();
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(1); // Length
-        encoded.write_var(3); // Invalid value (only 0, 1, 2 are valid)
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(1); // Length
+        encoded.write_var_or_debug_assert(3); // Invalid value (only 0, 1, 2 are valid)
 
         let result = TransportParameters::read(Side::Client, &mut encoded.as_slice());
         assert!(result.is_err());
@@ -2128,16 +2128,16 @@ mod test {
 
         // Test empty parameter (zero-length)
         let mut encoded = Vec::new();
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(0); // Zero length
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(0); // Zero length
 
         let result = TransportParameters::read(Side::Client, &mut encoded.as_slice());
         assert!(result.is_err());
 
         // Test value too large
         let mut encoded = Vec::new();
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(1); // Length
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(1); // Length
         encoded.put_u8(255); // Invalid value (only 0, 1, 2 are valid)
 
         let result = TransportParameters::read(Side::Client, &mut encoded.as_slice());
@@ -2148,8 +2148,8 @@ mod test {
     fn test_address_discovery_malformed_length() {
         // Create a malformed parameter with wrong length
         let mut encoded = Vec::new();
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(1); // Says 1 byte but no data follows
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(1); // Says 1 byte but no data follows
 
         let result = TransportParameters::read(Side::Client, &mut encoded.as_slice());
         assert!(result.is_err());
@@ -2162,13 +2162,13 @@ mod test {
         let mut encoded = Vec::new();
 
         // First occurrence
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(1);
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(1);
         encoded.put_u8(0x80); // enabled=true
 
         // Duplicate occurrence
-        encoded.write_var(TransportParameterId::AddressDiscovery as u64);
-        encoded.write_var(1);
+        encoded.write_var_or_debug_assert(TransportParameterId::AddressDiscovery as u64);
+        encoded.write_var_or_debug_assert(1);
         encoded.put_u8(0xC0); // Different config
 
         let result = TransportParameters::read(Side::Client, &mut encoded.as_slice());
@@ -2270,13 +2270,13 @@ mod test {
         let mut encoded = Vec::new();
 
         // Write a valid parameter
-        encoded.write_var(TransportParameterId::PqcAlgorithms as u64);
-        encoded.write_var(1u64); // Length
+        encoded.write_var_or_debug_assert(TransportParameterId::PqcAlgorithms as u64);
+        encoded.write_var_or_debug_assert(1u64); // Length
         encoded.write(0b1111u8); // All algorithms enabled
 
         // Write duplicate
-        encoded.write_var(TransportParameterId::PqcAlgorithms as u64);
-        encoded.write_var(1u64);
+        encoded.write_var_or_debug_assert(TransportParameterId::PqcAlgorithms as u64);
+        encoded.write_var_or_debug_assert(1u64);
         encoded.write(0b0000u8);
 
         // Should fail to decode

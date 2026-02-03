@@ -13,7 +13,7 @@ use crate::crypto::raw_public_keys::pqc::{
     ML_DSA_65_SIGNATURE_SIZE, sign_with_ml_dsa, verify_with_ml_dsa,
 };
 use crate::relay::{RelayError, RelayResult};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,40 @@ pub struct AuthToken {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+struct NonceWindow {
+    order: VecDeque<u64>,
+    set: HashSet<u64>,
+}
+
+impl NonceWindow {
+    fn contains(&self, nonce: u64) -> bool {
+        self.set.contains(&nonce)
+    }
+
+    fn insert_with_limit(&mut self, nonce: u64, max_size: usize) {
+        if self.set.insert(nonce) {
+            self.order.push_back(nonce);
+        }
+        while self.set.len() > max_size {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.set.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// ML-DSA-65 authenticator with anti-replay protection
 #[derive(Debug)]
 pub struct RelayAuthenticator {
@@ -40,7 +74,7 @@ pub struct RelayAuthenticator {
     /// ML-DSA-65 secret key for this node
     secret_key: MlDsaSecretKey,
     /// Set of used nonces for anti-replay protection
-    used_nonces: Arc<Mutex<HashSet<u64>>>,
+    used_nonces: Arc<Mutex<NonceWindow>>,
     /// Maximum age of tokens in seconds (default: 5 minutes)
     max_token_age: u64,
     /// Size of anti-replay window
@@ -139,7 +173,7 @@ impl RelayAuthenticator {
         Ok(Self {
             public_key,
             secret_key,
-            used_nonces: Arc::new(Mutex::new(HashSet::new())),
+            used_nonces: Arc::new(Mutex::new(NonceWindow::default())),
             max_token_age: 300, // 5 minutes
             replay_window_size: 1000,
         })
@@ -150,7 +184,7 @@ impl RelayAuthenticator {
         Self {
             public_key,
             secret_key,
-            used_nonces: Arc::new(Mutex::new(HashSet::new())),
+            used_nonces: Arc::new(Mutex::new(NonceWindow::default())),
             max_token_age: 300,
             replay_window_size: 1000,
         }
@@ -193,22 +227,14 @@ impl RelayAuthenticator {
             .lock()
             .expect("Mutex poisoning is unexpected in normal operation");
 
-        if used_nonces.contains(&token.nonce) {
+        if used_nonces.contains(token.nonce) {
             return Err(RelayError::AuthenticationFailed {
                 reason: "Token replay detected".to_string(),
             });
         }
 
-        // Add nonce to used set (with size limit)
-        if used_nonces.len() >= self.replay_window_size as usize {
-            // Remove oldest entries (simple approach - in production might use LRU)
-            let to_remove: Vec<_> = used_nonces.iter().take(100).cloned().collect();
-            for nonce in to_remove {
-                used_nonces.remove(&nonce);
-            }
-        }
-
-        used_nonces.insert(token.nonce);
+        // Add nonce to used set and evict oldest entries without sorting.
+        used_nonces.insert_with_limit(token.nonce, self.replay_window_size as usize);
 
         Ok(())
     }

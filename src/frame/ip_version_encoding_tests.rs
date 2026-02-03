@@ -104,7 +104,7 @@ mod observed_address_ip_version_tests {
         // Manually construct IPv4 frame
         let mut buf = Vec::new();
         buf.write(FrameType::OBSERVED_ADDRESS_IPV4); // Frame type
-        buf.write_var(42); // Sequence number
+        buf.write_var_or_debug_assert(42); // Sequence number
         buf.extend_from_slice(&[10, 0, 0, 1]); // IPv4 address
         buf.extend_from_slice(&[0x00, 0x50]); // Port 80
         

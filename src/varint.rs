@@ -36,13 +36,8 @@ impl VarInt {
     #[inline]
     pub(crate) fn from_u64_bounded(x: u64) -> Self {
         debug_assert!(x < 2u64.pow(62), "VarInt value {} exceeds maximum", x);
-        if x < 2u64.pow(62) {
-            Self(x)
-        } else {
-            // In production, clamp to MAX instead of panicking
-            tracing::error!("VarInt overflow: {} exceeds maximum, clamping to MAX", x);
-            Self::MAX
-        }
+        // Safety: caller guarantees the bound.
+        unsafe { Self::from_u64_unchecked(x) }
     }
 
     /// Construct a `VarInt` infallibly
@@ -212,8 +207,8 @@ impl Codec for VarInt {
         } else if x < 2u64.pow(62) {
             w.put_u64((0b11 << 62) | x);
         } else {
-            tracing::error!("VarInt overflow: {} exceeds maximum, clamping to MAX", x);
-            w.put_u64((0b11 << 62) | VarInt::MAX.0);
+            tracing::error!("VarInt overflow: {} exceeds maximum", x);
+            debug_assert!(false, "VarInt overflow: {}", x);
         }
     }
 }

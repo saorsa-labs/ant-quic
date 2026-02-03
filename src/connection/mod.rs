@@ -3949,7 +3949,7 @@ impl Connection {
             };
             trace!(sequence = seq, "RETIRE_CONNECTION_ID");
             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
-            buf.write_var(seq);
+            buf.write_var_or_debug_assert(seq);
             sent.retransmits.get_or_create().retire_cids.push(seq);
             self.stats.frame_tx.retire_connection_id += 1;
         }

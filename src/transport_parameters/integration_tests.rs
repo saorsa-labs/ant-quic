@@ -58,9 +58,9 @@ mod transport_parameter_error_integration_tests {
         let mut buf = Vec::new();
 
         // Write invalid max_udp_payload_size
-        buf.write_var(0x03); // max_udp_payload_size ID
-        buf.write_var(2); // length
-        buf.write_var(1000); // Invalid: < 1200
+        buf.write_var_or_debug_assert(0x03); // max_udp_payload_size ID
+        buf.write_var_or_debug_assert(2); // length
+        buf.write_var_or_debug_assert(1000); // Invalid: < 1200
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -101,13 +101,13 @@ mod transport_parameter_error_integration_tests {
         let mut buf = Vec::new();
 
         // Write multiple invalid parameters
-        buf.write_var(0x0a); // ack_delay_exponent
-        buf.write_var(1);
+        buf.write_var_or_debug_assert(0x0a); // ack_delay_exponent
+        buf.write_var_or_debug_assert(1);
         buf.push(21); // Invalid: > 20
 
-        buf.write_var(0x03); // max_udp_payload_size
-        buf.write_var(2);
-        buf.write_var(1000); // Invalid: < 1200
+        buf.write_var_or_debug_assert(0x03); // max_udp_payload_size
+        buf.write_var_or_debug_assert(2);
+        buf.write_var_or_debug_assert(1000); // Invalid: < 1200
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -123,8 +123,8 @@ mod transport_parameter_error_integration_tests {
         let mut buf = Vec::new();
 
         // Write preferred_address (server-only)
-        buf.write_var(0x0d); // preferred_address ID
-        buf.write_var(49); // correct length: 4+2+16+2+1+8+16
+        buf.write_var_or_debug_assert(0x0d); // preferred_address ID
+        buf.write_var_or_debug_assert(49); // correct length: 4+2+16+2+1+8+16
 
         // Minimal preferred address content
         buf.extend_from_slice(&[127, 0, 0, 1]); // IPv4

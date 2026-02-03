@@ -38,8 +38,8 @@ mod transport_parameter_error_tests {
     fn test_ack_delay_exponent_validation() {
         // ack_delay_exponent must be <= 20
         let mut buf = Vec::new();
-        buf.write_var(0x0a); // ack_delay_exponent ID
-        buf.write_var(1); // length
+        buf.write_var_or_debug_assert(0x0a); // ack_delay_exponent ID
+        buf.write_var_or_debug_assert(1); // length
         buf.push(21); // Invalid value > 20
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
@@ -53,10 +53,10 @@ mod transport_parameter_error_tests {
     fn test_max_ack_delay_validation() {
         // max_ack_delay must be < 2^14
         let mut buf = Vec::new();
-        buf.write_var(0x0b); // max_ack_delay ID
+        buf.write_var_or_debug_assert(0x0b); // max_ack_delay ID
         let invalid_delay = 1u64 << 14; // 2^14 is invalid
-        buf.write_var(VarInt::from_u64(invalid_delay).unwrap().size() as u64); // length
-        buf.write_var(invalid_delay); // value as VarInt
+        buf.write_var_or_debug_assert(VarInt::from_u64(invalid_delay).unwrap().size() as u64); // length
+        buf.write_var_or_debug_assert(invalid_delay); // value as VarInt
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -69,9 +69,9 @@ mod transport_parameter_error_tests {
     fn test_active_connection_id_limit_validation() {
         // active_connection_id_limit must be >= 2
         let mut buf = Vec::new();
-        buf.write_var(0x0e); // active_connection_id_limit ID
-        buf.write_var(1); // length
-        buf.write_var(1); // Invalid value < 2
+        buf.write_var_or_debug_assert(0x0e); // active_connection_id_limit ID
+        buf.write_var_or_debug_assert(1); // length
+        buf.write_var_or_debug_assert(1); // Invalid value < 2
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -84,9 +84,9 @@ mod transport_parameter_error_tests {
     fn test_max_udp_payload_size_validation() {
         // max_udp_payload_size must be >= 1200
         let mut buf = Vec::new();
-        buf.write_var(0x03); // max_udp_payload_size ID
-        buf.write_var(2); // length
-        buf.write_var(1199); // Invalid value < 1200
+        buf.write_var_or_debug_assert(0x03); // max_udp_payload_size ID
+        buf.write_var_or_debug_assert(2); // length
+        buf.write_var_or_debug_assert(1199); // Invalid value < 1200
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -105,9 +105,9 @@ mod transport_parameter_error_tests {
         params.write(&mut buf).unwrap();
 
         // Append min_ack_delay parameter
-        buf.write_var(0xFF04DE1B); // min_ack_delay ID (draft-ietf-quic-ack-frequency)
-        buf.write_var(4); // length
-        buf.write_var(26000); // 26ms in microseconds, which is > max_ack_delay
+        buf.write_var_or_debug_assert(0xFF04DE1B); // min_ack_delay ID (draft-ietf-quic-ack-frequency)
+        buf.write_var_or_debug_assert(4); // length
+        buf.write_var_or_debug_assert(26000); // 26ms in microseconds, which is > max_ack_delay
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -132,8 +132,8 @@ mod transport_parameter_error_tests {
     fn test_preferred_address_server_only() {
         // preferred_address can only be sent by servers
         let mut buf = Vec::new();
-        buf.write_var(0x0d); // preferred_address ID
-        buf.write_var(49); // correct length: 4+2+16+2+1+8+16
+        buf.write_var_or_debug_assert(0x0d); // preferred_address ID
+        buf.write_var_or_debug_assert(49); // correct length: 4+2+16+2+1+8+16
 
         // Write a minimal preferred address
         buf.extend_from_slice(&[127, 0, 0, 1]); // IPv4
@@ -158,14 +158,14 @@ mod transport_parameter_error_tests {
         let mut buf = Vec::new();
 
         // First max_idle_timeout
-        buf.write_var(0x01); // max_idle_timeout ID
-        buf.write_var(2); // length
-        buf.write_var(30000); // value
+        buf.write_var_or_debug_assert(0x01); // max_idle_timeout ID
+        buf.write_var_or_debug_assert(2); // length
+        buf.write_var_or_debug_assert(30000); // value
 
         // Duplicate max_idle_timeout
-        buf.write_var(0x01); // max_idle_timeout ID again
-        buf.write_var(2); // length
-        buf.write_var(60000); // different value
+        buf.write_var_or_debug_assert(0x01); // max_idle_timeout ID again
+        buf.write_var_or_debug_assert(2); // length
+        buf.write_var_or_debug_assert(60000); // different value
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
         assert!(result.is_err());
@@ -178,8 +178,8 @@ mod transport_parameter_error_tests {
     fn test_malformed_varint_parameter() {
         // Test malformed VarInt encoding
         let mut buf = Vec::new();
-        buf.write_var(0x01); // max_idle_timeout ID
-        buf.write_var(5); // length claims 5 bytes
+        buf.write_var_or_debug_assert(0x01); // max_idle_timeout ID
+        buf.write_var_or_debug_assert(5); // length claims 5 bytes
         buf.push(0xc0); // Start of 8-byte varint
         // But only provide 1 byte instead of 8
 
@@ -195,8 +195,8 @@ mod transport_parameter_error_tests {
 
         // Test concurrency_limit = 0 (invalid)
         let mut buf = Vec::new();
-        buf.write_var(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
-        buf.write_var(1); // length
+        buf.write_var_or_debug_assert(0x3d7e9f0bca12fea6); // NAT traversal parameter ID
+        buf.write_var_or_debug_assert(1); // length
         buf.push(0); // Invalid: concurrency_limit must be > 0
 
         let result = TransportParameters::read(Side::Server, &mut buf.as_slice());
@@ -267,8 +267,8 @@ mod transport_parameter_error_tests {
     fn test_parameter_length_mismatch() {
         // Test parameter with incorrect length
         let mut buf = Vec::new();
-        buf.write_var(0x00); // original_dst_cid ID
-        buf.write_var(5); // claim 5 bytes
+        buf.write_var_or_debug_assert(0x00); // original_dst_cid ID
+        buf.write_var_or_debug_assert(5); // claim 5 bytes
         buf.extend_from_slice(&[1, 2, 3]); // but only provide 3
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());
@@ -281,13 +281,13 @@ mod transport_parameter_error_tests {
         let mut buf = Vec::new();
 
         // Known parameter
-        buf.write_var(0x01); // max_idle_timeout
-        buf.write_var(VarInt::from_u32(30000).size() as u64); // length
-        buf.write_var(30000); // value
+        buf.write_var_or_debug_assert(0x01); // max_idle_timeout
+        buf.write_var_or_debug_assert(VarInt::from_u32(30000).size() as u64); // length
+        buf.write_var_or_debug_assert(30000); // value
 
         // Unknown parameter (should be ignored)
-        buf.write_var(0xffffff); // Unknown ID
-        buf.write_var(4); // length
+        buf.write_var_or_debug_assert(0xffffff); // Unknown ID
+        buf.write_var_or_debug_assert(4); // length
         buf.extend_from_slice(&[1, 2, 3, 4]); // arbitrary data
 
         let result = TransportParameters::read(Side::Client, &mut buf.as_slice());

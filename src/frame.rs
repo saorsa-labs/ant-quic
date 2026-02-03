@@ -59,7 +59,7 @@ impl coding::Codec for FrameType {
         Ok(Self(buf.get_var()?))
     }
     fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var(self.0);
+        buf.write_var_or_debug_assert(self.0);
     }
 }
 
@@ -349,13 +349,13 @@ impl ConnectionClose {
         out.write(FrameType::CONNECTION_CLOSE); // 1 byte
         out.write(self.error_code); // <= 8 bytes
         let ty = self.frame_type.map_or(0, |x| x.0);
-        out.write_var(ty); // <= 8 bytes
+        out.write_var_or_debug_assert(ty); // <= 8 bytes
         let max_len = max_len
             - 3
             - VarInt::from_u64_bounded(ty).size()
             - VarInt::from_u64_bounded(self.reason.len() as u64).size();
         let actual_len = self.reason.len().min(max_len);
-        out.write_var(actual_len as u64); // <= 8 bytes
+        out.write_var_or_debug_assert(actual_len as u64); // <= 8 bytes
         out.put_slice(&self.reason[0..actual_len]); // whatever's left
     }
 }
@@ -393,7 +393,7 @@ impl ApplicationClose {
         out.write(self.error_code); // <= 8 bytes
         let max_len = max_len - 3 - VarInt::from_u64_bounded(self.reason.len() as u64).size();
         let actual_len = self.reason.len().min(max_len);
-        out.write_var(actual_len as u64); // <= 8 bytes
+        out.write_var_or_debug_assert(actual_len as u64); // <= 8 bytes
         out.put_slice(&self.reason[0..actual_len]); // whatever's left
     }
 }
@@ -464,15 +464,15 @@ impl Ack {
         } else {
             FrameType::ACK
         });
-        buf.write_var(largest);
-        buf.write_var(delay);
-        buf.write_var(ranges.len() as u64 - 1);
-        buf.write_var(first_size - 1);
+        buf.write_var_or_debug_assert(largest);
+        buf.write_var_or_debug_assert(delay);
+        buf.write_var_or_debug_assert(ranges.len() as u64 - 1);
+        buf.write_var_or_debug_assert(first_size - 1);
         let mut prev = first.start;
         for block in rest {
             let size = block.end - block.start;
-            buf.write_var(prev - block.end - 1);
-            buf.write_var(size - 1);
+            buf.write_var_or_debug_assert(prev - block.end - 1);
+            buf.write_var_or_debug_assert(size - 1);
             prev = block.start;
         }
         if let Some(x) = ecn {
@@ -521,9 +521,9 @@ impl EcnCounts {
     };
 
     pub fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write_var(self.ect0);
-        out.write_var(self.ect1);
-        out.write_var(self.ce);
+        out.write_var_or_debug_assert(self.ect0);
+        out.write_var_or_debug_assert(self.ect1);
+        out.write_var_or_debug_assert(self.ce);
     }
 }
 
@@ -570,13 +570,13 @@ impl StreamMeta {
         if self.fin {
             ty |= 0x01;
         }
-        out.write_var(ty); // 1 byte
+        out.write_var_or_debug_assert(ty); // 1 byte
         out.write(self.id); // <=8 bytes
         if self.offsets.start != 0 {
-            out.write_var(self.offsets.start); // <=8 bytes
+            out.write_var_or_debug_assert(self.offsets.start); // <=8 bytes
         }
         if length {
-            out.write_var(self.offsets.end - self.offsets.start); // <=8 bytes
+            out.write_var_or_debug_assert(self.offsets.end - self.offsets.start); // <=8 bytes
         }
     }
 }
@@ -595,8 +595,8 @@ impl Crypto {
 
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
         out.write(FrameType::CRYPTO);
-        out.write_var(self.offset);
-        out.write_var(self.data.len() as u64);
+        out.write_var_or_debug_assert(self.offset);
+        out.write_var_or_debug_assert(self.data.len() as u64);
         out.put_slice(&self.data);
     }
 }
@@ -609,7 +609,7 @@ pub(crate) struct NewToken {
 impl NewToken {
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
         out.write(FrameType::NEW_TOKEN);
-        out.write_var(self.token.len() as u64);
+        out.write_var_or_debug_assert(self.token.len() as u64);
         out.put_slice(&self.token);
     }
 
@@ -988,8 +988,8 @@ pub(crate) struct NewConnectionId {
 impl NewConnectionId {
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
         out.write(FrameType::NEW_CONNECTION_ID);
-        out.write_var(self.sequence);
-        out.write_var(self.retire_prior_to);
+        out.write_var_or_debug_assert(self.sequence);
+        out.write_var_or_debug_assert(self.retire_prior_to);
         out.write(self.id.len() as u8);
         out.put_slice(&self.id);
         out.put_slice(&self.reset_token);
@@ -1070,7 +1070,7 @@ impl ObservedAddress {
         };
 
         // Write sequence number as varint
-        buf.write_var(self.sequence_number.0);
+        buf.write_var_or_debug_assert(self.sequence_number.0);
 
         // Write address and port directly (no IP version byte needed)
         match self.address {
@@ -1698,7 +1698,7 @@ mod test {
         let mut buf = Vec::new();
         // Use IPv6 variant for test
         buf.write(FrameType::OBSERVED_ADDRESS_IPV6);
-        buf.write_var(1); // sequence number
+        buf.write_var_or_debug_assert(1); // sequence number
         buf.put_slice(&[0x20, 0x01, 0x0d, 0xb8]); // Only 4 bytes instead of 16
 
         let result = Iter::new(Bytes::from(buf));
@@ -1903,7 +1903,7 @@ mod test {
         // Malformed OBSERVED_ADDRESS frame (truncated)
         // Use IPv4 variant for test
         buf.write(FrameType::OBSERVED_ADDRESS_IPV4);
-        buf.write_var(1); // sequence number
+        buf.write_var_or_debug_assert(1); // sequence number
         buf.put_slice(&[192, 168]); // Only 2 bytes instead of 4 for IPv4
 
         // Another valid PING frame (should not be parsed due to error above)

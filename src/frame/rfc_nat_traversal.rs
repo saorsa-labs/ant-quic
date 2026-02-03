@@ -39,12 +39,12 @@ impl RfcAddAddress {
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
         // Frame type determines IPv4 vs IPv6
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV6.0),
         }
 
         // Sequence number
-        buf.write_var(self.sequence_number.0);
+        buf.write_var_or_debug_assert(self.sequence_number.0);
 
         // Address (no IP version byte!)
         match self.address {
@@ -122,13 +122,13 @@ impl RfcPunchMeNow {
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
         // Frame type determines IPv4 vs IPv6
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV6.0),
         }
 
         // Fields
-        buf.write_var(self.round.0);
-        buf.write_var(self.paired_with_sequence_number.0);
+        buf.write_var_or_debug_assert(self.round.0);
+        buf.write_var_or_debug_assert(self.paired_with_sequence_number.0);
 
         // Address (no IP version byte!)
         match self.address {
@@ -194,8 +194,8 @@ pub struct RfcRemoveAddress {
 #[allow(dead_code)]
 impl RfcRemoveAddress {
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
-        buf.write_var(FrameType::REMOVE_ADDRESS.0);
-        buf.write_var(self.sequence_number.0);
+        buf.write_var_or_debug_assert(FrameType::REMOVE_ADDRESS.0);
+        buf.write_var_or_debug_assert(self.sequence_number.0);
     }
 
     pub fn decode<R: Buf>(r: &mut R) -> Result<Self, UnexpectedEnd> {

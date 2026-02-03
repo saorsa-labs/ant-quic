@@ -85,7 +85,7 @@ impl AddAddress {
     }
     
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var(self.sequence_number.into_inner());
+        buf.write_var_or_debug_assert(self.sequence_number.into_inner());
         
         match self.address.ip() {
             IpAddr::V4(ipv4) => {
@@ -134,8 +134,8 @@ impl PunchMeNow {
     }
     
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var(self.round.into_inner());
-        buf.write_var(self.paired_with_sequence_number.into_inner());
+        buf.write_var_or_debug_assert(self.round.into_inner());
+        buf.write_var_or_debug_assert(self.paired_with_sequence_number.into_inner());
         
         match self.address.ip() {
             IpAddr::V4(ipv4) => {
@@ -158,7 +158,7 @@ impl RemoveAddress {
     }
     
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var(self.sequence_number.into_inner());
+        buf.write_var_or_debug_assert(self.sequence_number.into_inner());
     }
 }
 

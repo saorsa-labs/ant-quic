@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
-use crate::VarInt;
+use crate::{VarInt, VarIntBoundsExceeded};
 
 /// Error indicating that the provided buffer was too small
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
@@ -129,7 +129,13 @@ pub trait BufMutExt {
     /// Write and encode a value to the buffer
     fn write<T: Codec>(&mut self, x: T);
     /// Write a variable-length integer to the buffer
-    fn write_var(&mut self, x: u64);
+    fn write_var(&mut self, x: u64) -> std::result::Result<(), VarIntBoundsExceeded>;
+    /// Write a variable-length integer, debug-asserting on overflow in debug builds
+    fn write_var_or_debug_assert(&mut self, x: u64) {
+        if self.write_var(x).is_err() {
+            debug_assert!(false, "VarInt overflow: {}", x);
+        }
+    }
 }
 
 impl<T: BufMut> BufMutExt for T {
@@ -137,15 +143,9 @@ impl<T: BufMut> BufMutExt for T {
         x.encode(self);
     }
 
-    fn write_var(&mut self, x: u64) {
-        // VarInt::from_u64 only fails for values > 2^62 - 1
-        // This is a programming error if it happens
-        match VarInt::from_u64(x) {
-            Ok(var) => var.encode(self),
-            Err(_) => {
-                // This should never happen in practice as QUIC limits are well below 2^62
-                debug_assert!(false, "VarInt overflow: {}", x);
-            }
-        }
+    fn write_var(&mut self, x: u64) -> std::result::Result<(), VarIntBoundsExceeded> {
+        let var = VarInt::from_u64(x)?;
+        var.encode(self);
+        Ok(())
     }
 }

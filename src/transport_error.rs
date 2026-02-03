@@ -66,7 +66,7 @@ impl coding::Codec for Code {
         Ok(Self(buf.get_var()?))
     }
     fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var(self.0)
+        buf.write_var_or_debug_assert(self.0)
     }
 }
 

@@ -57,8 +57,8 @@ impl AddAddress {
     pub fn encode_rfc<W: BufMut>(&self, buf: &mut W) {
         // Frame type determines IPv4 vs IPv6
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV6.0),
         }
 
         // Sequence number
@@ -81,8 +81,8 @@ impl AddAddress {
     /// Encode in legacy format (for compatibility)
     pub fn encode_legacy<W: BufMut>(&self, buf: &mut W) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV6.0),
         }
 
         buf.write(self.sequence);
@@ -230,8 +230,8 @@ impl PunchMeNow {
     /// Encode in RFC-compliant format
     pub fn encode_rfc<W: BufMut>(&self, buf: &mut W) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV6.0),
         }
 
         buf.write(self.round);
@@ -252,8 +252,8 @@ impl PunchMeNow {
     /// Encode in legacy format
     pub fn encode_legacy<W: BufMut>(&self, buf: &mut W) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV6.0),
         }
 
         buf.write(self.round);
@@ -444,7 +444,7 @@ impl RemoveAddress {
 
     /// Encode (same format for RFC and legacy)
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
-        buf.write_var(FrameType::REMOVE_ADDRESS.0);
+        buf.write_var_or_debug_assert(FrameType::REMOVE_ADDRESS.0);
         buf.write(self.sequence);
     }
 
@@ -526,8 +526,8 @@ impl TryConnectTo {
     /// Encode to buffer
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
         match self.target_address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::TRY_CONNECT_TO_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::TRY_CONNECT_TO_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_IPV4.0),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_IPV6.0),
         }
 
         buf.write(self.request_id);
@@ -636,8 +636,12 @@ impl TryConnectToResponse {
     /// Encode to buffer
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
         match self.source_address {
-            SocketAddr::V4(_) => buf.write_var(FrameType::TRY_CONNECT_TO_RESPONSE_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var(FrameType::TRY_CONNECT_TO_RESPONSE_IPV6.0),
+            SocketAddr::V4(_) => {
+                buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_RESPONSE_IPV4.0)
+            }
+            SocketAddr::V6(_) => {
+                buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_RESPONSE_IPV6.0)
+            }
         }
 
         buf.write(self.request_id);

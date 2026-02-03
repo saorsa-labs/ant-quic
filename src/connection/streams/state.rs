@@ -511,7 +511,7 @@ impl StreamsState {
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
             buf.write(frame::FrameType::MAX_STREAM_DATA);
             buf.write(id);
-            buf.write_var(max);
+            buf.write_var_or_debug_assert(max);
             stats.max_stream_data += 1;
         }
 
@@ -532,7 +532,7 @@ impl StreamsState {
                 Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
                 Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
             });
-            buf.write_var(self.max_remote[dir as usize]);
+            buf.write_var_or_debug_assert(self.max_remote[dir as usize]);
             match dir {
                 Dir::Uni => stats.max_streams_uni += 1,
                 Dir::Bi => stats.max_streams_bidi += 1,

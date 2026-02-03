@@ -29,10 +29,10 @@ struct TestAddAddress {
 impl TestAddAddress {
     fn encode(&self, buf: &mut BytesMut) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FRAME_TYPE_ADD_ADDRESS_IPV4),
-            SocketAddr::V6(_) => buf.write_var(FRAME_TYPE_ADD_ADDRESS_IPV6),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV4),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV6),
         }
-        buf.write_var(u64::from(self.sequence_number));
+        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
         match self.address {
             SocketAddr::V4(addr) => {
                 buf.put_slice(&addr.ip().octets());
@@ -56,11 +56,11 @@ struct TestPunchMeNow {
 impl TestPunchMeNow {
     fn encode(&self, buf: &mut BytesMut) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
-            SocketAddr::V6(_) => buf.write_var(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
         }
-        buf.write_var(u64::from(self.round));
-        buf.write_var(u64::from(self.paired_with_sequence_number));
+        buf.write_var_or_debug_assert(u64::from(self.round));
+        buf.write_var_or_debug_assert(u64::from(self.paired_with_sequence_number));
         match self.address {
             SocketAddr::V4(addr) => {
                 buf.put_slice(&addr.ip().octets());
@@ -81,8 +81,8 @@ struct TestRemoveAddress {
 
 impl TestRemoveAddress {
     fn encode(&self, buf: &mut BytesMut) {
-        buf.write_var(FRAME_TYPE_REMOVE_ADDRESS);
-        buf.write_var(u64::from(self.sequence_number));
+        buf.write_var_or_debug_assert(FRAME_TYPE_REMOVE_ADDRESS);
+        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
     }
 }
 
@@ -97,12 +97,12 @@ impl RfcAddAddress {
     fn encode(&self, buf: &mut BytesMut) {
         // Frame type determines IPv4 vs IPv6
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FRAME_TYPE_ADD_ADDRESS_IPV4),
-            SocketAddr::V6(_) => buf.write_var(FRAME_TYPE_ADD_ADDRESS_IPV6),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV4),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV6),
         }
 
         // Sequence number
-        buf.write_var(u64::from(self.sequence_number));
+        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
 
         // Address (no IP version byte!)
         match self.address {
@@ -164,12 +164,12 @@ impl RfcPunchMeNow {
     #[allow(dead_code)]
     fn encode(&self, buf: &mut BytesMut) {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
-            SocketAddr::V6(_) => buf.write_var(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
+            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
+            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
         }
 
-        buf.write_var(u64::from(self.round));
-        buf.write_var(u64::from(self.paired_with_sequence_number));
+        buf.write_var_or_debug_assert(u64::from(self.round));
+        buf.write_var_or_debug_assert(u64::from(self.paired_with_sequence_number));
 
         match self.address {
             SocketAddr::V4(addr) => {
@@ -228,8 +228,8 @@ struct RfcRemoveAddress {
 impl RfcRemoveAddress {
     #[allow(dead_code)]
     fn encode(&self, buf: &mut BytesMut) {
-        buf.write_var(FRAME_TYPE_REMOVE_ADDRESS);
-        buf.write_var(u64::from(self.sequence_number));
+        buf.write_var_or_debug_assert(FRAME_TYPE_REMOVE_ADDRESS);
+        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
     }
 
     #[allow(dead_code)]
@@ -492,7 +492,7 @@ fn test_add_address_ipv4_rfc_encoding() {
     // - Address: 192.168.1.100:8080
 
     // Write frame type (VarInt encoding of 0x3d7e90)
-    expected.write_var(FRAME_TYPE_ADD_ADDRESS_IPV4);
+    expected.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV4);
 
     // Write sequence number (VarInt encoding of 42)
     expected.put_u8(0x2a); // 42 as 1-byte VarInt

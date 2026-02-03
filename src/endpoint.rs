@@ -897,8 +897,10 @@ impl Endpoint {
         self.last_stateless_reset = Some(now);
         // Resets with at least this much padding can't possibly be distinguished from real packets
         const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
-        let padding_len = if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+        let padding_len = if max_padding_len <= MIN_PADDING_LEN {
             max_padding_len
+        } else if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+            self.rng.gen_range(MIN_PADDING_LEN..=max_padding_len)
         } else {
             self.rng.gen_range(IDEAL_MIN_PADDING_LEN..max_padding_len)
         };

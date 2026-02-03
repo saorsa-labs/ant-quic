@@ -323,7 +323,7 @@ impl Header {
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
-                w.write_var(token.len() as u64);
+                w.write_var_or_debug_assert(token.len() as u64);
                 w.put_slice(token);
                 w.write::<u16>(0); // Placeholder for payload length; see `set_payload_length`
                 number.encode(w);

@@ -1810,6 +1810,25 @@ impl NatTraversalState {
         }
     }
 
+    fn next_sequence_u32(&mut self) -> VarInt {
+        let current_raw = self.next_sequence.into_inner();
+        let current = match u32::try_from(current_raw) {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(
+                    "NAT traversal sequence out of range ({}), resetting to u32::MAX",
+                    current_raw
+                );
+                u32::MAX
+            }
+        };
+        if current == u32::MAX {
+            warn!("NAT traversal sequence wrapped at u32::MAX");
+        }
+        self.next_sequence = VarInt::from_u32(current.wrapping_add(1));
+        VarInt::from_u32(current)
+    }
+
     /// Add a remote candidate from AddAddress frame with security validation
     pub(super) fn add_remote_candidate(
         &mut self,
@@ -1957,16 +1976,13 @@ impl NatTraversalState {
     }
 
     /// Add a local candidate that we've discovered
-    #[allow(clippy::expect_used)]
     pub(super) fn add_local_candidate(
         &mut self,
         address: SocketAddr,
         source: CandidateSource,
         now: Instant,
     ) -> VarInt {
-        let sequence = self.next_sequence;
-        self.next_sequence = VarInt::from_u64(self.next_sequence.into_inner() + 1)
-            .expect("sequence number overflow");
+        let sequence = self.next_sequence_u32();
         // Calculate priority for this candidate
         let candidate_type = classify_candidate_type(source);
         let local_preference = self.calculate_local_preference(address);
@@ -2380,9 +2396,7 @@ impl NatTraversalState {
             }
         }
 
-        let round = self.next_sequence;
-        self.next_sequence = VarInt::from_u64(self.next_sequence.into_inner() + 1)
-            .expect("sequence number overflow");
+        let round = self.next_sequence_u32();
 
         // Calculate synchronized punch time (grace period for coordination)
         let coordination_grace = Duration::from_millis(500); // 500ms for coordination
@@ -3091,6 +3105,12 @@ impl NatTraversalState {
         connection_id: crate::shared::ConnectionId,
         now: Instant,
     ) -> Result<Option<crate::frame::AddAddress>, NatTraversalError> {
+        if self.bootstrap_coordinator.is_none() {
+            // Not a bootstrap node
+            return Ok(None);
+        }
+
+        let sequence = self.next_sequence_u32();
         if let Some(bootstrap_coordinator) = &mut self.bootstrap_coordinator {
             let connection_context = ConnectionContext {
                 connection_id,
@@ -3107,10 +3127,6 @@ impl NatTraversalState {
             )?;
 
             // Generate ADD_ADDRESS frame to inform peer of their observed address
-            let sequence = self.next_sequence;
-            self.next_sequence =
-                VarInt::from_u32((self.next_sequence.into_inner() + 1).try_into().unwrap());
-
             let priority = VarInt::from_u32(100); // Server-reflexive priority
             let add_address_frame =
                 bootstrap_coordinator.generate_add_address_frame(peer_id, sequence, priority);
