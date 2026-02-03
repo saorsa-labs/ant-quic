@@ -417,7 +417,7 @@ impl StreamsState {
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
         max_size: usize,
-    ) {
+    ) -> Result<(), crate::VarIntBoundsExceeded> {
         // RESET_STREAM
         while buf.len() + frame::ResetStream::SIZE_BOUND < max_size {
             let (id, error_code) = match pending.reset_stream.pop() {
@@ -438,7 +438,7 @@ impl StreamsState {
                 error_code,
                 final_offset: VarInt::try_from(stream.offset()).expect("impossibly large offset"),
             }
-            .encode(buf);
+            .try_encode(buf)?;
             stats.reset_stream += 1;
         }
 
@@ -456,7 +456,7 @@ impl StreamsState {
             // peer, but we discard that information as soon as the application consumes it, so it
             // can't be relied upon regardless.
             trace!(stream = %frame.id, "STOP_SENDING");
-            frame.encode(buf);
+            frame.try_encode(buf)?;
             retransmits.get_or_create().stop_sending.push(frame);
             stats.stop_sending += 1;
         }
@@ -479,8 +479,8 @@ impl StreamsState {
             }
 
             retransmits.get_or_create().max_data = true;
-            buf.write(frame::FrameType::MAX_DATA);
-            buf.write(max);
+            frame::FrameType::MAX_DATA.try_encode(buf)?;
+            buf.write_var(max.into_inner())?;
             stats.max_data += 1;
         }
 
@@ -509,9 +509,9 @@ impl StreamsState {
             rs.record_sent_max_stream_data(max);
 
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
-            buf.write(frame::FrameType::MAX_STREAM_DATA);
+            frame::FrameType::MAX_STREAM_DATA.try_encode(buf)?;
             buf.write(id);
-            buf.write_var_or_debug_assert(max);
+            buf.write_var(max)?;
             stats.max_stream_data += 1;
         }
 
@@ -528,16 +528,18 @@ impl StreamsState {
                 value = self.max_remote[dir as usize],
                 "MAX_STREAMS ({:?})", dir
             );
-            buf.write(match dir {
+            let frame_type = match dir {
                 Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
                 Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
-            });
-            buf.write_var_or_debug_assert(self.max_remote[dir as usize]);
+            };
+            frame_type.try_encode(buf)?;
+            buf.write_var(self.max_remote[dir as usize])?;
             match dir {
                 Dir::Uni => stats.max_streams_uni += 1,
                 Dir::Bi => stats.max_streams_bidi += 1,
             }
         }
+        Ok(())
     }
 
     pub(crate) fn write_stream_frames(

@@ -130,7 +130,13 @@ impl PacketBuilder {
                 version,
             }),
         };
-        let partial_encode = header.encode(buffer);
+        let partial_encode = match header.try_encode(buffer) {
+            Ok(encode) => encode,
+            Err(_) => {
+                conn.handle_encode_error(now, "Header");
+                return None;
+            }
+        };
         if conn.peer_params.grease_quic_bit && conn.rng.r#gen::<bool>() {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }

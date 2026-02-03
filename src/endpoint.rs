@@ -1388,16 +1388,22 @@ impl Endpoint {
             }
         };
 
-        self.clean_up_incoming(&incoming);
-        incoming.improper_drop_warner.dismiss();
-
         let header = Header::Retry {
             src_cid: loc_cid,
             dst_cid: incoming.packet.header.src_cid,
             version: incoming.packet.header.version,
         };
 
-        let encode = header.encode(buf);
+        let encode = match header.try_encode(buf) {
+            Ok(encode) => encode,
+            Err(_) => {
+                error!("failed to encode retry header due to varint overflow");
+                return Err(RetryError::incoming(incoming));
+            }
+        };
+
+        self.clean_up_incoming(&incoming);
+        incoming.improper_drop_warner.dismiss();
         buf.put_slice(&token);
         buf.extend_from_slice(&server_config_arc.crypto.retry_tag(
             incoming.packet.header.version,
@@ -1515,10 +1521,20 @@ impl Endpoint {
             version,
         });
 
-        let partial_encode = header.encode(buf);
+        let partial_encode = match header.try_encode(buf) {
+            Ok(encode) => encode,
+            Err(_) => {
+                error!("failed to encode initial close header due to varint overflow");
+                header.encode(buf)
+            }
+        };
         let max_len =
             INITIAL_MTU as usize - partial_encode.header_len - crypto.packet.local.tag_len();
-        frame::Close::from(reason).encode(buf, max_len);
+        let close = frame::Close::from(reason);
+        if close.try_encode(buf, max_len).is_err() {
+            error!("failed to encode initial close frame due to varint overflow");
+            close.encode(buf, max_len);
+        }
         buf.resize(buf.len() + crypto.packet.local.tag_len(), 0);
         partial_encode.finish(buf, &*crypto.header.local, Some((0, &*crypto.packet.local)));
         Transmit {
