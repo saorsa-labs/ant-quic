@@ -36,6 +36,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Required for posting comments on PRs
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
   benchmark:
     name: Run Benchmarks
