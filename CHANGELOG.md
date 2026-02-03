@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.
+- Token v2 helpers now distinguish binding tokens (`encode_binding_token`/`decode_binding_token`) from address-validation tokens (Retry/NEW_TOKEN).
+
 ## [0.21.0] - 2026-02-01
 
 ### Breaking Changes

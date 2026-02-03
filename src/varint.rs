@@ -85,7 +85,7 @@ impl VarInt {
         } else if x < 2u64.pow(62) {
             8
         } else {
-            panic!("malformed VarInt");
+            Self::MAX_SIZE
         }
     }
 }
@@ -212,7 +212,8 @@ impl Codec for VarInt {
         } else if x < 2u64.pow(62) {
             w.put_u64((0b11 << 62) | x);
         } else {
-            unreachable!("malformed VarInt")
+            tracing::error!("VarInt overflow: {} exceeds maximum, clamping to MAX", x);
+            w.put_u64((0b11 << 62) | VarInt::MAX.0);
         }
     }
 }
