@@ -133,6 +133,7 @@ pub trait BufMutExt {
     /// Write a variable-length integer, debug-asserting on overflow in debug builds
     fn write_var_or_debug_assert(&mut self, x: u64) {
         if self.write_var(x).is_err() {
+            tracing::error!("VarInt overflow: {} exceeds maximum", x);
             debug_assert!(false, "VarInt overflow: {}", x);
         }
     }
@@ -144,8 +145,6 @@ impl<T: BufMut> BufMutExt for T {
     }
 
     fn write_var(&mut self, x: u64) -> std::result::Result<(), VarIntBoundsExceeded> {
-        let var = VarInt::from_u64(x)?;
-        var.encode(self);
-        Ok(())
+        VarInt::encode_checked(x, self)
     }
 }

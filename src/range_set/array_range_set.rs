@@ -64,15 +64,14 @@ impl ArrayRangeSet {
     }
 
     pub fn contains(&self, x: u64) -> bool {
-        for range in self.0.iter() {
-            if range.start > x {
-                // We only get here if there was no prior range that contained x
-                return false;
-            } else if range.contains(&x) {
-                return true;
-            }
+        // Use binary search since ranges are sorted by start
+        // Find the rightmost range whose start <= x
+        let idx = self.0.partition_point(|range| range.start <= x);
+        if idx == 0 {
+            return false;
         }
-        false
+        // Check if x falls within the range that starts before or at x
+        self.0[idx - 1].contains(&x)
     }
 
     pub fn subtract(&mut self, other: &Self) {
@@ -128,11 +127,13 @@ impl ArrayRangeSet {
                 range.end = x.end;
 
                 // Merge all follow-up ranges which overlap
-                while idx != self.0.len() - 1 {
-                    let curr = self.0[idx].clone();
-                    let next = self.0[idx + 1].clone();
-                    if curr.end >= next.start {
-                        self.0[idx].end = next.end.max(curr.end);
+                // Avoid cloning by using direct indexing
+                while idx + 1 < self.0.len() {
+                    let curr_end = self.0[idx].end;
+                    let next_start = self.0[idx + 1].start;
+                    if curr_end >= next_start {
+                        let next_end = self.0[idx + 1].end;
+                        self.0[idx].end = next_end.max(curr_end);
                         self.0.remove(idx + 1);
                     } else {
                         break;
@@ -211,6 +212,8 @@ impl ArrayRangeSet {
     }
 
     pub fn max(&self) -> Option<u64> {
-        self.iter().next_back().map(|x| x.end - 1)
+        // SAFETY: Use checked_sub to prevent underflow if end is 0
+        // (though this shouldn't happen with valid ranges, defensive programming is important)
+        self.iter().next_back().and_then(|x| x.end.checked_sub(1))
     }
 }

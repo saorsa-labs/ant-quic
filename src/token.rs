@@ -198,7 +198,6 @@ impl IncomingToken {
 ///
 /// The connection cannot be established.
 pub(crate) struct InvalidRetryTokenError;
-
 /// Stateless reset token
 ///
 /// Used for an endpoint to securely communicate that it has lost state for a connection.
@@ -251,7 +250,6 @@ impl fmt::Display for ResetToken {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use super::*;
-    use rand::prelude::*;
 
     #[test]
     fn retry_token_sanity() {
@@ -312,7 +310,7 @@ mod test {
 
         let mut random_data = [0; 32];
         rand::thread_rng().fill_bytes(&mut random_data);
-        invalid_token.put_slice(&random_data);
+        invalid_token.extend_from_slice(&random_data);
 
         // Assert: garbage sealed data returns err
         assert!(crate::token_v2::decode_token(&key, &invalid_token).is_none());

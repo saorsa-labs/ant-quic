@@ -222,10 +222,21 @@ impl RelayAuthenticator {
         }
 
         // Check for replay attack
-        let mut used_nonces = self
-            .used_nonces
-            .lock()
-            .expect("Mutex poisoning is unexpected in normal operation");
+        // SECURITY: Mutex poisoning indicates a panic occurred while holding the lock,
+        // which may have left the nonce set in an inconsistent state. Continuing with
+        // corrupted state could enable replay attacks. Fail authentication instead.
+        let mut used_nonces = match self.used_nonces.lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => {
+                tracing::error!(
+                    "Mutex poisoned in relay authenticator - potential security compromise, \
+                     failing authentication to prevent replay attacks"
+                );
+                return Err(RelayError::AuthenticationFailed {
+                    reason: "Internal security state compromised".to_string(),
+                });
+            }
+        };
 
         if used_nonces.contains(token.nonce) {
             return Err(RelayError::AuthenticationFailed {
@@ -275,6 +286,7 @@ impl RelayAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;
 

@@ -12,7 +12,7 @@
 
 use super::{FrameStruct, FrameType};
 use crate::{
-    VarInt,
+    VarInt, VarIntBoundsExceeded,
     coding::{BufExt, BufMutExt, UnexpectedEnd},
     transport_parameters::TransportParameters,
 };
@@ -23,6 +23,11 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 /// This is a different parameter from the standard NAT traversal parameter
 /// to allow independent negotiation of RFC-compliant frame formats
 pub const TRANSPORT_PARAM_RFC_NAT_TRAVERSAL: u64 = 0x3d7e9f0bca12fea8;
+
+fn log_encode_overflow(context: &'static str) {
+    tracing::error!("VarInt overflow while encoding {context}");
+    debug_assert!(false, "VarInt overflow while encoding {context}");
+}
 
 /// Unified ADD_ADDRESS frame that can handle both formats
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,19 +55,31 @@ impl AddAddress {
     /// Encode method for compatibility with existing code
     /// Uses the legacy format by default for backward compatibility
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
-        self.encode_legacy(buf);
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("AddAddress");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        self.try_encode_legacy(buf)
     }
 
     /// Encode in RFC-compliant format
     pub fn encode_rfc<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode_rfc(buf).is_err() {
+            log_encode_overflow("AddAddress::encode_rfc");
+        }
+    }
+
+    pub fn try_encode_rfc<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         // Frame type determines IPv4 vs IPv6
         match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV6.0)?,
         }
 
         // Sequence number
-        buf.write(self.sequence);
+        buf.write_var(self.sequence.into_inner())?;
 
         // Address (no IP version byte, no priority!)
         match self.address {
@@ -76,17 +93,24 @@ impl AddAddress {
                 // No flowinfo or scope_id in RFC
             }
         }
+        Ok(())
     }
 
     /// Encode in legacy format (for compatibility)
     pub fn encode_legacy<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode_legacy(buf).is_err() {
+            log_encode_overflow("AddAddress::encode_legacy");
+        }
+    }
+
+    pub fn try_encode_legacy<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::ADD_ADDRESS_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::ADD_ADDRESS_IPV6.0)?,
         }
 
-        buf.write(self.sequence);
-        buf.write(self.priority);
+        buf.write_var(self.sequence.into_inner())?;
+        buf.write_var(self.priority.into_inner())?;
 
         match self.address {
             SocketAddr::V4(addr) => {
@@ -102,6 +126,7 @@ impl AddAddress {
                 buf.put_u32(addr.scope_id());
             }
         }
+        Ok(())
     }
 
     /// Decode from RFC format
@@ -224,18 +249,30 @@ impl PunchMeNow {
     /// Encode method for compatibility with existing code
     /// Uses the legacy format by default for backward compatibility
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
-        self.encode_legacy(buf);
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("PunchMeNow");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        self.try_encode_legacy(buf)
     }
 
     /// Encode in RFC-compliant format
     pub fn encode_rfc<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode_rfc(buf).is_err() {
+            log_encode_overflow("PunchMeNow::encode_rfc");
+        }
+    }
+
+    pub fn try_encode_rfc<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV6.0)?,
         }
 
-        buf.write(self.round);
-        buf.write(self.paired_with_sequence_number);
+        buf.write_var(self.round.into_inner())?;
+        buf.write_var(self.paired_with_sequence_number.into_inner())?;
 
         match self.address {
             SocketAddr::V4(addr) => {
@@ -247,17 +284,24 @@ impl PunchMeNow {
                 buf.put_u16(addr.port());
             }
         }
+        Ok(())
     }
 
     /// Encode in legacy format
     pub fn encode_legacy<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode_legacy(buf).is_err() {
+            log_encode_overflow("PunchMeNow::encode_legacy");
+        }
+    }
+
+    pub fn try_encode_legacy<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::PUNCH_ME_NOW_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::PUNCH_ME_NOW_IPV6.0)?,
         }
 
-        buf.write(self.round);
-        buf.write(self.paired_with_sequence_number); // Called target_sequence in legacy
+        buf.write_var(self.round.into_inner())?;
+        buf.write_var(self.paired_with_sequence_number.into_inner())?; // Called target_sequence in legacy
 
         match self.address {
             SocketAddr::V4(addr) => {
@@ -284,6 +328,7 @@ impl PunchMeNow {
                 buf.put_u8(0); // No peer ID
             }
         }
+        Ok(())
     }
 
     /// Decode from RFC format
@@ -444,8 +489,15 @@ impl RemoveAddress {
 
     /// Encode (same format for RFC and legacy)
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
-        buf.write_var_or_debug_assert(FrameType::REMOVE_ADDRESS.0);
-        buf.write(self.sequence);
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("RemoveAddress");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        buf.write_var(FrameType::REMOVE_ADDRESS.0)?;
+        buf.write_var(self.sequence.into_inner())?;
+        Ok(())
     }
 
     /// Decode
@@ -525,12 +577,18 @@ impl TryConnectTo {
 
     /// Encode to buffer
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("TryConnectTo");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.target_address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_IPV4.0),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_IPV6.0),
+            SocketAddr::V4(_) => buf.write_var(FrameType::TRY_CONNECT_TO_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::TRY_CONNECT_TO_IPV6.0)?,
         }
 
-        buf.write(self.request_id);
+        buf.write_var(self.request_id.into_inner())?;
 
         match self.target_address {
             SocketAddr::V4(addr) => {
@@ -544,6 +602,7 @@ impl TryConnectTo {
         }
 
         buf.put_u16(self.timeout_ms);
+        Ok(())
     }
 
     /// Decode from buffer
@@ -635,16 +694,18 @@ impl TryConnectToResponse {
 
     /// Encode to buffer
     pub fn encode<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("TryConnectToResponse");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.source_address {
-            SocketAddr::V4(_) => {
-                buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_RESPONSE_IPV4.0)
-            }
-            SocketAddr::V6(_) => {
-                buf.write_var_or_debug_assert(FrameType::TRY_CONNECT_TO_RESPONSE_IPV6.0)
-            }
+            SocketAddr::V4(_) => buf.write_var(FrameType::TRY_CONNECT_TO_RESPONSE_IPV4.0)?,
+            SocketAddr::V6(_) => buf.write_var(FrameType::TRY_CONNECT_TO_RESPONSE_IPV6.0)?,
         }
 
-        buf.write(self.request_id);
+        buf.write_var(self.request_id.into_inner())?;
         buf.put_u8(if self.success { 1 } else { 0 });
 
         if let Some(error) = self.error_code {
@@ -663,6 +724,7 @@ impl TryConnectToResponse {
                 buf.put_u16(addr.port());
             }
         }
+        Ok(())
     }
 
     /// Decode from buffer

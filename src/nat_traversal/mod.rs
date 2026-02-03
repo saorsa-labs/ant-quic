@@ -34,8 +34,8 @@
 //!
 //! ## Key Types
 //!
-//! - [`CapabilityFlags`]: Compact 16-bit summary of transport capabilities
-//! - [`frames::AddAddress`]: Extended ADD_ADDRESS frame with transport type
+//! - [`CapabilityFlags`](crate::nat_traversal::CapabilityFlags): Compact 16-bit summary of transport capabilities
+//! - [`AddAddress`](crate::nat_traversal::frames::AddAddress): Extended ADD_ADDRESS frame with transport type
 //! - [`NatTraversalEndpoint::advertise_transport_address`]: Multi-transport advertising
 //!
 //! ## Example

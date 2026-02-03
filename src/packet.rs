@@ -309,6 +309,24 @@ pub(crate) enum Header {
 
 impl Header {
     pub(crate) fn encode(&self, w: &mut Vec<u8>) -> PartialEncode {
+        match self.try_encode(w) {
+            Ok(encode) => encode,
+            Err(_) => {
+                tracing::error!("VarInt overflow while encoding Header");
+                debug_assert!(false, "VarInt overflow while encoding Header");
+                PartialEncode {
+                    start: w.len(),
+                    header_len: 0,
+                    pn: None,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_encode(
+        &self,
+        w: &mut Vec<u8>,
+    ) -> Result<PartialEncode, crate::VarIntBoundsExceeded> {
         use Header::*;
         let start = w.len();
         match *self {
@@ -323,15 +341,15 @@ impl Header {
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
-                w.write_var_or_debug_assert(token.len() as u64);
+                w.write_var(token.len() as u64)?;
                 w.put_slice(token);
                 w.write::<u16>(0); // Placeholder for payload length; see `set_payload_length`
                 number.encode(w);
-                PartialEncode {
+                Ok(PartialEncode {
                     start,
                     header_len: w.len() - start,
                     pn: Some((number.len(), true)),
-                }
+                })
             }
             Long {
                 ty,
@@ -346,11 +364,11 @@ impl Header {
                 src_cid.encode_long(w);
                 w.write::<u16>(0); // Placeholder for payload length; see `set_payload_length`
                 number.encode(w);
-                PartialEncode {
+                Ok(PartialEncode {
                     start,
                     header_len: w.len() - start,
                     pn: Some((number.len(), true)),
-                }
+                })
             }
             Retry {
                 ref dst_cid,
@@ -361,11 +379,11 @@ impl Header {
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
-                PartialEncode {
+                Ok(PartialEncode {
                     start,
                     header_len: w.len() - start,
                     pn: None,
-                }
+                })
             }
             Short {
                 spin,
@@ -381,11 +399,11 @@ impl Header {
                 );
                 w.put_slice(dst_cid);
                 number.encode(w);
-                PartialEncode {
+                Ok(PartialEncode {
                     start,
                     header_len: w.len() - start,
                     pn: Some((number.len(), false)),
-                }
+                })
             }
             VersionNegotiate {
                 ref random,
@@ -396,11 +414,11 @@ impl Header {
                 w.write::<u32>(0);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
-                PartialEncode {
+                Ok(PartialEncode {
                     start,
                     header_len: w.len() - start,
                     pn: None,
-                }
+                })
             }
         }
     }

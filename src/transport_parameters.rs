@@ -493,6 +493,11 @@ impl From<UnexpectedEnd> for Error {
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) -> Result<(), Error> {
+        macro_rules! write_var {
+            ($value:expr) => {
+                w.write_var($value).map_err(|_| Error::Internal)?
+            };
+        }
         for idx in self
             .write_order
             .as_ref()
@@ -505,67 +510,67 @@ impl TransportParameters {
             match id {
                 TransportParameterId::ReservedTransportParameter => {
                     if let Some(param) = self.grease_transport_parameter {
-                        param.write(w);
+                        param.write(w)?;
                     }
                 }
                 TransportParameterId::StatelessResetToken => {
                     if let Some(ref x) = self.stateless_reset_token {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(16);
+                        write_var!(id as u64);
+                        write_var!(16);
                         w.put_slice(x);
                     }
                 }
                 TransportParameterId::DisableActiveMigration => {
                     if self.disable_active_migration {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(0);
+                        write_var!(id as u64);
+                        write_var!(0);
                     }
                 }
                 TransportParameterId::MaxDatagramFrameSize => {
                     if let Some(x) = self.max_datagram_frame_size {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(x.size() as u64);
+                        write_var!(id as u64);
+                        write_var!(x.size() as u64);
                         w.write(x);
                     }
                 }
                 TransportParameterId::PreferredAddress => {
                     if let Some(ref x) = self.preferred_address {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(x.wire_size() as u64);
+                        write_var!(id as u64);
+                        write_var!(x.wire_size() as u64);
                         x.write(w);
                     }
                 }
                 TransportParameterId::OriginalDestinationConnectionId => {
                     if let Some(ref cid) = self.original_dst_cid {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(cid.len() as u64);
+                        write_var!(id as u64);
+                        write_var!(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::InitialSourceConnectionId => {
                     if let Some(ref cid) = self.initial_src_cid {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(cid.len() as u64);
+                        write_var!(id as u64);
+                        write_var!(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::RetrySourceConnectionId => {
                     if let Some(ref cid) = self.retry_src_cid {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(cid.len() as u64);
+                        write_var!(id as u64);
+                        write_var!(cid.len() as u64);
                         w.put_slice(cid);
                     }
                 }
                 TransportParameterId::GreaseQuicBit => {
                     if self.grease_quic_bit {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(0);
+                        write_var!(id as u64);
+                        write_var!(0);
                     }
                 }
                 TransportParameterId::MinAckDelayDraft07 => {
                     if let Some(x) = self.min_ack_delay {
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(x.size() as u64);
+                        write_var!(id as u64);
+                        write_var!(x.size() as u64);
                         w.write(x);
                     }
                 }
@@ -577,36 +582,36 @@ impl TransportParameters {
                         match config {
                             NatTraversalConfig::ClientSupport => {
                                 // Client sends empty value
-                                w.write_var_or_debug_assert(id as u64);
-                                w.write_var_or_debug_assert(0); // Empty value
+                                write_var!(id as u64);
+                                write_var!(0); // Empty value
                             }
                             NatTraversalConfig::ServerSupport { concurrency_limit } => {
                                 // Server sends concurrency limit as VarInt
-                                w.write_var_or_debug_assert(id as u64);
-                                w.write_var_or_debug_assert(concurrency_limit.size() as u64);
-                                w.write_var_or_debug_assert(concurrency_limit.0);
+                                write_var!(id as u64);
+                                write_var!(concurrency_limit.size() as u64);
+                                write_var!(concurrency_limit.0);
                             }
                         }
                     }
                 }
                 TransportParameterId::AddressDiscovery => {
                     if let Some(ref config) = self.address_discovery {
-                        w.write_var_or_debug_assert(id as u64);
+                        write_var!(id as u64);
                         let value = config.to_value();
-                        w.write_var_or_debug_assert(value.size() as u64);
-                        w.write_var_or_debug_assert(value.into_inner());
+                        write_var!(value.size() as u64);
+                        write_var!(value.into_inner());
                     }
                 }
                 TransportParameterId::RfcNatTraversal => {
                     if self.rfc_nat_traversal {
                         // Send empty parameter to indicate support
-                        w.write_var_or_debug_assert(id as u64);
-                        w.write_var_or_debug_assert(0); // Empty value
+                        write_var!(id as u64);
+                        write_var!(0); // Empty value
                     }
                 }
                 TransportParameterId::PqcAlgorithms => {
                     if let Some(ref algorithms) = self.pqc_algorithms {
-                        w.write_var_or_debug_assert(id as u64);
+                        write_var!(id as u64);
                         // Encode as bit field: 2 bits for pure PQC algorithms (v0.2)
                         let mut value = 0u8;
                         if algorithms.ml_kem_768 {
@@ -616,7 +621,7 @@ impl TransportParameters {
                             value |= 1 << 1;
                         }
                         // v0.2: Bits 2-3 reserved (hybrid removed)
-                        w.write_var_or_debug_assert(1u64); // Length is always 1 byte
+                        write_var!(1u64); // Length is always 1 byte
                         w.write(value);
                     }
                 }
@@ -626,10 +631,10 @@ impl TransportParameters {
                             match id {
                                 $(TransportParameterId::$id => {
                                     if self.$name.0 != $default {
-                                        w.write_var_or_debug_assert(id as u64);
+                                        write_var!(id as u64);
                                         let size = VarInt::try_from(self.$name.size())
                                             .map_err(|_| Error::Internal)?;
-                                        w.write(size);
+                                        write_var!(size.into_inner());
                                         w.write(self.$name);
                                     }
                                 })*,
@@ -1032,10 +1037,12 @@ impl ReservedTransportParameter {
         })
     }
 
-    fn write(&self, w: &mut impl BufMut) {
-        w.write_var_or_debug_assert(self.id.0);
-        w.write_var_or_debug_assert(self.payload_len as u64);
+    fn write(&self, w: &mut impl BufMut) -> Result<(), Error> {
+        w.write_var(self.id.0).map_err(|_| Error::Internal)?;
+        w.write_var(self.payload_len as u64)
+            .map_err(|_| Error::Internal)?;
         w.put_slice(&self.payload[..self.payload_len]);
+        Ok(())
     }
 
     /// Generates a random reserved identifier of the form `31 * N + 27`, as required by RFC 9000.
@@ -1906,7 +1913,7 @@ mod test {
         assert!(reserved_parameter.payload_len < ReservedTransportParameter::MAX_PAYLOAD_LEN);
         assert!(reserved_parameter.id.0 % 31 == 27);
 
-        reserved_parameter.write(&mut buf);
+        let _ = reserved_parameter.write(&mut buf);
         assert!(!buf.is_empty());
         let read_params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
         assert_eq!(read_params, TransportParameters::default());

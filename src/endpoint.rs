@@ -83,6 +83,8 @@ struct RelayQueue {
     max_relays_per_peer: usize,
     /// Rate limiting time window
     rate_limit_window: Duration,
+    /// Last time rate limiter was cleaned up (to avoid cleaning on every check)
+    last_rate_limit_cleanup: Option<Instant>,
 }
 
 /// Address discovery statistics
@@ -130,6 +132,7 @@ impl RelayQueue {
             rate_limiter: HashMap::new(),
             max_relays_per_peer: 10, // Max 10 relays per peer per time window
             rate_limit_window: Duration::from_secs(60), // 1 minute window
+            last_rate_limit_cleanup: None,
         }
     }
 
@@ -178,8 +181,16 @@ impl RelayQueue {
 
     /// Check if a relay request is within rate limits
     fn check_rate_limit(&mut self, peer_id: PeerId, now: Instant) -> bool {
-        // Clean up old entries first
-        self.cleanup_rate_limiter(now);
+        // Only clean up periodically (every 10 seconds) to reduce overhead
+        const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+        let should_cleanup = self
+            .last_rate_limit_cleanup
+            .is_none_or(|last| now.saturating_duration_since(last) >= CLEANUP_INTERVAL);
+
+        if should_cleanup {
+            self.cleanup_rate_limiter(now);
+            self.last_rate_limit_cleanup = Some(now);
+        }
 
         // Check current request count for this peer
         if let Some(requests) = self.rate_limiter.get(&peer_id) {
@@ -272,29 +283,19 @@ impl RelayQueue {
     /// Clean up expired requests and return number of items cleaned
     fn cleanup_expired(&mut self, now: Instant) -> usize {
         let initial_len = self.pending.len();
+        let timeout = self.request_timeout;
 
-        // Collect expired keys
-        let expired_keys: Vec<u64> = self
-            .pending
-            .iter()
-            .filter_map(|(seq, item)| {
-                if now.saturating_duration_since(item.created_at) > self.request_timeout {
-                    Some(*seq)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove expired items
-        for key in expired_keys {
-            if let Some(expired) = self.pending.shift_remove(&key) {
+        // Use retain for O(n) in-place removal instead of O(n) collect + O(n) remove
+        self.pending.retain(|_seq, item| {
+            let expired = now.saturating_duration_since(item.created_at) > timeout;
+            if expired {
                 debug!(
                     "Removing expired relay request for peer {:?}",
-                    expired.target_peer_id
+                    item.target_peer_id
                 );
             }
-        }
+            !expired
+        });
 
         initial_len - self.pending.len()
     }
@@ -501,37 +502,35 @@ impl Endpoint {
 
     /// Process queued relay requests for a specific peer that just connected
     fn process_queued_relays_for_peer(&mut self, peer_id: PeerId) {
-        let _now = Instant::now();
         let mut processed = 0;
 
-        // Collect items to process for this peer
-        let mut items_to_process = Vec::new();
-        let mut keys_to_remove = Vec::new();
-
-        // Find all items for this peer
-        for (seq, item) in &self.relay_queue.pending {
-            if item.target_peer_id == peer_id {
-                items_to_process.push(item.clone());
-                keys_to_remove.push(*seq);
-            }
-        }
-
-        // Remove items from queue
-        for key in keys_to_remove {
-            self.relay_queue.pending.shift_remove(&key);
-        }
-
-        // Process the items
-        for item in items_to_process {
-            if let Some(ch) = self.lookup_peer_connection(&peer_id) {
-                if self.relay_frame_to_connection(ch, item.frame.clone()) {
-                    self.relay_stats.requests_relayed += 1;
-                    processed += 1;
-                    trace!("Processed queued relay for peer {:?}", peer_id);
+        // Collect only the sequence numbers for items to process (avoid cloning items)
+        let keys_to_process: Vec<u64> = self
+            .relay_queue
+            .pending
+            .iter()
+            .filter_map(|(seq, item)| {
+                if item.target_peer_id == peer_id {
+                    Some(*seq)
                 } else {
-                    // Failed to relay, requeue
-                    self.relay_queue.requeue_failed(item);
-                    self.relay_stats.requests_failed += 1;
+                    None
+                }
+            })
+            .collect();
+
+        // Remove and process items by key
+        for key in keys_to_process {
+            if let Some(item) = self.relay_queue.pending.shift_remove(&key) {
+                if let Some(ch) = self.lookup_peer_connection(&peer_id) {
+                    if self.relay_frame_to_connection(ch, item.frame.clone()) {
+                        self.relay_stats.requests_relayed += 1;
+                        processed += 1;
+                        trace!("Processed queued relay for peer {:?}", peer_id);
+                    } else {
+                        // Failed to relay, requeue
+                        self.relay_queue.requeue_failed(item);
+                        self.relay_stats.requests_failed += 1;
+                    }
                 }
             }
         }
@@ -539,10 +538,7 @@ impl Endpoint {
         self.relay_stats.current_queue_size = self.relay_queue.len();
 
         if processed > 0 {
-            debug!(
-                "Processed {} queued relay requests for peer {:?}",
-                processed, peer_id
-            );
+            debug!("Processed {processed} queued relay requests for peer {peer_id:?}");
         }
     }
 
@@ -897,11 +893,15 @@ impl Endpoint {
         self.last_stateless_reset = Some(now);
         // Resets with at least this much padding can't possibly be distinguished from real packets
         const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
+        // Always randomize padding length to prevent fingerprinting
         let padding_len = if max_padding_len <= MIN_PADDING_LEN {
+            // Minimum case: no room for randomization
             max_padding_len
         } else if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+            // Small packet: randomize within available range
             self.rng.gen_range(MIN_PADDING_LEN..=max_padding_len)
         } else {
+            // Normal case: randomize above ideal minimum
             self.rng.gen_range(IDEAL_MIN_PADDING_LEN..max_padding_len)
         };
         buf.reserve(padding_len + RESET_TOKEN_SIZE);
@@ -1388,16 +1388,22 @@ impl Endpoint {
             }
         };
 
-        self.clean_up_incoming(&incoming);
-        incoming.improper_drop_warner.dismiss();
-
         let header = Header::Retry {
             src_cid: loc_cid,
             dst_cid: incoming.packet.header.src_cid,
             version: incoming.packet.header.version,
         };
 
-        let encode = header.encode(buf);
+        let encode = match header.try_encode(buf) {
+            Ok(encode) => encode,
+            Err(_) => {
+                error!("failed to encode retry header due to varint overflow");
+                return Err(RetryError::incoming(incoming));
+            }
+        };
+
+        self.clean_up_incoming(&incoming);
+        incoming.improper_drop_warner.dismiss();
         buf.put_slice(&token);
         buf.extend_from_slice(&server_config_arc.crypto.retry_tag(
             incoming.packet.header.version,
@@ -1515,10 +1521,20 @@ impl Endpoint {
             version,
         });
 
-        let partial_encode = header.encode(buf);
+        let partial_encode = match header.try_encode(buf) {
+            Ok(encode) => encode,
+            Err(_) => {
+                error!("failed to encode initial close header due to varint overflow");
+                header.encode(buf)
+            }
+        };
         let max_len =
             INITIAL_MTU as usize - partial_encode.header_len - crypto.packet.local.tag_len();
-        frame::Close::from(reason).encode(buf, max_len);
+        let close = frame::Close::from(reason);
+        if close.try_encode(buf, max_len).is_err() {
+            error!("failed to encode initial close frame due to varint overflow");
+            close.encode(buf, max_len);
+        }
         buf.resize(buf.len() + crypto.packet.local.tag_len(), 0);
         partial_encode.finish(buf, &*crypto.header.local, Some((0, &*crypto.packet.local)));
         Transmit {

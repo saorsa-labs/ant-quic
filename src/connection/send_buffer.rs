@@ -48,13 +48,14 @@ impl SendBuffer {
     /// Discard a range of acknowledged stream data
     pub(super) fn ack(&mut self, mut range: Range<u64>) {
         // Clamp the range to data which is still tracked
-        let base_offset = self.offset - self.unacked_len as u64;
+        // Use saturating_sub to prevent underflow if unacked_len exceeds offset (logic error)
+        let base_offset = self.offset.saturating_sub(self.unacked_len as u64);
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
         self.acks.insert(range);
 
-        while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
+        while self.acks.min() == Some(self.offset.saturating_sub(self.unacked_len as u64)) {
             let prefix = self.acks.pop_min().unwrap();
             let mut to_advance = (prefix.end - prefix.start) as usize;
 
@@ -69,7 +70,11 @@ impl SendBuffer {
                     to_advance -= front.len();
                     self.unacked_segments.pop_front();
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                    // Only shrink occasionally to avoid repeated reallocations
+                    // Shrink when capacity is >8x length and capacity is significant (>32)
+                    let cap = self.unacked_segments.capacity();
+                    let len = self.unacked_segments.len();
+                    if cap > 32 && len * 8 < cap {
                         self.unacked_segments.shrink_to_fit();
                     }
                 } else {
@@ -144,7 +149,7 @@ impl SendBuffer {
     /// should call the function again with an incremented start offset to
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
-        let base_offset = self.offset - self.unacked_len as u64;
+        let base_offset = self.offset.saturating_sub(self.unacked_len as u64);
 
         let mut segment_offset = base_offset;
         for segment in self.unacked_segments.iter() {

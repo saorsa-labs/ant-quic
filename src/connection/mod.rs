@@ -26,7 +26,7 @@ use tracing::{debug, error, info, trace, trace_span, warn};
 use crate::{
     Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, MtuDiscoveryConfig, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
-    TransportError, TransportErrorCode, VarInt,
+    TransportError, TransportErrorCode, VarInt, VarIntBoundsExceeded,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -955,14 +955,19 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 if !self.spaces[space_id].pending_acks.ranges().is_empty() {
-                    Self::populate_acks(
+                    if Self::populate_acks(
                         now,
                         self.receiving_ecn,
                         &mut SentFrames::default(),
                         &mut self.spaces[space_id],
                         buf,
                         &mut self.stats,
-                    );
+                    )
+                    .is_err()
+                    {
+                        self.handle_encode_error(now, "ACK (close)");
+                        return None;
+                    }
                 }
 
                 // Since there only 64 ACK frames there will always be enough space
@@ -976,23 +981,35 @@ impl Connection {
                     let max_frame_size = builder.max_size - buf.len();
                     match self.state {
                         State::Closed(state::Closed { ref reason }) => {
-                            if space_id == SpaceId::Data || reason.is_transport_layer() {
-                                reason.encode(buf, max_frame_size)
+                            let result = if space_id == SpaceId::Data || reason.is_transport_layer()
+                            {
+                                reason.try_encode(buf, max_frame_size)
                             } else {
                                 frame::ConnectionClose {
                                     error_code: TransportErrorCode::APPLICATION_ERROR,
                                     frame_type: None,
                                     reason: Bytes::new(),
                                 }
-                                .encode(buf, max_frame_size)
+                                .try_encode(buf, max_frame_size)
+                            };
+                            if result.is_err() {
+                                self.handle_encode_error(now, "ConnectionClose");
+                                return None;
                             }
                         }
-                        State::Draining => frame::ConnectionClose {
-                            error_code: TransportErrorCode::NO_ERROR,
-                            frame_type: None,
-                            reason: Bytes::new(),
+                        State::Draining => {
+                            if (frame::ConnectionClose {
+                                error_code: TransportErrorCode::NO_ERROR,
+                                frame_type: None,
+                                reason: Bytes::new(),
+                            })
+                            .try_encode(buf, max_frame_size)
+                            .is_err()
+                            {
+                                self.handle_encode_error(now, "ConnectionClose (draining)");
+                                return None;
+                            }
                         }
-                        .encode(buf, max_frame_size),
                         _ => unreachable!(
                             "tried to make a close packet when the connection wasn't closed"
                         ),
@@ -1020,7 +1037,13 @@ impl Connection {
                     // above.
                     let mut builder = builder_storage.take().unwrap();
                     trace!("PATH_RESPONSE {:08x} (off-path)", token);
-                    buf.write(frame::FrameType::PATH_RESPONSE);
+                    if !self.encode_or_close(
+                        now,
+                        frame::FrameType::PATH_RESPONSE.try_encode(buf),
+                        "PATH_RESPONSE (off-path)",
+                    ) {
+                        return None;
+                    }
                     buf.write(token);
                     self.stats.frame_tx.path_response += 1;
                     let min_size = self.pqc_state.min_initial_size();
@@ -1158,12 +1181,20 @@ impl Connection {
             )?;
 
             // We implement MTU probes as ping packets padded up to the probe size
-            buf.write(frame::FrameType::PING);
+            if !self.encode_or_close(now, frame::FrameType::PING.try_encode(buf), "PING (MTU)") {
+                return None;
+            }
             self.stats.frame_tx.ping += 1;
 
             // If supported by the peer, we want no delays to the probe's ACK
             if self.peer_supports_ack_frequency() {
-                buf.write(frame::FrameType::IMMEDIATE_ACK);
+                if !self.encode_or_close(
+                    now,
+                    frame::FrameType::IMMEDIATE_ACK.try_encode(buf),
+                    "IMMEDIATE_ACK (MTU)",
+                ) {
+                    return None;
+                }
                 self.stats.frame_tx.immediate_ack += 1;
             }
 
@@ -1314,7 +1345,13 @@ impl Connection {
             "sending coordinated PATH_CHALLENGE {:08x} to {}",
             challenge, target_addr
         );
-        buf.write(frame::FrameType::PATH_CHALLENGE);
+        if !self.encode_or_close(
+            now,
+            frame::FrameType::PATH_CHALLENGE.try_encode(buf),
+            "PATH_CHALLENGE (coordination)",
+        ) {
+            return None;
+        }
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
@@ -1405,7 +1442,13 @@ impl Connection {
             "sending PATH_CHALLENGE {:08x} to NAT candidate {}",
             challenge, remote_addr
         );
-        buf.write(frame::FrameType::PATH_CHALLENGE);
+        if !self.encode_or_close(
+            now,
+            frame::FrameType::PATH_CHALLENGE.try_encode(buf),
+            "PATH_CHALLENGE (nat)",
+        ) {
+            return None;
+        }
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
@@ -1464,7 +1507,13 @@ impl Connection {
             self,
         )?;
         trace!("validating previous path with PATH_CHALLENGE {:08x}", token);
-        buf.write(frame::FrameType::PATH_CHALLENGE);
+        if !self.encode_or_close(
+            now,
+            frame::FrameType::PATH_CHALLENGE.try_encode(buf),
+            "PATH_CHALLENGE (prev path)",
+        ) {
+            return None;
+        }
         buf.write(token);
         self.stats.frame_tx.path_challenge += 1;
 
@@ -3731,6 +3780,29 @@ impl Connection {
         self.peer_params.stateless_reset_token = Some(reset_token);
     }
 
+    fn handle_encode_error(&mut self, now: Instant, context: &'static str) {
+        tracing::error!("VarInt overflow while encoding {context}");
+        self.close_inner(
+            now,
+            Close::from(TransportError::INTERNAL_ERROR(
+                "varint overflow during encoding",
+            )),
+        );
+    }
+
+    fn encode_or_close(
+        &mut self,
+        now: Instant,
+        result: Result<(), VarIntBoundsExceeded>,
+        context: &'static str,
+    ) -> bool {
+        if result.is_err() {
+            self.handle_encode_error(now, context);
+            return false;
+        }
+        true
+    }
+
     /// Issue an initial set of connection IDs to the peer upon connection
     fn issue_first_cids(&mut self, now: Instant) {
         if self.local_cid_state.cid_len() == 0 {
@@ -3761,10 +3833,22 @@ impl Connection {
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
+        macro_rules! encode_or_close {
+            ($result:expr, $context:expr) => {{
+                if $result.is_err() {
+                    drop(space);
+                    self.handle_encode_error(now, $context);
+                    return sent;
+                }
+            }};
+        }
 
         // HANDSHAKE_DONE
         if !is_0rtt && mem::replace(&mut space.pending.handshake_done, false) {
-            buf.write(frame::FrameType::HANDSHAKE_DONE);
+            encode_or_close!(
+                frame::FrameType::HANDSHAKE_DONE.try_encode(buf),
+                "HANDSHAKE_DONE"
+            );
             sent.retransmits.get_or_create().handshake_done = true;
             // This is just a u8 counter and the frame is typically just sent once
             self.stats.frame_tx.handshake_done =
@@ -3774,7 +3858,7 @@ impl Connection {
         // PING
         if mem::replace(&mut space.ping_pending, false) {
             trace!("PING");
-            buf.write(frame::FrameType::PING);
+            encode_or_close!(frame::FrameType::PING.try_encode(buf), "PING");
             sent.non_retransmits = true;
             self.stats.frame_tx.ping += 1;
         }
@@ -3782,14 +3866,17 @@ impl Connection {
         // IMMEDIATE_ACK
         if mem::replace(&mut space.immediate_ack_pending, false) {
             trace!("IMMEDIATE_ACK");
-            buf.write(frame::FrameType::IMMEDIATE_ACK);
+            encode_or_close!(
+                frame::FrameType::IMMEDIATE_ACK.try_encode(buf),
+                "IMMEDIATE_ACK"
+            );
             sent.non_retransmits = true;
             self.stats.frame_tx.immediate_ack += 1;
         }
 
         // ACK
         if space.pending_acks.can_send() {
-            Self::populate_acks(
+            let ack_result = Self::populate_acks(
                 now,
                 self.receiving_ecn,
                 &mut sent,
@@ -3797,6 +3884,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
             );
+            encode_or_close!(ack_result, "ACK");
         }
 
         // ACK_FREQUENCY
@@ -3815,13 +3903,19 @@ impl Connection {
 
             trace!(?max_ack_delay, "ACK_FREQUENCY");
 
-            frame::AckFrequency {
-                sequence: sequence_number,
-                ack_eliciting_threshold: config.ack_eliciting_threshold,
-                request_max_ack_delay: max_ack_delay.as_micros().try_into().unwrap_or(VarInt::MAX),
-                reordering_threshold: config.reordering_threshold,
-            }
-            .encode(buf);
+            encode_or_close!(
+                (frame::AckFrequency {
+                    sequence: sequence_number,
+                    ack_eliciting_threshold: config.ack_eliciting_threshold,
+                    request_max_ack_delay: max_ack_delay
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(VarInt::MAX),
+                    reordering_threshold: config.reordering_threshold,
+                })
+                .try_encode(buf),
+                "ACK_FREQUENCY"
+            );
 
             sent.retransmits.get_or_create().ack_frequency = true;
 
@@ -3838,7 +3932,10 @@ impl Connection {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 trace!("PATH_CHALLENGE {:08x}", token);
-                buf.write(frame::FrameType::PATH_CHALLENGE);
+                encode_or_close!(
+                    frame::FrameType::PATH_CHALLENGE.try_encode(buf),
+                    "PATH_CHALLENGE"
+                );
                 buf.write(token);
                 self.stats.frame_tx.path_challenge += 1;
             }
@@ -3853,7 +3950,10 @@ impl Connection {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 trace!("PATH_RESPONSE {:08x}", token);
-                buf.write(frame::FrameType::PATH_RESPONSE);
+                encode_or_close!(
+                    frame::FrameType::PATH_RESPONSE.try_encode(buf),
+                    "PATH_RESPONSE"
+                );
                 buf.write(token);
                 self.stats.frame_tx.path_response += 1;
             }
@@ -3900,7 +4000,7 @@ impl Connection {
                 truncated.offset,
                 truncated.data.len()
             );
-            truncated.encode(buf);
+            encode_or_close!(truncated.try_encode(buf), "CRYPTO");
             self.stats.frame_tx.crypto += 1;
             sent.retransmits.get_or_create().crypto.push_back(truncated);
             if !frame.data.is_empty() {
@@ -3910,13 +4010,14 @@ impl Connection {
         }
 
         if space_id == SpaceId::Data {
-            self.streams.write_control_frames(
+            let control_result = self.streams.write_control_frames(
                 buf,
                 &mut space.pending,
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
             );
+            encode_or_close!(control_result, "control frames");
         }
 
         // NEW_CONNECTION_ID
@@ -3930,13 +4031,16 @@ impl Connection {
                 id = %issued.id,
                 "NEW_CONNECTION_ID"
             );
-            frame::NewConnectionId {
-                sequence: issued.sequence,
-                retire_prior_to: self.local_cid_state.retire_prior_to(),
-                id: issued.id,
-                reset_token: issued.reset_token,
-            }
-            .encode(buf);
+            encode_or_close!(
+                (frame::NewConnectionId {
+                    sequence: issued.sequence,
+                    retire_prior_to: self.local_cid_state.retire_prior_to(),
+                    id: issued.id,
+                    reset_token: issued.reset_token,
+                })
+                .try_encode(buf),
+                "NEW_CONNECTION_ID"
+            );
             sent.retransmits.get_or_create().new_cids.push(issued);
             self.stats.frame_tx.new_connection_id += 1;
         }
@@ -3948,8 +4052,11 @@ impl Connection {
                 None => break,
             };
             trace!(sequence = seq, "RETIRE_CONNECTION_ID");
-            buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
-            buf.write_var_or_debug_assert(seq);
+            encode_or_close!(
+                frame::FrameType::RETIRE_CONNECTION_ID.try_encode(buf),
+                "RETIRE_CONNECTION_ID"
+            );
+            encode_or_close!(buf.write_var(seq), "RETIRE_CONNECTION_ID seq");
             sent.retransmits.get_or_create().retire_cids.push(seq);
             self.stats.frame_tx.retire_connection_id += 1;
         }
@@ -4017,7 +4124,7 @@ impl Connection {
                 break;
             }
 
-            new_token.encode(buf);
+            encode_or_close!(new_token.try_encode(buf), "NEW_TOKEN");
             sent.retransmits
                 .get_or_create()
                 .new_tokens
@@ -4038,9 +4145,9 @@ impl Connection {
             );
             // Use the correct encoding format based on negotiated configuration
             if self.nat_traversal_frame_config.use_rfc_format {
-                add_address.encode_rfc(buf);
+                encode_or_close!(add_address.try_encode_rfc(buf), "ADD_ADDRESS (rfc)");
             } else {
-                add_address.encode_legacy(buf);
+                encode_or_close!(add_address.try_encode_legacy(buf), "ADD_ADDRESS (legacy)");
             }
             sent.retransmits
                 .get_or_create()
@@ -4062,9 +4169,9 @@ impl Connection {
             );
             // Use the correct encoding format based on negotiated configuration
             if self.nat_traversal_frame_config.use_rfc_format {
-                punch_me_now.encode_rfc(buf);
+                encode_or_close!(punch_me_now.try_encode_rfc(buf), "PUNCH_ME_NOW (rfc)");
             } else {
-                punch_me_now.encode_legacy(buf);
+                encode_or_close!(punch_me_now.try_encode_legacy(buf), "PUNCH_ME_NOW (legacy)");
             }
             sent.retransmits
                 .get_or_create()
@@ -4084,7 +4191,7 @@ impl Connection {
                 "REMOVE_ADDRESS"
             );
             // RemoveAddress has the same format in both RFC and legacy versions
-            remove_address.encode(buf);
+            encode_or_close!(remove_address.try_encode(buf), "REMOVE_ADDRESS");
             sent.retransmits
                 .get_or_create()
                 .remove_addresses
@@ -4104,7 +4211,7 @@ impl Connection {
                 sequence = %observed_address.sequence_number,
                 "populate_packet: ENCODING OBSERVED_ADDRESS into packet"
             );
-            observed_address.encode(buf);
+            encode_or_close!(observed_address.try_encode(buf), "OBSERVED_ADDRESS");
             sent.retransmits
                 .get_or_create()
                 .outbound_observations
@@ -4134,7 +4241,7 @@ impl Connection {
         space: &mut PacketSpace,
         buf: &mut Vec<u8>,
         stats: &mut ConnectionStats,
-    ) {
+    ) -> Result<(), VarIntBoundsExceeded> {
         debug_assert!(!space.pending_acks.ranges().is_empty());
 
         // 0-RTT packets must never carry acks (which would have to be of handshake packets)
@@ -4158,8 +4265,9 @@ impl Connection {
             delay_micros
         );
 
-        frame::Ack::encode(delay as _, space.pending_acks.ranges(), ecn, buf);
+        frame::Ack::try_encode(delay as _, space.pending_acks.ranges(), ecn, buf)?;
         stats.frame_tx.acks += 1;
+        Ok(())
     }
 
     fn close_common(&mut self) {

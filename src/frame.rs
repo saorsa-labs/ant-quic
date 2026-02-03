@@ -18,11 +18,16 @@ use tinyvec::TinyVec;
 
 use crate::{
     Dir, MAX_CID_SIZE, RESET_TOKEN_SIZE, ResetToken, StreamId, TransportError, TransportErrorCode,
-    VarInt,
+    VarInt, VarIntBoundsExceeded,
     coding::{self, BufExt, BufMutExt, UnexpectedEnd},
     range_set::ArrayRangeSet,
     shared::{ConnectionId, EcnCodepoint},
 };
+
+fn log_encode_overflow(context: &'static str) {
+    tracing::error!("VarInt overflow while encoding {context}");
+    debug_assert!(false, "VarInt overflow while encoding {context}");
+}
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -52,6 +57,10 @@ impl FrameType {
             None
         }
     }
+
+    pub(crate) fn try_encode<B: BufMut>(&self, buf: &mut B) -> Result<(), VarIntBoundsExceeded> {
+        buf.write_var(self.0)
+    }
 }
 
 impl coding::Codec for FrameType {
@@ -59,7 +68,9 @@ impl coding::Codec for FrameType {
         Ok(Self(buf.get_var()?))
     }
     fn encode<B: BufMut>(&self, buf: &mut B) {
-        buf.write_var_or_debug_assert(self.0);
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("FrameType");
+        }
     }
 }
 
@@ -281,9 +292,19 @@ pub enum Close {
 
 impl Close {
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W, max_len: usize) {
+        if self.try_encode(out, max_len).is_err() {
+            log_encode_overflow("Close");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(
+        &self,
+        out: &mut W,
+        max_len: usize,
+    ) -> Result<(), VarIntBoundsExceeded> {
         match *self {
-            Self::Connection(ref x) => x.encode(out, max_len),
-            Self::Application(ref x) => x.encode(out, max_len),
+            Self::Connection(ref x) => x.try_encode(out, max_len),
+            Self::Application(ref x) => x.try_encode(out, max_len),
         }
     }
 
@@ -345,18 +366,30 @@ impl FrameStruct for ConnectionClose {
 }
 
 impl ConnectionClose {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W, max_len: usize) {
-        out.write(FrameType::CONNECTION_CLOSE); // 1 byte
-        out.write(self.error_code); // <= 8 bytes
+        if self.try_encode(out, max_len).is_err() {
+            log_encode_overflow("ConnectionClose");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(
+        &self,
+        out: &mut W,
+        max_len: usize,
+    ) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::CONNECTION_CLOSE.try_encode(out)?; // 1 byte
+        out.write_var(u64::from(self.error_code))?; // <= 8 bytes
         let ty = self.frame_type.map_or(0, |x| x.0);
-        out.write_var_or_debug_assert(ty); // <= 8 bytes
+        out.write_var(ty)?; // <= 8 bytes
         let max_len = max_len
             - 3
             - VarInt::from_u64_bounded(ty).size()
             - VarInt::from_u64_bounded(self.reason.len() as u64).size();
         let actual_len = self.reason.len().min(max_len);
-        out.write_var_or_debug_assert(actual_len as u64); // <= 8 bytes
+        out.write_var(actual_len as u64)?; // <= 8 bytes
         out.put_slice(&self.reason[0..actual_len]); // whatever's left
+        Ok(())
     }
 }
 
@@ -388,13 +421,25 @@ impl FrameStruct for ApplicationClose {
 }
 
 impl ApplicationClose {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W, max_len: usize) {
-        out.write(FrameType::APPLICATION_CLOSE); // 1 byte
-        out.write(self.error_code); // <= 8 bytes
+        if self.try_encode(out, max_len).is_err() {
+            log_encode_overflow("ApplicationClose");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(
+        &self,
+        out: &mut W,
+        max_len: usize,
+    ) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::APPLICATION_CLOSE.try_encode(out)?; // 1 byte
+        out.write_var(self.error_code.into_inner())?; // <= 8 bytes
         let max_len = max_len - 3 - VarInt::from_u64_bounded(self.reason.len() as u64).size();
         let actual_len = self.reason.len().min(max_len);
-        out.write_var_or_debug_assert(actual_len as u64); // <= 8 bytes
+        out.write_var(actual_len as u64)?; // <= 8 bytes
         out.put_slice(&self.reason[0..actual_len]); // whatever's left
+        Ok(())
     }
 }
 
@@ -453,31 +498,47 @@ impl Ack {
         ecn: Option<&EcnCounts>,
         buf: &mut W,
     ) {
+        if Self::try_encode(delay, ranges, ecn, buf).is_err() {
+            log_encode_overflow("Ack");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(
+        delay: u64,
+        ranges: &ArrayRangeSet,
+        ecn: Option<&EcnCounts>,
+        buf: &mut W,
+    ) -> Result<(), VarIntBoundsExceeded> {
         let mut rest = ranges.iter().rev();
-        let first = rest
-            .next()
-            .unwrap_or_else(|| panic!("ACK ranges should have at least one range"));
+        let first = match rest.next() {
+            Some(first) => first,
+            None => {
+                tracing::error!("ACK ranges should have at least one range");
+                return Err(VarIntBoundsExceeded);
+            }
+        };
         let largest = first.end - 1;
         let first_size = first.end - first.start;
-        buf.write(if ecn.is_some() {
-            FrameType::ACK_ECN
+        if ecn.is_some() {
+            FrameType::ACK_ECN.try_encode(buf)?;
         } else {
-            FrameType::ACK
-        });
-        buf.write_var_or_debug_assert(largest);
-        buf.write_var_or_debug_assert(delay);
-        buf.write_var_or_debug_assert(ranges.len() as u64 - 1);
-        buf.write_var_or_debug_assert(first_size - 1);
+            FrameType::ACK.try_encode(buf)?;
+        }
+        buf.write_var(largest)?;
+        buf.write_var(delay)?;
+        buf.write_var(ranges.len() as u64 - 1)?;
+        buf.write_var(first_size - 1)?;
         let mut prev = first.start;
         for block in rest {
             let size = block.end - block.start;
-            buf.write_var_or_debug_assert(prev - block.end - 1);
-            buf.write_var_or_debug_assert(size - 1);
+            buf.write_var(prev - block.end - 1)?;
+            buf.write_var(size - 1)?;
             prev = block.start;
         }
         if let Some(x) = ecn {
-            x.encode(buf)
+            x.try_encode(buf)?;
         }
+        Ok(())
     }
 
     /// Iterate over acknowledged packet ranges
@@ -521,9 +582,16 @@ impl EcnCounts {
     };
 
     pub fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write_var_or_debug_assert(self.ect0);
-        out.write_var_or_debug_assert(self.ect1);
-        out.write_var_or_debug_assert(self.ce);
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("EcnCounts");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        out.write_var(self.ect0)?;
+        out.write_var(self.ect1)?;
+        out.write_var(self.ce)?;
+        Ok(())
     }
 }
 
@@ -560,6 +628,16 @@ impl Default for StreamMeta {
 
 impl StreamMeta {
     pub(crate) fn encode<W: BufMut>(&self, length: bool, out: &mut W) {
+        if self.try_encode(length, out).is_err() {
+            log_encode_overflow("StreamMeta");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(
+        &self,
+        length: bool,
+        out: &mut W,
+    ) -> Result<(), VarIntBoundsExceeded> {
         let mut ty = *STREAM_TYS.start();
         if self.offsets.start != 0 {
             ty |= 0x04;
@@ -570,14 +648,15 @@ impl StreamMeta {
         if self.fin {
             ty |= 0x01;
         }
-        out.write_var_or_debug_assert(ty); // 1 byte
+        out.write_var(ty)?; // 1 byte
         out.write(self.id); // <=8 bytes
         if self.offsets.start != 0 {
-            out.write_var_or_debug_assert(self.offsets.start); // <=8 bytes
+            out.write_var(self.offsets.start)?; // <=8 bytes
         }
         if length {
-            out.write_var_or_debug_assert(self.offsets.end - self.offsets.start); // <=8 bytes
+            out.write_var(self.offsets.end - self.offsets.start)?; // <=8 bytes
         }
+        Ok(())
     }
 }
 
@@ -593,11 +672,19 @@ pub(crate) struct Crypto {
 impl Crypto {
     pub(crate) const SIZE_BOUND: usize = 17;
 
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write(FrameType::CRYPTO);
-        out.write_var_or_debug_assert(self.offset);
-        out.write_var_or_debug_assert(self.data.len() as u64);
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("Crypto");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::CRYPTO.try_encode(out)?;
+        out.write_var(self.offset)?;
+        out.write_var(self.data.len() as u64)?;
         out.put_slice(&self.data);
+        Ok(())
     }
 }
 
@@ -607,10 +694,18 @@ pub(crate) struct NewToken {
 }
 
 impl NewToken {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write(FrameType::NEW_TOKEN);
-        out.write_var_or_debug_assert(self.token.len() as u64);
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("NewToken");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::NEW_TOKEN.try_encode(out)?;
+        out.write_var(self.token.len() as u64)?;
         out.put_slice(&self.token);
+        Ok(())
     }
 
     pub(crate) fn size(&self) -> usize {
@@ -951,11 +1046,19 @@ impl FrameStruct for ResetStream {
 }
 
 impl ResetStream {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write(FrameType::RESET_STREAM); // 1 byte
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("ResetStream");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::RESET_STREAM.try_encode(out)?; // 1 byte
         out.write(self.id); // <= 8 bytes
-        out.write(self.error_code); // <= 8 bytes
-        out.write(self.final_offset); // <= 8 bytes
+        out.write_var(self.error_code.into_inner())?; // <= 8 bytes
+        out.write_var(self.final_offset.into_inner())?; // <= 8 bytes
+        Ok(())
     }
 }
 
@@ -970,10 +1073,18 @@ impl FrameStruct for StopSending {
 }
 
 impl StopSending {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write(FrameType::STOP_SENDING); // 1 byte
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("StopSending");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::STOP_SENDING.try_encode(out)?; // 1 byte
         out.write(self.id); // <= 8 bytes
-        out.write(self.error_code) // <= 8 bytes
+        out.write_var(self.error_code.into_inner())?; // <= 8 bytes
+        Ok(())
     }
 }
 
@@ -986,13 +1097,21 @@ pub(crate) struct NewConnectionId {
 }
 
 impl NewConnectionId {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
-        out.write(FrameType::NEW_CONNECTION_ID);
-        out.write_var_or_debug_assert(self.sequence);
-        out.write_var_or_debug_assert(self.retire_prior_to);
+        if self.try_encode(out).is_err() {
+            log_encode_overflow("NewConnectionId");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, out: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::NEW_CONNECTION_ID.try_encode(out)?;
+        out.write_var(self.sequence)?;
+        out.write_var(self.retire_prior_to)?;
         out.write(self.id.len() as u8);
         out.put_slice(&self.id);
         out.put_slice(&self.reset_token);
+        Ok(())
     }
 }
 
@@ -1012,12 +1131,22 @@ impl FrameStruct for Datagram {
 
 impl Datagram {
     pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
-        out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
+        if self.try_encode(length, out).is_err() {
+            log_encode_overflow("Datagram");
+        }
+    }
+
+    pub(crate) fn try_encode(
+        &self,
+        length: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VarIntBoundsExceeded> {
+        FrameType(*DATAGRAM_TYS.start() | u64::from(length)).try_encode(out)?; // 1 byte
         if length {
-            // Safe to unwrap because we check length sanity before queueing datagrams
-            out.write(VarInt::from_u64_bounded(self.data.len() as u64)); // <= 8 bytes
+            out.write_var(self.data.len() as u64)?; // <= 8 bytes
         }
         out.extend_from_slice(&self.data);
+        Ok(())
     }
 
     pub(crate) fn size(&self, length: bool) -> usize {
@@ -1038,12 +1167,20 @@ pub(crate) struct AckFrequency {
 }
 
 impl AckFrequency {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, buf: &mut W) {
-        buf.write(FrameType::ACK_FREQUENCY);
-        buf.write(self.sequence);
-        buf.write(self.ack_eliciting_threshold);
-        buf.write(self.request_max_ack_delay);
-        buf.write(self.reordering_threshold);
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("AckFrequency");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        FrameType::ACK_FREQUENCY.try_encode(buf)?;
+        buf.write_var(self.sequence.into_inner())?;
+        buf.write_var(self.ack_eliciting_threshold.into_inner())?;
+        buf.write_var(self.request_max_ack_delay.into_inner())?;
+        buf.write_var(self.reordering_threshold.into_inner())?;
+        Ok(())
     }
 }
 
@@ -1063,14 +1200,21 @@ pub(crate) struct ObservedAddress {
 }
 
 impl ObservedAddress {
+    #[allow(dead_code)]
     pub(crate) fn encode<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("ObservedAddress");
+        }
+    }
+
+    pub(crate) fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
         match self.address {
-            SocketAddr::V4(_) => buf.write(FrameType::OBSERVED_ADDRESS_IPV4),
-            SocketAddr::V6(_) => buf.write(FrameType::OBSERVED_ADDRESS_IPV6),
+            SocketAddr::V4(_) => FrameType::OBSERVED_ADDRESS_IPV4.try_encode(buf)?,
+            SocketAddr::V6(_) => FrameType::OBSERVED_ADDRESS_IPV6.try_encode(buf)?,
         };
 
         // Write sequence number as varint
-        buf.write_var_or_debug_assert(self.sequence_number.0);
+        buf.write_var(self.sequence_number.0)?;
 
         // Write address and port directly (no IP version byte needed)
         match self.address {
@@ -1083,6 +1227,7 @@ impl ObservedAddress {
                 buf.put_u16(addr.port());
             }
         }
+        Ok(())
     }
 
     pub(crate) fn decode<R: Buf>(r: &mut R, is_ipv6: bool) -> Result<Self, UnexpectedEnd> {
