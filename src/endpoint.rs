@@ -83,6 +83,8 @@ struct RelayQueue {
     max_relays_per_peer: usize,
     /// Rate limiting time window
     rate_limit_window: Duration,
+    /// Last time rate limiter was cleaned up (to avoid cleaning on every check)
+    last_rate_limit_cleanup: Option<Instant>,
 }
 
 /// Address discovery statistics
@@ -130,6 +132,7 @@ impl RelayQueue {
             rate_limiter: HashMap::new(),
             max_relays_per_peer: 10, // Max 10 relays per peer per time window
             rate_limit_window: Duration::from_secs(60), // 1 minute window
+            last_rate_limit_cleanup: None,
         }
     }
 
@@ -178,8 +181,16 @@ impl RelayQueue {
 
     /// Check if a relay request is within rate limits
     fn check_rate_limit(&mut self, peer_id: PeerId, now: Instant) -> bool {
-        // Clean up old entries first
-        self.cleanup_rate_limiter(now);
+        // Only clean up periodically (every 10 seconds) to reduce overhead
+        const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+        let should_cleanup = self
+            .last_rate_limit_cleanup
+            .is_none_or(|last| now.saturating_duration_since(last) >= CLEANUP_INTERVAL);
+
+        if should_cleanup {
+            self.cleanup_rate_limiter(now);
+            self.last_rate_limit_cleanup = Some(now);
+        }
 
         // Check current request count for this peer
         if let Some(requests) = self.rate_limiter.get(&peer_id) {
@@ -884,11 +895,15 @@ impl Endpoint {
         self.last_stateless_reset = Some(now);
         // Resets with at least this much padding can't possibly be distinguished from real packets
         const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
+        // Always randomize padding length to prevent fingerprinting
         let padding_len = if max_padding_len <= MIN_PADDING_LEN {
+            // Minimum case: no room for randomization
             max_padding_len
         } else if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+            // Small packet: randomize within available range
             self.rng.gen_range(MIN_PADDING_LEN..=max_padding_len)
         } else {
+            // Normal case: randomize above ideal minimum
             self.rng.gen_range(IDEAL_MIN_PADDING_LEN..max_padding_len)
         };
         buf.reserve(padding_len + RESET_TOKEN_SIZE);

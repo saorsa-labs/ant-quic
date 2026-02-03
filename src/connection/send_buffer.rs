@@ -69,7 +69,11 @@ impl SendBuffer {
                     to_advance -= front.len();
                     self.unacked_segments.pop_front();
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                    // Only shrink occasionally to avoid repeated reallocations
+                    // Shrink when capacity is >8x length and capacity is significant (>32)
+                    let cap = self.unacked_segments.capacity();
+                    let len = self.unacked_segments.len();
+                    if cap > 32 && len * 8 < cap {
                         self.unacked_segments.shrink_to_fit();
                     }
                 } else {
