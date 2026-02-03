@@ -198,7 +198,6 @@ impl IncomingToken {
 ///
 /// The connection cannot be established.
 pub(crate) struct InvalidRetryTokenError;
-
 /// Stateless reset token
 ///
 /// Used for an endpoint to securely communicate that it has lost state for a connection.
