@@ -1913,7 +1913,7 @@ mod test {
         assert!(reserved_parameter.payload_len < ReservedTransportParameter::MAX_PAYLOAD_LEN);
         assert!(reserved_parameter.id.0 % 31 == 27);
 
-        reserved_parameter.write(&mut buf);
+        let _ = reserved_parameter.write(&mut buf);
         assert!(!buf.is_empty());
         let read_params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
         assert_eq!(read_params, TransportParameters::default());
