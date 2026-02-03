@@ -74,7 +74,7 @@
 //!
 //! # Protocol Engine Selection
 //!
-//! Use [`ConstrainedTransport::should_use_constrained`] to determine whether
+//! Use [`ConstrainedTransport::should_use_constrained`](crate::constrained::ConstrainedTransport::should_use_constrained) to determine whether
 //! to use the constrained engine based on transport capabilities:
 //!
 //! | Capability | QUIC | Constrained |
