@@ -83,6 +83,24 @@ impl VarInt {
             Self::MAX_SIZE
         }
     }
+
+    pub(crate) fn encode_checked<B: BufMut>(x: u64, w: &mut B) -> Result<(), VarIntBoundsExceeded> {
+        if x < 2u64.pow(6) {
+            w.put_u8(x as u8);
+            Ok(())
+        } else if x < 2u64.pow(14) {
+            w.put_u16((0b01 << 14) | x as u16);
+            Ok(())
+        } else if x < 2u64.pow(30) {
+            w.put_u32((0b10 << 30) | x as u32);
+            Ok(())
+        } else if x < 2u64.pow(62) {
+            w.put_u64((0b11 << 62) | x);
+            Ok(())
+        } else {
+            Err(VarIntBoundsExceeded)
+        }
+    }
 }
 
 impl From<VarInt> for u64 {
@@ -197,18 +215,9 @@ impl Codec for VarInt {
     }
 
     fn encode<B: BufMut>(&self, w: &mut B) {
-        let x = self.0;
-        if x < 2u64.pow(6) {
-            w.put_u8(x as u8);
-        } else if x < 2u64.pow(14) {
-            w.put_u16((0b01 << 14) | x as u16);
-        } else if x < 2u64.pow(30) {
-            w.put_u32((0b10 << 30) | x as u32);
-        } else if x < 2u64.pow(62) {
-            w.put_u64((0b11 << 62) | x);
-        } else {
-            tracing::error!("VarInt overflow: {} exceeds maximum", x);
-            debug_assert!(false, "VarInt overflow: {}", x);
+        if let Err(_) = Self::encode_checked(self.0, w) {
+            tracing::error!("VarInt overflow: {} exceeds maximum", self.0);
+            debug_assert!(false, "VarInt overflow: {}", self.0);
         }
     }
 }
