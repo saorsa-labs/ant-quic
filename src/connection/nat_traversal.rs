@@ -1958,8 +1958,8 @@ impl NatTraversalState {
             self.remote_candidates.insert(sequence, candidate);
             self.stats.predicted_candidates_generated += 1;
 
-            // Trigger pair generation for this new candidate
-            self.generate_candidate_pairs(now);
+            // Incrementally add pairs for this new remote candidate (O(n) vs O(n*m))
+            self.add_pairs_for_remote_candidate(sequence, now);
         }
     }
 
@@ -2001,8 +2001,8 @@ impl NatTraversalState {
         self.local_candidates.insert(sequence, candidate);
         self.stats.local_candidates_sent += 1;
 
-        // Regenerate pairs when we add a new local candidate
-        self.generate_candidate_pairs(now);
+        // Incrementally add pairs for this new local candidate (O(m) vs O(n*m))
+        self.add_pairs_for_local_candidate(sequence, now);
 
         sequence
     }
@@ -2032,6 +2032,10 @@ impl NatTraversalState {
         }
     }
     /// Generate all possible candidate pairs from local and remote candidates
+    ///
+    /// Note: This is O(n*m) where n=local candidates, m=remote candidates.
+    /// For incremental updates when adding single candidates, use
+    /// `add_pairs_for_local_candidate` or `add_pairs_for_remote_candidate`.
     pub(super) fn generate_candidate_pairs(&mut self, now: Instant) {
         self.candidate_pairs.clear();
         self.pair_index.clear();
@@ -2094,17 +2098,154 @@ impl NatTraversalState {
             }
         }
 
+        self.sort_and_reindex_pairs();
+
+        trace!("Generated {} candidate pairs", self.candidate_pairs.len());
+    }
+
+    /// Sort pairs by priority and rebuild the index.
+    /// Called after adding pairs to maintain sorted order.
+    ///
+    /// Note: pair_index maps remote_addr to the index of the HIGHEST PRIORITY pair
+    /// with that remote address. When multiple pairs share the same remote_addr
+    /// (but have different local_addr), only the highest priority one is indexed.
+    /// This is intentional - lookups by remote_addr return the best pair for that peer.
+    fn sort_and_reindex_pairs(&mut self) {
         // Sort pairs by priority (highest first) - use unstable sort for better performance
         self.candidate_pairs
             .sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
 
-        // Rebuild index after sorting since indices changed
+        // Rebuild index after sorting - since pairs are sorted by priority (highest first),
+        // we iterate in reverse to ensure the HIGHEST priority pair for each remote_addr
+        // ends up in the index (last insert wins, and we want the first/highest priority one)
         self.pair_index.clear();
-        for (idx, pair) in self.candidate_pairs.iter().enumerate() {
+        for (idx, pair) in self.candidate_pairs.iter().enumerate().rev() {
             self.pair_index.insert(pair.remote_addr, idx);
         }
+    }
 
-        trace!("Generated {} candidate pairs", self.candidate_pairs.len());
+    /// Incrementally add pairs for a newly added local candidate.
+    /// This is O(m) where m = remote candidates, vs O(n*m) for full regeneration.
+    pub(super) fn add_pairs_for_local_candidate(&mut self, local_seq: VarInt, now: Instant) {
+        // Check if we're already at the limit
+        let max_pairs = self.resource_manager.config.max_candidate_pairs;
+        if self.candidate_pairs.len() >= max_pairs {
+            trace!("Skipping pair generation for local candidate - at limit ({max_pairs})");
+            return;
+        }
+
+        let local_candidate = match self.local_candidates.get(&local_seq) {
+            Some(c) if c.state != CandidateState::Removed => c,
+            _ => return,
+        };
+
+        let local_type = classify_candidate_type(local_candidate.source);
+        let local_addr = local_candidate.address;
+        let local_priority = local_candidate.priority;
+
+        // Calculate how many pairs we can still add
+        let remaining_capacity = max_pairs.saturating_sub(self.candidate_pairs.len());
+
+        // Collect pairs to add (avoid borrow issues), respecting the limit
+        let new_pairs: Vec<_> = self
+            .remote_candidates
+            .iter()
+            .filter(|(_, rc)| rc.state != CandidateState::Removed)
+            .filter(|(_, rc)| {
+                // Check compatibility inline to avoid needing local_candidate borrow
+                let local_is_v4 = local_addr.is_ipv4();
+                let remote_is_v4 = rc.address.is_ipv4();
+                local_is_v4 == remote_is_v4
+            })
+            .take(remaining_capacity)
+            .map(|(remote_seq, rc)| {
+                let pair_priority = calculate_pair_priority(local_priority, rc.priority);
+                let remote_type = classify_candidate_type(rc.source);
+                let pair_type = classify_pair_type(local_type, remote_type);
+                CandidatePair {
+                    remote_sequence: *remote_seq,
+                    local_addr,
+                    remote_addr: rc.address,
+                    priority: pair_priority,
+                    state: PairState::Waiting,
+                    pair_type,
+                    created_at: now,
+                    last_check: None,
+                }
+            })
+            .collect();
+
+        if new_pairs.is_empty() {
+            return;
+        }
+
+        self.candidate_pairs.extend(new_pairs);
+        self.sort_and_reindex_pairs();
+
+        trace!(
+            "Added pairs for local candidate, total: {}",
+            self.candidate_pairs.len()
+        );
+    }
+
+    /// Incrementally add pairs for a newly added remote candidate.
+    /// This is O(n) where n = local candidates, vs O(n*m) for full regeneration.
+    pub(super) fn add_pairs_for_remote_candidate(&mut self, remote_seq: VarInt, now: Instant) {
+        // Check if we're already at the limit
+        let max_pairs = self.resource_manager.config.max_candidate_pairs;
+        if self.candidate_pairs.len() >= max_pairs {
+            trace!("Skipping pair generation for remote candidate - at limit ({max_pairs})");
+            return;
+        }
+
+        let remote_candidate = match self.remote_candidates.get(&remote_seq) {
+            Some(c) if c.state != CandidateState::Removed => c,
+            _ => return,
+        };
+
+        let remote_type = classify_candidate_type(remote_candidate.source);
+        let remote_addr = remote_candidate.address;
+        let remote_priority = remote_candidate.priority;
+        let remote_is_v4 = remote_addr.is_ipv4();
+
+        // Calculate how many pairs we can still add
+        let remaining_capacity = max_pairs.saturating_sub(self.candidate_pairs.len());
+
+        // Collect pairs to add (avoid borrow issues), respecting the limit
+        let new_pairs: Vec<_> = self
+            .local_candidates
+            .values()
+            .filter(|lc| lc.state != CandidateState::Removed)
+            .filter(|lc| lc.address.is_ipv4() == remote_is_v4)
+            .take(remaining_capacity)
+            .map(|lc| {
+                let local_type = classify_candidate_type(lc.source);
+                let pair_priority = calculate_pair_priority(lc.priority, remote_priority);
+                let pair_type = classify_pair_type(local_type, remote_type);
+                CandidatePair {
+                    remote_sequence: remote_seq,
+                    local_addr: lc.address,
+                    remote_addr,
+                    priority: pair_priority,
+                    state: PairState::Waiting,
+                    pair_type,
+                    created_at: now,
+                    last_check: None,
+                }
+            })
+            .collect();
+
+        if new_pairs.is_empty() {
+            return;
+        }
+
+        self.candidate_pairs.extend(new_pairs);
+        self.sort_and_reindex_pairs();
+
+        trace!(
+            "Added pairs for remote candidate, total: {}",
+            self.candidate_pairs.len()
+        );
     }
 
     /// Get the highest priority pairs ready for validation

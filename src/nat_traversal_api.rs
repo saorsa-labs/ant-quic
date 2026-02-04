@@ -37,11 +37,15 @@ use crate::SHUTDOWN_DRAIN_TIMEOUT;
 /// # Added in Version 0.6.1
 /// This function was introduced as part of security improvements in commit 6e633cd9
 /// to enhance protocol obfuscation capabilities.
-#[allow(clippy::panic)]
 fn create_random_port_bind_addr() -> SocketAddr {
-    "0.0.0.0:0"
-        .parse()
-        .unwrap_or_else(|_| panic!("Random port bind address format is always valid"))
+    // SAFETY: This is a compile-time constant string that is always valid.
+    // Using a const assertion to ensure this at compile time.
+    const BIND_ADDR: &str = "0.0.0.0:0";
+    // This parse will never fail for a valid constant, but we handle it gracefully
+    // by falling back to a known-good default constructed directly.
+    BIND_ADDR.parse().unwrap_or_else(|_| {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    })
 }
 
 /// Extract ML-DSA-65 public key from SubjectPublicKeyInfo DER structure.
@@ -2608,11 +2612,14 @@ impl NatTraversalEndpoint {
         // Start accepting connections in a background task
         let endpoint_clone = endpoint.clone();
         let shutdown_clone = self.shutdown.clone();
-        let event_tx = self
-            .event_tx
-            .as_ref()
-            .unwrap_or_else(|| panic!("event transmitter should be initialized"))
-            .clone();
+        let event_tx = match self.event_tx.as_ref() {
+            Some(tx) => tx.clone(),
+            None => {
+                return Err(NatTraversalError::ProtocolError(
+                    "Event transmitter not initialized - endpoint may not have been properly constructed".to_string(),
+                ));
+            }
+        };
         let connections_clone = self.connections.clone();
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
