@@ -789,6 +789,42 @@ impl CandidateDiscoveryManager {
             if let Some((DiscoveryPhase::LocalInterfaceScanning { started_at }, session_start)) =
                 phase_info
             {
+                let bound_candidate = self.config.bound_address.and_then(|addr| {
+                    if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
+                        Some(addr)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(bound_addr) = bound_candidate {
+                    if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                        let already_present = session
+                            .discovered_candidates
+                            .iter()
+                            .any(|candidate| candidate.address == bound_addr);
+                        if !already_present {
+                            let candidate = DiscoveryCandidate {
+                                address: bound_addr,
+                                priority: 60000,
+                                source: DiscoverySourceType::Local,
+                                state: CandidateState::New,
+                            };
+
+                            session.discovered_candidates.push(candidate.clone());
+                            session.statistics.local_candidates_found += 1;
+                            all_events.push(DiscoveryEvent::LocalCandidateDiscovered {
+                                candidate: candidate.to_candidate_address(),
+                            });
+
+                            debug!(
+                                "Added bound address {} as local candidate for peer {:?} before scan completion",
+                                bound_addr, peer_id
+                            );
+                        }
+                    }
+                }
+
                 // Step 1: Start interface scan if just entering phase (within first 50ms)
                 if started_at.elapsed().as_millis() < 50 {
                     let scan_result = self.interface_discovery.lock().start_scan();
@@ -945,7 +981,41 @@ impl CandidateDiscoveryManager {
                         peer_id
                     );
 
+                    let bound_candidate = self.config.bound_address.and_then(|addr| {
+                        if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
+                            Some(addr)
+                        } else {
+                            None
+                        }
+                    });
+
                     if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                        if let Some(bound_addr) = bound_candidate {
+                            let already_present = session
+                                .discovered_candidates
+                                .iter()
+                                .any(|candidate| candidate.address == bound_addr);
+                            if !already_present {
+                                let candidate = DiscoveryCandidate {
+                                    address: bound_addr,
+                                    priority: 60000,
+                                    source: DiscoverySourceType::Local,
+                                    state: CandidateState::New,
+                                };
+
+                                session.discovered_candidates.push(candidate.clone());
+                                session.statistics.local_candidates_found += 1;
+                                all_events.push(DiscoveryEvent::LocalCandidateDiscovered {
+                                    candidate: candidate.to_candidate_address(),
+                                });
+
+                                debug!(
+                                    "Added bound address {} as local candidate after scan timeout for peer {:?}",
+                                    bound_addr, peer_id
+                                );
+                            }
+                        }
+
                         let final_candidates: Vec<ValidatedCandidate> = session
                             .discovered_candidates
                             .iter()
@@ -1193,6 +1263,7 @@ impl CandidateDiscoveryManager {
     fn is_valid_local_address(&self, address: &SocketAddr) -> bool {
         // Use the enhanced validation from CandidateAddress
         use crate::nat_traversal_api::CandidateAddress;
+        let allow_loopback = Self::allow_loopback_from_env();
 
         if let Err(e) = CandidateAddress::validate_address(address) {
             debug!("Address {} failed validation: {}", address, e);
@@ -1205,6 +1276,9 @@ impl CandidateDiscoveryManager {
                 #[cfg(test)]
                 if ipv4.is_loopback() {
                     return true;
+                }
+                if ipv4.is_loopback() {
+                    return allow_loopback;
                 }
                 // For local addresses, we want actual interface addresses
                 // Allow private addresses (RFC1918)
@@ -1220,6 +1294,9 @@ impl CandidateDiscoveryManager {
                 if ipv6.is_loopback() {
                     return true;
                 }
+                if ipv6.is_loopback() {
+                    return allow_loopback;
+                }
                 // For IPv6, accept most addresses except special ones
                 let segments = ipv6.segments();
                 let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
@@ -1231,6 +1308,17 @@ impl CandidateDiscoveryManager {
             }
         }
     }
+
+    fn allow_loopback_from_env() -> bool {
+    matches!(
+        std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
 
     // Removed server reflexive address validation helper
 

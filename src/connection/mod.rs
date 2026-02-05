@@ -48,6 +48,17 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
+fn allow_loopback_from_env() -> bool {
+    matches!(
+        std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
@@ -5006,7 +5017,8 @@ impl Connection {
         let target = try_connect_to.target_address;
 
         // Don't allow requests to loopback addresses from remote peers
-        if target.ip().is_loopback() {
+        let allow_loopback = allow_loopback_from_env();
+        if target.ip().is_loopback() && !allow_loopback {
             warn!(
                 "Rejecting TryConnectTo request to loopback address: {}",
                 target
