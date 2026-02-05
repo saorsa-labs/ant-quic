@@ -1310,15 +1310,15 @@ impl CandidateDiscoveryManager {
     }
 
     fn allow_loopback_from_env() -> bool {
-    matches!(
-        std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes"
-    )
-}
+        matches!(
+            std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        )
+    }
 
     // Removed server reflexive address validation helper
 
