@@ -1203,7 +1203,15 @@ pub(super) struct ResourceManagementConfig {
     max_local_candidates: usize,
     /// Maximum number of remote candidates
     max_remote_candidates: usize,
-    /// Maximum number of candidate pairs
+    /// Maximum number of candidate pairs to generate.
+    ///
+    /// This limit prevents DoS attacks via unbounded memory allocation when
+    /// receiving many candidates from peers. Both full regeneration
+    /// (`generate_candidate_pairs`) and incremental generation
+    /// (`add_pairs_for_local_candidate`, `add_pairs_for_remote_candidate`)
+    /// respect this limit.
+    ///
+    /// Default: 200 (see `ResourceManagementConfig::new()`)
     max_candidate_pairs: usize,
     /// Maximum coordination rounds to keep in history
     max_coordination_history: usize,
@@ -1897,6 +1905,9 @@ impl NatTraversalState {
         self.remote_candidates.insert(sequence, candidate);
         self.stats.remote_candidates_received += 1;
 
+        // Incrementally add pairs for this new remote candidate (O(n) vs O(n*m))
+        self.add_pairs_for_remote_candidate(sequence, now);
+
         // Feed the predictor and potentially generate new candidates
         // Only consider global unicast addresses (public IPs) for prediction
         if !address.ip().is_loopback() && !address.ip().is_unspecified() {
@@ -1958,8 +1969,8 @@ impl NatTraversalState {
             self.remote_candidates.insert(sequence, candidate);
             self.stats.predicted_candidates_generated += 1;
 
-            // Trigger pair generation for this new candidate
-            self.generate_candidate_pairs(now);
+            // Incrementally add pairs for this new remote candidate (O(n) vs O(n*m))
+            self.add_pairs_for_remote_candidate(sequence, now);
         }
     }
 
@@ -2001,8 +2012,8 @@ impl NatTraversalState {
         self.local_candidates.insert(sequence, candidate);
         self.stats.local_candidates_sent += 1;
 
-        // Regenerate pairs when we add a new local candidate
-        self.generate_candidate_pairs(now);
+        // Incrementally add pairs for this new local candidate (O(m) vs O(n*m))
+        self.add_pairs_for_local_candidate(sequence, now);
 
         sequence
     }
@@ -2032,6 +2043,10 @@ impl NatTraversalState {
         }
     }
     /// Generate all possible candidate pairs from local and remote candidates
+    ///
+    /// Note: This is O(n*m) where n=local candidates, m=remote candidates.
+    /// For incremental updates when adding single candidates, use
+    /// `add_pairs_for_local_candidate` or `add_pairs_for_remote_candidate`.
     pub(super) fn generate_candidate_pairs(&mut self, now: Instant) {
         self.candidate_pairs.clear();
         self.pair_index.clear();
@@ -2094,17 +2109,154 @@ impl NatTraversalState {
             }
         }
 
+        self.sort_and_reindex_pairs();
+
+        trace!("Generated {} candidate pairs", self.candidate_pairs.len());
+    }
+
+    /// Sort pairs by priority and rebuild the index.
+    /// Called after adding pairs to maintain sorted order.
+    ///
+    /// Note: pair_index maps remote_addr to the index of the HIGHEST PRIORITY pair
+    /// with that remote address. When multiple pairs share the same remote_addr
+    /// (but have different local_addr), only the highest priority one is indexed.
+    /// This is intentional - lookups by remote_addr return the best pair for that peer.
+    fn sort_and_reindex_pairs(&mut self) {
         // Sort pairs by priority (highest first) - use unstable sort for better performance
         self.candidate_pairs
             .sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
 
-        // Rebuild index after sorting since indices changed
+        // Rebuild index after sorting - since pairs are sorted by priority (highest first),
+        // we iterate in reverse to ensure the HIGHEST priority pair for each remote_addr
+        // ends up in the index (last insert wins, and we want the first/highest priority one)
         self.pair_index.clear();
-        for (idx, pair) in self.candidate_pairs.iter().enumerate() {
+        for (idx, pair) in self.candidate_pairs.iter().enumerate().rev() {
             self.pair_index.insert(pair.remote_addr, idx);
         }
+    }
 
-        trace!("Generated {} candidate pairs", self.candidate_pairs.len());
+    /// Incrementally add pairs for a newly added local candidate.
+    /// This is O(m) where m = remote candidates, vs O(n*m) for full regeneration.
+    pub(super) fn add_pairs_for_local_candidate(&mut self, local_seq: VarInt, now: Instant) {
+        // Check if we're already at the limit
+        let max_pairs = self.resource_manager.config.max_candidate_pairs;
+        if self.candidate_pairs.len() >= max_pairs {
+            trace!("Skipping pair generation for local candidate - at limit ({max_pairs})");
+            return;
+        }
+
+        let local_candidate = match self.local_candidates.get(&local_seq) {
+            Some(c) if c.state != CandidateState::Removed => c,
+            _ => return,
+        };
+
+        let local_type = classify_candidate_type(local_candidate.source);
+        let local_addr = local_candidate.address;
+        let local_priority = local_candidate.priority;
+
+        // Calculate how many pairs we can still add
+        let remaining_capacity = max_pairs.saturating_sub(self.candidate_pairs.len());
+
+        // Collect pairs to add (avoid borrow issues), respecting the limit
+        let new_pairs: Vec<_> = self
+            .remote_candidates
+            .iter()
+            .filter(|(_, rc)| rc.state != CandidateState::Removed)
+            .filter(|(_, rc)| {
+                // Check compatibility inline to avoid needing local_candidate borrow
+                let local_is_v4 = local_addr.is_ipv4();
+                let remote_is_v4 = rc.address.is_ipv4();
+                local_is_v4 == remote_is_v4
+            })
+            .take(remaining_capacity)
+            .map(|(remote_seq, rc)| {
+                let pair_priority = calculate_pair_priority(local_priority, rc.priority);
+                let remote_type = classify_candidate_type(rc.source);
+                let pair_type = classify_pair_type(local_type, remote_type);
+                CandidatePair {
+                    remote_sequence: *remote_seq,
+                    local_addr,
+                    remote_addr: rc.address,
+                    priority: pair_priority,
+                    state: PairState::Waiting,
+                    pair_type,
+                    created_at: now,
+                    last_check: None,
+                }
+            })
+            .collect();
+
+        if new_pairs.is_empty() {
+            return;
+        }
+
+        self.candidate_pairs.extend(new_pairs);
+        self.sort_and_reindex_pairs();
+
+        trace!(
+            "Added pairs for local candidate, total: {}",
+            self.candidate_pairs.len()
+        );
+    }
+
+    /// Incrementally add pairs for a newly added remote candidate.
+    /// This is O(n) where n = local candidates, vs O(n*m) for full regeneration.
+    pub(super) fn add_pairs_for_remote_candidate(&mut self, remote_seq: VarInt, now: Instant) {
+        // Check if we're already at the limit
+        let max_pairs = self.resource_manager.config.max_candidate_pairs;
+        if self.candidate_pairs.len() >= max_pairs {
+            trace!("Skipping pair generation for remote candidate - at limit ({max_pairs})");
+            return;
+        }
+
+        let remote_candidate = match self.remote_candidates.get(&remote_seq) {
+            Some(c) if c.state != CandidateState::Removed => c,
+            _ => return,
+        };
+
+        let remote_type = classify_candidate_type(remote_candidate.source);
+        let remote_addr = remote_candidate.address;
+        let remote_priority = remote_candidate.priority;
+        let remote_is_v4 = remote_addr.is_ipv4();
+
+        // Calculate how many pairs we can still add
+        let remaining_capacity = max_pairs.saturating_sub(self.candidate_pairs.len());
+
+        // Collect pairs to add (avoid borrow issues), respecting the limit
+        let new_pairs: Vec<_> = self
+            .local_candidates
+            .values()
+            .filter(|lc| lc.state != CandidateState::Removed)
+            .filter(|lc| lc.address.is_ipv4() == remote_is_v4)
+            .take(remaining_capacity)
+            .map(|lc| {
+                let local_type = classify_candidate_type(lc.source);
+                let pair_priority = calculate_pair_priority(lc.priority, remote_priority);
+                let pair_type = classify_pair_type(local_type, remote_type);
+                CandidatePair {
+                    remote_sequence: remote_seq,
+                    local_addr: lc.address,
+                    remote_addr,
+                    priority: pair_priority,
+                    state: PairState::Waiting,
+                    pair_type,
+                    created_at: now,
+                    last_check: None,
+                }
+            })
+            .collect();
+
+        if new_pairs.is_empty() {
+            return;
+        }
+
+        self.candidate_pairs.extend(new_pairs);
+        self.sort_and_reindex_pairs();
+
+        trace!(
+            "Added pairs for remote candidate, total: {}",
+            self.candidate_pairs.len()
+        );
     }
 
     /// Get the highest priority pairs ready for validation
@@ -3862,5 +4014,350 @@ mod tests {
             .filter(|p| p.local_addr == discovered_addr)
             .collect();
         assert_eq!(discovered_pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_pair_generation_local() {
+        // Test that add_pairs_for_local_candidate produces correct results
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Add two remote candidates first
+        let remote1 = SocketAddr::from(([93, 184, 215, 1], 6000));
+        let remote2 = SocketAddr::from(([93, 184, 215, 2], 7000));
+        state
+            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .expect("add remote candidate should succeed");
+        state
+            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .expect("add remote candidate should succeed");
+
+        // Now add a local candidate - this triggers incremental pair generation
+        let local_addr = SocketAddr::from(([192, 168, 1, 10], 5000));
+        let _local_seq = state.add_local_candidate(local_addr, CandidateSource::Local, now);
+
+        // Should have 2 pairs (1 local × 2 remote)
+        assert_eq!(state.candidate_pairs.len(), 2);
+
+        // Verify both remote candidates are paired with the local
+        let paired_remotes: Vec<_> = state
+            .candidate_pairs
+            .iter()
+            .map(|p| p.remote_addr)
+            .collect();
+        assert!(paired_remotes.contains(&remote1));
+        assert!(paired_remotes.contains(&remote2));
+
+        // Verify pairs are sorted by priority (highest first)
+        for i in 1..state.candidate_pairs.len() {
+            assert!(
+                state.candidate_pairs[i - 1].priority >= state.candidate_pairs[i].priority,
+                "Pairs should be sorted by priority"
+            );
+        }
+
+        // Add another local candidate
+        let local_addr2 = SocketAddr::from(([192, 168, 1, 20], 5001));
+        state.add_local_candidate(local_addr2, CandidateSource::Local, now);
+
+        // Should now have 4 pairs (2 local × 2 remote)
+        assert_eq!(state.candidate_pairs.len(), 4);
+    }
+
+    #[test]
+    fn test_incremental_pair_generation_remote() {
+        // Test that add_pairs_for_remote_candidate produces correct results
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Add two local candidates first
+        let local1 = SocketAddr::from(([192, 168, 1, 10], 5000));
+        let local2 = SocketAddr::from(([192, 168, 1, 20], 5001));
+        state.add_local_candidate(local1, CandidateSource::Local, now);
+        state.add_local_candidate(local2, CandidateSource::Local, now);
+
+        // Pairs are empty initially (no remote candidates)
+        assert_eq!(state.candidate_pairs.len(), 0);
+
+        // Add a remote candidate - this triggers incremental pair generation
+        let remote_addr = SocketAddr::from(([93, 184, 215, 1], 6000));
+        state
+            .add_remote_candidate(VarInt::from_u32(1), remote_addr, VarInt::from_u32(100), now)
+            .expect("add remote candidate should succeed");
+
+        // Should have 2 pairs (2 local × 1 remote)
+        assert_eq!(state.candidate_pairs.len(), 2);
+
+        // Verify both local candidates are paired with the remote
+        let paired_locals: Vec<_> = state.candidate_pairs.iter().map(|p| p.local_addr).collect();
+        assert!(paired_locals.contains(&local1));
+        assert!(paired_locals.contains(&local2));
+    }
+
+    #[test]
+    fn test_pair_index_highest_priority_wins() {
+        // Test that pair_index correctly stores the highest priority pair
+        // when multiple pairs share the same remote_addr
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Add two local candidates with different priorities
+        // (Local candidates get different local preference based on address)
+        let local_high_prio = SocketAddr::from(([8, 8, 8, 8], 5000)); // Public IP = higher prio
+        let local_low_prio = SocketAddr::from(([127, 0, 0, 1], 5001)); // Loopback = lower prio
+        state.add_local_candidate(local_high_prio, CandidateSource::Local, now);
+        state.add_local_candidate(local_low_prio, CandidateSource::Local, now);
+
+        // Add one remote candidate (both local candidates will pair with it)
+        let remote_addr = SocketAddr::from(([93, 184, 215, 1], 6000));
+        state
+            .add_remote_candidate(VarInt::from_u32(1), remote_addr, VarInt::from_u32(100), now)
+            .expect("add remote candidate should succeed");
+
+        // Should have 2 pairs with the same remote_addr
+        assert_eq!(state.candidate_pairs.len(), 2);
+
+        // The pair_index should point to the HIGHEST priority pair for this remote_addr
+        let indexed_pair_idx = state
+            .pair_index
+            .get(&remote_addr)
+            .expect("index should exist");
+        let indexed_pair = &state.candidate_pairs[*indexed_pair_idx];
+
+        // Verify pairs are sorted by priority
+        assert!(
+            state.candidate_pairs[0].priority >= state.candidate_pairs[1].priority,
+            "Pairs should be sorted highest priority first"
+        );
+
+        // The indexed pair should be at index 0 (highest priority)
+        assert_eq!(
+            *indexed_pair_idx, 0,
+            "Index should point to highest priority pair (index 0)"
+        );
+
+        // The indexed pair should have the highest priority
+        assert_eq!(
+            indexed_pair.priority, state.candidate_pairs[0].priority,
+            "Indexed pair should have highest priority"
+        );
+    }
+
+    #[test]
+    fn test_incremental_vs_full_generation_consistency() {
+        // Test that incremental generation produces same results as full regeneration
+        let now = Instant::now();
+
+        // Create state and add candidates incrementally
+        let mut state_incremental = create_test_state();
+        let local1 = SocketAddr::from(([192, 168, 1, 10], 5000));
+        let local2 = SocketAddr::from(([192, 168, 1, 20], 5001));
+        let remote1 = SocketAddr::from(([93, 184, 215, 1], 6000));
+        let remote2 = SocketAddr::from(([93, 184, 215, 2], 7000));
+
+        // Add incrementally (each add generates pairs incrementally)
+        state_incremental.add_local_candidate(local1, CandidateSource::Local, now);
+        state_incremental.add_local_candidate(local2, CandidateSource::Local, now);
+        state_incremental
+            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .unwrap();
+        state_incremental
+            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .unwrap();
+
+        // Create another state and do full regeneration
+        let mut state_full = create_test_state();
+        state_full.add_local_candidate(local1, CandidateSource::Local, now);
+        state_full.add_local_candidate(local2, CandidateSource::Local, now);
+        state_full
+            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .unwrap();
+        state_full
+            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .unwrap();
+        // Force full regeneration
+        state_full.generate_candidate_pairs(now);
+
+        // Both should have same number of pairs
+        assert_eq!(
+            state_incremental.candidate_pairs.len(),
+            state_full.candidate_pairs.len(),
+            "Incremental and full generation should produce same pair count"
+        );
+
+        // Both should have pairs sorted by priority
+        for state in [&state_incremental, &state_full] {
+            for i in 1..state.candidate_pairs.len() {
+                assert!(
+                    state.candidate_pairs[i - 1].priority >= state.candidate_pairs[i].priority,
+                    "Pairs should be sorted by priority"
+                );
+            }
+        }
+
+        // Verify same (local_addr, remote_addr) pairs exist in both
+        let pairs_inc: std::collections::HashSet<_> = state_incremental
+            .candidate_pairs
+            .iter()
+            .map(|p| (p.local_addr, p.remote_addr))
+            .collect();
+        let pairs_full: std::collections::HashSet<_> = state_full
+            .candidate_pairs
+            .iter()
+            .map(|p| (p.local_addr, p.remote_addr))
+            .collect();
+        assert_eq!(
+            pairs_inc, pairs_full,
+            "Both methods should produce same (local, remote) pairs"
+        );
+    }
+
+    #[test]
+    fn test_max_candidate_pairs_limit() {
+        // Test that incremental generation respects max_candidate_pairs limit
+        let mut state = NatTraversalState::new(
+            100, // max_candidates (high enough to not limit)
+            Duration::from_secs(30),
+        );
+        let now = Instant::now();
+
+        // The default max_candidate_pairs is 200
+        // Add enough candidates to exceed the limit
+        // With 15 local × 15 remote = 225 pairs (exceeds 200)
+        for i in 0..15u8 {
+            let local = SocketAddr::from(([192, 168, 1, i], 5000 + i as u16));
+            state.add_local_candidate(local, CandidateSource::Local, now);
+        }
+
+        for i in 0..15u32 {
+            let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
+            let _ =
+                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+        }
+
+        // Should be capped at max_candidate_pairs (200)
+        // Note: max_candidate_pairs default is defined in ResourceManagementConfig::new()
+        // at src/connection/nat_traversal.rs line ~1269
+        assert!(
+            state.candidate_pairs.len() <= 200,
+            "Pairs should not exceed max_candidate_pairs limit: got {}",
+            state.candidate_pairs.len()
+        );
+    }
+
+    #[test]
+    fn test_add_pairs_at_exact_limit() {
+        // Test behavior when exactly at the limit
+        let mut state = NatTraversalState::new(100, Duration::from_secs(30));
+        let now = Instant::now();
+
+        // Add candidates to get close to limit (14 × 14 = 196 pairs)
+        for i in 0..14u8 {
+            let local = SocketAddr::from(([192, 168, 1, i], 5000 + i as u16));
+            state.add_local_candidate(local, CandidateSource::Local, now);
+        }
+        for i in 0..14u32 {
+            let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
+            let _ =
+                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+        }
+
+        let pairs_at_limit = state.candidate_pairs.len();
+        assert!(pairs_at_limit <= 200, "Should be at or under limit");
+
+        // Add one more local candidate - should generate at most 4 more pairs
+        // (or fewer if limit reached)
+        let extra_local = SocketAddr::from(([192, 168, 1, 100], 9000));
+        state.add_local_candidate(extra_local, CandidateSource::Local, now);
+
+        assert!(
+            state.candidate_pairs.len() <= 200,
+            "Should not exceed limit after adding more candidates"
+        );
+    }
+
+    #[test]
+    fn test_sort_and_reindex_with_duplicate_remote_addrs() {
+        // Test that sort_and_reindex_pairs correctly handles multiple pairs
+        // with the same remote_addr (different local_addr)
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Add three local candidates
+        let local1 = SocketAddr::from(([192, 168, 1, 1], 5001));
+        let local2 = SocketAddr::from(([192, 168, 1, 2], 5002));
+        let local3 = SocketAddr::from(([192, 168, 1, 3], 5003));
+        state.add_local_candidate(local1, CandidateSource::Local, now);
+        state.add_local_candidate(local2, CandidateSource::Local, now);
+        state.add_local_candidate(local3, CandidateSource::Local, now);
+
+        // Add one remote - creates 3 pairs with same remote_addr
+        let remote = SocketAddr::from(([93, 184, 215, 1], 6000));
+        state
+            .add_remote_candidate(VarInt::from_u32(1), remote, VarInt::from_u32(100), now)
+            .unwrap();
+
+        // Should have 3 pairs
+        assert_eq!(state.candidate_pairs.len(), 3);
+
+        // All pairs should have the same remote_addr
+        for pair in &state.candidate_pairs {
+            assert_eq!(pair.remote_addr, remote);
+        }
+
+        // pair_index should have exactly one entry for this remote_addr
+        assert!(state.pair_index.contains_key(&remote));
+
+        // The indexed pair should be the highest priority one (index 0)
+        let indexed_idx = *state.pair_index.get(&remote).unwrap();
+        assert_eq!(
+            indexed_idx, 0,
+            "Index should point to highest priority pair"
+        );
+
+        // Verify the indexed pair has the highest priority
+        let indexed_priority = state.candidate_pairs[indexed_idx].priority;
+        for pair in &state.candidate_pairs {
+            assert!(
+                indexed_priority >= pair.priority,
+                "Indexed pair should have highest or equal priority"
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_add_with_zero_remaining_capacity() {
+        // Test that incremental add gracefully handles zero capacity
+        let mut state = NatTraversalState::new(100, Duration::from_secs(30));
+        let now = Instant::now();
+
+        // Fill up to the limit
+        for i in 0..15u8 {
+            let local = SocketAddr::from(([192, 168, 1, i], 5000 + i as u16));
+            state.add_local_candidate(local, CandidateSource::Local, now);
+        }
+        for i in 0..14u32 {
+            let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
+            let _ =
+                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+        }
+
+        // Record count at limit
+        let _count_at_limit = state.candidate_pairs.len();
+
+        // Try to add more when at or near limit
+        let extra_remote = SocketAddr::from(([93, 184, 215, 200], 9000));
+        let _ = state.add_remote_candidate(
+            VarInt::from_u32(100),
+            extra_remote,
+            VarInt::from_u32(100),
+            now,
+        );
+
+        // Should not panic, and count should not exceed limit
+        assert!(
+            state.candidate_pairs.len() <= 200,
+            "Should handle limit gracefully without panic"
+        );
     }
 }

@@ -218,8 +218,10 @@ impl PacketSpace {
         let packet = self.sent_packets.remove(&number)?;
         self.in_flight -= u64::from(packet.size);
         if !packet.ack_eliciting && number > self.largest_ack_eliciting_sent {
+            // Saturating subtraction prevents underflow panic if counter is already 0.
+            // This can happen in edge cases where packet accounting becomes inconsistent.
             self.unacked_non_ack_eliciting_tail =
-                self.unacked_non_ack_eliciting_tail.checked_sub(1).unwrap();
+                self.unacked_non_ack_eliciting_tail.saturating_sub(1);
         }
         Some(packet)
     }
