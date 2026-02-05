@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "ant-quic"
-version = "0.21.3"
+version = "0.21.4"
 edition = "2024"
 rust-version = "1.85.0"
 license = "MIT OR Apache-2.0"
@@ -157,7 +157,6 @@ pin-project-lite = "0.2"
 regex = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 rustls-native-certs = "0.8"
-ant-quic-workspace-hack = { version = "0.1", path = "ant-quic-workspace-hack" }
 
 # Platform-specific target dependencies
 [target.'cfg(windows)'.dependencies]
@@ -184,6 +183,7 @@ core-foundation = "0.9"
 libc = "0.2"
 
 [dev-dependencies]
+ant-quic-workspace-hack = { path = "ant-quic-workspace-hack" }
 assert_matches = "1.1"
 hex-literal = "0.4"
 rand_pcg = "0.3"

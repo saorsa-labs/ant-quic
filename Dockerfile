@@ -19,6 +19,7 @@ COPY src ./src
 COPY benches ./benches
 COPY tests ./tests
 COPY examples ./examples
+COPY ant-quic-workspace-hack ./ant-quic-workspace-hack
 # Note: docs/rfcs/ contains specifications but is not needed for the build
 
 # Build release binary
