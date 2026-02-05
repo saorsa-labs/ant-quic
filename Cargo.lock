@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "ant-quic"
-version = "0.21.2"
+version = "0.21.3"
 dependencies = [
  "ant-quic-workspace-hack",
  "anyhow",
