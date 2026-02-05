@@ -4014,8 +4014,9 @@ impl NatTraversalEndpoint {
 
     /// Shutdown the endpoint
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
-        // Set shutdown flag
+        // Set shutdown flag and wake any task parked in accept_connection()
         self.shutdown.store(true, Ordering::Relaxed);
+        self.incoming_notify.notify_waiters();
 
         // Close all active connections
         // DashMap: collect peer_ids then remove them one by one
