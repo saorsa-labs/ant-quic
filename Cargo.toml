@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "ant-quic-workspace-hack",
 ]
 
 [package]
@@ -156,6 +157,7 @@ pin-project-lite = "0.2"
 regex = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 rustls-native-certs = "0.8"
+ant-quic-workspace-hack = { version = "0.1", path = "ant-quic-workspace-hack" }
 
 # Platform-specific target dependencies
 [target.'cfg(windows)'.dependencies]
