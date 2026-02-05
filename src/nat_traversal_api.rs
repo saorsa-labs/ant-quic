@@ -3025,6 +3025,7 @@ impl NatTraversalEndpoint {
                 remote_address: remote_addr,
                 side: Side::Client,
             });
+            self.incoming_notify.notify_one();
         }
 
         Ok(connection)
@@ -3466,6 +3467,7 @@ impl NatTraversalEndpoint {
                 remote_address,
                 side,
             });
+            self.incoming_notify.notify_one();
         }
 
         // Spawn connection monitoring task
@@ -4512,6 +4514,7 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let incoming_notify = self.incoming_notify.clone();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
@@ -4546,6 +4549,7 @@ impl NatTraversalEndpoint {
                                             remote_address: address,
                                             side: Side::Client,
                                         });
+                                    incoming_notify.notify_one();
 
                                     // Handle the connection
                                     Self::handle_connection(peer_id_clone, connection, event_tx)
