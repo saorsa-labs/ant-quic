@@ -101,21 +101,21 @@ See [NAT Traversal Architecture](#nat-traversal-architecture) below for details 
 cargo build --release
 
 # Run all tests (comprehensive suite with 580+ tests)
-cargo test
+cargo nextest run
 
 # Run tests with output (useful for debugging)
-cargo test -- --nocapture
+cargo nextest run --no-capture
 
 # Run stress tests (normally ignored)
-cargo test -- --ignored stress
+cargo nextest run --ignored stress
 
 # Quick compilation check
 cargo check --all-targets
 
 # Run specific test categories
-cargo test nat_traversal
-cargo test candidate_discovery
-cargo test connection_establishment
+cargo nextest run nat_traversal
+cargo nextest run candidate_discovery
+cargo nextest run connection_establishment
 ```
 
 ### Code Quality
@@ -159,11 +159,11 @@ cargo run --example dashboard_demo
 ### Feature Testing
 ```bash
 # Test different crypto providers
-cargo test --no-default-features --features rustls-ring
-cargo test --no-default-features --features rustls-aws-lc-rs
+cargo nextest run --no-default-features --features rustls-ring
+cargo nextest run --no-default-features --features rustls-aws-lc-rs
 
 # Test with PQC features
-cargo test --features "pqc aws-lc-rs"
+cargo nextest run --features "pqc aws-lc-rs"
 cargo build --features "pqc aws-lc-rs" --all-targets
 ```
 
@@ -260,26 +260,26 @@ Known peers (specified via `known_peers` config) act as **initial connection tar
 ### Running Tests
 ```bash
 # Comprehensive test suite
-cargo test --locked
+cargo nextest run --locked
 
 # Specific test modules
-cargo test range_set
-cargo test transport_parameters
-cargo test connection::nat_traversal
+cargo nextest run range_set
+cargo nextest run transport_parameters
+cargo nextest run connection::nat_traversal
 
 # Integration tests only
-cargo test --test nat_traversal_comprehensive
+cargo nextest run --test nat_traversal_comprehensive
 
 # Run security validation tests
-cargo test --test address_discovery_security
+cargo nextest run --test address_discovery_security
 
 # Run PQC tests
-cargo test pqc
-cargo test ml_kem
-cargo test ml_dsa
+cargo nextest run pqc
+cargo nextest run ml_kem
+cargo nextest run ml_dsa
 
 # Run stress tests (normally ignored)
-cargo test -- --ignored stress
+cargo nextest run --ignored stress
 ```
 
 ## Code Conventions
@@ -361,7 +361,7 @@ cargo test -- --ignored stress
 RUST_LOG=ant_quic::nat_traversal=debug cargo run --bin ant-quic
 
 # Connection-level debugging
-RUST_LOG=ant_quic::connection=trace cargo test -- --nocapture
+RUST_LOG=ant_quic::connection=trace cargo nextest run --no-capture
 
 # Full debugging
 RUST_LOG=debug cargo run --example nat_simulation

@@ -764,6 +764,7 @@ impl CandidateAddress {
 
     /// Check if this candidate is suitable for NAT traversal
     pub fn is_suitable_for_nat_traversal(&self) -> bool {
+        let allow_loopback = allow_loopback_from_env();
         match self.address.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 // For NAT traversal, we want:
@@ -773,6 +774,9 @@ impl CandidateAddress {
                 #[cfg(test)]
                 if ipv4.is_loopback() {
                     return true;
+                }
+                if ipv4.is_loopback() {
+                    return allow_loopback;
                 }
                 !ipv4.is_loopback()
                     && !ipv4.is_link_local()
@@ -788,6 +792,9 @@ impl CandidateAddress {
                 #[cfg(test)]
                 if ipv6.is_loopback() {
                     return true;
+                }
+                if ipv6.is_loopback() {
+                    return allow_loopback;
                 }
                 let segments = ipv6.segments();
                 let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
@@ -808,6 +815,17 @@ impl CandidateAddress {
             CandidateState::Removed => 0,
         }
     }
+}
+
+fn allow_loopback_from_env() -> bool {
+    matches!(
+        std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 /// Errors that can occur during candidate address validation

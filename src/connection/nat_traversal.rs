@@ -17,6 +17,17 @@ use tracing::{debug, info, trace, warn};
 use super::{PortPredictor, PortPredictorConfig};
 use crate::{Instant, VarInt};
 
+fn allow_loopback_from_env() -> bool {
+    matches!(
+        std::env::var("ANT_QUIC_ALLOW_LOOPBACK")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 /// NAT traversal state for a QUIC connection
 ///
 /// This manages address candidate discovery, validation, and coordination
@@ -661,12 +672,13 @@ impl SecurityValidationState {
 
     /// Check if address is in a suspicious range
     fn is_address_in_suspicious_range(&self, addr: SocketAddr) -> bool {
+        let allow_loopback = allow_loopback_from_env();
         match addr.ip() {
             IpAddr::V4(ipv4) => {
                 // Check for addresses commonly used in attacks
                 let octets = ipv4.octets();
                 // Reject certain reserved ranges that shouldn't be used for P2P
-                if octets[0] == 0 || octets[0] == 127 {
+                if octets[0] == 0 || (!allow_loopback && octets[0] == 127) {
                     return true;
                 }
 
@@ -685,7 +697,7 @@ impl SecurityValidationState {
             }
             IpAddr::V6(ipv6) => {
                 // Check for suspicious IPv6 ranges
-                if ipv6.is_loopback() || ipv6.is_unspecified() {
+                if ipv6.is_unspecified() || (!allow_loopback && ipv6.is_loopback()) {
                     return true;
                 }
 
@@ -790,10 +802,14 @@ impl SecurityValidationState {
 
     /// Perform actual address validation
     fn perform_address_validation(&self, addr: SocketAddr) -> AddressValidationResult {
+        let allow_loopback = allow_loopback_from_env();
         match addr.ip() {
             IpAddr::V4(ipv4) => {
                 // Check for invalid IPv4 addresses
                 if ipv4.is_unspecified() || ipv4.is_broadcast() {
+                    return AddressValidationResult::Invalid;
+                }
+                if ipv4.is_loopback() && !allow_loopback {
                     return AddressValidationResult::Invalid;
                 }
                 // Check for suspicious addresses
@@ -802,7 +818,7 @@ impl SecurityValidationState {
                 }
 
                 // Check for reserved ranges that shouldn't be used for P2P
-                if ipv4.octets()[0] == 0 || ipv4.octets()[0] == 127 {
+                if ipv4.octets()[0] == 0 || (!allow_loopback && ipv4.octets()[0] == 127) {
                     return AddressValidationResult::Invalid;
                 }
 
@@ -814,6 +830,9 @@ impl SecurityValidationState {
             IpAddr::V6(ipv6) => {
                 // Check for invalid IPv6 addresses
                 if ipv6.is_unspecified() || ipv6.is_multicast() {
+                    return AddressValidationResult::Invalid;
+                }
+                if ipv6.is_loopback() && !allow_loopback {
                     return AddressValidationResult::Invalid;
                 }
 

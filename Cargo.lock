@@ -115,6 +115,7 @@ dependencies = [
 name = "ant-quic"
 version = "0.21.2"
 dependencies = [
+ "ant-quic-workspace-hack",
  "anyhow",
  "arbitrary",
  "assert_matches",
@@ -179,6 +180,28 @@ dependencies = [
  "windows 0.58.0",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "ant-quic-workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "either",
+ "libc",
+ "log",
+ "memchr",
+ "num-traits",
+ "proc-macro2",
+ "quote",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rand_core 0.9.5",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "smallvec",
+ "syn",
+ "zerocopy",
 ]
 
 [[package]]
