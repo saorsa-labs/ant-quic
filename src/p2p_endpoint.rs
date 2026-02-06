@@ -1228,15 +1228,15 @@ impl P2pEndpoint {
             .initiate_nat_traversal(peer_id, coord_addr)
             .map_err(EndpointError::NatTraversal)?;
 
-        // Poll for completion
-        let start = Instant::now();
-        let timeout = self
-            .config
-            .timeouts
-            .nat_traversal
-            .connection_establishment_timeout;
+        // Poll for completion using event-driven notification instead of sleep loop
+        let deadline = tokio::time::Instant::now()
+            + self
+                .config
+                .timeouts
+                .nat_traversal
+                .connection_establishment_timeout;
 
-        while start.elapsed() < timeout {
+        loop {
             if self.shutdown.is_cancelled() {
                 return Err(EndpointError::ShuttingDown);
             }
@@ -1286,10 +1286,17 @@ impl P2pEndpoint {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for connection notification, shutdown, or timeout
+            tokio::select! {
+                _ = self.inner.connection_notify().notified() => {}
+                _ = self.shutdown.cancelled() => {
+                    return Err(EndpointError::ShuttingDown);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(EndpointError::Timeout);
+                }
+            }
         }
-
-        Err(EndpointError::Timeout)
     }
 
     /// Connect with automatic fallback: IPv4 → IPv6 → HolePunch → Relay
@@ -1548,11 +1555,10 @@ impl P2pEndpoint {
             .initiate_nat_traversal(peer_id, coordinator)
             .map_err(EndpointError::NatTraversal)?;
 
-        // Poll for completion with shorter timeout
-        let start = Instant::now();
-        let timeout_duration = Duration::from_secs(15);
+        // Poll for completion with event-driven notification instead of sleep loop
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
-        while start.elapsed() < timeout_duration {
+        loop {
             if self.shutdown.is_cancelled() {
                 return Err(EndpointError::ShuttingDown);
             }
@@ -1601,10 +1607,17 @@ impl P2pEndpoint {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for connection notification, shutdown, or timeout
+            tokio::select! {
+                _ = self.inner.connection_notify().notified() => {}
+                _ = self.shutdown.cancelled() => {
+                    return Err(EndpointError::ShuttingDown);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(EndpointError::Timeout);
+                }
+            }
         }
-
-        Err(EndpointError::Timeout)
     }
 
     async fn try_relay_connection(

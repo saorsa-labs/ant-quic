@@ -715,8 +715,10 @@ impl CandidateDiscoveryManager {
                 return Ok(candidates);
             }
 
-            // Small sleep to avoid busy waiting
-            std::thread::sleep(Duration::from_millis(10));
+            // Yield to other threads briefly. Local interface enumeration is a
+            // single syscall (getifaddrs on Unix) and should complete nearly
+            // instantly, so we only need to yield rather than sleep.
+            std::thread::yield_now();
         }
     }
 

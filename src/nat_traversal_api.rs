@@ -271,6 +271,9 @@ pub struct NatTraversalEndpoint {
     /// Notify waiters when a new ConnectionEstablished event is available.
     /// Eliminates the 10ms polling loop in accept_connection().
     incoming_notify: Arc<tokio::sync::Notify>,
+    /// Notify waiters when the endpoint is shutting down.
+    /// Eliminates polling loops that check the AtomicBool in transport listeners.
+    shutdown_notify: Arc<tokio::sync::Notify>,
     /// Active connections by peer ID
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
@@ -1278,6 +1281,7 @@ impl NatTraversalEndpoint {
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
@@ -1329,7 +1333,7 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to receive from this transport's inbound channel
                     let mut inbound_rx = provider.inbound();
-                    let shutdown_clone = endpoint.shutdown.clone();
+                    let shutdown_notify_clone = endpoint.shutdown_notify.clone();
                     let engine_clone = endpoint.constrained_engine.clone();
                     let registry_clone = endpoint.transport_registry.clone();
                     let event_tx_clone = endpoint.constrained_event_tx.clone();
@@ -1339,12 +1343,8 @@ impl NatTraversalEndpoint {
 
                         loop {
                             tokio::select! {
-                                // Check shutdown signal
-                                _ = async {
-                                    while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    }
-                                } => {
+                                // Check shutdown signal via Notify (no polling)
+                                _ = shutdown_notify_clone.notified() => {
                                     debug!("Shutting down transport listener for '{}'", transport_name);
                                     break;
                                 }
@@ -1675,6 +1675,7 @@ impl NatTraversalEndpoint {
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
@@ -1726,7 +1727,7 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to receive from this transport's inbound channel
                     let mut inbound_rx = provider.inbound();
-                    let shutdown_clone = endpoint.shutdown.clone();
+                    let shutdown_notify_clone = endpoint.shutdown_notify.clone();
                     let engine_clone = endpoint.constrained_engine.clone();
                     let registry_clone = endpoint.transport_registry.clone();
                     let event_tx_clone = endpoint.constrained_event_tx.clone();
@@ -1736,12 +1737,8 @@ impl NatTraversalEndpoint {
 
                         loop {
                             tokio::select! {
-                                // Check shutdown signal
-                                _ = async {
-                                    while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    }
-                                } => {
+                                // Check shutdown signal via Notify (no polling)
+                                _ = shutdown_notify_clone.notified() => {
                                     debug!("Shutting down transport listener for '{}'", transport_name);
                                     break;
                                 }
@@ -3424,6 +3421,15 @@ impl NatTraversalEndpoint {
         self.local_peer_id
     }
 
+    /// Returns a reference to the connection notification handle.
+    ///
+    /// This `Notify` is triggered whenever a `ConnectionEstablished` event
+    /// is produced, allowing callers to await connection events without
+    /// polling in a sleep loop.
+    pub fn connection_notify(&self) -> &tokio::sync::Notify {
+        &self.incoming_notify
+    }
+
     /// Get an active connection by peer ID
     pub fn get_connection(
         &self,
@@ -4035,8 +4041,10 @@ impl NatTraversalEndpoint {
     /// Shutdown the endpoint
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
         // Set shutdown flag and wake any task parked in accept_connection()
+        // or transport listener loops
         self.shutdown.store(true, Ordering::Relaxed);
         self.incoming_notify.notify_waiters();
+        self.shutdown_notify.notify_waiters();
 
         // Close all active connections
         // DashMap: collect peer_ids then remove them one by one
@@ -4163,8 +4171,16 @@ impl NatTraversalEndpoint {
                 }
             }
 
-            // Brief delay before next poll
-            sleep(Duration::from_millis(10)).await;
+            // Wait briefly for more events, but respect the overall timeout.
+            // The discovery manager uses a synchronous poll() model, so we still
+            // need a brief interval. This avoids overshooting the deadline.
+            let remaining = timeout_duration
+                .checked_sub(start_time.elapsed())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break;
+            }
+            sleep(remaining.min(Duration::from_millis(10))).await;
         }
 
         if candidates.is_empty() {
