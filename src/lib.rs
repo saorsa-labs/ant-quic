@@ -137,6 +137,9 @@ pub mod transport_resilience;
 /// Connection strategy state machine for progressive NAT traversal fallback
 pub mod connection_strategy;
 
+/// RFC 8305 Happy Eyeballs v2 for parallel IPv4/IPv6 connection racing
+pub mod happy_eyeballs;
+
 /// Discovery trait for stream composition
 pub mod discovery_trait;
 

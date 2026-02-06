@@ -73,6 +73,7 @@ use crate::constrained::EngineEvent;
 use crate::crypto::raw_public_keys::key_utils::{
     derive_peer_id_from_public_key, generate_ml_dsa_keypair,
 };
+use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics, PeerId,
@@ -1395,52 +1396,103 @@ impl P2pEndpoint {
             target_ipv4, target_ipv6, peer_id
         );
 
+        // Collect direct addresses for Happy Eyeballs racing (RFC 8305)
+        let mut direct_addresses: Vec<SocketAddr> = Vec::new();
+        if let Some(v6) = target_ipv6 {
+            direct_addresses.push(v6);
+        }
+        if let Some(v4) = target_ipv4 {
+            direct_addresses.push(v4);
+        }
+
         loop {
             match strategy.current_stage().clone() {
                 ConnectionStage::DirectIPv4 { .. } => {
-                    if let Some(addr) = target_ipv4 {
-                        info!("Trying direct IPv4 connection to {}", addr);
-                        match timeout(strategy.ipv4_timeout(), self.connect(addr)).await {
-                            Ok(Ok(conn)) => {
-                                info!("✓ Direct IPv4 connection succeeded to {}", addr);
-                                return Ok((conn, ConnectionMethod::DirectIPv4));
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Direct IPv4 failed: {}", e);
-                                strategy.transition_to_ipv6(e.to_string());
-                            }
-                            Err(_) => {
-                                debug!("Direct IPv4 timed out");
-                                strategy.transition_to_ipv6("Timeout");
-                            }
+                    // Use Happy Eyeballs (RFC 8305) to race all direct addresses (IPv4 + IPv6)
+                    // instead of trying them sequentially. This prevents stalls when one address
+                    // family is broken by racing with a 250ms stagger.
+                    if direct_addresses.is_empty() {
+                        debug!("No direct addresses provided, skipping to hole-punch");
+                        strategy.transition_to_ipv6("No direct addresses");
+                        continue;
+                    }
+
+                    let he_config = HappyEyeballsConfig::default();
+                    let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+
+                    info!(
+                        "Happy Eyeballs: racing {} direct addresses (timeout: {:?})",
+                        direct_addresses.len(),
+                        direct_timeout
+                    );
+
+                    // Clone the QUIC endpoint for use in the Happy Eyeballs closure.
+                    // Each spawned attempt needs its own reference to create connections.
+                    let quic_endpoint = match self.inner.get_endpoint().cloned() {
+                        Some(ep) => ep,
+                        None => {
+                            debug!("QUIC endpoint not available, skipping direct");
+                            strategy.transition_to_ipv6("QUIC endpoint not available");
+                            strategy.transition_to_holepunch("QUIC endpoint not available");
+                            continue;
                         }
-                    } else {
-                        debug!("No IPv4 address provided, skipping");
-                        strategy.transition_to_ipv6("No IPv4 address");
+                    };
+
+                    let addrs = direct_addresses.clone();
+                    let he_result = timeout(direct_timeout, async {
+                        happy_eyeballs::race_connect(&addrs, &he_config, |addr| {
+                            let ep = quic_endpoint.clone();
+                            async move {
+                                let connecting = ep
+                                    .connect(addr, "peer")
+                                    .map_err(|e| format!("connect error: {e}"))?;
+                                connecting
+                                    .await
+                                    .map_err(|e| format!("handshake error: {e}"))
+                            }
+                        })
+                        .await
+                    })
+                    .await;
+
+                    match he_result {
+                        Ok(Ok((connection, winning_addr))) => {
+                            let method = if winning_addr.is_ipv6() {
+                                ConnectionMethod::DirectIPv6
+                            } else {
+                                ConnectionMethod::DirectIPv4
+                            };
+                            info!(
+                                "Happy Eyeballs: {} connection to {} succeeded",
+                                method, winning_addr
+                            );
+
+                            // Complete the connection setup (peer ID, handlers, stats)
+                            let peer_conn = self
+                                .finalize_direct_connection(connection, winning_addr, peer_id)
+                                .await?;
+                            return Ok((peer_conn, method));
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Happy Eyeballs: all direct attempts failed: {}", e);
+                            strategy.transition_to_ipv6(e.to_string());
+                            strategy.transition_to_holepunch("Happy Eyeballs exhausted");
+                        }
+                        Err(_) => {
+                            debug!("Happy Eyeballs: direct connection timed out");
+                            strategy.transition_to_ipv6("Timeout");
+                            strategy.transition_to_holepunch("Happy Eyeballs timed out");
+                        }
                     }
                 }
 
                 ConnectionStage::DirectIPv6 { .. } => {
-                    if let Some(addr) = target_ipv6 {
-                        info!("Trying direct IPv6 connection to {}", addr);
-                        match timeout(strategy.ipv6_timeout(), self.connect(addr)).await {
-                            Ok(Ok(conn)) => {
-                                info!("✓ Direct IPv6 connection succeeded to {}", addr);
-                                return Ok((conn, ConnectionMethod::DirectIPv6));
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Direct IPv6 failed: {}", e);
-                                strategy.transition_to_holepunch(e.to_string());
-                            }
-                            Err(_) => {
-                                debug!("Direct IPv6 timed out");
-                                strategy.transition_to_holepunch("Timeout");
-                            }
-                        }
-                    } else {
-                        debug!("No IPv6 address provided, skipping");
-                        strategy.transition_to_holepunch("No IPv6 address");
-                    }
+                    // Happy Eyeballs already handled both IPv4 and IPv6 in the DirectIPv4 stage.
+                    // If we reach here, it means Happy Eyeballs failed and we need to move on.
+                    debug!(
+                        "DirectIPv6 stage reached after Happy Eyeballs, advancing to hole-punch"
+                    );
+                    strategy.transition_to_holepunch("Handled by Happy Eyeballs");
                 }
 
                 ConnectionStage::HolePunching {
@@ -1539,6 +1591,69 @@ impl P2pEndpoint {
                 }
             }
         }
+    }
+
+    /// Finalize a direct QUIC connection established by Happy Eyeballs.
+    ///
+    /// Takes the raw QUIC `Connection` from the successful handshake and completes
+    /// the P2P connection setup: peer ID extraction, connection storage, handler
+    /// spawning, stats update, and event broadcast.
+    async fn finalize_direct_connection(
+        &self,
+        connection: crate::high_level::Connection,
+        addr: SocketAddr,
+        hint_peer_id: Option<PeerId>,
+    ) -> Result<PeerConnection, EndpointError> {
+        // Extract authenticated peer ID from TLS, or derive from address/hint
+        let peer_id = self
+            .inner
+            .extract_peer_id_from_connection(&connection)
+            .await
+            .or(hint_peer_id)
+            .unwrap_or_else(|| peer_id_from_socket_addr(addr));
+
+        // Store in NAT traversal layer
+        self.inner
+            .add_connection(peer_id, connection.clone())
+            .map_err(EndpointError::NatTraversal)?;
+
+        // Spawn connection handler (Client side - we initiated)
+        self.inner
+            .spawn_connection_handler(peer_id, connection, Side::Client)
+            .map_err(EndpointError::NatTraversal)?;
+
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp(addr),
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        // Spawn reader task before storing peer to prevent data loss race
+        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
+            self.spawn_reader_task(peer_id, conn).await;
+        }
+
+        self.connected_peers
+            .write()
+            .await
+            .insert(peer_id, peer_conn.clone());
+
+        {
+            let mut stats = self.stats.write().await;
+            stats.active_connections += 1;
+            stats.successful_connections += 1;
+            stats.direct_connections += 1;
+        }
+
+        let _ = self.event_tx.send(P2pEvent::PeerConnected {
+            peer_id,
+            addr: TransportAddr::Udp(addr),
+            side: Side::Client,
+        });
+
+        Ok(peer_conn)
     }
 
     /// Internal helper for hole-punch attempt
