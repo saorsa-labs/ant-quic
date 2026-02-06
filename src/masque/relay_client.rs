@@ -141,16 +141,17 @@ impl RelayClientStats {
     }
 }
 
+/// Maximum age for pending datagrams before they are considered stale
+const PENDING_DATAGRAM_MAX_AGE: Duration = Duration::from_secs(10);
+
 /// Pending datagram awaiting context acknowledgement
 #[derive(Debug)]
 struct PendingDatagram {
     /// Target address for the datagram
     target: SocketAddr,
     /// The datagram payload (stored for retry after ACK)
-    #[allow(dead_code)]
     payload: Bytes,
     /// When the datagram was queued (for timeout handling)
-    #[allow(dead_code)]
     created_at: Instant,
 }
 
@@ -291,8 +292,15 @@ impl MasqueRelayClient {
                     "Context acknowledged by relay"
                 );
 
-                // Try to send any pending datagrams for this context
-                self.flush_pending_for_context(ack.context_id).await;
+                // Flush pending datagrams for this context - payloads can be re-sent
+                let flushed_payloads = self.flush_pending_for_context(ack.context_id).await;
+                if !flushed_payloads.is_empty() {
+                    tracing::debug!(
+                        context_id = ack.context_id.into_inner(),
+                        count = flushed_payloads.len(),
+                        "Flushed pending datagrams for acknowledged context"
+                    );
+                }
                 Ok(None)
             }
             Err(e) => {
@@ -461,8 +469,12 @@ impl MasqueRelayClient {
         Ok((Datagram::Compressed(datagram), capsule))
     }
 
-    /// Flush pending datagrams for a context
-    async fn flush_pending_for_context(&self, ctx_id: VarInt) {
+    /// Flush pending datagrams for a context, returning payloads for re-sending
+    ///
+    /// When a context receives its ACK, any queued datagrams for that target
+    /// are extracted and returned so the caller can re-send them through the
+    /// now-active context. Stale datagrams (older than 10s) are dropped.
+    async fn flush_pending_for_context(&self, ctx_id: VarInt) -> Vec<Bytes> {
         let target = {
             let mgr = self.context_manager.read().await;
             mgr.get_target(ctx_id)
@@ -470,8 +482,36 @@ impl MasqueRelayClient {
 
         if let Some(target) = target {
             let mut pending = self.pending_datagrams.write().await;
-            pending.retain(|d| d.target != target);
+            let now = Instant::now();
+            let mut payloads = Vec::new();
+
+            pending.retain(|d| {
+                if d.target == target {
+                    // Only return non-stale payloads
+                    if now.duration_since(d.created_at) < PENDING_DATAGRAM_MAX_AGE {
+                        payloads.push(d.payload.clone());
+                    }
+                    false // Remove from pending regardless
+                } else {
+                    true // Keep datagrams for other targets
+                }
+            });
+
+            payloads
+        } else {
+            Vec::new()
         }
+    }
+
+    /// Remove stale pending datagrams that have exceeded the maximum age
+    ///
+    /// Returns the number of datagrams that were cleaned up.
+    pub async fn cleanup_stale_pending(&self) -> usize {
+        let mut pending = self.pending_datagrams.write().await;
+        let before = pending.len();
+        let now = Instant::now();
+        pending.retain(|d| now.duration_since(d.created_at) < PENDING_DATAGRAM_MAX_AGE);
+        before - pending.len()
     }
 
     /// Decode an incoming datagram from the relay
@@ -702,5 +742,73 @@ mod tests {
         client.record_sent(100);
         assert_eq!(stats.total_sent(), 100);
         assert_eq!(stats.datagrams_sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_pending_returns_payloads() {
+        let config = RelayClientConfig {
+            prefer_compressed: true,
+            ..Default::default()
+        };
+        let client = MasqueRelayClient::new(relay_addr(), config);
+
+        // Connect
+        let response = ConnectUdpResponse::success(Some(test_addr(12345)));
+        client.handle_connect_response(response).await.unwrap();
+
+        let target = test_addr(8080);
+        let payload = Bytes::from("queued data");
+
+        // Create datagram - this queues a pending datagram since context is new
+        let (_datagram, capsule) = client
+            .create_datagram(target, payload.clone())
+            .await
+            .unwrap();
+        assert!(capsule.is_some(), "First call should create a new context");
+
+        // Get the context ID from the capsule
+        let ctx_id = match capsule.unwrap() {
+            Capsule::CompressionAssign(assign) => assign.context_id,
+            _ => panic!("Expected CompressionAssign capsule"),
+        };
+
+        // ACK the context and check that pending datagrams are flushed
+        let ack = CompressionAck::new(ctx_id);
+        client
+            .handle_capsule(Capsule::CompressionAck(ack))
+            .await
+            .unwrap();
+
+        // After flush, pending should be empty
+        let cleaned = client.cleanup_stale_pending().await;
+        assert_eq!(cleaned, 0, "All pending should have been flushed already");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_pending() {
+        let config = RelayClientConfig::default();
+        let client = MasqueRelayClient::new(relay_addr(), config);
+
+        // Manually push a stale pending datagram
+        {
+            let mut pending = client.pending_datagrams.write().await;
+            pending.push(PendingDatagram {
+                target: test_addr(8080),
+                payload: Bytes::from("old data"),
+                created_at: Instant::now() - Duration::from_secs(15), // 15s old > 10s max
+            });
+            pending.push(PendingDatagram {
+                target: test_addr(9090),
+                payload: Bytes::from("fresh data"),
+                created_at: Instant::now(), // fresh
+            });
+        }
+
+        let cleaned = client.cleanup_stale_pending().await;
+        assert_eq!(cleaned, 1, "Should have cleaned 1 stale datagram");
+
+        let remaining = client.pending_datagrams.read().await;
+        assert_eq!(remaining.len(), 1, "One fresh datagram should remain");
+        assert_eq!(remaining[0].target, test_addr(9090));
     }
 }

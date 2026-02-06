@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::VarInt;
 use crate::masque::{
@@ -42,6 +42,14 @@ use crate::masque::{
     Datagram,
 };
 use crate::relay::error::{RelayError, RelayResult, SessionErrorKind};
+
+/// Get current time as milliseconds since UNIX epoch
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Configuration for relay sessions
 #[derive(Debug, Clone)]
@@ -163,9 +171,9 @@ pub struct RelaySession {
     /// Whether this session is bridging between IPv4 and IPv6
     is_bridging: bool,
     /// Bytes forwarded in current rate limit window
-    bytes_in_window: u64,
-    /// Rate limit window start time
-    window_start: Instant,
+    bytes_in_window: AtomicU64,
+    /// Rate limit window start time (epoch millis for atomic storage)
+    window_start_ms: AtomicU64,
 }
 
 impl RelaySession {
@@ -184,8 +192,8 @@ impl RelaySession {
             last_activity: now,
             stats: Arc::new(RelaySessionStats::new()),
             is_bridging: false,
-            bytes_in_window: 0,
-            window_start: now,
+            bytes_in_window: AtomicU64::new(0),
+            window_start_ms: AtomicU64::new(now_ms()),
         }
     }
 
@@ -252,23 +260,35 @@ impl RelaySession {
     /// Check rate limit and update counters
     ///
     /// Returns `true` if the transfer is within limits, `false` if rate limited.
+    /// Uses atomic operations for lock-free rate limiting.
     pub fn check_rate_limit(&self, bytes: usize) -> bool {
         // If no limit configured, allow all
         if self.config.bandwidth_limit == 0 {
             return true;
         }
 
+        let now = now_ms();
+        let window_start = self.window_start_ms.load(Ordering::Relaxed);
+
         // Reset window if expired (1 second window)
-        let elapsed = self.window_start.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            // Note: We can't modify self here since we take &self
-            // For a proper implementation, this should use interior mutability
-            // For now, just check against the limit
+        if now.saturating_sub(window_start) >= 1000 {
+            self.window_start_ms.store(now, Ordering::Relaxed);
+            self.bytes_in_window.store(bytes as u64, Ordering::Relaxed);
             return bytes as u64 <= self.config.bandwidth_limit;
         }
 
         // Check if adding these bytes would exceed the limit
-        self.bytes_in_window + bytes as u64 <= self.config.bandwidth_limit
+        let current = self
+            .bytes_in_window
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if current + bytes as u64 > self.config.bandwidth_limit {
+            // Undo the add since we're rejecting
+            self.bytes_in_window
+                .fetch_sub(bytes as u64, Ordering::Relaxed);
+            return false;
+        }
+
+        true
     }
 
     /// Activate the session
@@ -663,5 +683,43 @@ mod tests {
             .handle_capsule(Capsule::CompressionAssign(assign2))
             .unwrap();
         assert!(matches!(response2, Some(Capsule::CompressionClose(_))));
+    }
+
+    #[test]
+    fn test_rate_limit_allows_within_limit() {
+        let config = RelaySessionConfig {
+            bandwidth_limit: 1000,
+            ..Default::default()
+        };
+        let session = RelaySession::new(1, config, test_addr(9000));
+
+        // Should allow up to 1000 bytes
+        assert!(session.check_rate_limit(500));
+        assert!(session.check_rate_limit(400));
+        assert!(session.check_rate_limit(100));
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_over_limit() {
+        let config = RelaySessionConfig {
+            bandwidth_limit: 1000,
+            ..Default::default()
+        };
+        let session = RelaySession::new(1, config, test_addr(9000));
+
+        assert!(session.check_rate_limit(900));
+        // 900 + 200 = 1100 > 1000, should reject
+        assert!(!session.check_rate_limit(200));
+    }
+
+    #[test]
+    fn test_rate_limit_zero_means_unlimited() {
+        let config = RelaySessionConfig {
+            bandwidth_limit: 0,
+            ..Default::default()
+        };
+        let session = RelaySession::new(1, config, test_addr(9000));
+
+        assert!(session.check_rate_limit(999_999_999));
     }
 }

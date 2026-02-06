@@ -1356,7 +1356,7 @@ impl P2pEndpoint {
                 .first()
                 .and_then(|addr| addr.as_socket_addr());
         }
-        if config.relay_addr.is_none() {
+        if config.relay_addrs.is_empty() {
             // Optimization: Try to find a high-quality relay from our cache first
             let target_addr = target_ipv4.or(target_ipv6);
             if let Some(addr) = target_addr {
@@ -1370,17 +1370,21 @@ impl P2pEndpoint {
                     // Use the first address of the best relay
                     // In a perfect world we'd check reachability of this address too,
                     // but for now we assume cached addresses are valid candidates.
-                    config.relay_addr = best_relay.addresses.first().copied();
-                    debug!(
-                        "Selected optimized relay from cache: {:?} for target {}",
-                        config.relay_addr, addr
-                    );
+                    if let Some(relay_addr) = best_relay.addresses.first().copied() {
+                        config.relay_addrs.push(relay_addr);
+                        debug!(
+                            "Selected optimized relay from cache: {:?} for target {}",
+                            relay_addr, addr
+                        );
+                    }
                 }
             }
 
             // Fallback to static config if cache gave nothing
-            if config.relay_addr.is_none() {
-                config.relay_addr = self.config.nat.relay_nodes.first().copied();
+            if config.relay_addrs.is_empty() {
+                if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
+                    config.relay_addrs.push(relay_addr);
+                }
             }
         }
 

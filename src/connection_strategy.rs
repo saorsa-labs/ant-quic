@@ -133,8 +133,10 @@ pub enum ConnectionStage {
     },
     /// Attempting relay connection
     Relay {
-        /// The relay server address
+        /// The relay server address being tried
         relay_addr: SocketAddr,
+        /// Index into relay_addrs being tried
+        relay_index: usize,
         /// When this stage started
         started: Instant,
     },
@@ -169,8 +171,8 @@ pub struct StrategyConfig {
     pub relay_enabled: bool,
     /// Optional coordinator address for hole-punching
     pub coordinator: Option<SocketAddr>,
-    /// Optional relay server address
-    pub relay_addr: Option<SocketAddr>,
+    /// Relay server addresses for fallback (tried in order)
+    pub relay_addrs: Vec<SocketAddr>,
 }
 
 impl Default for StrategyConfig {
@@ -184,7 +186,7 @@ impl Default for StrategyConfig {
             ipv6_enabled: true,
             relay_enabled: true,
             coordinator: None,
-            relay_addr: None,
+            relay_addrs: Vec::new(),
         }
     }
 }
@@ -243,9 +245,15 @@ impl StrategyConfig {
         self
     }
 
-    /// Set the relay server address
+    /// Add a relay server address to the fallback list
     pub fn with_relay(mut self, addr: SocketAddr) -> Self {
-        self.relay_addr = Some(addr);
+        self.relay_addrs.push(addr);
+        self
+    }
+
+    /// Set multiple relay server addresses for fallback
+    pub fn with_relays(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.relay_addrs = addrs;
         self
     }
 }
@@ -387,19 +395,42 @@ impl ConnectionStrategy {
         self.transition_to_relay_internal();
     }
 
-    fn transition_to_relay_internal(&mut self) {
-        if self.config.relay_enabled {
-            if let Some(relay_addr) = self.config.relay_addr {
+    /// Record a relay error and try the next relay, or fail if all exhausted
+    pub fn transition_to_next_relay(&mut self, error: impl Into<String>) {
+        if let ConnectionStage::Relay { relay_index, .. } = &self.stage {
+            self.errors.push(ConnectionAttemptError {
+                method: AttemptedMethod::Relay,
+                error: error.into(),
+                timestamp: Instant::now(),
+            });
+
+            let next_index = relay_index + 1;
+            if next_index < self.config.relay_addrs.len() {
                 self.stage = ConnectionStage::Relay {
-                    relay_addr,
+                    relay_addr: self.config.relay_addrs[next_index],
+                    relay_index: next_index,
                     started: Instant::now(),
                 };
             } else {
-                // No relay available
-                self.transition_to_failed("No relay server configured");
+                // All relays exhausted
+                self.stage = ConnectionStage::Failed {
+                    errors: std::mem::take(&mut self.errors),
+                };
             }
-        } else {
+        }
+    }
+
+    fn transition_to_relay_internal(&mut self) {
+        if self.config.relay_enabled && !self.config.relay_addrs.is_empty() {
+            self.stage = ConnectionStage::Relay {
+                relay_addr: self.config.relay_addrs[0],
+                relay_index: 0,
+                started: Instant::now(),
+            };
+        } else if !self.config.relay_enabled {
             self.transition_to_failed("Relay disabled and all other methods failed");
+        } else {
+            self.transition_to_failed("No relay servers configured");
         }
     }
 
@@ -573,8 +604,14 @@ mod tests {
         strategy.transition_to_holepunch("IPv6 failed");
         strategy.transition_to_relay("Holepunch failed");
 
-        if let ConnectionStage::Relay { relay_addr, .. } = strategy.current_stage() {
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
             assert_eq!(relay_addr.port(), 9001);
+            assert_eq!(*relay_index, 0);
         } else {
             panic!("Expected Relay stage");
         }
@@ -665,6 +702,103 @@ mod tests {
         strategy.transition_to_relay("Holepunch failed");
 
         // Should fail since relay is disabled
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_multi_relay_fallback() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay("127.0.0.1:9001".parse().unwrap())
+            .with_relay("127.0.0.1:9002".parse().unwrap())
+            .with_relay("127.0.0.1:9003".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        // Should start at first relay
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9001);
+            assert_eq!(*relay_index, 0);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail first relay, try second
+        strategy.transition_to_next_relay("Relay 1 failed");
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9002);
+            assert_eq!(*relay_index, 1);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail second relay, try third
+        strategy.transition_to_next_relay("Relay 2 failed");
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9003);
+            assert_eq!(*relay_index, 2);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail third relay - all exhausted
+        strategy.transition_to_next_relay("Relay 3 failed");
+        if let ConnectionStage::Failed { errors } = strategy.current_stage() {
+            // Should have errors from: IPv4, IPv6, holepunch, relay1, relay2, relay3
+            assert_eq!(errors.len(), 6);
+        } else {
+            panic!("Expected Failed stage");
+        }
+    }
+
+    #[test]
+    fn test_with_relays_vec() {
+        let relays: Vec<SocketAddr> = vec![
+            "127.0.0.1:9001".parse().unwrap(),
+            "127.0.0.1:9002".parse().unwrap(),
+        ];
+        let config = StrategyConfig::new().with_relays(relays);
+        assert_eq!(config.relay_addrs.len(), 2);
+    }
+
+    #[test]
+    fn test_single_relay_still_works() {
+        // Verify backward compatibility - single with_relay() still works
+        let config = StrategyConfig::new().with_relay("127.0.0.1:9001".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        if let ConnectionStage::Relay { relay_addr, .. } = strategy.current_stage() {
+            assert_eq!(relay_addr.port(), 9001);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        strategy.transition_to_next_relay("Relay failed");
         assert!(matches!(
             strategy.current_stage(),
             ConnectionStage::Failed { .. }
