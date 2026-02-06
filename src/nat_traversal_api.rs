@@ -1334,6 +1334,7 @@ impl NatTraversalEndpoint {
                     // Spawn task to receive from this transport's inbound channel
                     let mut inbound_rx = provider.inbound();
                     let shutdown_notify_clone = endpoint.shutdown_notify.clone();
+                    let shutdown_flag_clone = endpoint.shutdown.clone();
                     let engine_clone = endpoint.constrained_engine.clone();
                     let registry_clone = endpoint.transport_registry.clone();
                     let event_tx_clone = endpoint.constrained_event_tx.clone();
@@ -1342,8 +1343,16 @@ impl NatTraversalEndpoint {
                         debug!("Started listening on transport '{}'", transport_name);
 
                         loop {
+                            // Fallback shutdown check: notify_waiters() can be missed
+                            // if no task is awaiting .notified() at the moment shutdown()
+                            // fires, so we check the AtomicBool on each iteration.
+                            if shutdown_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                debug!("Shutting down transport listener for '{}'", transport_name);
+                                break;
+                            }
+
                             tokio::select! {
-                                // Check shutdown signal via Notify (no polling)
+                                // Instant shutdown via Notify
                                 _ = shutdown_notify_clone.notified() => {
                                     debug!("Shutting down transport listener for '{}'", transport_name);
                                     break;
@@ -1728,6 +1737,7 @@ impl NatTraversalEndpoint {
                     // Spawn task to receive from this transport's inbound channel
                     let mut inbound_rx = provider.inbound();
                     let shutdown_notify_clone = endpoint.shutdown_notify.clone();
+                    let shutdown_flag_clone = endpoint.shutdown.clone();
                     let engine_clone = endpoint.constrained_engine.clone();
                     let registry_clone = endpoint.transport_registry.clone();
                     let event_tx_clone = endpoint.constrained_event_tx.clone();
@@ -1736,8 +1746,16 @@ impl NatTraversalEndpoint {
                         debug!("Started listening on transport '{}'", transport_name);
 
                         loop {
+                            // Fallback shutdown check: notify_waiters() can be missed
+                            // if no task is awaiting .notified() at the moment shutdown()
+                            // fires, so we check the AtomicBool on each iteration.
+                            if shutdown_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                debug!("Shutting down transport listener for '{}'", transport_name);
+                                break;
+                            }
+
                             tokio::select! {
-                                // Check shutdown signal via Notify (no polling)
+                                // Instant shutdown via Notify
                                 _ = shutdown_notify_clone.notified() => {
                                     debug!("Shutting down transport listener for '{}'", transport_name);
                                     break;
