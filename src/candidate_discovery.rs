@@ -715,7 +715,9 @@ impl CandidateDiscoveryManager {
                 return Ok(candidates);
             }
 
-            // Small sleep to avoid busy waiting
+            // Brief sleep to avoid busy-waiting while scan completes.
+            // Although getifaddrs is fast, in edge cases check_scan_complete()
+            // may return None for up to 2s, so we throttle to avoid CPU burn.
             std::thread::sleep(Duration::from_millis(10));
         }
     }
