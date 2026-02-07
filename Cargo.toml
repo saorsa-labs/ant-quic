@@ -278,7 +278,6 @@ path = "tests/standard/main.rs"
 [[test]]
 name = "long"
 path = "tests/long/main.rs"
-harness = false  # Custom test runner for long tests
 
 [[test]]
 name = "property_tests"

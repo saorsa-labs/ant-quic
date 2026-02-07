@@ -39,15 +39,16 @@ fn test_pqc_provider_creation() {
     }
 }
 
-/// Test that config requires at least one algorithm enabled
+/// Test that PQC algorithms cannot be disabled (v0.13.0+: PQC is mandatory)
 #[test]
-fn test_pqc_requires_algorithms() {
-    // PqcConfig builder should reject config without algorithms
+fn test_pqc_always_enabled() {
+    // v0.13.0+: PqcConfig builder forces PQC algorithms to always be enabled.
+    // Passing `false` is a no-op — PQC is mandatory for all connections.
     let result = PqcConfig::builder().ml_kem(false).ml_dsa(false).build();
 
     assert!(
-        result.is_err(),
-        "Config without algorithms should fail validation"
+        result.is_ok(),
+        "PQC is mandatory in v0.13.0+ — builder should always succeed regardless of flags"
     );
 }
 
