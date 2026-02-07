@@ -889,12 +889,20 @@ impl P2pEndpoint {
                     peer_id
                 );
                 connection.close(0u32.into(), b"duplicate");
-                let peers = self.connected_peers.read().await;
-                if let Some(existing) = peers.get(&peer_id) {
-                    return Ok(existing.clone());
+                // Wait briefly for the accept path to populate connected_peers
+                for _ in 0..10 {
+                    let peers = self.connected_peers.read().await;
+                    if let Some(existing) = peers.get(&peer_id) {
+                        return Ok(existing.clone());
+                    }
+                    drop(peers);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                // Accept path hasn't stored to connected_peers yet; fall through
-                // to store this connection as a placeholder that will be replaced.
+                // Accept path never stored the connection — return error so caller
+                // can retry, rather than storing the closed connection as a phantom.
+                return Err(EndpointError::Connection(
+                    "simultaneous open: peer connection not yet available, retry".into(),
+                ));
             } else {
                 // We have the lower PeerId: keep our outgoing connection,
                 // the existing one from accept path will be closed.
@@ -1765,6 +1773,42 @@ impl P2pEndpoint {
             .or(hint_peer_id)
             .unwrap_or_else(|| peer_id_from_socket_addr(addr));
 
+        // Dedup check: if already connected to this peer, use tiebreaker
+        if self.inner.is_peer_connected(&peer_id) {
+            let local_id = self.inner.local_peer_id();
+            let we_keep_client = local_id < peer_id;
+            if !we_keep_client {
+                // We have the higher PeerId: close this outgoing connection,
+                // keep the existing one (from accept path).
+                info!(
+                    "finalize_direct_connection: simultaneous open for peer {:?} — \
+                     our PeerId is higher, closing outgoing (keeping incoming)",
+                    peer_id
+                );
+                connection.close(0u32.into(), b"duplicate");
+                // Wait briefly for the accept path to populate connected_peers
+                for _ in 0..10 {
+                    let peers = self.connected_peers.read().await;
+                    if let Some(existing) = peers.get(&peer_id) {
+                        return Ok(existing.clone());
+                    }
+                    drop(peers);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                return Err(EndpointError::Connection(
+                    "simultaneous open: peer connection not yet available, retry".into(),
+                ));
+            }
+            // We have the lower PeerId: keep our outgoing connection,
+            // remove the old one from accept path.
+            info!(
+                "finalize_direct_connection: simultaneous open for peer {:?} — \
+                 our PeerId is lower, keeping outgoing (replacing incoming)",
+                peer_id
+            );
+            let _ = self.inner.remove_connection(&peer_id);
+        }
+
         // Store in NAT traversal layer
         self.inner
             .add_connection(peer_id, connection.clone())
@@ -2507,26 +2551,29 @@ impl P2pEndpoint {
                     peer_conn.last_activity = Instant::now();
                 }
 
-                // Health check protocol: messages starting with 0xFF are internal
-                // and are NOT forwarded to the application data channel.
-                if data.first() == Some(&HEALTH_CHECK_PREFIX) {
-                    if data.len() == 2 && data[1] == HEALTH_PING[1] {
+                // Health check protocol: only exact PING/PONG messages are internal.
+                // All other messages (including those starting with 0xFF) are forwarded
+                // to the application to avoid silent data loss.
+                if data.len() == 2 && data[0] == HEALTH_CHECK_PREFIX {
+                    if data[1] == HEALTH_PING[1] {
                         // Received PING — respond with PONG
                         tracing::trace!("Health PING from peer {:?}, sending PONG", peer_id);
                         if let Ok(mut send) = connection.open_uni().await {
                             let _ = send.write_all(&HEALTH_PONG).await;
                             let _ = send.finish();
                         }
-                    } else if data.len() == 2 && data[1] == HEALTH_PONG[1] {
+                        continue;
+                    } else if data[1] == HEALTH_PONG[1] {
                         // Received PONG — update health timestamp
                         tracing::trace!("Health PONG from peer {:?}", peer_id);
                         if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
                             peer_conn.last_health_pong_received = Some(Instant::now());
                         }
+                        continue;
                     }
-                    // Don't forward health check messages to the application
-                    continue;
                 }
+                // Any other message (including 0xFF-prefixed non-health messages) is
+                // forwarded to the application.
 
                 // Emit DataReceived event
                 let _ = event_tx.send(P2pEvent::DataReceived {
