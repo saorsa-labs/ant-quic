@@ -346,7 +346,7 @@ cargo nextest run --ignored stress
 
 ## Development Notes
 
-- **Minimum Rust Version**: 1.85.0
+- **Minimum Rust Version**: 1.88.0
 - **Rust Edition**: 2024 (enhanced async syntax and performance)
 - **Primary Dependencies**: Quinn, tokio, rustls, ring/aws-lc-rs
 - **License**: Dual MIT/Apache-2.0
