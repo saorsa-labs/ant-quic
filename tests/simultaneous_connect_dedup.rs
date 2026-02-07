@@ -227,7 +227,9 @@ async fn test_simultaneous_connect_repeated() {
         assert!(
             a_ok || b_ok,
             "Iteration {}: at least one connect should succeed (a={}, b={})",
-            iteration, a_ok, b_ok
+            iteration,
+            a_ok,
+            b_ok
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -344,9 +346,7 @@ async fn test_connect_after_failure_succeeds() {
     // Spawn accept on node_b
     let accept_handle = tokio::spawn({
         let node = node_b.clone();
-        async move {
-            timeout(Duration::from_secs(15), node.accept()).await
-        }
+        async move { timeout(Duration::from_secs(15), node.accept()).await }
     });
 
     // First: try connecting to a bogus address (will fail)
@@ -390,9 +390,7 @@ async fn test_connection_health_status() {
     // Spawn accept on node_b
     let accept_handle = tokio::spawn({
         let node = node_b.clone();
-        async move {
-            timeout(Duration::from_secs(5), node.accept()).await
-        }
+        async move { timeout(Duration::from_secs(5), node.accept()).await }
     });
 
     // Connect A → B
@@ -419,7 +417,10 @@ async fn test_connection_health_status() {
     // After one cycle, the peer should still be Healthy (PONG received)
     let health_after = node_a.connection_health(&conn.peer_id).await;
     assert!(
-        matches!(health_after, Some(ConnectionHealth::Healthy) | Some(ConnectionHealth::Checking)),
+        matches!(
+            health_after,
+            Some(ConnectionHealth::Healthy) | Some(ConnectionHealth::Checking)
+        ),
         "After one health cycle, peer should be Healthy or Checking, got {:?}",
         health_after
     );
@@ -444,10 +445,7 @@ async fn test_connection_health_unknown_peer() {
 
     let unknown_peer = ant_quic::PeerId([0xDE; 32]);
     let health = node.connection_health(&unknown_peer).await;
-    assert_eq!(
-        health, None,
-        "Unknown peer should return None"
-    );
+    assert_eq!(health, None, "Unknown peer should return None");
 
     node.shutdown().await;
 }
@@ -462,9 +460,7 @@ async fn test_connection_health_after_disconnect() {
 
     let accept_handle = tokio::spawn({
         let node = node_b.clone();
-        async move {
-            timeout(Duration::from_secs(5), node.accept()).await
-        }
+        async move { timeout(Duration::from_secs(5), node.accept()).await }
     });
 
     let conn = timeout(Duration::from_secs(10), node_a.connect_addr(addr_b))
@@ -481,7 +477,10 @@ async fn test_connection_health_after_disconnect() {
     );
 
     // Disconnect
-    node_a.disconnect(&conn.peer_id).await.expect("disconnect should succeed");
+    node_a
+        .disconnect(&conn.peer_id)
+        .await
+        .expect("disconnect should succeed");
 
     // After disconnect, health should be None
     let health = node_a.connection_health(&conn.peer_id).await;
@@ -595,9 +594,7 @@ async fn test_rapid_connect_disconnect_cycles() {
         // Spawn accept
         let accept = tokio::spawn({
             let n = node_b.clone();
-            async move {
-                timeout(Duration::from_secs(10), n.accept()).await
-            }
+            async move { timeout(Duration::from_secs(10), n.accept()).await }
         });
 
         // Connect

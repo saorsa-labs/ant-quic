@@ -2864,9 +2864,11 @@ impl P2pEndpoint {
                             // Only evict if we've sent at least one PING and
                             // haven't received a PONG within the threshold.
                             if let Some(ping_sent) = pc.last_health_ping_sent {
-                                let pong_time = pc.last_health_pong_received.unwrap_or(pc.connected_at);
+                                let pong_time =
+                                    pc.last_health_pong_received.unwrap_or(pc.connected_at);
                                 ping_sent > pong_time
-                                    && now.duration_since(ping_sent) > HEALTH_CHECK_EVICTION_THRESHOLD
+                                    && now.duration_since(ping_sent)
+                                        > HEALTH_CHECK_EVICTION_THRESHOLD
                             } else {
                                 false
                             }
@@ -2908,7 +2910,8 @@ impl P2pEndpoint {
                                 if send.write_all(&HEALTH_PING).await.is_ok() {
                                     let _ = send.finish();
                                     // Record PING send time
-                                    if let Some(pc) = connected_peers.write().await.get_mut(peer_id) {
+                                    if let Some(pc) = connected_peers.write().await.get_mut(peer_id)
+                                    {
                                         pc.last_health_ping_sent = Some(Instant::now());
                                     }
                                     tracing::trace!("Health PING sent to peer {:?}", peer_id);
