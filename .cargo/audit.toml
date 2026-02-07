@@ -1,0 +1,10 @@
+# cargo-audit configuration
+# https://docs.rs/cargo-audit/latest/cargo_audit/
+
+[advisories]
+# Ignored advisories (with justification)
+ignore = [
+    # time 0.3.45 DoS via stack exhaustion - fix (0.3.47) requires Rust 1.88+,
+    # our MSRV is 1.85. Will upgrade when MSRV allows.
+    "RUSTSEC-2026-0009",
+]
