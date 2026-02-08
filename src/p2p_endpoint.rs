@@ -533,6 +533,47 @@ pub enum EndpointError {
     NoAddress,
 }
 
+/// Shared cleanup logic for removing a peer from all tracking structures.
+///
+/// Used by both `P2pEndpoint::cleanup_connection()` and the background reaper
+/// to ensure consistent cleanup behaviour (single source of truth).
+///
+/// Returns `true` if the peer was actually present in `connected_peers`.
+async fn do_cleanup_connection(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    inner: &NatTraversalEndpoint,
+    reader_handles: &RwLock<HashMap<PeerId, tokio::task::AbortHandle>>,
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: &PeerId,
+    reason: DisconnectReason,
+) -> bool {
+    let removed = connected_peers.write().await.remove(peer_id);
+    let _ = inner.remove_connection(peer_id);
+
+    // Abort the background reader task for this peer
+    if let Some(handle) = reader_handles.write().await.remove(peer_id) {
+        handle.abort();
+    }
+
+    if removed.is_some() {
+        {
+            let mut s = stats.write().await;
+            s.active_connections = s.active_connections.saturating_sub(1);
+        }
+
+        let _ = event_tx.send(P2pEvent::PeerDisconnected {
+            peer_id: *peer_id,
+            reason,
+        });
+
+        info!("Cleaned up connection for peer {:?}", peer_id);
+        true
+    } else {
+        false
+    }
+}
+
 impl P2pEndpoint {
     /// Create a new P2P endpoint with the given configuration
     pub async fn new(config: P2pConfig) -> Result<Self, EndpointError> {
@@ -2107,27 +2148,16 @@ impl P2pEndpoint {
     ///
     /// Safe to call even if the peer is not in all structures (idempotent).
     async fn cleanup_connection(&self, peer_id: &PeerId, reason: DisconnectReason) {
-        let removed = self.connected_peers.write().await.remove(peer_id);
-        let _ = self.inner.remove_connection(peer_id);
-
-        // Abort the background reader task for this peer
-        if let Some(handle) = self.reader_handles.write().await.remove(peer_id) {
-            handle.abort();
-        }
-
-        if removed.is_some() {
-            {
-                let mut stats = self.stats.write().await;
-                stats.active_connections = stats.active_connections.saturating_sub(1);
-            }
-
-            let _ = self.event_tx.send(P2pEvent::PeerDisconnected {
-                peer_id: *peer_id,
-                reason,
-            });
-
-            info!("Cleaned up connection for peer {:?}", peer_id);
-        }
+        do_cleanup_connection(
+            &*self.connected_peers,
+            &*self.inner,
+            &*self.reader_handles,
+            &*self.stats,
+            &self.event_tx,
+            peer_id,
+            reason,
+        )
+        .await;
     }
 
     /// Disconnect from a peer
@@ -2826,20 +2856,16 @@ impl P2pEndpoint {
                 }
 
                 for peer_id in &stale_peers {
-                    connected_peers.write().await.remove(peer_id);
-                    let _ = inner.remove_connection(peer_id);
-                    if let Some(handle) = reader_handles.write().await.remove(peer_id) {
-                        handle.abort();
-                    }
-                    {
-                        let mut s = stats.write().await;
-                        s.active_connections = s.active_connections.saturating_sub(1);
-                    }
-                    let _ = event_tx.send(P2pEvent::PeerDisconnected {
-                        peer_id: *peer_id,
-                        reason: DisconnectReason::Timeout,
-                    });
-                    info!("Reaped stale connection for peer {:?}", peer_id);
+                    do_cleanup_connection(
+                        &*connected_peers,
+                        &*inner,
+                        &*reader_handles,
+                        &*stats,
+                        &event_tx,
+                        peer_id,
+                        DisconnectReason::Timeout,
+                    )
+                    .await;
                 }
 
                 // --- Phase B: Health-check live connections ---
@@ -2886,20 +2912,19 @@ impl P2pEndpoint {
                         if let Ok(Some(conn)) = inner.get_connection(peer_id) {
                             conn.close(0u32.into(), b"health_check_failed");
                         }
-                        connected_peers.write().await.remove(peer_id);
-                        let _ = inner.remove_connection(peer_id);
-                        if let Some(handle) = reader_handles.write().await.remove(peer_id) {
-                            handle.abort();
+                        let was_present = do_cleanup_connection(
+                            &*connected_peers,
+                            &*inner,
+                            &*reader_handles,
+                            &*stats,
+                            &event_tx,
+                            peer_id,
+                            DisconnectReason::ConnectionLost,
+                        )
+                        .await;
+                        if was_present {
+                            stats.write().await.phantom_connections_evicted += 1;
                         }
-                        {
-                            let mut s = stats.write().await;
-                            s.active_connections = s.active_connections.saturating_sub(1);
-                            s.phantom_connections_evicted += 1;
-                        }
-                        let _ = event_tx.send(P2pEvent::PeerDisconnected {
-                            peer_id: *peer_id,
-                            reason: DisconnectReason::ConnectionLost,
-                        });
                         continue;
                     }
 
