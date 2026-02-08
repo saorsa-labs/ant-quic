@@ -260,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(n) = recv.read(&mut buf).await? {
         total_received += n as u64;
 
-        if total_received % (10 * 1024 * 1024) == 0 {
+        if total_received.is_multiple_of(10 * 1024 * 1024) {
             info!(
                 "Received {} MB / {} MB ({:.1}%)",
                 total_received / (1024 * 1024),

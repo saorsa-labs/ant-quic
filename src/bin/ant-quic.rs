@@ -741,11 +741,11 @@ async fn main() -> anyhow::Result<()> {
 
     // All nodes are symmetric - accept connections while running
     while !shutdown.is_cancelled() {
-        if let Some(max_duration) = duration {
-            if start_time.elapsed() > max_duration {
-                info!("Duration limit reached");
-                break;
-            }
+        if let Some(max_duration) = duration
+            && start_time.elapsed() > max_duration
+        {
+            info!("Duration limit reached");
+            break;
         }
 
         match tokio::time::timeout(Duration::from_millis(100), endpoint.accept()).await {
@@ -1252,10 +1252,10 @@ async fn handle_command(command: Command) -> anyhow::Result<()> {
 /// Expand tilde to home directory
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
     let path_str = path.to_string_lossy();
-    if let Some(stripped) = path_str.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
+    if let Some(stripped) = path_str.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
     }
     path.to_path_buf()
 }
@@ -1407,18 +1407,18 @@ async fn handle_cache_command(action: CacheAction) -> anyhow::Result<()> {
                 let metadata = std::fs::metadata(&cache_file)?;
                 println!("File size: {} bytes", metadata.len());
 
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(elapsed) = modified.elapsed() {
-                        let secs = elapsed.as_secs();
-                        if secs < 60 {
-                            println!("Last modified: {}s ago", secs);
-                        } else if secs < 3600 {
-                            println!("Last modified: {}m ago", secs / 60);
-                        } else if secs < 86400 {
-                            println!("Last modified: {}h ago", secs / 3600);
-                        } else {
-                            println!("Last modified: {}d ago", secs / 86400);
-                        }
+                if let Ok(modified) = metadata.modified()
+                    && let Ok(elapsed) = modified.elapsed()
+                {
+                    let secs = elapsed.as_secs();
+                    if secs < 60 {
+                        println!("Last modified: {}s ago", secs);
+                    } else if secs < 3600 {
+                        println!("Last modified: {}m ago", secs / 60);
+                    } else if secs < 86400 {
+                        println!("Last modified: {}h ago", secs / 3600);
+                    } else {
+                        println!("Last modified: {}d ago", secs / 86400);
                     }
                 }
 

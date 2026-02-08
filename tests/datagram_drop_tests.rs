@@ -227,10 +227,10 @@ async fn test_datagram_no_drop_when_reading() {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Read immediately to prevent buffer overflow
-        if let Ok(result) = timeout(Duration::from_millis(100), server_conn.read_datagram()).await {
-            if result.is_ok() {
-                received_count += 1;
-            }
+        if let Ok(result) = timeout(Duration::from_millis(100), server_conn.read_datagram()).await
+            && result.is_ok()
+        {
+            received_count += 1;
         }
     }
 

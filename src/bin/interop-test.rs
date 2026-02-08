@@ -97,10 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = impl_name.as_str().unwrap_or("unknown");
 
         // Skip if specific implementation requested and this isn't it
-        if let Some(ref target) = args.implementation {
-            if name != target {
-                continue;
-            }
+        if let Some(ref target) = args.implementation
+            && name != target
+        {
+            continue;
         }
 
         info!("Testing implementation: {}", name);

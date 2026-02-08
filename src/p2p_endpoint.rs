@@ -73,6 +73,7 @@ use crate::constrained::EngineEvent;
 use crate::crypto::raw_public_keys::key_utils::{
     derive_peer_id_from_public_key, generate_ml_dsa_keypair,
 };
+use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics, PeerId,
@@ -85,6 +86,23 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Maximum payload size for a single uni stream read (1 MB)
 const MAX_UNI_STREAM_READ_BYTES: usize = 1024 * 1024;
+
+/// Health check protocol prefix byte.
+///
+/// Uni streams whose payload starts with this byte are health check messages
+/// handled by the reader task; they are NOT forwarded to the application data channel.
+const HEALTH_CHECK_PREFIX: u8 = 0xFF;
+
+/// Health PING payload: `[0xFF, 0x01]`.  Sent periodically by the stale connection
+/// reaper.  The remote reader task responds with a PONG.
+const HEALTH_PING: [u8; 2] = [HEALTH_CHECK_PREFIX, 0x01];
+
+/// Health PONG payload: `[0xFF, 0x02]`.  Sent in response to a PING.
+const HEALTH_PONG: [u8; 2] = [HEALTH_CHECK_PREFIX, 0x02];
+
+/// Maximum age of the last health check response before a connection is
+/// considered unresponsive and evicted (2 check intervals = 60s).
+const HEALTH_CHECK_EVICTION_THRESHOLD: Duration = Duration::from_secs(60);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -207,6 +225,17 @@ impl std::fmt::Debug for P2pEndpoint {
     }
 }
 
+/// Health status for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionHealth {
+    /// Connection recently confirmed alive (PONG received within threshold).
+    Healthy,
+    /// A health PING has been sent but no PONG received yet.
+    Checking,
+    /// No PONG received within the eviction threshold — connection is phantom/dead.
+    Unresponsive,
+}
+
 /// Connection information for a peer
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -224,6 +253,12 @@ pub struct PeerConnection {
 
     /// Last activity time
     pub last_activity: Instant,
+
+    /// Timestamp of the last health PING sent to this peer.
+    pub last_health_ping_sent: Option<Instant>,
+
+    /// Timestamp of the last health PONG received from this peer.
+    pub last_health_pong_received: Option<Instant>,
 }
 
 /// Connection metrics for P2P peers
@@ -280,6 +315,9 @@ pub struct EndpointStats {
 
     /// Average coordination time for NAT traversal
     pub average_coordination_time: Duration,
+
+    /// Number of phantom/unresponsive connections evicted by health checks
+    pub phantom_connections_evicted: u64,
 }
 
 impl Default for EndpointStats {
@@ -296,6 +334,7 @@ impl Default for EndpointStats {
             connected_bootstrap_nodes: 0,
             start_time: Instant::now(),
             average_coordination_time: Duration::ZERO,
+            phantom_connections_evicted: 0,
         }
     }
 }
@@ -494,6 +533,47 @@ pub enum EndpointError {
     NoAddress,
 }
 
+/// Shared cleanup logic for removing a peer from all tracking structures.
+///
+/// Used by both `P2pEndpoint::cleanup_connection()` and the background reaper
+/// to ensure consistent cleanup behaviour (single source of truth).
+///
+/// Returns `true` if the peer was actually present in `connected_peers`.
+async fn do_cleanup_connection(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    inner: &NatTraversalEndpoint,
+    reader_handles: &RwLock<HashMap<PeerId, tokio::task::AbortHandle>>,
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: &PeerId,
+    reason: DisconnectReason,
+) -> bool {
+    let removed = connected_peers.write().await.remove(peer_id);
+    let _ = inner.remove_connection(peer_id);
+
+    // Abort the background reader task for this peer
+    if let Some(handle) = reader_handles.write().await.remove(peer_id) {
+        handle.abort();
+    }
+
+    if removed.is_some() {
+        {
+            let mut s = stats.write().await;
+            s.active_connections = s.active_connections.saturating_sub(1);
+        }
+
+        let _ = event_tx.send(P2pEvent::PeerDisconnected {
+            peer_id: *peer_id,
+            reason,
+        });
+
+        info!("Cleaned up connection for peer {:?}", peer_id);
+        true
+    } else {
+        false
+    }
+}
+
 impl P2pEndpoint {
     /// Create a new P2P endpoint with the given configuration
     pub async fn new(config: P2pConfig) -> Result<Self, EndpointError> {
@@ -682,6 +762,10 @@ impl P2pEndpoint {
         // Spawn background constrained poller task
         endpoint.spawn_constrained_poller();
 
+        // Spawn stale connection reaper — periodically detects and removes
+        // dead connections from tracking structures (issue #137 fix).
+        endpoint.spawn_stale_connection_reaper();
+
         Ok(endpoint)
     }
 
@@ -733,9 +817,58 @@ impl P2pEndpoint {
     ///
     /// Uses Raw Public Key authentication - the peer's identity is verified via their
     /// ML-DSA-65 public key, not via SNI/certificates.
+    ///
+    /// If we already have a live connection to the target address, returns the
+    /// existing connection instead of creating a duplicate. After handshake, if
+    /// we discover a simultaneous open (both sides connected at the same time),
+    /// a deterministic tiebreaker ensures both sides keep the same connection.
     pub async fn connect(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
+        }
+
+        // Dedup check: if we already have a live connection to this address, return it.
+        // This prevents creating duplicate connections when connect_addr() is called
+        // multiple times to the same target (e.g. during reconnect loops).
+        {
+            let peers = self.connected_peers.read().await;
+            for (_, existing) in peers.iter() {
+                if existing.remote_addr == TransportAddr::Udp(addr) {
+                    // Verify the underlying QUIC connection is still alive
+                    if let Some(peer_id) = peers
+                        .iter()
+                        .find(|(_, p)| p.remote_addr == TransportAddr::Udp(addr))
+                        .map(|(id, _)| *id)
+                    {
+                        if self.inner.is_peer_connected(&peer_id) {
+                            info!(
+                                "connect: reusing existing live connection to {} (peer {:?})",
+                                addr, peer_id
+                            );
+                            return Ok(existing.clone());
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // If a dead connection was found, is_peer_connected() already cleaned it up.
+        // Remove stale entry from connected_peers too.
+        {
+            let mut peers = self.connected_peers.write().await;
+            let stale_peer_ids: Vec<PeerId> = peers
+                .iter()
+                .filter(|(_, p)| p.remote_addr == TransportAddr::Udp(addr))
+                .filter(|(id, _)| !self.inner.is_peer_connected(id))
+                .map(|(id, _)| *id)
+                .collect();
+            for stale_id in &stale_peer_ids {
+                peers.remove(stale_id);
+                info!(
+                    "connect: removed stale connection entry for peer {:?} at {}",
+                    stale_id, addr
+                );
+            }
         }
 
         info!("Connecting directly to {}", addr);
@@ -749,9 +882,28 @@ impl P2pEndpoint {
             .connect(addr, "peer")
             .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
-        let connection = connecting
-            .await
-            .map_err(|e| EndpointError::Connection(e.to_string()))?;
+        // Enforce a hard timeout on the QUIC handshake to prevent the 76s hang
+        // reported in issue #137. The connection_timeout config or 30s default
+        // ensures callers always get a response within a bounded window.
+        let handshake_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+        let connection = match timeout(handshake_timeout, connecting).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                info!("connect: handshake to {} failed: {}", addr, e);
+                return Err(EndpointError::Connection(e.to_string()));
+            }
+            Err(_) => {
+                info!(
+                    "connect: handshake to {} timed out after {:?}",
+                    addr, handshake_timeout
+                );
+                return Err(EndpointError::Timeout);
+            }
+        };
 
         // Prefer peer ID derived from the authenticated public key.
         let peer_id = self
@@ -759,6 +911,51 @@ impl P2pEndpoint {
             .extract_peer_id_from_connection(&connection)
             .await
             .unwrap_or_else(|| peer_id_from_socket_addr(addr));
+
+        // Post-handshake dedup: check if a connection to this PeerId already exists
+        // (e.g. from a simultaneous open where the peer's accept() path already added one).
+        if self.inner.is_peer_connected(&peer_id) {
+            // Simultaneous open detected — both sides connected at the same time.
+            // Use deterministic tiebreaker: the node with the LOWER PeerId keeps
+            // its Client (outgoing) connection. This ensures both sides independently
+            // agree on which connection to keep without any coordination.
+            let local_id = self.inner.local_peer_id();
+            let we_keep_client = local_id < peer_id;
+            if !we_keep_client {
+                // We have the higher PeerId: close our outgoing connection,
+                // keep the existing one (which came from accept path = Server side).
+                info!(
+                    "connect: simultaneous open for peer {:?} — our PeerId is higher, \
+                     closing outgoing connection (keeping incoming)",
+                    peer_id
+                );
+                connection.close(0u32.into(), b"duplicate");
+                // Wait briefly for the accept path to populate connected_peers
+                for _ in 0..10 {
+                    let peers = self.connected_peers.read().await;
+                    if let Some(existing) = peers.get(&peer_id) {
+                        return Ok(existing.clone());
+                    }
+                    drop(peers);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // Accept path never stored the connection — return error so caller
+                // can retry, rather than storing the closed connection as a phantom.
+                return Err(EndpointError::Connection(
+                    "simultaneous open: peer connection not yet available, retry".into(),
+                ));
+            } else {
+                // We have the lower PeerId: keep our outgoing connection,
+                // the existing one from accept path will be closed.
+                info!(
+                    "connect: simultaneous open for peer {:?} — our PeerId is lower, \
+                     keeping outgoing connection (replacing incoming)",
+                    peer_id
+                );
+                // Remove the old connection so we can replace it with ours
+                let _ = self.inner.remove_connection(&peer_id);
+            }
+        }
 
         // Store connection
         self.inner
@@ -778,6 +975,8 @@ impl P2pEndpoint {
             authenticated: true, // TLS handles authentication
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
 
         // Spawn background reader task BEFORE storing peer in connected_peers
@@ -877,6 +1076,8 @@ impl P2pEndpoint {
                     authenticated: false, // Constrained connections don't have TLS auth yet
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
+                    last_health_ping_sent: None,
+                    last_health_pong_received: None,
                 };
 
                 // Store peer
@@ -1260,6 +1461,8 @@ impl P2pEndpoint {
                             authenticated: true, // TLS handles authentication
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
+                            last_health_ping_sent: None,
+                            last_health_pong_received: None,
                         };
 
                         // Spawn background reader task BEFORE storing in connected_peers
@@ -1356,7 +1559,7 @@ impl P2pEndpoint {
                 .first()
                 .and_then(|addr| addr.as_socket_addr());
         }
-        if config.relay_addr.is_none() {
+        if config.relay_addrs.is_empty() {
             // Optimization: Try to find a high-quality relay from our cache first
             let target_addr = target_ipv4.or(target_ipv6);
             if let Some(addr) = target_addr {
@@ -1370,17 +1573,21 @@ impl P2pEndpoint {
                     // Use the first address of the best relay
                     // In a perfect world we'd check reachability of this address too,
                     // but for now we assume cached addresses are valid candidates.
-                    config.relay_addr = best_relay.addresses.first().copied();
-                    debug!(
-                        "Selected optimized relay from cache: {:?} for target {}",
-                        config.relay_addr, addr
-                    );
+                    if let Some(relay_addr) = best_relay.addresses.first().copied() {
+                        config.relay_addrs.push(relay_addr);
+                        debug!(
+                            "Selected optimized relay from cache: {:?} for target {}",
+                            relay_addr, addr
+                        );
+                    }
                 }
             }
 
             // Fallback to static config if cache gave nothing
-            if config.relay_addr.is_none() {
-                config.relay_addr = self.config.nat.relay_nodes.first().copied();
+            if config.relay_addrs.is_empty() {
+                if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
+                    config.relay_addrs.push(relay_addr);
+                }
             }
         }
 
@@ -1391,52 +1598,103 @@ impl P2pEndpoint {
             target_ipv4, target_ipv6, peer_id
         );
 
+        // Collect direct addresses for Happy Eyeballs racing (RFC 8305)
+        let mut direct_addresses: Vec<SocketAddr> = Vec::new();
+        if let Some(v6) = target_ipv6 {
+            direct_addresses.push(v6);
+        }
+        if let Some(v4) = target_ipv4 {
+            direct_addresses.push(v4);
+        }
+
         loop {
             match strategy.current_stage().clone() {
                 ConnectionStage::DirectIPv4 { .. } => {
-                    if let Some(addr) = target_ipv4 {
-                        info!("Trying direct IPv4 connection to {}", addr);
-                        match timeout(strategy.ipv4_timeout(), self.connect(addr)).await {
-                            Ok(Ok(conn)) => {
-                                info!("✓ Direct IPv4 connection succeeded to {}", addr);
-                                return Ok((conn, ConnectionMethod::DirectIPv4));
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Direct IPv4 failed: {}", e);
-                                strategy.transition_to_ipv6(e.to_string());
-                            }
-                            Err(_) => {
-                                debug!("Direct IPv4 timed out");
-                                strategy.transition_to_ipv6("Timeout");
-                            }
+                    // Use Happy Eyeballs (RFC 8305) to race all direct addresses (IPv4 + IPv6)
+                    // instead of trying them sequentially. This prevents stalls when one address
+                    // family is broken by racing with a 250ms stagger.
+                    if direct_addresses.is_empty() {
+                        debug!("No direct addresses provided, skipping to hole-punch");
+                        strategy.transition_to_ipv6("No direct addresses");
+                        continue;
+                    }
+
+                    let he_config = HappyEyeballsConfig::default();
+                    let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+
+                    info!(
+                        "Happy Eyeballs: racing {} direct addresses (timeout: {:?})",
+                        direct_addresses.len(),
+                        direct_timeout
+                    );
+
+                    // Clone the QUIC endpoint for use in the Happy Eyeballs closure.
+                    // Each spawned attempt needs its own reference to create connections.
+                    let quic_endpoint = match self.inner.get_endpoint().cloned() {
+                        Some(ep) => ep,
+                        None => {
+                            debug!("QUIC endpoint not available, skipping direct");
+                            strategy.transition_to_ipv6("QUIC endpoint not available");
+                            strategy.transition_to_holepunch("QUIC endpoint not available");
+                            continue;
                         }
-                    } else {
-                        debug!("No IPv4 address provided, skipping");
-                        strategy.transition_to_ipv6("No IPv4 address");
+                    };
+
+                    let addrs = direct_addresses.clone();
+                    let he_result = timeout(direct_timeout, async {
+                        happy_eyeballs::race_connect(&addrs, &he_config, |addr| {
+                            let ep = quic_endpoint.clone();
+                            async move {
+                                let connecting = ep
+                                    .connect(addr, "peer")
+                                    .map_err(|e| format!("connect error: {e}"))?;
+                                connecting
+                                    .await
+                                    .map_err(|e| format!("handshake error: {e}"))
+                            }
+                        })
+                        .await
+                    })
+                    .await;
+
+                    match he_result {
+                        Ok(Ok((connection, winning_addr))) => {
+                            let method = if winning_addr.is_ipv6() {
+                                ConnectionMethod::DirectIPv6
+                            } else {
+                                ConnectionMethod::DirectIPv4
+                            };
+                            info!(
+                                "Happy Eyeballs: {} connection to {} succeeded",
+                                method, winning_addr
+                            );
+
+                            // Complete the connection setup (peer ID, handlers, stats)
+                            let peer_conn = self
+                                .finalize_direct_connection(connection, winning_addr, peer_id)
+                                .await?;
+                            return Ok((peer_conn, method));
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Happy Eyeballs: all direct attempts failed: {}", e);
+                            strategy.transition_to_ipv6(e.to_string());
+                            strategy.transition_to_holepunch("Happy Eyeballs exhausted");
+                        }
+                        Err(_) => {
+                            debug!("Happy Eyeballs: direct connection timed out");
+                            strategy.transition_to_ipv6("Timeout");
+                            strategy.transition_to_holepunch("Happy Eyeballs timed out");
+                        }
                     }
                 }
 
                 ConnectionStage::DirectIPv6 { .. } => {
-                    if let Some(addr) = target_ipv6 {
-                        info!("Trying direct IPv6 connection to {}", addr);
-                        match timeout(strategy.ipv6_timeout(), self.connect(addr)).await {
-                            Ok(Ok(conn)) => {
-                                info!("✓ Direct IPv6 connection succeeded to {}", addr);
-                                return Ok((conn, ConnectionMethod::DirectIPv6));
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Direct IPv6 failed: {}", e);
-                                strategy.transition_to_holepunch(e.to_string());
-                            }
-                            Err(_) => {
-                                debug!("Direct IPv6 timed out");
-                                strategy.transition_to_holepunch("Timeout");
-                            }
-                        }
-                    } else {
-                        debug!("No IPv6 address provided, skipping");
-                        strategy.transition_to_holepunch("No IPv6 address");
-                    }
+                    // Happy Eyeballs already handled both IPv4 and IPv6 in the DirectIPv4 stage.
+                    // If we reach here, it means Happy Eyeballs failed and we need to move on.
+                    debug!(
+                        "DirectIPv6 stage reached after Happy Eyeballs, advancing to hole-punch"
+                    );
+                    strategy.transition_to_holepunch("Handled by Happy Eyeballs");
                 }
 
                 ConnectionStage::HolePunching {
@@ -1537,6 +1795,107 @@ impl P2pEndpoint {
         }
     }
 
+    /// Finalize a direct QUIC connection established by Happy Eyeballs.
+    ///
+    /// Takes the raw QUIC `Connection` from the successful handshake and completes
+    /// the P2P connection setup: peer ID extraction, connection storage, handler
+    /// spawning, stats update, and event broadcast.
+    async fn finalize_direct_connection(
+        &self,
+        connection: crate::high_level::Connection,
+        addr: SocketAddr,
+        hint_peer_id: Option<PeerId>,
+    ) -> Result<PeerConnection, EndpointError> {
+        // Extract authenticated peer ID from TLS, or derive from address/hint
+        let peer_id = self
+            .inner
+            .extract_peer_id_from_connection(&connection)
+            .await
+            .or(hint_peer_id)
+            .unwrap_or_else(|| peer_id_from_socket_addr(addr));
+
+        // Dedup check: if already connected to this peer, use tiebreaker
+        if self.inner.is_peer_connected(&peer_id) {
+            let local_id = self.inner.local_peer_id();
+            let we_keep_client = local_id < peer_id;
+            if !we_keep_client {
+                // We have the higher PeerId: close this outgoing connection,
+                // keep the existing one (from accept path).
+                info!(
+                    "finalize_direct_connection: simultaneous open for peer {:?} — \
+                     our PeerId is higher, closing outgoing (keeping incoming)",
+                    peer_id
+                );
+                connection.close(0u32.into(), b"duplicate");
+                // Wait briefly for the accept path to populate connected_peers
+                for _ in 0..10 {
+                    let peers = self.connected_peers.read().await;
+                    if let Some(existing) = peers.get(&peer_id) {
+                        return Ok(existing.clone());
+                    }
+                    drop(peers);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                return Err(EndpointError::Connection(
+                    "simultaneous open: peer connection not yet available, retry".into(),
+                ));
+            }
+            // We have the lower PeerId: keep our outgoing connection,
+            // remove the old one from accept path.
+            info!(
+                "finalize_direct_connection: simultaneous open for peer {:?} — \
+                 our PeerId is lower, keeping outgoing (replacing incoming)",
+                peer_id
+            );
+            let _ = self.inner.remove_connection(&peer_id);
+        }
+
+        // Store in NAT traversal layer
+        self.inner
+            .add_connection(peer_id, connection.clone())
+            .map_err(EndpointError::NatTraversal)?;
+
+        // Spawn connection handler (Client side - we initiated)
+        self.inner
+            .spawn_connection_handler(peer_id, connection, Side::Client)
+            .map_err(EndpointError::NatTraversal)?;
+
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp(addr),
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
+        };
+
+        // Spawn reader task before storing peer to prevent data loss race
+        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
+            self.spawn_reader_task(peer_id, conn).await;
+        }
+
+        self.connected_peers
+            .write()
+            .await
+            .insert(peer_id, peer_conn.clone());
+
+        {
+            let mut stats = self.stats.write().await;
+            stats.active_connections += 1;
+            stats.successful_connections += 1;
+            stats.direct_connections += 1;
+        }
+
+        let _ = self.event_tx.send(P2pEvent::PeerConnected {
+            peer_id,
+            addr: TransportAddr::Udp(addr),
+            side: Side::Client,
+        });
+
+        Ok(peer_conn)
+    }
+
     /// Internal helper for hole-punch attempt
     async fn try_hole_punch(
         &self,
@@ -1581,6 +1940,8 @@ impl P2pEndpoint {
                             authenticated: true,
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
+                            last_health_ping_sent: None,
+                            last_health_pong_received: None,
                         };
 
                         // Spawn background reader task BEFORE storing in connected_peers
@@ -1692,6 +2053,38 @@ impl P2pEndpoint {
                     }
                 }
 
+                // Dedup check: if we already have a live connection to this peer
+                // (e.g. from a simultaneous open where our connect() path already
+                // established one), use the deterministic tiebreaker.
+                // Rule: node with LOWER PeerId keeps its Client (outgoing) connection.
+                if self.inner.is_peer_connected(&resolved_peer_id) {
+                    let local_id = self.inner.local_peer_id();
+                    let we_keep_client = local_id < resolved_peer_id;
+                    if we_keep_client {
+                        // We have the lower PeerId: keep our outgoing (Client) connection,
+                        // close this incoming (Server) one.
+                        let peers = self.connected_peers.read().await;
+                        if let Some(existing) = peers.get(&resolved_peer_id) {
+                            info!(
+                                "accept: simultaneous open for peer {:?} — our PeerId is lower, \
+                                 closing incoming connection (keeping outgoing)",
+                                resolved_peer_id
+                            );
+                            connection.close(0u32.into(), b"duplicate");
+                            return Some(existing.clone());
+                        }
+                    } else {
+                        // We have the higher PeerId: keep this incoming (Server) connection,
+                        // replace the outgoing (Client) one.
+                        info!(
+                            "accept: simultaneous open for peer {:?} — our PeerId is higher, \
+                             keeping incoming connection (replacing outgoing)",
+                            resolved_peer_id
+                        );
+                        let _ = self.inner.remove_connection(&resolved_peer_id);
+                    }
+                }
+
                 // They initiated the connection to us = Server side
                 if let Err(e) =
                     self.inner
@@ -1708,6 +2101,8 @@ impl P2pEndpoint {
                     authenticated: true, // TLS handles authentication
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
+                    last_health_ping_sent: None,
+                    last_health_pong_received: None,
                 };
 
                 // Spawn background reader task BEFORE storing in connected_peers
@@ -1743,33 +2138,58 @@ impl P2pEndpoint {
         }
     }
 
+    /// Clean up a connection from ALL tracking structures.
+    ///
+    /// This is the single point of cleanup for connections — it removes the peer from:
+    /// - `connected_peers` HashMap
+    /// - `NatTraversalEndpoint.connections` DashMap (via `remove_connection()`)
+    /// - `reader_handles` (aborts the background reader task)
+    /// - Updates stats and emits a disconnect event
+    ///
+    /// Safe to call even if the peer is not in all structures (idempotent).
+    async fn cleanup_connection(&self, peer_id: &PeerId, reason: DisconnectReason) {
+        do_cleanup_connection(
+            &*self.connected_peers,
+            &*self.inner,
+            &*self.reader_handles,
+            &*self.stats,
+            &self.event_tx,
+            peer_id,
+            reason,
+        )
+        .await;
+    }
+
     /// Disconnect from a peer
     pub async fn disconnect(&self, peer_id: &PeerId) -> Result<(), EndpointError> {
-        if let Some(peer_conn) = self.connected_peers.write().await.remove(peer_id) {
-            let _ = self.inner.remove_connection(peer_id);
-
-            // Abort the background reader task for this peer
-            if let Some(handle) = self.reader_handles.write().await.remove(peer_id) {
-                handle.abort();
-            }
-
-            {
-                let mut stats = self.stats.write().await;
-                stats.active_connections = stats.active_connections.saturating_sub(1);
-            }
-
-            let _ = self.event_tx.send(P2pEvent::PeerDisconnected {
-                peer_id: *peer_id,
-                reason: DisconnectReason::Normal,
-            });
-
-            info!(
-                "Disconnected from peer {:?} at {}",
-                peer_id, peer_conn.remote_addr
-            );
+        if self.connected_peers.read().await.contains_key(peer_id) {
+            self.cleanup_connection(peer_id, DisconnectReason::Normal)
+                .await;
             Ok(())
         } else {
             Err(EndpointError::PeerNotFound(*peer_id))
+        }
+    }
+
+    /// Query the health status of a connection to a specific peer.
+    ///
+    /// Returns `None` if the peer is not connected.
+    pub async fn connection_health(&self, peer_id: &PeerId) -> Option<ConnectionHealth> {
+        let peers = self.connected_peers.read().await;
+        let pc = peers.get(peer_id)?;
+
+        // Not yet probed — treat as healthy (just connected)
+        let Some(ping_sent) = pc.last_health_ping_sent else {
+            return Some(ConnectionHealth::Healthy);
+        };
+
+        let pong_time = pc.last_health_pong_received.unwrap_or(pc.connected_at);
+        if pong_time >= ping_sent {
+            Some(ConnectionHealth::Healthy)
+        } else if Instant::now().duration_since(ping_sent) > HEALTH_CHECK_EVICTION_THRESHOLD {
+            Some(ConnectionHealth::Unresponsive)
+        } else {
+            Some(ConnectionHealth::Checking)
         }
     }
 
@@ -2161,6 +2581,30 @@ impl P2pEndpoint {
                     peer_conn.last_activity = Instant::now();
                 }
 
+                // Health check protocol: only exact PING/PONG messages are internal.
+                // All other messages (including those starting with 0xFF) are forwarded
+                // to the application to avoid silent data loss.
+                if data.len() == 2 && data[0] == HEALTH_CHECK_PREFIX {
+                    if data[1] == HEALTH_PING[1] {
+                        // Received PING — respond with PONG
+                        tracing::trace!("Health PING from peer {:?}, sending PONG", peer_id);
+                        if let Ok(mut send) = connection.open_uni().await {
+                            let _ = send.write_all(&HEALTH_PONG).await;
+                            let _ = send.finish();
+                        }
+                        continue;
+                    } else if data[1] == HEALTH_PONG[1] {
+                        // Received PONG — update health timestamp
+                        tracing::trace!("Health PONG from peer {:?}", peer_id);
+                        if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
+                            peer_conn.last_health_pong_received = Some(Instant::now());
+                        }
+                        continue;
+                    }
+                }
+                // Any other message (including 0xFF-prefixed non-health messages) is
+                // forwarded to the application.
+
                 // Emit DataReceived event
                 let _ = event_tx.send(P2pEvent::DataReceived {
                     peer_id,
@@ -2229,6 +2673,8 @@ impl P2pEndpoint {
                     authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
+                    last_health_ping_sent: None,
+                    last_health_pong_received: None,
                 },
             );
             let _ = event_tx.send(P2pEvent::PeerConnected {
@@ -2358,6 +2804,157 @@ impl P2pEndpoint {
         });
     }
 
+    /// Spawn a background task that periodically detects and removes stale connections
+    /// and probes live connections with health-check PINGs.
+    ///
+    /// Two-tier detection for issue #137 phantom connections:
+    ///
+    /// 1. **QUIC-level:** connections whose underlying transport is dead
+    ///    (`is_peer_connected() == false`) are reaped immediately.
+    /// 2. **App-level:** connections whose QUIC state looks alive but have not
+    ///    responded to a health PING within [`HEALTH_CHECK_EVICTION_THRESHOLD`]
+    ///    are considered phantom and evicted.
+    ///
+    /// Runs every 30 seconds until the endpoint shuts down.
+    fn spawn_stale_connection_reaper(&self) {
+        let connected_peers = Arc::clone(&self.connected_peers);
+        let inner = Arc::clone(&self.inner);
+        let event_tx = self.event_tx.clone();
+        let stats = Arc::clone(&self.stats);
+        let reader_handles = Arc::clone(&self.reader_handles);
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown.cancelled() => {
+                        debug!("Stale connection reaper shutting down");
+                        return;
+                    }
+                }
+
+                // --- Phase A: Remove QUIC-dead connections ---
+
+                let stale_peers: Vec<PeerId> = {
+                    let peers = connected_peers.read().await;
+                    peers
+                        .keys()
+                        .filter(|id| !inner.is_peer_connected(id))
+                        .copied()
+                        .collect()
+                };
+
+                if !stale_peers.is_empty() {
+                    info!(
+                        "Stale connection reaper: removing {} dead connection(s)",
+                        stale_peers.len()
+                    );
+                }
+
+                for peer_id in &stale_peers {
+                    do_cleanup_connection(
+                        &*connected_peers,
+                        &*inner,
+                        &*reader_handles,
+                        &*stats,
+                        &event_tx,
+                        peer_id,
+                        DisconnectReason::Timeout,
+                    )
+                    .await;
+                }
+
+                // --- Phase B: Health-check live connections ---
+
+                // Collect peers that are still alive at the QUIC level for probing.
+                let alive_peers: Vec<PeerId> = {
+                    let peers = connected_peers.read().await;
+                    peers
+                        .keys()
+                        .filter(|id| inner.is_peer_connected(id))
+                        .copied()
+                        .collect()
+                };
+
+                let now = Instant::now();
+
+                for peer_id in &alive_peers {
+                    // Check if this peer has missed too many health checks.
+                    let should_evict = {
+                        let peers = connected_peers.read().await;
+                        if let Some(pc) = peers.get(peer_id) {
+                            // Only evict if we've sent at least one PING and
+                            // haven't received a PONG within the threshold.
+                            if let Some(ping_sent) = pc.last_health_ping_sent {
+                                let pong_time =
+                                    pc.last_health_pong_received.unwrap_or(pc.connected_at);
+                                ping_sent > pong_time
+                                    && now.duration_since(ping_sent)
+                                        > HEALTH_CHECK_EVICTION_THRESHOLD
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_evict {
+                        warn!(
+                            "Health check: peer {:?} unresponsive for {:?}, evicting phantom connection",
+                            peer_id, HEALTH_CHECK_EVICTION_THRESHOLD
+                        );
+                        // Close the QUIC connection to force cleanup on both sides
+                        if let Ok(Some(conn)) = inner.get_connection(peer_id) {
+                            conn.close(0u32.into(), b"health_check_failed");
+                        }
+                        let was_present = do_cleanup_connection(
+                            &*connected_peers,
+                            &*inner,
+                            &*reader_handles,
+                            &*stats,
+                            &event_tx,
+                            peer_id,
+                            DisconnectReason::ConnectionLost,
+                        )
+                        .await;
+                        if was_present {
+                            stats.write().await.phantom_connections_evicted += 1;
+                        }
+                        continue;
+                    }
+
+                    // Send health PING to this peer
+                    if let Ok(Some(conn)) = inner.get_connection(peer_id) {
+                        match conn.open_uni().await {
+                            Ok(mut send) => {
+                                if send.write_all(&HEALTH_PING).await.is_ok() {
+                                    let _ = send.finish();
+                                    // Record PING send time
+                                    if let Some(pc) = connected_peers.write().await.get_mut(peer_id)
+                                    {
+                                        pc.last_health_ping_sent = Some(Instant::now());
+                                    }
+                                    tracing::trace!("Health PING sent to peer {:?}", peer_id);
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Health check: failed to open stream to peer {:?}: {}",
+                                    peer_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // v0.2: authenticate_peer removed - TLS handles peer authentication via ML-DSA-65
 }
 
@@ -2417,6 +3014,8 @@ mod tests {
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
         let debug_str = format!("{:?}", conn);
         assert!(debug_str.contains("PeerConnection"));
@@ -2639,6 +3238,8 @@ mod tests {
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
         assert_eq!(
             udp_conn.remote_addr.as_socket_addr(),
@@ -2657,6 +3258,8 @@ mod tests {
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
         assert!(
             ble_conn.remote_addr.as_socket_addr().is_none(),
@@ -2704,6 +3307,8 @@ mod tests {
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
 
         connections.insert(peer_id, conn.clone());
@@ -2733,6 +3338,8 @@ mod tests {
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
+                last_health_ping_sent: None,
+                last_health_pong_received: None,
             },
         );
 
@@ -2750,6 +3357,8 @@ mod tests {
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
+                last_health_ping_sent: None,
+                last_health_pong_received: None,
             },
         );
 
@@ -2797,6 +3406,8 @@ mod tests {
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
+                    last_health_ping_sent: None,
+                    last_health_pong_received: None,
                 },
             );
         }
@@ -2844,6 +3455,8 @@ mod tests {
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            last_health_ping_sent: None,
+            last_health_pong_received: None,
         };
 
         // Simulate updating the connection (e.g., after authentication)
