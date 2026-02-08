@@ -8,6 +8,7 @@
 //! ant-quic: QUIC transport protocol with advanced NAT traversal for P2P networks
 #![allow(elided_lifetimes_in_paths)]
 #![allow(missing_debug_implementations)]
+#![allow(clippy::manual_is_multiple_of)]
 //!
 //! This library provides a clean, modular implementation of QUIC-native NAT traversal
 //! using raw public keys for authentication. It is designed to be minimal, focused,

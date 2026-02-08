@@ -355,16 +355,16 @@ mod specific_regression_tests {
         match result {
             Ok(endpoint) => {
                 // If we can get the endpoint, verify it has a proper address
-                if let Some(quic_ep) = endpoint.get_endpoint() {
-                    if let Ok(addr) = quic_ep.local_addr() {
-                        assert_ne!(addr.port(), 0, "Should have assigned port");
-                        assert_eq!(
-                            addr.ip().to_string(),
-                            "0.0.0.0",
-                            "Should bind to all interfaces"
-                        );
-                        println!("✓ Random port binding successful: {addr}");
-                    }
+                if let Some(quic_ep) = endpoint.get_endpoint()
+                    && let Ok(addr) = quic_ep.local_addr()
+                {
+                    assert_ne!(addr.port(), 0, "Should have assigned port");
+                    assert_eq!(
+                        addr.ip().to_string(),
+                        "0.0.0.0",
+                        "Should bind to all interfaces"
+                    );
+                    println!("✓ Random port binding successful: {addr}");
                 }
             }
             Err(e) => {

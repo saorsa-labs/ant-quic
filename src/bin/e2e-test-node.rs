@@ -672,11 +672,11 @@ async fn main() -> anyhow::Result<()> {
     info!("Ready. Press Ctrl+C to shutdown.");
 
     while !shutdown.is_cancelled() {
-        if let Some(max_duration) = duration {
-            if start_time.elapsed() > max_duration {
-                info!("Duration limit reached");
-                break;
-            }
+        if let Some(max_duration) = duration
+            && start_time.elapsed() > max_duration
+        {
+            info!("Duration limit reached");
+            break;
         }
 
         match tokio::time::timeout(Duration::from_millis(100), endpoint.accept()).await {
