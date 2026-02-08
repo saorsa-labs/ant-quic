@@ -1,0 +1,6 @@
+# cargo-audit configuration
+# https://docs.rs/cargo-audit/latest/cargo_audit/
+
+[advisories]
+# Ignored advisories (with justification)
+ignore = []

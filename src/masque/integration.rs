@@ -138,7 +138,21 @@ impl RelayManagerStats {
     }
 }
 
+/// Health status of a relay node
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayHealthStatus {
+    /// No health check performed yet
+    Unknown,
+    /// Relay is responding normally
+    Healthy,
+    /// Relay is responding but with elevated latency
+    Degraded,
+    /// Relay is not responding
+    Unreachable,
+}
+
 /// Information about a relay node
+#[allow(dead_code)] // Fields/methods used in tests, reserved for future health monitoring
 #[derive(Debug)]
 struct RelayNodeInfo {
     /// Relay server address (primary)
@@ -155,6 +169,12 @@ struct RelayNodeInfo {
     failure_count: u32,
     /// Whether the relay is currently usable
     available: bool,
+    /// Exponential moving average latency in milliseconds
+    latency_ms: Option<f64>,
+    /// Last time health was checked
+    last_health_check: Option<Instant>,
+    /// Current health status
+    health_status: RelayHealthStatus,
 }
 
 impl RelayNodeInfo {
@@ -167,6 +187,9 @@ impl RelayNodeInfo {
             last_attempt: None,
             failure_count: 0,
             available: true,
+            latency_ms: None,
+            last_health_check: None,
+            health_status: RelayHealthStatus::Unknown,
         }
     }
 
@@ -180,6 +203,9 @@ impl RelayNodeInfo {
             last_attempt: None,
             failure_count: 0,
             available: true,
+            latency_ms: None,
+            last_health_check: None,
+            health_status: RelayHealthStatus::Unknown,
         }
     }
 
@@ -213,6 +239,43 @@ impl RelayNodeInfo {
             None => true,
         }
     }
+
+    /// Record a successful health check with measured latency
+    #[allow(dead_code)] // Used in tests, reserved for future production health monitoring
+    fn record_health_check(&mut self, latency: Duration) {
+        let latency_ms_val = latency.as_secs_f64() * 1000.0;
+        self.latency_ms = Some(match self.latency_ms {
+            Some(prev) => prev * 0.7 + latency_ms_val * 0.3, // EMA with alpha=0.3
+            None => latency_ms_val,
+        });
+        self.last_health_check = Some(Instant::now());
+        self.health_status = if latency_ms_val < 500.0 {
+            RelayHealthStatus::Healthy
+        } else {
+            RelayHealthStatus::Degraded
+        };
+    }
+
+    /// Record a failed health check
+    #[allow(dead_code)] // Used in tests, reserved for future production health monitoring
+    fn record_health_failure(&mut self) {
+        self.last_health_check = Some(Instant::now());
+        self.health_status = RelayHealthStatus::Unreachable;
+    }
+}
+
+/// Result of preparing a datagram for relay forwarding
+///
+/// Contains the encoded bytes that should be sent over the QUIC connection
+/// to the relay server.
+#[derive(Debug, Clone)]
+pub struct RelayForwardResult {
+    /// Encoded datagram bytes ready for QUIC DATAGRAM frame
+    pub datagram_bytes: Vec<u8>,
+    /// Optional capsule bytes to send first (e.g., COMPRESSION_ASSIGN for new contexts)
+    pub capsule_bytes: Option<Vec<u8>>,
+    /// The relay address this should be sent to
+    pub relay_addr: SocketAddr,
 }
 
 /// Result of a relay operation
@@ -436,20 +499,26 @@ impl RelayManager {
         None
     }
 
-    /// Send datagram through relay
+    /// Prepare a datagram for relay forwarding
+    ///
+    /// Encodes the payload as a MASQUE datagram addressed to the target,
+    /// using the specified relay's context compression when available.
+    ///
+    /// Returns a `RelayForwardResult` containing the encoded bytes ready
+    /// to be sent over the QUIC connection to the relay.
     pub async fn send_via_relay(
         &self,
         relay: SocketAddr,
         target: SocketAddr,
         payload: Bytes,
-    ) -> RelayResult<()> {
+    ) -> RelayResult<RelayForwardResult> {
         let relays = self.relays.read().await;
         let info = relays.get(&relay).ok_or(RelayError::SessionError {
             session_id: None,
             kind: SessionErrorKind::NotFound,
         })?;
 
-        let _client = info.client.as_ref().ok_or(RelayError::SessionError {
+        let client = info.client.as_ref().ok_or(RelayError::SessionError {
             session_id: None,
             kind: SessionErrorKind::InvalidState {
                 current_state: "not connected".into(),
@@ -457,11 +526,11 @@ impl RelayManager {
             },
         })?;
 
-        // Note: In a full implementation, we would:
-        // 1. Get or create context for target
-        // 2. Send COMPRESSION_ASSIGN capsule if needed
-        // 3. Encode datagram with context ID
-        // 4. Send over QUIC datagram
+        // Use the client to create a relay datagram
+        let (datagram, capsule) = client.create_datagram(target, payload.clone()).await?;
+
+        let datagram_bytes = datagram.encode().to_vec();
+        let capsule_bytes = capsule.map(|c| c.encode().to_vec());
 
         self.stats.record_sent(payload.len() as u64);
 
@@ -469,10 +538,15 @@ impl RelayManager {
             relay = %relay,
             target = %target,
             bytes = payload.len(),
-            "Sent datagram via relay"
+            has_capsule = capsule_bytes.is_some(),
+            "Prepared datagram for relay forwarding"
         );
 
-        Ok(())
+        Ok(RelayForwardResult {
+            datagram_bytes,
+            capsule_bytes,
+            relay_addr: relay,
+        })
     }
 
     /// Close all relay connections
@@ -499,6 +573,141 @@ impl RelayManager {
     /// Check if relay fallback is available
     pub async fn has_available_relay(&self) -> bool {
         !self.available_relays().await.is_empty()
+    }
+
+    /// Get relays for a target, sorted by quality (best first)
+    ///
+    /// Selection criteria (in priority order):
+    /// 1. Connected relays before disconnected ones
+    /// 2. Lower latency before higher latency
+    /// 3. Compatible IP version (same version or dual-stack)
+    ///
+    /// Returns empty vec if no suitable relays available.
+    pub async fn best_relay_for_target(&self, target: SocketAddr) -> Vec<SocketAddr> {
+        let relays = self.relays.read().await;
+        let mut candidates: Vec<_> = relays
+            .iter()
+            .filter(|(_, info)| {
+                info.available
+                    && info.can_retry(self.config.retry_delay, self.config.max_retries)
+                    && info.can_bridge_to(&target)
+            })
+            .collect();
+
+        // Sort: connected first, then by latency (lower is better)
+        candidates.sort_by(|(_, a), (_, b)| {
+            let a_connected = a.client.is_some();
+            let b_connected = b.client.is_some();
+
+            // Connected relays first
+            match (a_connected, b_connected) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    // Then by latency (None = infinity)
+                    let a_lat = a.latency_ms.unwrap_or(f64::MAX);
+                    let b_lat = b.latency_ms.unwrap_or(f64::MAX);
+                    a_lat
+                        .partial_cmp(&b_lat)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+            }
+        });
+
+        candidates.into_iter().map(|(addr, _)| *addr).collect()
+    }
+
+    /// Record measured latency for a relay
+    ///
+    /// Updates the relay's health tracking with the measured latency.
+    /// Call this after successful relay operations to improve selection accuracy.
+    pub async fn record_relay_latency(&self, relay: SocketAddr, latency: Duration) {
+        let mut relays = self.relays.write().await;
+        if let Some(info) = relays.get_mut(&relay) {
+            info.record_health_check(latency);
+        }
+    }
+
+    /// Record a relay health check failure
+    ///
+    /// Marks the relay as unreachable in health tracking.
+    pub async fn record_relay_failure(&self, relay: SocketAddr) {
+        let mut relays = self.relays.write().await;
+        if let Some(info) = relays.get_mut(&relay) {
+            info.record_health_failure();
+        }
+    }
+
+    /// Perform a health check on all connected relays
+    ///
+    /// For each connected relay, checks if the client is still connected.
+    /// Relays that have disconnected are marked as failed and their stats updated.
+    ///
+    /// Returns the number of relays that were found to be disconnected.
+    pub async fn health_check_relays(&self) -> usize {
+        let mut disconnected = 0;
+        let mut relays = self.relays.write().await;
+
+        for info in relays.values_mut() {
+            if let Some(ref client) = info.client {
+                let state = client.state().await;
+                if !matches!(state, RelayConnectionState::Connected) {
+                    // Relay has disconnected
+                    info.record_health_failure();
+                    info.mark_failed();
+                    info.client = None;
+                    self.stats.record_disconnect();
+                    disconnected += 1;
+
+                    tracing::warn!(
+                        relay = %info.address,
+                        "Health check: relay disconnected"
+                    );
+                } else {
+                    // Still connected - update health check timestamp
+                    // Use a small latency value as a "still alive" signal
+                    // (real latency measurement would require an RTT probe)
+                    let check_time = Duration::from_millis(1);
+                    info.record_health_check(check_time);
+                }
+            }
+        }
+
+        disconnected
+    }
+
+    /// Spawn a background keepalive task that periodically checks relay health
+    ///
+    /// The task runs at the configured keepalive interval, checking that all
+    /// connected relays are still responsive.
+    ///
+    /// # Arguments
+    /// * `manager` - Arc-wrapped RelayManager
+    /// * `interval` - How often to run health checks
+    ///
+    /// # Returns
+    /// A `JoinHandle` that can be used to cancel the task
+    pub fn spawn_keepalive_task(
+        manager: Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // Skip immediate first tick
+
+            loop {
+                tick.tick().await;
+
+                if !manager.active.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let disconnected = manager.health_check_relays().await;
+                if disconnected > 0 {
+                    tracing::info!(disconnected, "Keepalive: detected disconnected relays");
+                }
+            }
+        })
     }
 }
 
@@ -753,5 +962,210 @@ mod tests {
         let info = RelayNodeInfo::new_dual_stack(relay_addr(1), ipv6_relay_addr(1));
         assert!(info.can_bridge_to(&ipv4_target(1))); // Dual-stack -> IPv4
         assert!(info.can_bridge_to(&ipv6_target(1))); // Dual-stack -> IPv6
+    }
+
+    // ========== RelayHealth Tests ==========
+
+    #[test]
+    fn test_relay_health_initial_state() {
+        let info = RelayNodeInfo::new(relay_addr(1));
+        assert_eq!(info.health_status, RelayHealthStatus::Unknown);
+        assert!(info.latency_ms.is_none());
+        assert!(info.last_health_check.is_none());
+    }
+
+    #[test]
+    fn test_relay_health_check_healthy() {
+        let mut info = RelayNodeInfo::new(relay_addr(1));
+        info.record_health_check(Duration::from_millis(50));
+        assert_eq!(info.health_status, RelayHealthStatus::Healthy);
+        assert!(info.latency_ms.is_some());
+        assert!(info.last_health_check.is_some());
+        // First check should set latency directly (no EMA)
+        let latency = info.latency_ms.unwrap();
+        assert!((latency - 50.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_relay_health_check_degraded() {
+        let mut info = RelayNodeInfo::new(relay_addr(1));
+        info.record_health_check(Duration::from_millis(600));
+        assert_eq!(info.health_status, RelayHealthStatus::Degraded);
+    }
+
+    #[test]
+    fn test_relay_health_check_ema() {
+        let mut info = RelayNodeInfo::new(relay_addr(1));
+        info.record_health_check(Duration::from_millis(100));
+        assert!((info.latency_ms.unwrap() - 100.0).abs() < 1.0);
+
+        // Second check at 200ms: EMA = 100 * 0.7 + 200 * 0.3 = 130
+        info.record_health_check(Duration::from_millis(200));
+        assert!((info.latency_ms.unwrap() - 130.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_relay_health_failure() {
+        let mut info = RelayNodeInfo::new(relay_addr(1));
+        info.record_health_check(Duration::from_millis(50));
+        assert_eq!(info.health_status, RelayHealthStatus::Healthy);
+
+        info.record_health_failure();
+        assert_eq!(info.health_status, RelayHealthStatus::Unreachable);
+        // latency_ms should be preserved from last successful check
+        assert!(info.latency_ms.is_some());
+    }
+
+    // ========== Latency-Based Selection Tests ==========
+
+    #[tokio::test]
+    async fn test_best_relay_for_target_by_latency() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        manager.add_relay_node(relay_addr(1)).await;
+        manager.add_relay_node(relay_addr(2)).await;
+        manager.add_relay_node(relay_addr(3)).await;
+
+        // Set latencies: relay 3 fastest, relay 1 slowest
+        manager
+            .record_relay_latency(relay_addr(1), Duration::from_millis(200))
+            .await;
+        manager
+            .record_relay_latency(relay_addr(2), Duration::from_millis(100))
+            .await;
+        manager
+            .record_relay_latency(relay_addr(3), Duration::from_millis(50))
+            .await;
+
+        let best = manager.best_relay_for_target(ipv4_target(1)).await;
+        assert_eq!(best.len(), 3);
+        assert_eq!(best[0], relay_addr(3)); // lowest latency
+        assert_eq!(best[1], relay_addr(2));
+        assert_eq!(best[2], relay_addr(1)); // highest latency
+    }
+
+    #[tokio::test]
+    async fn test_best_relay_filters_incompatible() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        manager.add_relay_node(relay_addr(1)).await; // IPv4
+        manager.add_relay_node(ipv6_relay_addr(2)).await; // IPv6 only
+
+        let best_v4 = manager.best_relay_for_target(ipv4_target(1)).await;
+        assert_eq!(best_v4.len(), 1);
+        assert_eq!(best_v4[0], relay_addr(1));
+
+        let best_v6 = manager.best_relay_for_target(ipv6_target(1)).await;
+        assert_eq!(best_v6.len(), 1);
+        assert_eq!(best_v6[0], ipv6_relay_addr(2));
+    }
+
+    #[tokio::test]
+    async fn test_best_relay_unknown_latency_last() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        manager.add_relay_node(relay_addr(1)).await;
+        manager.add_relay_node(relay_addr(2)).await;
+
+        // Only set latency for relay 1
+        manager
+            .record_relay_latency(relay_addr(1), Duration::from_millis(100))
+            .await;
+        // relay 2 has no latency data
+
+        let best = manager.best_relay_for_target(ipv4_target(1)).await;
+        assert_eq!(best[0], relay_addr(1)); // Known latency first
+        assert_eq!(best[1], relay_addr(2)); // Unknown latency last
+    }
+
+    #[tokio::test]
+    async fn test_record_relay_failure() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        manager.add_relay_node(relay_addr(1)).await;
+        manager
+            .record_relay_latency(relay_addr(1), Duration::from_millis(50))
+            .await;
+        manager.record_relay_failure(relay_addr(1)).await;
+
+        // Relay should still be in the list (health status doesn't affect availability filter)
+        let available = manager.available_relays().await;
+        assert_eq!(available.len(), 1);
+    }
+
+    // ========== send_via_relay Tests ==========
+
+    #[tokio::test]
+    async fn test_send_via_relay_no_client() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        let relay = relay_addr(1);
+        manager.add_relay_node(relay).await;
+
+        // Should fail because relay has no connected client
+        let result = manager
+            .send_via_relay(relay, ipv4_target(1), Bytes::from_static(b"hello"))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_via_relay_unknown_relay() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        // Should fail because relay doesn't exist
+        let result = manager
+            .send_via_relay(relay_addr(99), ipv4_target(1), Bytes::from_static(b"hello"))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // ========== Keepalive Tests ==========
+
+    #[tokio::test]
+    async fn test_health_check_no_relays() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        let disconnected = manager.health_check_relays().await;
+        assert_eq!(disconnected, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_available_relay_no_client() {
+        let config = RelayManagerConfig::default();
+        let manager = RelayManager::new(config);
+
+        manager.add_relay_node(relay_addr(1)).await;
+
+        // No client connected, so nothing to check
+        let disconnected = manager.health_check_relays().await;
+        assert_eq!(disconnected, 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_keepalive_task() {
+        let config = RelayManagerConfig::default();
+        let manager = Arc::new(RelayManager::new(config));
+
+        let handle =
+            RelayManager::spawn_keepalive_task(Arc::clone(&manager), Duration::from_millis(50));
+
+        // Let it run for a bit
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Should still be running
+        assert!(!handle.is_finished());
+
+        // Deactivate and wait for it to stop
+        manager.close_all().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(handle.is_finished());
     }
 }

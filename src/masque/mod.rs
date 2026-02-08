@@ -111,7 +111,9 @@ pub use connect::{
 };
 pub use context::{ContextError, ContextInfo, ContextManager, ContextState};
 pub use datagram::{CompressedDatagram, Datagram, UncompressedDatagram};
-pub use integration::{RelayManager, RelayManagerConfig, RelayManagerStats, RelayOperationResult};
+pub use integration::{
+    RelayHealthStatus, RelayManager, RelayManagerConfig, RelayManagerStats, RelayOperationResult,
+};
 pub use migration::{MigrationConfig, MigrationCoordinator, MigrationState, MigrationStats};
 pub use relay_client::{
     MasqueRelayClient, RelayClientConfig, RelayClientStats, RelayConnectionState,

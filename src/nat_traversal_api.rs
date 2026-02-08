@@ -3448,6 +3448,24 @@ impl NatTraversalEndpoint {
         &self.incoming_notify
     }
 
+    /// Check if we have a live connection to the given peer.
+    ///
+    /// If the connection exists but is dead (closed/draining), removes it
+    /// from the connection table and returns `false`. This enables automatic
+    /// cleanup of phantom connections during deduplication checks.
+    pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+        if let Some(conn) = self.connections.get(peer_id) {
+            if conn.is_alive() {
+                return true;
+            }
+            // Connection is dead — drop the DashMap ref before removing
+            drop(conn);
+            // Clean up dead connection
+            let _ = self.remove_connection(peer_id);
+        }
+        false
+    }
+
     /// Get an active connection by peer ID
     pub fn get_connection(
         &self,

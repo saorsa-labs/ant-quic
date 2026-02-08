@@ -376,7 +376,7 @@ See [docs/review.md](docs/review.md) for detailed RFC compliance analysis.
 
 ## System Requirements
 
-- **Rust**: 1.85.0+ (Edition 2024)
+- **Rust**: 1.88.0+ (Edition 2024)
 - **OS**: Linux 3.10+, Windows 10+, macOS 10.15+
 - **Memory**: 64MB minimum, 256MB recommended
 - **Network**: UDP traffic on chosen port

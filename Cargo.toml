@@ -8,7 +8,7 @@ members = [
 name = "ant-quic"
 version = "0.21.5"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
 autobins = false
 repository = "https://github.com/dirvine/ant-quic"
@@ -122,7 +122,7 @@ rcgen = { version = "0.14" }
 tokio-util = { version = "0.7" }
 futures-util = { version = "0.3" }
 
-time = { version = "0.3" }
+time = { version = "0.3.47" }
 rustls-pemfile = { version = "2.0" }
 
 # Feature-specific dependencies (optional)
@@ -278,7 +278,6 @@ path = "tests/standard/main.rs"
 [[test]]
 name = "long"
 path = "tests/long/main.rs"
-harness = false  # Custom test runner for long tests
 
 [[test]]
 name = "property_tests"

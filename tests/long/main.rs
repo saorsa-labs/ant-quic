@@ -1,5 +1,7 @@
 //! Long-running test suite for ant-quic
 //! These tests take > 5 minutes and include stress, performance, and comprehensive tests
+//!
+//! Run with: `cargo nextest run --test long -- --ignored`
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -8,9 +10,10 @@ use std::time::Duration;
 pub mod utils {
     use super::*;
 
-    pub const LONG_TEST_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
+    /// Timeout for long-running tests (30 minutes)
+    pub const LONG_TEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
-    // Add common test utilities here
+    /// Set up test logging with debug level for ant-quic
     pub fn setup_test_logger() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("ant_quic=debug,warn")
@@ -22,15 +25,3 @@ pub mod utils {
 pub mod nat_comprehensive_tests;
 pub mod performance_tests;
 pub mod stress_tests;
-
-// Custom test runner for long tests
-fn main() {
-    println!("Running long tests...");
-
-    // Set up logging
-    utils::setup_test_logger();
-
-    // Run test suites
-    println!("Note: Long tests are typically run with --ignored flag");
-    println!("Use: cargo test --test long -- --ignored");
-}

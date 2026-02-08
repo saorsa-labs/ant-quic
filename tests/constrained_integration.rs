@@ -759,6 +759,8 @@ fn test_peer_connection_transport_addr() {
         authenticated: true,
         connected_at: Instant::now(),
         last_activity: Instant::now(),
+        last_health_ping_sent: None,
+        last_health_pong_received: None,
     };
     assert_eq!(peer_conn_udp.remote_addr, udp_addr);
     assert_eq!(
@@ -777,6 +779,8 @@ fn test_peer_connection_transport_addr() {
         authenticated: false,
         connected_at: Instant::now(),
         last_activity: Instant::now(),
+        last_health_ping_sent: None,
+        last_health_pong_received: None,
     };
     assert_eq!(peer_conn_ble.remote_addr, ble_addr);
     assert_eq!(

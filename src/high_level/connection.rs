@@ -463,6 +463,15 @@ impl Connection {
             .clone()
     }
 
+    /// Check if this connection is still alive (not closed or draining).
+    ///
+    /// Returns `true` if the connection has not been closed for any reason.
+    /// This is useful for detecting phantom or stale connections that should
+    /// be cleaned up before attempting deduplication.
+    pub fn is_alive(&self) -> bool {
+        self.0.state.lock("is_alive").error.is_none()
+    }
+
     /// If the connection is closed, the reason why.
     ///
     /// Returns `None` if the connection is still open.

@@ -8,6 +8,7 @@
 //! ant-quic: QUIC transport protocol with advanced NAT traversal for P2P networks
 #![allow(elided_lifetimes_in_paths)]
 #![allow(missing_debug_implementations)]
+#![allow(clippy::manual_is_multiple_of)]
 //!
 //! This library provides a clean, modular implementation of QUIC-native NAT traversal
 //! using raw public keys for authentication. It is designed to be minimal, focused,
@@ -136,6 +137,9 @@ pub mod transport_resilience;
 
 /// Connection strategy state machine for progressive NAT traversal fallback
 pub mod connection_strategy;
+
+/// RFC 8305 Happy Eyeballs v2 for parallel IPv4/IPv6 connection racing
+pub mod happy_eyeballs;
 
 /// Discovery trait for stream composition
 pub mod discovery_trait;
@@ -344,8 +348,8 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent, Traver
 
 /// P2P endpoint - for advanced use, prefer Node for most applications
 pub use p2p_endpoint::{
-    ConnectionMetrics, DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent,
-    PeerConnection, TraversalPhase,
+    ConnectionHealth, ConnectionMetrics, DisconnectReason, EndpointError, EndpointStats,
+    P2pEndpoint, P2pEvent, PeerConnection, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern
