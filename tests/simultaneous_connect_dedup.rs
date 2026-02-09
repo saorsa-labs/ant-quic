@@ -725,16 +725,12 @@ async fn test_simultaneous_connect_send_succeeds() {
         node_a
             .send(&conn_a.peer_id, payload.as_bytes())
             .await
-            .unwrap_or_else(|e| {
-                panic!("Iteration {}: A→B send failed: {}", iteration, e)
-            });
+            .unwrap_or_else(|e| panic!("Iteration {}: A→B send failed: {}", iteration, e));
 
         node_b
             .send(&conn_b.peer_id, payload.as_bytes())
             .await
-            .unwrap_or_else(|e| {
-                panic!("Iteration {}: B→A send failed: {}", iteration, e)
-            });
+            .unwrap_or_else(|e| panic!("Iteration {}: B→A send failed: {}", iteration, e));
 
         node_a.shutdown().await;
         node_b.shutdown().await;
