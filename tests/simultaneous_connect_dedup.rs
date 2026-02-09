@@ -650,3 +650,91 @@ async fn test_rapid_connect_disconnect_cycles() {
     node_a.shutdown().await;
     node_b.shutdown().await;
 }
+
+// ============================================================================
+// Phase 2: Data Transfer After Simultaneous Open
+// ============================================================================
+
+/// Verify that `send()` succeeds in both directions after a simultaneous open.
+///
+/// Regression test for the connection-loss bug fixed in aa55a3c1.  Before
+/// the fix, the accept-side dedup logic called `remove_connection()` without
+/// re-adding the incoming connection to the NatTraversalEndpoint DashMap.
+/// This left `connected_peers` populated but `send()` failing with
+/// `EndpointError::PeerNotFound` because the underlying QUIC connection
+/// was missing from storage.
+///
+/// The test runs 5 iterations because the simultaneous-open race is
+/// non-deterministic — some runs hit the dedup path, others don't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_simultaneous_connect_send_succeeds() {
+    for iteration in 0..5 {
+        let node_a = create_localhost_node().await;
+        let node_b = create_localhost_node().await;
+
+        let addr_a = node_a.local_addr().expect("node_a addr");
+        let addr_b = node_b.local_addr().expect("node_b addr");
+
+        // Spawn accept loops so incoming connections are processed.
+        let accept_a = tokio::spawn({
+            let n = node_a.clone();
+            async move {
+                for _ in 0..3 {
+                    match timeout(Duration::from_secs(5), n.accept()).await {
+                        Ok(Some(_)) => {}
+                        _ => break,
+                    }
+                }
+            }
+        });
+        let accept_b = tokio::spawn({
+            let n = node_b.clone();
+            async move {
+                for _ in 0..3 {
+                    match timeout(Duration::from_secs(5), n.accept()).await {
+                        Ok(Some(_)) => {}
+                        _ => break,
+                    }
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Simultaneously connect A→B and B→A.
+        let (r_a, r_b) = tokio::join!(
+            timeout(Duration::from_secs(10), node_a.connect_addr(addr_b)),
+            timeout(Duration::from_secs(10), node_b.connect_addr(addr_a)),
+        );
+
+        let conn_a = r_a
+            .unwrap_or_else(|_| panic!("Iteration {}: A→B timed out", iteration))
+            .unwrap_or_else(|e| panic!("Iteration {}: A→B failed: {}", iteration, e));
+        let conn_b = r_b
+            .unwrap_or_else(|_| panic!("Iteration {}: B→A timed out", iteration))
+            .unwrap_or_else(|e| panic!("Iteration {}: B→A failed: {}", iteration, e));
+
+        // Let connections stabilise after the dedup.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The actual regression: send() must not return PeerNotFound.
+        // Before the fix this failed because the DashMap entry was removed
+        // during dedup but never re-added.
+        let payload = format!("iteration {}", iteration);
+
+        node_a
+            .send(&conn_a.peer_id, payload.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("Iteration {}: A→B send failed: {}", iteration, e));
+
+        node_b
+            .send(&conn_b.peer_id, payload.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("Iteration {}: B→A send failed: {}", iteration, e));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        let _ = accept_a.await;
+        let _ = accept_b.await;
+    }
+}
