@@ -912,49 +912,18 @@ impl P2pEndpoint {
             .await
             .unwrap_or_else(|| peer_id_from_socket_addr(addr));
 
-        // Post-handshake dedup: check if a connection to this PeerId already exists
-        // (e.g. from a simultaneous open where the peer's accept() path already added one).
+        // Post-handshake dedup: if we already have a live connection to this
+        // peer (e.g. from a simultaneous open), just overwrite it with the new
+        // outgoing connection.  The accept() path does the same — both sides
+        // converge on the most recent healthy connection.  Previous attempts
+        // at deterministic tiebreaking (close one side, keep the other) caused
+        // cascading race conditions: retry storms, infinite accept loops, and
+        // "closed by peer: duplicate" errors.
         if self.inner.is_peer_connected(&peer_id) {
-            // Simultaneous open detected — both sides connected at the same time.
-            // Use deterministic tiebreaker: the node with the LOWER PeerId keeps
-            // its Client (outgoing) connection. This ensures both sides independently
-            // agree on which connection to keep without any coordination.
-            let local_id = self.inner.local_peer_id();
-            let we_keep_client = local_id < peer_id;
-            if !we_keep_client {
-                // We have the higher PeerId: close our outgoing connection,
-                // keep the existing one (which came from accept path = Server side).
-                info!(
-                    "connect: simultaneous open for peer {:?} — our PeerId is higher, \
-                     closing outgoing connection (keeping incoming)",
-                    peer_id
-                );
-                connection.close(0u32.into(), b"duplicate");
-                // Wait briefly for the accept path to populate connected_peers
-                for _ in 0..10 {
-                    let peers = self.connected_peers.read().await;
-                    if let Some(existing) = peers.get(&peer_id) {
-                        return Ok(existing.clone());
-                    }
-                    drop(peers);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                // Accept path never stored the connection — return error so caller
-                // can retry, rather than storing the closed connection as a phantom.
-                return Err(EndpointError::Connection(
-                    "simultaneous open: peer connection not yet available, retry".into(),
-                ));
-            } else {
-                // We have the lower PeerId: keep our outgoing connection,
-                // the existing one from accept path will be closed.
-                info!(
-                    "connect: simultaneous open for peer {:?} — our PeerId is lower, \
-                     keeping outgoing connection (replacing incoming)",
-                    peer_id
-                );
-                // Remove the old connection so we can replace it with ours
-                let _ = self.inner.remove_connection(&peer_id);
-            }
+            debug!(
+                "connect: simultaneous open for peer {:?} — overwriting existing connection",
+                peer_id
+            );
         }
 
         // Store connection
@@ -2053,36 +2022,21 @@ impl P2pEndpoint {
                     }
                 }
 
-                // Dedup check: if we already have a live connection to this peer
-                // (e.g. from a simultaneous open where our connect() path already
-                // established one), use the deterministic tiebreaker.
-                // Rule: node with LOWER PeerId keeps its Client (outgoing) connection.
+                // Simultaneous open: if there's already a live connection to
+                // this peer (e.g. from our connect() path), simply overwrite it
+                // with the incoming one.  The connect() path has its own dedup
+                // logic, and both sides independently converge — the most recent
+                // healthy connection wins.  Previous attempts to close one side
+                // or the other caused cascading race conditions (retry storms,
+                // infinite accept loops, "closed by peer: duplicate" errors).
                 if self.inner.is_peer_connected(&resolved_peer_id) {
-                    let local_id = self.inner.local_peer_id();
-                    let we_keep_client = local_id < resolved_peer_id;
-                    if we_keep_client {
-                        // We have the lower PeerId: keep our outgoing (Client) connection,
-                        // close this incoming (Server) one.
-                        let peers = self.connected_peers.read().await;
-                        if let Some(existing) = peers.get(&resolved_peer_id) {
-                            info!(
-                                "accept: simultaneous open for peer {:?} — our PeerId is lower, \
-                                 closing incoming connection (keeping outgoing)",
-                                resolved_peer_id
-                            );
-                            connection.close(0u32.into(), b"duplicate");
-                            return Some(existing.clone());
-                        }
-                    } else {
-                        // We have the higher PeerId: keep this incoming (Server) connection,
-                        // replace the outgoing (Client) one.
-                        info!(
-                            "accept: simultaneous open for peer {:?} — our PeerId is higher, \
-                             keeping incoming connection (replacing outgoing)",
-                            resolved_peer_id
-                        );
-                        let _ = self.inner.remove_connection(&resolved_peer_id);
-                    }
+                    debug!(
+                        "accept: simultaneous open for peer {:?} — overwriting existing connection",
+                        resolved_peer_id
+                    );
+                    let _ = self
+                        .inner
+                        .add_connection(resolved_peer_id, connection.clone());
                 }
 
                 // They initiated the connection to us = Server side
