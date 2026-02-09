@@ -2022,23 +2022,6 @@ impl P2pEndpoint {
                     }
                 }
 
-                // Simultaneous open: if there's already a live connection to
-                // this peer (e.g. from our connect() path), simply overwrite it
-                // with the incoming one.  The connect() path has its own dedup
-                // logic, and both sides independently converge — the most recent
-                // healthy connection wins.  Previous attempts to close one side
-                // or the other caused cascading race conditions (retry storms,
-                // infinite accept loops, "closed by peer: duplicate" errors).
-                if self.inner.is_peer_connected(&resolved_peer_id) {
-                    debug!(
-                        "accept: simultaneous open for peer {:?} — overwriting existing connection",
-                        resolved_peer_id
-                    );
-                    let _ = self
-                        .inner
-                        .add_connection(resolved_peer_id, connection.clone());
-                }
-
                 // They initiated the connection to us = Server side
                 if let Err(e) =
                     self.inner
