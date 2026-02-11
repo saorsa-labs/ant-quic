@@ -1,0 +1,34 @@
+/* Cover: Corporate (Business) */
+@page :first { margin: 0; }
+
+.cover-corporate {
+    width: 210mm; height: 297mm; margin: 0;
+    position: relative; overflow: hidden;
+    page-break-after: always; background: white;
+    font-family: 'Noto Sans SC', 'Helvetica Neue', sans-serif;
+}
+.cover-corporate .cover-left {
+    position: absolute; top: 0; left: 0; width: 55%; height: 100%;
+    padding: 50mm 35mm; box-sizing: border-box;
+}
+.cover-corporate .cover-right {
+    position: absolute; top: 0; right: 0; width: 45%; height: 100%;
+    background: linear-gradient(135deg, #1a365d 0%, #2c5282 100%);
+    clip-path: polygon(20% 0, 100% 0, 100% 100%, 0 100%);
+}
+.cover-corporate .cover-org {
+    font-size: 11pt; font-weight: 700; letter-spacing: 2px;
+    color: #1a365d; margin-bottom: 25mm; text-transform: uppercase;
+}
+.cover-corporate .cover-title {
+    font-size: 26pt; font-weight: 800; color: #1a202c;
+    line-height: 1.2; margin: 0 0 10mm 0;
+}
+.cover-corporate .cover-line { width: 60px; height: 4px; background: #2c5282; margin-bottom: 10mm; }
+.cover-corporate .cover-subtitle { font-size: 14pt; color: #4a5568; margin: 0; }
+.cover-corporate .cover-info {
+    position: absolute; bottom: 40mm; right: 40mm;
+    text-align: right; color: white; z-index: 10;
+}
+.cover-corporate .cover-author { font-size: 13pt; font-weight: 600; margin: 0 0 5mm 0; }
+.cover-corporate .cover-date { font-size: 11pt; margin: 0; opacity: 0.9; }

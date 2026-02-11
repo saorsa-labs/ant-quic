@@ -1,0 +1,9 @@
+{
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.40.0"
+  },
+  "optionalDependencies": {
+    "pdf-lib": "^1.17.1"
+  }
+}

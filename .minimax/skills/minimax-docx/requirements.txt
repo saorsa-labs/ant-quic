@@ -1,0 +1,8 @@
+# Core dependencies (required)
+lxml>=4.9.0
+
+# Optional dependencies
+# playwright>=1.40.0  # For background generation
+# matplotlib>=3.7.0   # For complex charts
+# numpy>=1.24.0       # For chart data
+# pytest>=7.0.0       # For testing

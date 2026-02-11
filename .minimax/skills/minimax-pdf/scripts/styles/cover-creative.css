@@ -1,0 +1,27 @@
+/* Cover: Creative (Marketing/Design) */
+@page :first { margin: 0; }
+
+.cover-creative {
+    width: 210mm; height: 297mm; margin: 0;
+    position: relative; overflow: hidden;
+    page-break-after: always;
+    background: linear-gradient(135deg, #fef3c7 0%, #fde68a 50%, #fbbf24 100%);
+    font-family: 'Noto Sans SC', 'Helvetica Neue', sans-serif;
+}
+.cover-creative .cover-shapes { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+.cover-creative .shape { position: absolute; border-radius: 50%; }
+.cover-creative .shape-1 { width: 200mm; height: 200mm; top: -80mm; right: -60mm; background: rgba(251, 191, 36, 0.4); }
+.cover-creative .shape-2 { width: 120mm; height: 120mm; bottom: 30mm; left: -40mm; background: rgba(245, 158, 11, 0.3); }
+.cover-creative .shape-3 { width: 80mm; height: 80mm; top: 40%; right: 20mm; background: rgba(252, 211, 77, 0.5); }
+.cover-creative .cover-content {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%); text-align: center; width: 70%; z-index: 10;
+}
+.cover-creative .cover-title {
+    font-size: 32pt; font-weight: 800; color: #78350f;
+    margin: 0 0 10mm 0; line-height: 1.2;
+}
+.cover-creative .cover-subtitle { font-size: 14pt; color: #92400e; margin: 0 0 30mm 0; }
+.cover-creative .cover-footer { font-size: 11pt; color: #a16207; }
+.cover-creative .cover-author { font-weight: 600; margin: 0 0 3mm 0; }
+.cover-creative .cover-date { margin: 0; }
