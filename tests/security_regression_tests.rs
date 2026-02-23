@@ -35,7 +35,7 @@ fn test_peer_config() -> NatTraversalConfig {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     }
 }
 
@@ -58,7 +58,7 @@ fn test_server_config() -> NatTraversalConfig {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     }
 }
 
@@ -104,7 +104,7 @@ async fn test_error_handling_no_panic() {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -131,7 +131,7 @@ async fn test_error_handling_no_panic() {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -221,7 +221,7 @@ async fn test_malformed_config_handling() {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     };
 
     let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
@@ -249,7 +249,7 @@ async fn test_malformed_config_handling() {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -284,7 +284,7 @@ async fn test_input_sanitization() {
         enable_relay_service: true,
         allow_ipv4_mapped: true,
         transport_registry: None,
-        max_message_size: 1024 * 1024,
+        max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -354,7 +354,7 @@ mod specific_regression_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         // Should not panic and should handle random port selection
@@ -404,7 +404,7 @@ mod specific_regression_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         // Should not panic, even if configuration is inconsistent

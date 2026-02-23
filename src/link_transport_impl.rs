@@ -844,6 +844,8 @@ pub struct SharedTransport<T: LinkTransport> {
     state: TokioRwLock<TransportState>,
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
+    /// Maximum message size for stream reads.
+    max_message_size: usize,
 }
 
 impl<T: LinkTransport> SharedTransport<T>
@@ -860,6 +862,7 @@ where
             peers: Arc::new(TokioRwLock::new(HashMap::new())),
             state: TokioRwLock::new(TransportState::Created),
             shutdown_tx,
+            max_message_size: P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -874,6 +877,7 @@ where
             peers: Arc::new(TokioRwLock::new(HashMap::new())),
             state: TokioRwLock::new(TransportState::Created),
             shutdown_tx,
+            max_message_size: P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -1132,7 +1136,7 @@ where
         }
 
         // Read response
-        let response = recv.read_to_end(1024 * 1024).await?;
+        let response = recv.read_to_end(self.max_message_size).await?;
         if response.is_empty() {
             Ok(None)
         } else {
@@ -1201,6 +1205,7 @@ where
                             let peers = Arc::clone(&self.peers);
                             let connections = Arc::clone(&self.connections);
                             let conn_shutdown_rx = self.shutdown_tx.subscribe();
+                            let max_msg_size = self.max_message_size;
 
                             tokio::spawn(async move {
                                 Self::run_connection_accept(
@@ -1209,6 +1214,7 @@ where
                                     peers,
                                     connections,
                                     conn_shutdown_rx,
+                                    max_msg_size,
                                 ).await;
                             });
                         }
@@ -1235,6 +1241,7 @@ where
         peers: Arc<TokioRwLock<HashMap<PeerId, PeerState>>>,
         connections: Arc<TokioRwLock<HashMap<PeerId, Arc<T::Conn>>>>,
         mut shutdown_rx: broadcast::Receiver<()>,
+        max_message_size: usize,
     ) {
         let conn = {
             let connections = connections.read().await;
@@ -1280,6 +1287,7 @@ where
                                     stream_type,
                                     send,
                                     recv,
+                                    max_message_size,
                                 ).await;
                             });
                         }
@@ -1305,6 +1313,7 @@ where
         stream_type: StreamType,
         mut send: Box<dyn LinkSendStream>,
         mut recv: Box<dyn LinkRecvStream>,
+        max_message_size: usize,
     ) {
         // Update peer stats
         {
@@ -1316,7 +1325,7 @@ where
         }
 
         // Read incoming data
-        let data = match recv.read_to_end(1024 * 1024).await {
+        let data = match recv.read_to_end(max_message_size).await {
             Ok(data) => Bytes::from(data),
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "Failed to read stream");

@@ -933,6 +933,21 @@ mod tests {
     }
 
     #[test]
+    fn test_max_message_size_minimum_accepted() {
+        let config = P2pConfig::builder()
+            .max_message_size(1)
+            .build()
+            .expect("size of 1 should be valid");
+        assert_eq!(config.max_message_size, 1);
+    }
+
+    #[test]
+    fn test_max_message_size_builder_default() {
+        let config = P2pConfig::builder().build().expect("default should work");
+        assert_eq!(config.max_message_size, P2pConfig::DEFAULT_MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
     fn test_to_nat_config() {
         let config = P2pConfig::builder()
             .known_peer("127.0.0.1:9000".parse::<SocketAddr>().expect("valid addr"))

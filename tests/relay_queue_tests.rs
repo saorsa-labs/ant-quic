@@ -105,7 +105,7 @@ mod nat_traversal_api_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -240,7 +240,7 @@ mod functional_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         // May fail due to zero values or other validation
@@ -265,7 +265,7 @@ mod functional_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         let result = NatTraversalEndpoint::new(valid_config, None, None).await;
@@ -450,7 +450,7 @@ mod performance_tests {
                 enable_relay_service: true,
                 allow_ipv4_mapped: true,
                 transport_registry: None,
-                max_message_size: 1024 * 1024,
+                max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             };
 
             // Use the config to prevent optimization
@@ -519,7 +519,7 @@ mod relay_functionality_tests {
             enable_relay_service: true,
             allow_ipv4_mapped: true,
             transport_registry: None,
-            max_message_size: 1024 * 1024,
+            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         };
 
         // This might be accepted or rejected depending on implementation
