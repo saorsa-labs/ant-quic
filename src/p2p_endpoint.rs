@@ -84,9 +84,6 @@ use crate::unified_config::P2pConfig;
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// Maximum payload size for a single uni stream read (1 MB)
-const MAX_UNI_STREAM_READ_BYTES: usize = 1024 * 1024;
-
 /// Health check protocol prefix byte.
 ///
 /// Uni streams whose payload starts with this byte are health check messages
@@ -2483,6 +2480,7 @@ impl P2pEndpoint {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
+        let max_read_bytes = self.config.max_message_size;
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             loop {
@@ -2498,7 +2496,7 @@ impl P2pEndpoint {
                     }
                 };
 
-                let data = match recv_stream.read_to_end(MAX_UNI_STREAM_READ_BYTES).await {
+                let data = match recv_stream.read_to_end(max_read_bytes).await {
                     Ok(data) if data.is_empty() => continue,
                     Ok(data) => data,
                     Err(e) => {
