@@ -34,7 +34,6 @@ use ant_quic::{
     ConnectionMethod, MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPhase,
 };
 use clap::{Parser, Subcommand};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -160,7 +159,7 @@ struct Args {
     node_id: Option<String>,
 
     // === Data Testing ===
-    /// Generate test data with SHA-256 checksums (size in bytes)
+    /// Generate test data with BLAKE3 checksums (size in bytes)
     #[arg(long)]
     generate_data: Option<u64>,
 
@@ -1072,15 +1071,10 @@ fn format_bytes(bytes: u64) -> String {
 
 // === Data Verification Functions ===
 
-/// Compute SHA-256 hash of data
+/// Compute BLAKE3 hash of data
 #[allow(dead_code)] // Will be used when data generation features are wired up
-fn compute_sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
+fn compute_hash(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
 }
 
 /// Verified data chunk with embedded checksum
@@ -1091,7 +1085,7 @@ pub struct VerifiedDataChunk {
     pub sequence: u64,
     /// The actual data
     pub data: Vec<u8>,
-    /// SHA-256 hash of the data
+    /// BLAKE3 hash of the data
     pub checksum: [u8; 32],
 }
 
@@ -1102,7 +1096,7 @@ impl VerifiedDataChunk {
         let data: Vec<u8> = (0..size)
             .map(|i| ((sequence + i as u64) % 256) as u8)
             .collect();
-        let checksum = compute_sha256(&data);
+        let checksum = compute_hash(&data);
         Self {
             sequence,
             data,
@@ -1137,7 +1131,7 @@ impl VerifiedDataChunk {
 
     /// Verify the checksum matches the data
     fn verify(&self) -> bool {
-        let computed = compute_sha256(&self.data);
+        let computed = compute_hash(&self.data);
         computed == self.checksum
     }
 }

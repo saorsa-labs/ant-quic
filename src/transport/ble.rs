@@ -1468,13 +1468,10 @@ impl BleTransport {
 
         // Generate a deterministic device ID from adapter info
         // This is a fallback since btleplug doesn't expose raw MAC on all platforms
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(adapter_info.as_bytes());
-        let hash = hasher.finalize();
+        let hash = blake3::hash(adapter_info.as_bytes());
 
         let mut device_id = [0u8; 6];
-        device_id.copy_from_slice(&hash[..6]);
+        device_id.copy_from_slice(&hash.as_bytes()[..6]);
         // Set locally administered bit to indicate this is derived, not actual MAC
         device_id[0] |= 0x02;
 
@@ -1522,13 +1519,12 @@ impl BleTransport {
 
                 // Simple hash of session key for resumption verification
                 let session_hash = {
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(session.session_key);
-                    hasher.update(session.session_id.to_le_bytes());
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&session.session_key);
+                    hasher.update(&session.session_id.to_le_bytes());
                     let result = hasher.finalize();
                     let mut hash = [0u8; 16];
-                    hash.copy_from_slice(&result[..16]);
+                    hash.copy_from_slice(&result.as_bytes()[..16]);
                     hash
                 };
 
@@ -2037,13 +2033,10 @@ impl BleTransport {
     /// btleplug uses platform-specific IDs, so we hash them to get a consistent 6-byte ID.
     #[cfg(feature = "ble")]
     fn peripheral_id_to_device_id(id_str: &str) -> [u8; 6] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(id_str.as_bytes());
-        let hash = hasher.finalize();
+        let hash = blake3::hash(id_str.as_bytes());
 
         let mut device_id = [0u8; 6];
-        device_id.copy_from_slice(&hash[..6]);
+        device_id.copy_from_slice(&hash.as_bytes()[..6]);
         // Set locally administered bit to indicate this is derived
         device_id[0] |= 0x02;
         device_id

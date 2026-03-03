@@ -64,14 +64,14 @@ Subagents (via the `Task` tool) MUST be used whenever possible. They provide:
 
 We use **Pure Post-Quantum Cryptography** with raw public keys (inspired by RFC 7250):
 - **Reference**: `docs/rfcs/ant-quic-pqc-authentication.md` (our specification)
-- **Identity**: ML-DSA-65 key pairs (PeerId = SHA-256 hash → 32 bytes compact identifier)
+- **Identity**: ML-DSA-65 key pairs (PeerId = BLAKE3 hash → 32 bytes compact identifier)
 - **Key Exchange**: ML-KEM-768 (IANA 0x0201) - FIPS 203
 - **Signatures**: ML-DSA-65 (IANA 0x0901) - FIPS 204
 - **Benefits**: Full quantum safety, no classical crypto, no PKI infrastructure
 - **No CA dependency**: Peers authenticate directly via public key fingerprints
 
 v0.2: This is a greenfield network - NO hybrid algorithms, NO classical fallback.
-Single ML-DSA-65 key pair for identity and auth. PeerId = SHA-256(public_key) for compact 32-byte identifiers.
+Single ML-DSA-65 key pair for identity and auth. PeerId = BLAKE3(public_key) for compact 32-byte identifiers.
 
 ### Network: Dual-Stack IPv4 and IPv6 Support
 
@@ -310,7 +310,7 @@ cargo nextest run --ignored stress
 - Transport parameter negotiation (0x3d7e9f0bca12fea6+) and extension frames
 - NAT traversal frames: ADD_ADDRESS (0x3d7e90-91), PUNCH_ME_NOW (0x3d7e92-93), REMOVE_ADDRESS (0x3d7e94)
 - Priority-based candidate pairing (inspired by ICE, but native QUIC implementation)
-- **Pure PQC Raw Public Keys** with SHA-256(ML-DSA-65) PeerId + ML-DSA-65 auth (v0.2) - NO X.509 certificates
+- **Pure PQC Raw Public Keys** with BLAKE3(ML-DSA-65) PeerId + ML-DSA-65 auth (v0.2) - NO X.509 certificates
 - **Dual-stack IPv4/IPv6** support with transparent address handling
 - High-level APIs: `QuicP2PNode` and `NatTraversalEndpoint`
 - Production binary `ant-quic` with full QUIC implementation
@@ -337,7 +337,7 @@ cargo nextest run --ignored stress
 - **Symmetric P2P**: All nodes are equal - can connect, accept, and coordinate NAT traversal
 - **100% PQC**: ML-KEM-768 key exchange on every connection, no classical fallback
 - **Native QUIC NAT traversal**: All hole-punching via QUIC extension frames, NO external protocols
-- **Pure PQC Raw Public Keys**: Authentication via ML-DSA-65, PeerId = SHA-256(public_key), NO X.509 certificate chains
+- **Pure PQC Raw Public Keys**: Authentication via ML-DSA-65, PeerId = BLAKE3(public_key), NO X.509 certificate chains
 - **Dual-stack networking**: Full IPv4 and IPv6 support with transparent handling
 - Address discovery via connected peers (per draft-ietf-quic-address-discovery-00)
 - Three-layer architecture: Protocol → Integration APIs → Applications

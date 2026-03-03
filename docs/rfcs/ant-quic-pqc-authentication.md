@@ -42,7 +42,7 @@ ant-quic is a QUIC transport implementation optimized for P2P networks with
 advanced NAT traversal capabilities. This specification defines the
 cryptographic mechanisms used for:
 
-- **Peer Identity**: Node identification using SHA-256(ML-DSA-65 public key) PeerIds
+- **Peer Identity**: Node identification using BLAKE3(ML-DSA-65 public key) PeerIds
 - **Key Exchange**: Quantum-resistant session key establishment using ML-KEM-768
 - **Authentication**: Handshake signing using ML-DSA-65
 
@@ -78,24 +78,24 @@ This enables a pure PQC approach:
 - **PQC**: Post-Quantum Cryptography resistant to quantum computer attacks
 - **ML-KEM**: Module-Lattice Key Encapsulation Mechanism (FIPS 203)
 - **ML-DSA**: Module-Lattice Digital Signature Algorithm (FIPS 204)
-- **PeerId**: 32-byte node identifier derived from SHA-256 hash of ML-DSA-65 public key
+- **PeerId**: 32-byte node identifier derived from BLAKE3 hash of ML-DSA-65 public key
 
 ---
 
 ## 2. Identity Model
 
-### 2.1 PeerId: SHA-256 Hash of ML-DSA-65 Public Key
+### 2.1 PeerId: BLAKE3 Hash of ML-DSA-65 Public Key
 
 Each ant-quic node has a persistent identity based on a single ML-DSA-65 key pair.
 The PeerId is derived by hashing the ML-DSA-65 public key:
 
 ```
-ML-DSA-65 Public Key: 1952 bytes → SHA-256 → PeerId (32 bytes)
+ML-DSA-65 Public Key: 1952 bytes → BLAKE3 → PeerId (32 bytes)
 ```
 
 **Rationale:** This provides a compact 32-byte identifier suitable for DHT
 routing and peer addressing while maintaining a single quantum-resistant key
-pair for both identity and authentication. The SHA-256 hash provides:
+pair for both identity and authentication. The BLAKE3 hash provides:
 - Uniform 32-byte identifiers regardless of public key size
 - Collision resistance (2^128 security level)
 - One-way function prevents recovering public key from PeerId
@@ -115,7 +115,7 @@ for both identity and authentication.
 ### 2.3 PeerId Derivation
 
 ```
-PeerId = SHA-256(ML-DSA-65_Public_Key)  (32 bytes)
+PeerId = BLAKE3(ML-DSA-65_Public_Key)  (32 bytes)
 ```
 
 Implementation:
@@ -314,10 +314,10 @@ All cryptographic operations use NIST-standardized post-quantum algorithms:
 |----------|-----------|-------------------|
 | Key Exchange | ML-KEM-768 | ✅ NIST Level 3 |
 | Authentication | ML-DSA-65 | ✅ NIST Level 3 |
-| Identity (PeerId) | SHA-256(ML-DSA-65) | ✅ Quantum-safe hash |
+| Identity (PeerId) | BLAKE3(ML-DSA-65) | ✅ Quantum-safe hash |
 
 **Fully Quantum-Resistant Identity:** The PeerId is derived from the ML-DSA-65
-public key via SHA-256. This provides:
+public key via BLAKE3. This provides:
 - Complete quantum resistance for both identity and authentication
 - No classical algorithm attack surface
 - Single key pair simplifies key management and reduces attack vectors
@@ -465,7 +465,7 @@ The reference implementation is available in the ant-quic source code:
 |---------|------|---------|
 | 1.0 | December 2025 | Initial hybrid specification |
 | 2.0 | December 2025 | **Pure PQC** - removed all hybrid algorithms |
-| 2.1 | December 2025 | **Single key pair** - PeerId from SHA-256(ML-DSA-65), removed Ed25519 identity |
+| 2.1 | December 2025 | **Single key pair** - PeerId from BLAKE3(ML-DSA-65), removed Ed25519 identity |
 
 ---
 

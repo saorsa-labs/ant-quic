@@ -22,7 +22,6 @@ use crate::crypto::raw_public_keys::pqc::{
     ML_DSA_65_SIGNATURE_SIZE, extract_public_key_from_spki, sign_with_ml_dsa, verify_with_ml_dsa,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{high_level::Connection, nat_traversal_api::PeerId};
@@ -60,9 +59,9 @@ pub enum TrustError {
 /// Contains the current fingerprint and optionally the previous one for continuity validation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinRecord {
-    /// The current SHA-256 fingerprint of the peer's public key (SPKI).
+    /// The current BLAKE3 fingerprint of the peer's public key (SPKI).
     pub current_fingerprint: [u8; 32],
-    /// The previous SHA-256 fingerprint if the key has been rotated, used for continuity validation.
+    /// The previous BLAKE3 fingerprint if the key has been rotated, used for continuity validation.
     pub previous_fingerprint: Option<[u8; 32]>,
 }
 
@@ -309,12 +308,7 @@ pub fn reset_global_runtime() {
 // ===================== Registration & Rotation =====================
 
 fn fingerprint_spki(spki: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(spki);
-    let r = h.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&r);
-    out
+    *blake3::hash(spki).as_bytes()
 }
 
 fn peer_id_from_spki(spki: &[u8]) -> PeerId {

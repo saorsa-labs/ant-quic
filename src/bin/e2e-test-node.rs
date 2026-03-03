@@ -9,7 +9,7 @@
 //!
 //! This binary extends ant-quic with capabilities for comprehensive E2E testing:
 //! - Metrics push to central dashboard (HTTP POST)
-//! - Data generation and verification with SHA-256 checksums
+//! - Data generation and verification with BLAKE3 checksums
 //! - Progress reporting for heavy throughput testing
 //! - Support for local and remote node deployment
 //!
@@ -40,7 +40,6 @@ use ant_quic::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,7 +78,7 @@ struct Args {
     #[arg(long, default_value = "0")]
     generate_data: u64,
 
-    /// Enable data integrity verification with SHA-256
+    /// Enable data integrity verification with BLAKE3
     #[arg(long)]
     verify_data: bool,
 
@@ -165,9 +164,9 @@ pub struct VerifiedDataChunk {
 }
 
 impl VerifiedDataChunk {
-    /// Create a new verified data chunk with SHA-256 checksum
+    /// Create a new verified data chunk with BLAKE3 checksum
     pub fn new(sequence: u64, data: Vec<u8>) -> Self {
-        let checksum = compute_sha256(&data);
+        let checksum = compute_hash(&data);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -182,7 +181,7 @@ impl VerifiedDataChunk {
 
     /// Verify the data integrity
     pub fn verify(&self) -> bool {
-        compute_sha256(&self.data) == self.checksum
+        compute_hash(&self.data) == self.checksum
     }
 }
 
@@ -214,11 +213,9 @@ struct PeerState {
     connection_type: String,
 }
 
-/// Compute SHA-256 checksum of data
-fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+/// Compute BLAKE3 checksum of data
+fn compute_hash(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
 }
 
 /// Generate random test data with verification

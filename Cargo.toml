@@ -133,7 +133,7 @@ qlog = { version = "0.13", optional = true }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 unicode-width = "=0.2.0"  # Pinned to match ratatui's requirement
 hex = "0.4"
-sha2 = "0.10"
+blake3 = "1"
 once_cell = "1.21"
 dashmap = "6"
 # Faster mutexes that don't poison and have fair locking
@@ -174,7 +174,6 @@ windows = { version = "0.58", features = [
 # Note: Using raw libc netlink sockets instead of netlink-packet crates
 # to avoid transitive dependency on unmaintained 'paste' crate
 hex = "0.4"
-sha2 = "0.10"
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.6"
 core-foundation = "0.9"

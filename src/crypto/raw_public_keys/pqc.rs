@@ -61,19 +61,17 @@ pub fn generate_ml_dsa_keypair() -> Result<(MlDsa65PublicKey, MlDsa65SecretKey),
     ml_dsa.generate_keypair()
 }
 
-/// Derive a PeerId from an ML-DSA-65 public key using SHA-256 hash
+/// Derive a PeerId from an ML-DSA-65 public key using BLAKE3 hash
 ///
 /// Pure PQC peer identification using ML-DSA-65 public keys.
 ///
-/// The SHA-256 hash ensures:
+/// The BLAKE3 hash ensures:
 /// - Uniform 32-byte distribution
 /// - Collision resistance
 /// - No direct key exposure in the peer ID
 pub fn derive_peer_id_from_public_key(
     public_key: &MlDsa65PublicKey,
 ) -> crate::nat_traversal_api::PeerId {
-    use aws_lc_rs::digest;
-
     let key_bytes = public_key.as_bytes();
 
     // Create the input data with domain separator
@@ -81,14 +79,10 @@ pub fn derive_peer_id_from_public_key(
     input.extend_from_slice(b"AUTONOMI_PEER_ID_V2:");
     input.extend_from_slice(key_bytes);
 
-    // Hash the input using SHA-256
-    let hash = digest::digest(&digest::SHA256, &input);
-    let hash_bytes = hash.as_ref();
+    // Hash the input using BLAKE3
+    let hash = blake3::hash(&input);
 
-    let mut peer_id_bytes = [0u8; 32];
-    peer_id_bytes.copy_from_slice(hash_bytes);
-
-    crate::nat_traversal_api::PeerId(peer_id_bytes)
+    crate::nat_traversal_api::PeerId(*hash.as_bytes())
 }
 
 /// Derive a PeerId from raw ML-DSA-65 public key bytes (1952 bytes)
