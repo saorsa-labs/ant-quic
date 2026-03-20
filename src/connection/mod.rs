@@ -4929,6 +4929,7 @@ impl Connection {
         tracing::info!(
             address = %observed_address.address,
             sequence = %observed_address.sequence_number,
+            from_peer = %self.peer_id_for_tokens.map(|pid| format!("{pid}")).unwrap_or_else(|| "unknown".to_string()),
             "handle_observed_address_frame: RECEIVED OBSERVED_ADDRESS from peer"
         );
         // Get the address discovery state
@@ -4949,12 +4950,17 @@ impl Connection {
         #[cfg(feature = "trace")]
         {
             use crate::trace_observed_address_received;
-            // Tracing imports handled by macros
+            let peer_bytes = self
+                .peer_id_for_tokens
+                .as_ref()
+                .map(|pid| pid.0)
+                .unwrap_or([0u8; 32]);
             trace_observed_address_received!(
                 &self.event_log,
                 self.trace_context.trace_id(),
                 observed_address.address,
-                0u64 // path_id not part of the frame yet
+                0u64, // path_id not part of the frame yet
+                peer_bytes
             );
         }
 

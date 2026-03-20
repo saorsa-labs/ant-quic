@@ -132,6 +132,15 @@ macro_rules! trace_observed_address_sent {
 #[macro_export]
 macro_rules! trace_observed_address_received {
     ($log:expr_2021, $trace_id:expr_2021, $addr:expr_2021, $path_id:expr_2021) => {
+        $crate::trace_observed_address_received!(
+            $log,
+            $trace_id,
+            $addr,
+            $path_id,
+            [0u8; 32]
+        )
+    };
+    ($log:expr_2021, $trace_id:expr_2021, $addr:expr_2021, $path_id:expr_2021, $peer_id:expr_2021) => {
         $crate::trace_event!($log, {
             let (addr_bytes, addr_type) = $crate::tracing::socket_addr_to_bytes($addr);
             $crate::tracing::Event {
@@ -140,7 +149,7 @@ macro_rules! trace_observed_address_received {
                 event_data: $crate::tracing::EventData::ObservedAddressReceived {
                     addr_bytes,
                     addr_type,
-                    from_peer: [0u8; 32], // TODO: Get actual peer ID
+                    from_peer: $peer_id,
                     _padding: [0u8; 13],
                 },
                 ..Default::default()
