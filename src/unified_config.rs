@@ -111,6 +111,13 @@ pub struct P2pConfig {
     ///
     /// Default: [`Self::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
     pub max_message_size: usize,
+
+    /// Maximum concurrent unidirectional QUIC streams per connection.
+    ///
+    /// Each `send()` call opens a new unidirectional stream. Applications with
+    /// high message throughput should increase this to avoid stream exhaustion.
+    /// Default: 100.
+    pub max_concurrent_uni_streams: u32,
 }
 // v0.13.0: enable_coordinator removed - all nodes are coordinators
 
@@ -264,6 +271,7 @@ impl Default for P2pConfig {
             transport_registry: TransportRegistry::new(),
             data_channel_capacity: Self::DEFAULT_DATA_CHANNEL_CAPACITY,
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
+            max_concurrent_uni_streams: 100,
         }
     }
 }
@@ -311,6 +319,7 @@ impl P2pConfig {
             allow_ipv4_mapped: true, // Required for dual-stack socket support
             transport_registry: Some(Arc::new(self.transport_registry.clone())),
             max_message_size: self.max_message_size,
+            max_concurrent_uni_streams: self.max_concurrent_uni_streams,
         }
     }
 
@@ -346,6 +355,7 @@ pub struct P2pConfigBuilder {
     transport_registry: Option<TransportRegistry>,
     data_channel_capacity: Option<usize>,
     max_message_size: Option<usize>,
+    max_concurrent_uni_streams: Option<u32>,
 }
 
 /// Error type for configuration validation
@@ -663,6 +673,16 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Set the maximum number of concurrent unidirectional QUIC streams per connection.
+    ///
+    /// Each `send()` call opens a new unidirectional stream. Applications with high
+    /// message throughput should increase this from the default (100) to avoid stream
+    /// exhaustion. Default: 100.
+    pub fn max_concurrent_uni_streams(mut self, count: u32) -> Self {
+        self.max_concurrent_uni_streams = Some(count);
+        self
+    }
+
     /// Set the maximum application-layer message size in bytes.
     ///
     /// This is a read-side guard only — it caps the bytes `read_to_end()` will
@@ -708,6 +728,7 @@ impl P2pConfigBuilder {
                 .data_channel_capacity
                 .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY),
             max_message_size,
+            max_concurrent_uni_streams: self.max_concurrent_uni_streams.unwrap_or(100),
         })
     }
 }

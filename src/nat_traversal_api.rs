@@ -449,10 +449,21 @@ pub struct NatTraversalConfig {
     /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+
+    /// Maximum concurrent unidirectional QUIC streams per connection.
+    ///
+    /// Each `send()` opens a new uni stream. Applications with high message
+    /// throughput should increase this. Default: 100.
+    #[serde(default = "default_max_concurrent_uni_streams")]
+    pub max_concurrent_uni_streams: u32,
 }
 
 fn default_max_message_size() -> usize {
     crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE
+}
+
+fn default_max_concurrent_uni_streams() -> u32 {
+    100
 }
 
 // varint_from_max_message_size removed — QUIC flow-control windows now use
@@ -1039,6 +1050,7 @@ impl Default for NatTraversalConfig {
             allow_ipv4_mapped: true,  // Required for dual-stack socket support
             transport_registry: None, // Use direct UDP binding by default
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
+            max_concurrent_uni_streams: 100,
         }
     }
 }
@@ -2509,6 +2521,9 @@ impl NatTraversalEndpoint {
             transport_config
                 .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
             transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            transport_config.max_concurrent_uni_streams(
+                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
+            );
 
             // QUIC flow-control windows (stream_receive_window, send_window) use
             // TransportConfig defaults — calculated from bandwidth-delay products.
@@ -2578,6 +2593,9 @@ impl NatTraversalEndpoint {
             transport_config.enable_address_discovery(true);
             transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
             transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            transport_config.max_concurrent_uni_streams(
+                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
+            );
 
             // QUIC flow-control windows (stream_receive_window, send_window) use
             // TransportConfig defaults — calculated from bandwidth-delay products.

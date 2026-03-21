@@ -274,6 +274,13 @@ impl Node {
         p2p_config.known_peers = config.known_peers.into_iter().map(Into::into).collect();
         p2p_config.keypair = config.keypair;
 
+        if let Some(capacity) = config.data_channel_capacity {
+            p2p_config.data_channel_capacity = capacity;
+        }
+        if let Some(streams) = config.max_concurrent_uni_streams {
+            p2p_config.max_concurrent_uni_streams = streams;
+        }
+
         // Create event channel
         let (event_tx, _) = broadcast::channel(256);
 

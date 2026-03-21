@@ -86,6 +86,14 @@ pub struct NodeConfig {
     /// Transport capabilities are propagated to peer advertisements and
     /// used for routing decisions.
     pub transport_providers: Vec<Arc<dyn TransportProvider>>,
+
+    /// Data channel capacity (bounded mpsc between reader tasks and recv).
+    /// Default: 256.
+    pub data_channel_capacity: Option<usize>,
+
+    /// Maximum concurrent unidirectional QUIC streams per connection.
+    /// Default: 100.
+    pub max_concurrent_uni_streams: Option<u32>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -142,6 +150,8 @@ pub struct NodeConfigBuilder {
     known_peers: Vec<TransportAddr>,
     keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     transport_providers: Vec<Arc<dyn TransportProvider>>,
+    data_channel_capacity: Option<usize>,
+    max_concurrent_uni_streams: Option<u32>,
 }
 
 impl NodeConfigBuilder {
@@ -307,6 +317,23 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the data channel capacity (bounded mpsc between reader tasks and recv).
+    ///
+    /// Higher values reduce backpressure on reader tasks. Default: 256.
+    pub fn data_channel_capacity(mut self, capacity: usize) -> Self {
+        self.data_channel_capacity = Some(capacity);
+        self
+    }
+
+    /// Set the maximum concurrent unidirectional QUIC streams per connection.
+    ///
+    /// Each `send()` call opens a new unidirectional stream. Applications with
+    /// high message throughput should increase this. Default: 100.
+    pub fn max_concurrent_uni_streams(mut self, count: u32) -> Self {
+        self.max_concurrent_uni_streams = Some(count);
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> NodeConfig {
         NodeConfig {
@@ -314,6 +341,8 @@ impl NodeConfigBuilder {
             known_peers: self.known_peers,
             keypair: self.keypair,
             transport_providers: self.transport_providers,
+            data_channel_capacity: self.data_channel_capacity,
+            max_concurrent_uni_streams: self.max_concurrent_uni_streams,
         }
     }
 }
