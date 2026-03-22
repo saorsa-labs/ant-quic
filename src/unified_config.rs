@@ -98,11 +98,18 @@ pub struct P2pConfig {
 
     /// Maximum application-layer message size in bytes.
     ///
-    /// Internally tunes QUIC stream flow control (`stream_receive_window`) and
-    /// the per-stream read buffer so that a single message of this size can be
-    /// transmitted without being rejected by the transport layer.
+    /// This is a **read-side guard only**: it caps the number of bytes
+    /// `read_to_end()` will accept on any single uni-directional stream.
+    /// Streams carrying more data than this limit are rejected with
+    /// `ReadToEndError::TooLong`.
     ///
-    /// Default: [`Self::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
+    /// QUIC flow-control windows (`stream_receive_window`, `send_window`) are
+    /// **not** derived from this value — they use the transport-layer defaults
+    /// calculated from bandwidth-delay products (see `TransportConfig`).
+    /// A message of any size flows through the window; the window only governs
+    /// how much data can be in-flight at once.
+    ///
+    /// Default: [`Self::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
     pub max_message_size: usize,
 }
 // v0.13.0: enable_coordinator removed - all nodes are coordinators
@@ -265,8 +272,13 @@ impl P2pConfig {
     /// Default capacity of the data channel between reader tasks and `recv()`.
     pub const DEFAULT_DATA_CHANNEL_CAPACITY: usize = 256;
 
-    /// Default maximum message size (1 MiB).
-    pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+    /// Default maximum message size (4 MiB).
+    ///
+    /// This is a read-side guard for `read_to_end()`. It does **not** affect
+    /// QUIC flow-control windows — those use transport-layer defaults based on
+    /// bandwidth-delay products. Increase this if your application sends
+    /// messages larger than 4 MiB on a single stream.
+    pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
     /// Create a new configuration builder
     pub fn builder() -> P2pConfigBuilder {
@@ -653,7 +665,8 @@ impl P2pConfigBuilder {
 
     /// Set the maximum application-layer message size in bytes.
     ///
-    /// Internally tunes QUIC stream flow control and read buffers.
+    /// This is a read-side guard only — it caps the bytes `read_to_end()` will
+    /// accept per stream. QUIC flow-control windows are **not** affected.
     pub fn max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = Some(bytes);
         self

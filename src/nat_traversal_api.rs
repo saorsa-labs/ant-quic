@@ -440,12 +440,13 @@ pub struct NatTraversalConfig {
     #[serde(skip)]
     pub transport_registry: Option<Arc<TransportRegistry>>,
 
-    /// Maximum message size in bytes.
+    /// Maximum message size in bytes (read-side guard).
     ///
-    /// Internally tunes the QUIC per-stream receive window so that a single
-    /// message of this size can be transmitted without flow-control rejection.
+    /// Caps the bytes `read_to_end()` will accept per stream. QUIC flow-control
+    /// windows are **not** derived from this value — they use transport-layer
+    /// defaults based on bandwidth-delay products.
     ///
-    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
+    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 }
@@ -454,18 +455,9 @@ fn default_max_message_size() -> usize {
     crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE
 }
 
-/// Convert `max_message_size` to a QUIC `VarInt` for stream/send window configuration.
-///
-/// Clamps to `VarInt::MAX` if the value exceeds the QUIC variable-length integer range.
-fn varint_from_max_message_size(max_message_size: usize) -> VarInt {
-    VarInt::from_u64(max_message_size as u64).unwrap_or_else(|_| {
-        warn!(
-            max_message_size,
-            "max_message_size exceeds VarInt::MAX, clamping window"
-        );
-        VarInt::MAX
-    })
-}
+// varint_from_max_message_size removed — QUIC flow-control windows now use
+// transport-layer defaults (bandwidth-delay product) instead of being derived
+// from the application-level max_message_size.
 
 // v0.13.0: EndpointRole enum has been removed.
 // All nodes are now symmetric P2P nodes - they can connect, accept connections,
@@ -2518,10 +2510,9 @@ impl NatTraversalEndpoint {
                 .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
             transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
 
-            // Tune QUIC flow-control windows from max_message_size
-            let window = varint_from_max_message_size(config.max_message_size);
-            transport_config.stream_receive_window(window);
-            transport_config.send_window(config.max_message_size as u64);
+            // QUIC flow-control windows (stream_receive_window, send_window) use
+            // TransportConfig defaults — calculated from bandwidth-delay products.
+            // max_message_size is a read-side guard only, not a flow-control knob.
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
             // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
@@ -2588,10 +2579,9 @@ impl NatTraversalEndpoint {
             transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
             transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
 
-            // Tune QUIC flow-control windows from max_message_size
-            let window = varint_from_max_message_size(config.max_message_size);
-            transport_config.stream_receive_window(window);
-            transport_config.send_window(config.max_message_size as u64);
+            // QUIC flow-control windows (stream_receive_window, send_window) use
+            // TransportConfig defaults — calculated from bandwidth-delay products.
+            // max_message_size is a read-side guard only, not a flow-control knob.
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
             // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
