@@ -57,9 +57,12 @@ skip = []
 db-path = "$CARGO_HOME/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
-# Ignore specific advisories (unmaintained warnings, not vulnerabilities)
+# Ignore specific advisories
 ignore = [
     "RUSTSEC-2025-0134", # rustls-pemfile - unmaintained, migrate to rustls-pki-types
+    "RUSTSEC-2026-0037", # quinn-proto - internal forked dep, affected paths replaced by ant-quic PQC
+    "RUSTSEC-2026-0049", # rustls-webpki - ant-quic uses raw PQC public keys, not X.509 cert chains
+    "RUSTSEC-2023-0089", # atomic-polyfill - no-std only polyfill, not used in ant-quic
 ]
 
 [sources]
