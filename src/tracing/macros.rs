@@ -132,13 +132,7 @@ macro_rules! trace_observed_address_sent {
 #[macro_export]
 macro_rules! trace_observed_address_received {
     ($log:expr_2021, $trace_id:expr_2021, $addr:expr_2021, $path_id:expr_2021) => {
-        $crate::trace_observed_address_received!(
-            $log,
-            $trace_id,
-            $addr,
-            $path_id,
-            [0u8; 32]
-        )
+        $crate::trace_observed_address_received!($log, $trace_id, $addr, $path_id, [0u8; 32])
     };
     ($log:expr_2021, $trace_id:expr_2021, $addr:expr_2021, $path_id:expr_2021, $peer_id:expr_2021) => {
         $crate::trace_event!($log, {
