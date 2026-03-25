@@ -125,9 +125,9 @@ fn test_raw_public_key_config_builder() {
     let client_result = client_builder.build_client_config();
     assert!(client_result.is_ok());
 
-    // Build server config with separate builder - use with_client_key for ML-DSA
+    // Build server config with separate builder - use with_server_key for ML-DSA
     let server_builder = RawPublicKeyConfigBuilder::new()
-        .with_client_key(public_key, secret_key)
+        .with_server_key(public_key, secret_key)
         .enable_certificate_type_extensions();
 
     let server_result = server_builder.build_server_config();

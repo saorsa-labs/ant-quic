@@ -42,9 +42,13 @@ mod zero_config_tests {
         let peer_id = node.peer_id();
         println!("Zero-config node peer ID: {:?}", peer_id);
 
-        // Verify it has a public key (PeerId is 32-byte SHA256 hash of ML-DSA-65 public key)
+        // Verify it has an ML-DSA-65 public key (1952 bytes)
         let public_key = node.public_key_bytes();
-        assert_eq!(public_key.len(), 32, "PeerId should be 32 bytes");
+        assert_eq!(
+            public_key.len(),
+            1952,
+            "ML-DSA-65 public key should be 1952 bytes"
+        );
 
         node.shutdown().await;
     }
@@ -114,8 +118,8 @@ mod zero_config_tests {
         println!("Node with keypair at: {}", local_addr);
         println!("Public key (peer ID): {}", hex::encode(public_key_bytes));
 
-        // PeerId is 32-byte SHA256 hash of ML-DSA-65 public key
-        assert_eq!(public_key_bytes.len(), 32);
+        // ML-DSA-65 public key is 1952 bytes
+        assert_eq!(public_key_bytes.len(), 1952);
 
         node.shutdown().await;
     }
