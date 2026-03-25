@@ -184,3 +184,6 @@ pub fn default_runtime() -> Option<Arc<dyn Runtime>> {
 // Tokio runtime (always available)
 mod tokio;
 pub use self::tokio::TokioRuntime;
+
+// Dual-stack socket (separate IPv4 + IPv6 sockets behind single AsyncUdpSocket)
+pub mod dual_stack;

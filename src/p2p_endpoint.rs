@@ -670,79 +670,137 @@ impl P2pEndpoint {
         // Create token store
         let token_store = Arc::new(BootstrapTokenStore::new(bootstrap_cache.clone()).await);
 
-        // Socket sharing: bind a single UDP socket shared between transport registry and Quinn.
-        // Default to [::]:0 (IPv6 dual-stack) which accepts both IPv4 and IPv6 connections
-        // on a single socket via IPV6_V6ONLY=0. Falls back to 0.0.0.0:0 if IPv6 unavailable.
-        let dual_stack_default: std::net::SocketAddr =
-            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
-        let ipv4_fallback: std::net::SocketAddr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-        let bind_addr = config
+        use crate::high_level::runtime::AsyncUdpSocket;
+
+        // Socket strategy: try dual-socket (separate IPv4 + IPv6) first for maximum
+        // platform compatibility. Fall back to single-socket dual-stack, then IPv4 only.
+        let requested_port = config
             .bind_addr
             .as_ref()
             .and_then(|addr| addr.as_socket_addr())
-            .unwrap_or(dual_stack_default);
-        // Try the requested bind address first. If using the dual-stack default and it fails
-        // (e.g. IPv6 not available on this system), fall back to IPv4.
-        let (udp_transport, quinn_socket) =
-            match crate::transport::UdpTransport::bind_for_quinn(bind_addr).await {
-                Ok(result) => result,
-                Err(e) if bind_addr == dual_stack_default => {
-                    info!(
-                        "Dual-stack bind to [::]:0 failed ({}), falling back to IPv4 0.0.0.0:0",
-                        e
-                    );
-                    crate::transport::UdpTransport::bind_for_quinn(ipv4_fallback)
-                        .await
-                        .map_err(|e2| {
-                            EndpointError::Config(format!(
-                                "Failed to bind UDP socket (IPv6: {e}, IPv4: {e2})"
-                            ))
-                        })?
-                }
-                Err(e) => {
-                    return Err(EndpointError::Config(format!(
-                        "Failed to bind UDP socket: {e}"
-                    )));
-                }
-            };
+            .map(|addr| addr.port())
+            .unwrap_or(0);
 
-        let actual_bind_addr = quinn_socket
-            .local_addr()
-            .map_err(|e| EndpointError::Config(format!("Failed to get local address: {e}")))?;
+        // Track DualStackSocket for local_addrs() API
+        let mut _dual_stack_ref: Option<
+            std::sync::Arc<crate::high_level::runtime::dual_stack::DualStackSocket>,
+        > = None;
 
-        let is_dual_stack = actual_bind_addr.is_ipv6();
-        info!(
-            "Bound shared UDP socket at {} ({})",
-            actual_bind_addr,
-            if is_dual_stack {
-                "dual-stack IPv4+IPv6"
-            } else {
-                "IPv4 only"
-            }
-        );
-
-        // Create transport registry with the UDP transport
-        // Also include any additional transports from the config
-        let mut transport_registry = config.transport_registry.clone();
-        transport_registry.register(Arc::new(udp_transport));
-
-        // Update NAT config to use our registry and bind address
-        nat_config.transport_registry = Some(Arc::new(transport_registry.clone()));
-        nat_config.bind_addr = Some(actual_bind_addr);
-
-        // Create NAT traversal endpoint with the shared socket
-        let inner = NatTraversalEndpoint::new_with_socket(
-            nat_config,
-            Some(event_callback),
-            Some(token_store.clone()),
-            Some(quinn_socket),
+        // Try dual-socket first (separate IPv4 + IPv6 sockets)
+        let inner = match crate::transport::UdpTransport::bind_dual_stack_for_endpoint(
+            requested_port,
         )
         .await
-        .map_err(|e| EndpointError::Config(e.to_string()))?;
+        {
+            Ok((transport, dual_socket)) => {
+                let (v4_addr, v6_addr) = dual_socket.local_addrs();
+                info!(
+                    "Bound dual-socket: IPv4={}, IPv6={} (true dual-stack, separate sockets)",
+                    v4_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    v6_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                );
 
-        // Wrap the registry in Arc for shared ownership
-        let transport_registry = Arc::new(transport_registry);
+                let actual_bind_addr = dual_socket.local_addr().map_err(|e| {
+                    EndpointError::Config(format!("Failed to get local address: {e}"))
+                })?;
+
+                // Create transport registry
+                let mut transport_registry = config.transport_registry.clone();
+                transport_registry.register(Arc::new(transport));
+
+                nat_config.transport_registry = Some(Arc::new(transport_registry));
+                nat_config.bind_addr = Some(actual_bind_addr);
+
+                let abs_socket: std::sync::Arc<dyn AsyncUdpSocket> = dual_socket.clone();
+                _dual_stack_ref = Some(dual_socket);
+
+                NatTraversalEndpoint::new_with_abstract_socket(
+                    nat_config,
+                    Some(event_callback),
+                    Some(token_store.clone()),
+                    abs_socket,
+                )
+                .await
+                .map_err(|e| EndpointError::Config(e.to_string()))?
+            }
+            Err(e) => {
+                // Fall back to single-socket approach
+                info!("Dual-socket failed ({e}), falling back to single-socket");
+
+                let dual_stack_default: std::net::SocketAddr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    requested_port,
+                );
+                let ipv4_fallback: std::net::SocketAddr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    requested_port,
+                );
+                let bind_addr = config
+                    .bind_addr
+                    .as_ref()
+                    .and_then(|addr| addr.as_socket_addr())
+                    .unwrap_or(dual_stack_default);
+
+                let (transport, quinn_socket) =
+                    match crate::transport::UdpTransport::bind_for_quinn(bind_addr).await {
+                        Ok(result) => result,
+                        Err(e2) if bind_addr == dual_stack_default => {
+                            info!("Single-socket dual-stack failed ({e2}), falling back to IPv4");
+                            crate::transport::UdpTransport::bind_for_quinn(ipv4_fallback)
+                                .await
+                                .map_err(|e3| {
+                                    EndpointError::Config(format!(
+                                        "All socket binds failed (dual: {e}, v6: {e2}, v4: {e3})"
+                                    ))
+                                })?
+                        }
+                        Err(e2) => {
+                            return Err(EndpointError::Config(format!(
+                                "Failed to bind UDP socket: {e2}"
+                            )));
+                        }
+                    };
+
+                let actual_bind_addr = quinn_socket.local_addr().map_err(|e2| {
+                    EndpointError::Config(format!("Failed to get local address: {e2}"))
+                })?;
+
+                info!(
+                    "Bound single socket at {} ({})",
+                    actual_bind_addr,
+                    if actual_bind_addr.is_ipv6() {
+                        "dual-stack IPv4+IPv6"
+                    } else {
+                        "IPv4 only"
+                    }
+                );
+
+                let mut transport_registry = config.transport_registry.clone();
+                transport_registry.register(Arc::new(transport));
+
+                nat_config.transport_registry = Some(Arc::new(transport_registry));
+                nat_config.bind_addr = Some(actual_bind_addr);
+
+                NatTraversalEndpoint::new_with_socket(
+                    nat_config,
+                    Some(event_callback),
+                    Some(token_store.clone()),
+                    Some(quinn_socket),
+                )
+                .await
+                .map_err(|e2| EndpointError::Config(e2.to_string()))?
+            }
+        };
+
+        // Get the transport registry that was set on the endpoint
+        let transport_registry = inner
+            .transport_registry()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::transport::TransportRegistry::new()));
 
         // Create connection router for automatic protocol engine selection
         let inner_arc = Arc::new(inner);

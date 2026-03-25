@@ -18,7 +18,7 @@ mod endpoint;
 mod incoming;
 mod mutex;
 mod recv_stream;
-mod runtime;
+pub(crate) mod runtime;
 mod send_stream;
 mod work_limiter;
 

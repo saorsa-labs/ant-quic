@@ -158,6 +158,54 @@ impl UdpTransport {
         Ok((transport, std_socket))
     }
 
+    /// Bind separate IPv4 and IPv6 sockets for true dual-stack operation.
+    ///
+    /// Returns the `UdpTransport` (for the transport registry) and an
+    /// `Arc<DualStackSocket>` that wraps both sockets behind a single
+    /// `AsyncUdpSocket` interface for the QUIC endpoint.
+    ///
+    /// The transport registry gets a clone of the IPv4 socket (or IPv6 if
+    /// IPv4 is unavailable). The QUIC endpoint receives the `DualStackSocket`.
+    pub async fn bind_dual_stack_for_endpoint(
+        port: u16,
+    ) -> io::Result<(
+        Self,
+        std::sync::Arc<crate::high_level::runtime::dual_stack::DualStackSocket>,
+    )> {
+        use crate::high_level::runtime::dual_stack;
+
+        let (v4_std, v6_std) = dual_stack::create_dual_stack_sockets(port)?;
+
+        // Pick a socket for the transport registry (prefer v4)
+        let registry_socket = v4_std
+            .as_ref()
+            .or(v6_std.as_ref())
+            .ok_or_else(|| io::Error::other("no sockets created"))?;
+
+        // Clone for the transport's tokio socket
+        let transport_clone = registry_socket.try_clone()?;
+        let tokio_socket = UdpSocket::from_std(transport_clone)?;
+        let local_addr = tokio_socket.local_addr()?;
+
+        let (inbound_tx, _) = mpsc::channel(1024);
+        let (shutdown_tx, _) = mpsc::channel(1);
+
+        let transport = Self {
+            socket: Arc::new(tokio_socket),
+            capabilities: TransportCapabilities::broadband(),
+            local_addr,
+            online: AtomicBool::new(true),
+            delegated_to_quinn: AtomicBool::new(true),
+            stats: UdpTransportStats::default(),
+            inbound_tx,
+            shutdown_tx,
+        };
+
+        // Create the DualStackSocket wrapper
+        let dual = dual_stack::wrap_dual_stack(v4_std, v6_std)?;
+        Ok((transport, std::sync::Arc::new(dual)))
+    }
+
     /// Create a std UDP socket with proper dual-stack configuration.
     ///
     /// Uses `socket2` (when available via the `network-discovery` feature) to set

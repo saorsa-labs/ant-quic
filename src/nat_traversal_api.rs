@@ -1590,11 +1590,41 @@ impl NatTraversalEndpoint {
     ///     Some(quinn_socket),
     /// ).await?;
     /// ```
+    /// Create a NatTraversalEndpoint with a pre-built abstract socket.
+    ///
+    /// Accepts an `Arc<dyn AsyncUdpSocket>` (e.g. `DualStackSocket`) instead of a raw
+    /// std socket. This allows custom socket implementations like dual-stack wrappers.
+    pub async fn new_with_abstract_socket(
+        config: NatTraversalConfig,
+        event_callback: Option<Box<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        token_store: Option<Arc<dyn crate::TokenStore>>,
+        abstract_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
+    ) -> Result<Self, NatTraversalError> {
+        Self::new_with_socket_inner(
+            config,
+            event_callback,
+            token_store,
+            None,
+            Some(abstract_socket),
+        )
+        .await
+    }
+
     pub async fn new_with_socket(
         config: NatTraversalConfig,
         event_callback: Option<Box<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         token_store: Option<Arc<dyn crate::TokenStore>>,
         quinn_socket: Option<std::net::UdpSocket>,
+    ) -> Result<Self, NatTraversalError> {
+        Self::new_with_socket_inner(config, event_callback, token_store, quinn_socket, None).await
+    }
+
+    async fn new_with_socket_inner(
+        config: NatTraversalConfig,
+        event_callback: Option<Box<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        token_store: Option<Arc<dyn crate::TokenStore>>,
+        quinn_socket: Option<std::net::UdpSocket>,
+        abstract_socket: Option<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>>,
     ) -> Result<Self, NatTraversalError> {
         // Wrap the callback in Arc so it can be shared with background tasks
         let event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>> =
@@ -1647,8 +1677,19 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
-        let (inner_endpoint, event_tx, event_rx, local_addr) =
-            Self::create_inner_endpoint(&config, token_store, registry_ref, quinn_socket).await?;
+        let (inner_endpoint, event_tx, event_rx, local_addr) = if let Some(abs_socket) =
+            abstract_socket
+        {
+            Self::create_inner_endpoint_with_abstract_socket(
+                &config,
+                token_store.clone(),
+                abs_socket,
+            )
+            .await?
+        } else {
+            Self::create_inner_endpoint(&config, token_store.clone(), registry_ref, quinn_socket)
+                .await?
+        };
 
         // Update discovery manager with the actual bound address
         {
@@ -2686,6 +2727,142 @@ impl NatTraversalEndpoint {
         // Create event channel
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        Ok((endpoint, event_tx, event_rx, local_addr))
+    }
+
+    /// Create the inner QUIC endpoint using a pre-built abstract socket.
+    ///
+    /// This variant accepts an `Arc<dyn AsyncUdpSocket>` (e.g. a `DualStackSocket`)
+    /// instead of a raw std socket, allowing custom socket implementations.
+    async fn create_inner_endpoint_with_abstract_socket(
+        config: &NatTraversalConfig,
+        token_store: Option<Arc<dyn crate::TokenStore>>,
+        abstract_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
+    ) -> Result<
+        (
+            InnerEndpoint,
+            mpsc::UnboundedSender<NatTraversalEvent>,
+            mpsc::UnboundedReceiver<NatTraversalEvent>,
+            SocketAddr,
+        ),
+        NatTraversalError,
+    > {
+        use std::sync::Arc;
+
+        // Build crypto configs (identical to create_inner_endpoint)
+        let server_config = {
+            let (server_pub_key, server_sec_key) = match config.identity_key.clone() {
+                Some(key) => key,
+                None => crate::crypto::raw_public_keys::key_utils::generate_ml_dsa_keypair()
+                    .map_err(|e| {
+                        NatTraversalError::ConfigError(format!("ML-DSA-65 keygen failed: {e:?}"))
+                    })?,
+            };
+
+            let mut rpk_builder = RawPublicKeyConfigBuilder::new()
+                .with_server_key(server_pub_key, server_sec_key)
+                .allow_any_key();
+
+            if let Some(ref pqc) = config.pqc {
+                rpk_builder = rpk_builder.with_pqc(pqc.clone());
+            }
+
+            let rpk_config = rpk_builder.build_rfc7250_server_config().map_err(|e| {
+                NatTraversalError::ConfigError(format!("RPK server config failed: {e}"))
+            })?;
+
+            let server_crypto = QuicServerConfig::try_from(rpk_config.inner().as_ref().clone())
+                .map_err(|e| NatTraversalError::ConfigError(e.to_string()))?;
+
+            let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+
+            let mut transport_config = TransportConfig::default();
+            transport_config.enable_address_discovery(true);
+            transport_config
+                .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
+            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            transport_config.max_concurrent_uni_streams(
+                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
+            );
+
+            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
+                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
+            };
+            transport_config.nat_traversal_config(Some(nat_config));
+            server_config.transport_config(Arc::new(transport_config));
+            Some(server_config)
+        };
+
+        let client_config = {
+            let (client_pub_key, client_sec_key) = match config.identity_key.clone() {
+                Some(key) => key,
+                None => crate::crypto::raw_public_keys::key_utils::generate_ml_dsa_keypair()
+                    .map_err(|e| {
+                        NatTraversalError::ConfigError(format!("ML-DSA-65 keygen failed: {e:?}"))
+                    })?,
+            };
+
+            let mut rpk_builder = RawPublicKeyConfigBuilder::new()
+                .with_client_key(client_pub_key, client_sec_key)
+                .allow_any_key();
+
+            if let Some(ref pqc) = config.pqc {
+                rpk_builder = rpk_builder.with_pqc(pqc.clone());
+            }
+
+            let rpk_config = rpk_builder.build_rfc7250_client_config().map_err(|e| {
+                NatTraversalError::ConfigError(format!("RPK client config failed: {e}"))
+            })?;
+
+            let client_crypto = QuicClientConfig::try_from(rpk_config.inner().as_ref().clone())
+                .map_err(|e| NatTraversalError::ConfigError(e.to_string()))?;
+
+            let mut client_config = ClientConfig::new(Arc::new(client_crypto));
+
+            if let Some(store) = token_store {
+                client_config.token_store(store);
+            }
+
+            let mut transport_config = TransportConfig::default();
+            transport_config.enable_address_discovery(true);
+            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            transport_config.max_concurrent_uni_streams(
+                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
+            );
+
+            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
+                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
+            };
+            transport_config.nat_traversal_config(Some(nat_config));
+            client_config.transport_config(Arc::new(transport_config));
+            client_config
+        };
+
+        // Create QUIC endpoint with abstract socket
+        let runtime = default_runtime().ok_or_else(|| {
+            NatTraversalError::ConfigError("No compatible async runtime found".to_string())
+        })?;
+
+        let mut endpoint = InnerEndpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            server_config,
+            abstract_socket,
+            runtime,
+        )
+        .map_err(|e| {
+            NatTraversalError::ConfigError(format!("Failed to create QUIC endpoint: {e}"))
+        })?;
+
+        endpoint.set_default_client_config(client_config);
+
+        let local_addr = endpoint.local_addr().map_err(|e| {
+            NatTraversalError::NetworkError(format!("Failed to get local address: {e}"))
+        })?;
+
+        info!("Endpoint bound to actual address: {}", local_addr);
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Ok((endpoint, event_tx, event_rx, local_addr))
     }
 
