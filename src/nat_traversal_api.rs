@@ -5008,6 +5008,37 @@ impl NatTraversalEndpoint {
             // Get timeout for current phase
             let timeout = self.get_phase_timeout(session.phase);
 
+            // EARLY ADVANCEMENT: Check if Discovery has candidates ready before timeout.
+            // Candidates are discovered asynchronously; advance as soon as they're available
+            // instead of waiting for the full phase timeout.
+            if session.phase == TraversalPhase::Discovery && elapsed <= timeout {
+                let discovered_candidates = self
+                    .discovery_manager
+                    .lock()
+                    .get_candidates_for_peer(session.peer_id);
+
+                if !discovered_candidates.is_empty() {
+                    session.candidates = discovered_candidates;
+                    session.phase = TraversalPhase::Coordination;
+                    // Reset timer for the new phase
+                    session.started_at = now;
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::PhaseTransition {
+                            peer_id: session.peer_id,
+                            from_phase: TraversalPhase::Discovery,
+                            to_phase: TraversalPhase::Coordination,
+                        },
+                    );
+                    info!(
+                        "Peer {:?} early-advanced from Discovery to Coordination with {} candidates ({:.1}s before timeout)",
+                        session.peer_id,
+                        session.candidates.len(),
+                        (timeout - elapsed).as_secs_f64()
+                    );
+                }
+            }
+
             // Check if we've exceeded the timeout
             if elapsed > timeout {
                 match session.phase {
@@ -5025,6 +5056,7 @@ impl NatTraversalEndpoint {
                         if !session.candidates.is_empty() {
                             // Advance to coordination phase
                             session.phase = TraversalPhase::Coordination;
+                            session.started_at = now;
                             self.emit_event(
                                 &mut events,
                                 NatTraversalEvent::PhaseTransition {
@@ -5034,7 +5066,7 @@ impl NatTraversalEndpoint {
                                 },
                             );
                             info!(
-                                "Peer {:?} advanced from Discovery to Coordination with {} candidates",
+                                "Peer {:?} advanced from Discovery to Coordination with {} candidates (at timeout)",
                                 session.peer_id,
                                 session.candidates.len()
                             );
@@ -5245,7 +5277,9 @@ impl NatTraversalEndpoint {
     /// Get timeout duration for a specific traversal phase
     fn get_phase_timeout(&self, phase: TraversalPhase) -> Duration {
         match phase {
-            TraversalPhase::Discovery => Duration::from_secs(10),
+            // Reduced from 10s to 3s — with early advancement, this is only
+            // the fallback timeout. Candidates typically arrive within 1-2s.
+            TraversalPhase::Discovery => Duration::from_secs(3),
             TraversalPhase::Coordination => self.config.coordination_timeout,
             TraversalPhase::Synchronization => Duration::from_secs(3),
             TraversalPhase::Punching => Duration::from_secs(5),
