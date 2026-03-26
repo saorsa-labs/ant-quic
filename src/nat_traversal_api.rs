@@ -3859,6 +3859,34 @@ impl NatTraversalEndpoint {
         Ok(None)
     }
 
+    /// Returns ALL observed external addresses from all connected peers and paths.
+    ///
+    /// Unlike `get_observed_external_address()` which returns only the first match,
+    /// this collects unique addresses across all connections and QUIC path IDs.
+    /// This is critical for dual-stack nodes where IPv4 and IPv6 addresses are
+    /// discovered from different peers or paths.
+    pub fn get_all_observed_external_addresses(
+        &self,
+    ) -> Result<Vec<SocketAddr>, NatTraversalError> {
+        let mut addrs = Vec::new();
+        for entry in self.connections.iter() {
+            let connection = entry.value();
+            for addr in connection.all_observed_addresses() {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        }
+        if !addrs.is_empty() {
+            debug!(
+                "Collected {} observed external addresses: {:?}",
+                addrs.len(),
+                addrs
+            );
+        }
+        Ok(addrs)
+    }
+
     // ============ Multi-Transport Address Advertising ============
 
     /// Advertise a transport address to all connected peers

@@ -571,10 +571,15 @@ impl Node {
             _ => false,
         };
 
-        // Collect external addresses
-        let mut external_addrs = Vec::new();
+        // Collect ALL external addresses (both IPv4 and IPv6) from all
+        // connections and QUIC paths. This is critical for dual-stack nodes
+        // where different peers report different address families.
+        let mut external_addrs = self.inner.all_external_addrs();
+        // Ensure the primary external address is included (backward compat)
         if let Some(addr) = external_addr {
-            external_addrs.push(addr);
+            if !external_addrs.contains(&addr) {
+                external_addrs.insert(0, addr);
+            }
         }
 
         // Calculate hole punch success rate

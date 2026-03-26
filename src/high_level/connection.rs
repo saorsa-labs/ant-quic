@@ -678,6 +678,17 @@ impl Connection {
             .observed_address()
     }
 
+    /// Returns all observed external addresses from all QUIC paths on this connection.
+    ///
+    /// Different paths may report different address families (IPv4 vs IPv6).
+    pub fn all_observed_addresses(&self) -> Vec<SocketAddr> {
+        self.0
+            .state
+            .lock("all_observed_addresses")
+            .inner
+            .all_observed_addresses()
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///

@@ -1939,6 +1939,17 @@ impl Connection {
             .and_then(|state| state.get_observed_address(0)) // Use path ID 0 for primary path
     }
 
+    /// Returns ALL observed external addresses from all QUIC paths.
+    ///
+    /// Different paths may report different addresses (e.g. IPv4 via one peer,
+    /// IPv6 via another). This collects observations from every path ID.
+    pub fn all_observed_addresses(&self) -> Vec<SocketAddr> {
+        self.address_discovery_state
+            .as_ref()
+            .map(|state| state.get_all_received_history())
+            .unwrap_or_default()
+    }
+
     /// Get the address discovery state (internal use)
     #[allow(dead_code)]
     pub(crate) fn address_discovery_state(&self) -> Option<&AddressDiscoveryState> {

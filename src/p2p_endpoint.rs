@@ -891,6 +891,16 @@ impl P2pEndpoint {
         self.inner.get_observed_external_address().ok().flatten()
     }
 
+    /// Returns all observed external addresses from all connections and paths.
+    ///
+    /// Collects both IPv4 and IPv6 addresses discovered via OBSERVED_ADDRESS
+    /// frames from peers. Critical for dual-stack nodes.
+    pub fn all_external_addrs(&self) -> Vec<SocketAddr> {
+        self.inner
+            .get_all_observed_external_addresses()
+            .unwrap_or_default()
+    }
+
     /// Get the transport registry for this endpoint
     ///
     /// The transport registry contains all registered transport providers (UDP, BLE, etc.)
