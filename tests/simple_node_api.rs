@@ -21,6 +21,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::time::timeout;
 
+/// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
 // ============================================================================
 // Zero-Config Node Creation Tests
 // ============================================================================
@@ -62,10 +71,11 @@ mod zero_config_tests {
             .expect("Node::bind() should succeed");
 
         let local_addr = node.local_addr().expect("Should have local address");
-        assert_eq!(
-            local_addr.ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            "Should bind to localhost"
+        // On dual-stack systems, binding to 127.0.0.1:0 may report [::]:PORT
+        assert!(
+            local_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) || local_addr.ip().is_unspecified(),
+            "Should bind to localhost or unspecified (dual-stack), got: {}",
+            local_addr.ip()
         );
         println!("Node bound to: {}", local_addr);
 
@@ -78,7 +88,7 @@ mod zero_config_tests {
         let node1 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .expect("First node should succeed");
-        let node1_addr = node1.local_addr().expect("Should have address");
+        let node1_addr = normalize_local_addr(node1.local_addr().expect("Should have address"));
         println!("First node at: {}", node1_addr);
 
         // Create second node with known peer
@@ -135,10 +145,9 @@ mod zero_config_tests {
             .expect("Node::with_config() should succeed");
 
         let local_addr = node.local_addr().expect("Should have address");
-        assert_eq!(
-            local_addr.ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            "Should use config bind address"
+        assert!(
+            local_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) || local_addr.ip().is_unspecified(),
+            "Should use config bind address (dual-stack may report [::])"
         );
 
         node.shutdown().await;
@@ -584,7 +593,7 @@ async fn test_simple_api_integration_summary() {
     let node = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .expect("Node::bind() failed");
-    let local_addr = node.local_addr().expect("Should have address");
+    let local_addr = normalize_local_addr(node.local_addr().expect("Should have address"));
     println!("   Success: {} / {:?}", local_addr, node.peer_id());
 
     // 2. Status observability

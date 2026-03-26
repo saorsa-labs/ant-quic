@@ -28,9 +28,16 @@ async fn test_external_address_discovery() -> anyhow::Result<()> {
         .build()?;
 
     let observer_node = P2pEndpoint::new(observer_config).await?;
-    let observer_addr = observer_node
+    let raw_addr = observer_node
         .local_addr()
         .expect("Observer should have local addr");
+    // On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
+    // Use 127.0.0.1 with the assigned port for the known_peers config.
+    let observer_addr = if raw_addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), raw_addr.port())
+    } else {
+        raw_addr
+    };
     println!("Observer node started at {}", observer_addr);
 
     let observer_task = {

@@ -38,6 +38,16 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Shutdown timeout to prevent test hangs
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
+/// Normalize to 127.0.0.1 for use as a known_peer address.
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
 /// Create a test node configuration
 fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
     P2pConfig::builder()
@@ -92,7 +102,8 @@ mod connection_lifecycle {
             .await
             .expect("Failed to create listener");
 
-        let listener_addr = listener.local_addr().expect("Listener should have address");
+        let listener_addr =
+            normalize_local_addr(listener.local_addr().expect("Listener should have address"));
         println!("Listener ready at: {}", listener_addr);
 
         // Subscribe to events (just testing API, not using)
@@ -138,7 +149,8 @@ mod connection_lifecycle {
         let listener = P2pEndpoint::new(listener_config)
             .await
             .expect("Failed to create listener");
-        let listener_addr = listener.local_addr().expect("Listener should have address");
+        let listener_addr =
+            normalize_local_addr(listener.local_addr().expect("Listener should have address"));
 
         // Create multiple connectors
         let mut connectors = Vec::new();
@@ -170,7 +182,8 @@ mod connection_lifecycle {
         let node1 = P2pEndpoint::new(node1_config)
             .await
             .expect("Failed to create node1");
-        let node1_addr = node1.local_addr().expect("Node1 should have address");
+        let node1_addr =
+            normalize_local_addr(node1.local_addr().expect("Node1 should have address"));
 
         let node2_config = test_node_config(vec![node1_addr]);
         let node2 = P2pEndpoint::new(node2_config)
@@ -243,7 +256,8 @@ mod connection_lifecycle {
         let node1 = P2pEndpoint::new(node1_config)
             .await
             .expect("Failed to create node1");
-        let node1_addr = node1.local_addr().expect("Node1 should have address");
+        let node1_addr =
+            normalize_local_addr(node1.local_addr().expect("Node1 should have address"));
 
         // Connect node2 to node1
         let node2_config = test_node_config(vec![node1_addr]);

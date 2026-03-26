@@ -39,6 +39,16 @@ async fn shutdown_with_timeout(node: P2pEndpoint) {
     // Drop the node regardless - this ensures cleanup even if shutdown hangs
 }
 
+/// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
+/// Normalize to 127.0.0.1 for use as a known_peer address.
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
 /// Create a test node configuration
 fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
     P2pConfig::builder()
@@ -56,7 +66,9 @@ fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
 
 /// Create a test node with optional known peers
 async fn create_test_node(known_peers: Vec<SocketAddr>) -> P2pEndpoint {
-    let config = test_node_config(known_peers);
+    let normalized_peers: Vec<SocketAddr> =
+        known_peers.into_iter().map(normalize_local_addr).collect();
+    let config = test_node_config(normalized_peers);
     P2pEndpoint::new(config)
         .await
         .expect("Failed to create test node")
@@ -122,7 +134,8 @@ mod first_node_tests {
     #[tokio::test]
     async fn test_first_node_can_accept_connections() {
         let listener = create_test_node(vec![]).await;
-        let listener_addr = listener.local_addr().expect("Listener should have address");
+        let listener_addr =
+            normalize_local_addr(listener.local_addr().expect("Listener should have address"));
 
         println!("Listener ready at: {}", listener_addr);
 
@@ -170,9 +183,9 @@ mod first_node_tests {
         let node2 = create_test_node(vec![]).await;
         let node3 = create_test_node(vec![]).await;
 
-        let addr1 = node1.local_addr().expect("Node 1 should have address");
-        let addr2 = node2.local_addr().expect("Node 2 should have address");
-        let addr3 = node3.local_addr().expect("Node 3 should have address");
+        let addr1 = normalize_local_addr(node1.local_addr().expect("Node 1 should have address"));
+        let addr2 = normalize_local_addr(node2.local_addr().expect("Node 2 should have address"));
+        let addr3 = normalize_local_addr(node3.local_addr().expect("Node 3 should have address"));
 
         // All should have different ports
         let mut ports = HashSet::new();
@@ -203,12 +216,14 @@ mod bootstrap_tests {
     async fn test_connect_to_known_peer() {
         // Create first node (no known peers)
         let node1 = create_test_node(vec![]).await;
-        let node1_addr = node1.local_addr().expect("Node 1 should have address");
+        let node1_addr =
+            normalize_local_addr(node1.local_addr().expect("Node 1 should have address"));
         println!("Node 1 listening at: {}", node1_addr);
 
         // Create second node with node1 as known peer
         let node2 = create_test_node(vec![node1_addr]).await;
-        let node2_addr = node2.local_addr().expect("Node 2 should have address");
+        let node2_addr =
+            normalize_local_addr(node2.local_addr().expect("Node 2 should have address"));
         println!("Node 2 listening at: {}", node2_addr);
 
         // Spawn accept task on node1
@@ -241,12 +256,13 @@ mod bootstrap_tests {
     async fn test_three_node_bootstrap_chain() {
         // Create first node (the "seed" node)
         let seed = create_test_node(vec![]).await;
-        let seed_addr = seed.local_addr().expect("Seed should have address");
+        let seed_addr = normalize_local_addr(seed.local_addr().expect("Seed should have address"));
         println!("Seed node at: {}", seed_addr);
 
         // Create second node, knows seed
         let node2 = create_test_node(vec![seed_addr]).await;
-        let node2_addr = node2.local_addr().expect("Node 2 should have address");
+        let node2_addr =
+            normalize_local_addr(node2.local_addr().expect("Node 2 should have address"));
         println!("Node 2 at: {}", node2_addr);
 
         // Create third node, knows both seed and node2
@@ -299,7 +315,8 @@ mod address_discovery_tests {
     #[tokio::test]
     async fn test_address_discovery_event() {
         let observer = create_test_node(vec![]).await;
-        let observer_addr = observer.local_addr().expect("Observer needs address");
+        let observer_addr =
+            normalize_local_addr(observer.local_addr().expect("Observer needs address"));
 
         // Subscribe to events
         let events = observer.subscribe();
@@ -355,7 +372,7 @@ mod data_transfer_tests {
     #[tokio::test]
     async fn test_send_receive_data() {
         let server = create_test_node(vec![]).await;
-        let server_addr = server.local_addr().expect("Server needs address");
+        let server_addr = normalize_local_addr(server.local_addr().expect("Server needs address"));
 
         // Subscribe to events on both sides
         let _server_events = server.subscribe();
@@ -410,7 +427,7 @@ mod data_transfer_tests {
     #[tokio::test]
     async fn test_bidirectional_data_transfer() {
         let node1 = create_test_node(vec![]).await;
-        let node1_addr = node1.local_addr().expect("Node 1 needs address");
+        let node1_addr = normalize_local_addr(node1.local_addr().expect("Node 1 needs address"));
 
         let node2 = create_test_node(vec![node1_addr]).await;
 
@@ -995,7 +1012,7 @@ mod channel_recv_and_shutdown_tests {
     #[tokio::test]
     async fn test_recv_delivers_data_via_channel() {
         let server = create_test_node(vec![]).await;
-        let server_addr = server.local_addr().expect("Server needs address");
+        let server_addr = normalize_local_addr(server.local_addr().expect("Server needs address"));
 
         // Spawn server accept so handshake completes and reader task is spawned
         let server_clone = server.clone();
@@ -1111,7 +1128,7 @@ mod channel_recv_and_shutdown_tests {
     #[tokio::test]
     async fn test_shutdown_completes_within_bounded_time() {
         let server = create_test_node(vec![]).await;
-        let server_addr = server.local_addr().expect("Server needs address");
+        let server_addr = normalize_local_addr(server.local_addr().expect("Server needs address"));
 
         // Spawn accept so handshake can complete
         let server_clone = server.clone();

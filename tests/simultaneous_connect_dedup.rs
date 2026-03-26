@@ -13,6 +13,15 @@
 use ant_quic::{ConnectionHealth, Node, PeerConnection};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
+
+/// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
 use tokio::time::timeout;
 
 /// Helper to create a node bound to localhost with an ephemeral port.
@@ -29,7 +38,7 @@ async fn test_connect_addr_dedup_same_address() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
 
-    let addr_b = node_b.local_addr().expect("node_b should have address");
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
 
     // Spawn accept loop on node_b
     let accept_handle = tokio::spawn({
@@ -90,8 +99,8 @@ async fn test_simultaneous_connect_no_phantom() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
 
-    let addr_a = node_a.local_addr().expect("node_a should have address");
-    let addr_b = node_b.local_addr().expect("node_b should have address");
+    let addr_a = normalize_local_addr(node_a.local_addr().expect("node_a should have address"));
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
 
     // Spawn accept loops on both nodes
     let accept_a = tokio::spawn({
@@ -185,8 +194,8 @@ async fn test_simultaneous_connect_repeated() {
         let node_a = create_localhost_node().await;
         let node_b = create_localhost_node().await;
 
-        let addr_a = node_a.local_addr().expect("node_a addr");
-        let addr_b = node_b.local_addr().expect("node_b addr");
+        let addr_a = normalize_local_addr(node_a.local_addr().expect("node_a addr"));
+        let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
 
         // Spawn accept loops
         let accept_a = tokio::spawn({
@@ -354,7 +363,7 @@ async fn test_connect_after_failure_succeeds() {
     let _ = timeout(Duration::from_secs(10), node_a.connect_addr(bogus)).await;
 
     // Second: connect to the real node — this should succeed
-    let addr_b = node_b.local_addr().expect("node_b addr");
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
     let result = timeout(Duration::from_secs(10), node_a.connect_addr(addr_b)).await;
 
     assert!(
@@ -385,7 +394,7 @@ async fn test_connection_health_status() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
 
-    let addr_b = node_b.local_addr().expect("node_b should have address");
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
 
     // Spawn accept on node_b
     let accept_handle = tokio::spawn({
@@ -456,7 +465,7 @@ async fn test_connection_health_after_disconnect() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
 
-    let addr_b = node_b.local_addr().expect("node_b addr");
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
 
     let accept_handle = tokio::spawn({
         let node = node_b.clone();
@@ -513,7 +522,7 @@ async fn test_four_node_mesh_formation() {
 
     let addrs: Vec<SocketAddr> = nodes
         .iter()
-        .map(|n| n.local_addr().expect("node addr"))
+        .map(|n| normalize_local_addr(n.local_addr().expect("node addr")))
         .collect();
 
     // Spawn accept loops on all nodes
@@ -588,7 +597,7 @@ async fn test_four_node_mesh_formation() {
 async fn test_rapid_connect_disconnect_cycles() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
-    let addr_b = node_b.local_addr().expect("node_b addr");
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
 
     for cycle in 0..10 {
         // Spawn accept
@@ -672,8 +681,8 @@ async fn test_simultaneous_connect_send_succeeds() {
         let node_a = create_localhost_node().await;
         let node_b = create_localhost_node().await;
 
-        let addr_a = node_a.local_addr().expect("node_a addr");
-        let addr_b = node_b.local_addr().expect("node_b addr");
+        let addr_a = normalize_local_addr(node_a.local_addr().expect("node_a addr"));
+        let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
 
         // Spawn accept loops so incoming connections are processed.
         let accept_a = tokio::spawn({
