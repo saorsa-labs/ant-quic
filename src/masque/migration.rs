@@ -46,6 +46,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::shared::normalize_socket_addr;
+
 /// Configuration for connection migration
 #[derive(Debug, Clone)]
 pub struct MigrationConfig {
@@ -274,7 +276,10 @@ impl MigrationCoordinator {
         let peer_candidates = candidates.entry(peer).or_default();
 
         for addr in addrs {
-            if !peer_candidates.iter().any(|c| c.address == addr) {
+            if !peer_candidates
+                .iter()
+                .any(|c| normalize_socket_addr(c.address) == normalize_socket_addr(addr))
+            {
                 peer_candidates.push(CandidatePath::new(addr));
             }
         }
@@ -478,7 +483,10 @@ impl MigrationCoordinator {
         {
             let mut candidates = self.candidates.write().await;
             if let Some(peer_candidates) = candidates.get_mut(&peer) {
-                if let Some(candidate) = peer_candidates.iter_mut().find(|c| c.address == path) {
+                if let Some(candidate) = peer_candidates
+                    .iter_mut()
+                    .find(|c| normalize_socket_addr(c.address) == normalize_socket_addr(path))
+                {
                     candidate.validated = true;
                     candidate.rtt = Some(rtt);
                 }

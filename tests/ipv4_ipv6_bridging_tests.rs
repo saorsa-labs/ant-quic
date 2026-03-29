@@ -19,14 +19,12 @@
 //! Test approach: Use loopback binding (127.0.0.1 for IPv4, ::1 for IPv6)
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ant_quic::bootstrap_cache::{CachedPeer, PeerCapabilities};
 use ant_quic::masque::{
     ConnectUdpRequest, MasqueRelayConfig, MasqueRelayServer, RelayManager, RelayManagerConfig,
 };
-use bytes::Bytes;
 
 // ============================================================================
 // Test Helpers
@@ -271,34 +269,9 @@ async fn test_relay_session_timeout() {
     );
 }
 
-#[tokio::test]
-async fn test_relay_rate_limit_rejection() {
-    let mut relay_config = dual_stack_relay_config();
-    relay_config.session_config.bandwidth_limit = 100; // Very low limit
-
-    let relay = MasqueRelayServer::new_dual_stack(relay_config, ipv4_addr(9302), ipv6_addr(9302));
-
-    let client_addr = ipv4_addr(10012);
-    let request = ConnectUdpRequest::bind_any();
-    let _ = relay
-        .handle_connect_request(&request, client_addr)
-        .await
-        .unwrap();
-
-    // Send many large datagrams to trigger rate limit
-    let large_payload = Bytes::from(vec![0u8; 1000]);
-    for _ in 0..200 {
-        let _ = relay
-            .forward_datagram(client_addr, ipv4_addr(10013), large_payload.clone())
-            .await;
-    }
-
-    // Check rate limit was hit
-    assert!(
-        relay.stats().rate_limit_rejections.load(Ordering::Relaxed) > 0,
-        "Rate limit should have been triggered"
-    );
-}
+// Rate limiting is tested in relay_session.rs unit tests (check_rate_limit).
+// The previous test_relay_rate_limit_rejection used a no-op forward_datagram
+// stub that never actually forwarded data, giving false confidence.
 
 // ============================================================================
 // PROOF LEVEL 5: RelayManager Integration

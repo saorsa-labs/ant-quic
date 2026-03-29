@@ -71,18 +71,21 @@ fn broadcast_address_to_peers(
     address: SocketAddr,
     priority: u32,
 ) {
-    for mut entry in connections.iter_mut() {
-        let peer_id = *entry.key();
-        let conn = entry.value_mut();
-        match conn.send_nat_address_advertisement(address, priority) {
-            Ok(seq) => {
-                info!(
-                    "Sent ADD_ADDRESS to peer {:?}: addr={}, seq={}",
-                    peer_id, address, seq
-                );
-            }
-            Err(e) => {
-                debug!("Failed to send ADD_ADDRESS to peer {:?}: {:?}", peer_id, e);
+    // Snapshot keys to avoid holding iter_mut() write guards on all DashMap shards
+    let peer_ids: Vec<PeerId> = connections.iter().map(|e| *e.key()).collect();
+    for peer_id in peer_ids {
+        if let Some(mut entry) = connections.get_mut(&peer_id) {
+            let conn = entry.value_mut();
+            match conn.send_nat_address_advertisement(address, priority) {
+                Ok(seq) => {
+                    info!(
+                        "Sent ADD_ADDRESS to peer {:?}: addr={}, seq={}",
+                        peer_id, address, seq
+                    );
+                }
+                Err(e) => {
+                    debug!("Failed to send ADD_ADDRESS to peer {:?}: {:?}", peer_id, e);
+                }
             }
         }
     }
@@ -2195,9 +2198,13 @@ impl NatTraversalEndpoint {
         let mut updates = Vec::new();
         let now = std::time::Instant::now();
 
-        // DashMap provides lock-free .iter_mut() that yields RefMulti entries
-        for mut entry in self.active_sessions.iter_mut() {
-            let peer_id = *entry.key(); // Copy before mutable borrow
+        // Snapshot keys to avoid holding iter_mut() write guards on all shards
+        // while accessing self.connections (another DashMap)
+        let session_keys: Vec<PeerId> = self.active_sessions.iter().map(|e| *e.key()).collect();
+        for peer_id in session_keys {
+            let Some(mut entry) = self.active_sessions.get_mut(&peer_id) else {
+                continue;
+            };
             let session = entry.value_mut();
             let mut state_changed = false;
 
@@ -2491,7 +2498,10 @@ impl NatTraversalEndpoint {
         let mut bootstrap_nodes = self.bootstrap_nodes.write();
 
         // Check if already exists
-        if !bootstrap_nodes.iter().any(|b| b.address == address) {
+        if !bootstrap_nodes
+            .iter()
+            .any(|b| normalize_socket_addr(b.address) == normalize_socket_addr(address))
+        {
             bootstrap_nodes.push(BootstrapNode {
                 address,
                 last_seen: std::time::Instant::now(),
@@ -4999,6 +5009,10 @@ impl NatTraversalEndpoint {
         let mut coordination_requests: Vec<(PeerId, SocketAddr)> = Vec::new();
         let mut hole_punch_requests: Vec<(PeerId, Vec<CandidateAddress>)> = Vec::new();
         let mut validation_requests: Vec<(PeerId, SocketAddr)> = Vec::new();
+        // Collect Discovery-phase peers for deferred discovery_manager access
+        // to avoid locking discovery_manager while iter_mut() holds all shard guards
+        let mut early_discovery_peers: Vec<(PeerId, Duration)> = Vec::new();
+        let mut timeout_discovery_peers: Vec<PeerId> = Vec::new();
 
         // Phase 1: Collect work and update session states (brief DashMap access)
         for mut entry in self.active_sessions.iter_mut() {
@@ -5008,93 +5022,18 @@ impl NatTraversalEndpoint {
             // Get timeout for current phase
             let timeout = self.get_phase_timeout(session.phase);
 
-            // EARLY ADVANCEMENT: Check if Discovery has candidates ready before timeout.
-            // Candidates are discovered asynchronously; advance as soon as they're available
-            // instead of waiting for the full phase timeout.
+            // Record Discovery-phase sessions for deferred processing
+            // (discovery_manager.lock() cannot be called while iter_mut() holds all shard guards)
             if session.phase == TraversalPhase::Discovery && elapsed <= timeout {
-                let discovered_candidates = self
-                    .discovery_manager
-                    .lock()
-                    .get_candidates_for_peer(session.peer_id);
-
-                if !discovered_candidates.is_empty() {
-                    session.candidates = discovered_candidates;
-                    session.phase = TraversalPhase::Coordination;
-                    // Reset timer for the new phase
-                    session.started_at = now;
-                    self.emit_event(
-                        &mut events,
-                        NatTraversalEvent::PhaseTransition {
-                            peer_id: session.peer_id,
-                            from_phase: TraversalPhase::Discovery,
-                            to_phase: TraversalPhase::Coordination,
-                        },
-                    );
-                    info!(
-                        "Peer {:?} early-advanced from Discovery to Coordination with {} candidates ({:.1}s before timeout)",
-                        session.peer_id,
-                        session.candidates.len(),
-                        (timeout - elapsed).as_secs_f64()
-                    );
-                }
+                early_discovery_peers.push((session.peer_id, timeout - elapsed));
             }
 
             // Check if we've exceeded the timeout
             if elapsed > timeout {
                 match session.phase {
                     TraversalPhase::Discovery => {
-                        // Get candidates from discovery manager (safe - different lock)
-                        let discovered_candidates = self
-                            .discovery_manager
-                            .lock()
-                            .get_candidates_for_peer(session.peer_id);
-
-                        // Update session candidates
-                        session.candidates = discovered_candidates.clone();
-
-                        // Check if we have discovered any candidates
-                        if !session.candidates.is_empty() {
-                            // Advance to coordination phase
-                            session.phase = TraversalPhase::Coordination;
-                            session.started_at = now;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::PhaseTransition {
-                                    peer_id: session.peer_id,
-                                    from_phase: TraversalPhase::Discovery,
-                                    to_phase: TraversalPhase::Coordination,
-                                },
-                            );
-                            info!(
-                                "Peer {:?} advanced from Discovery to Coordination with {} candidates (at timeout)",
-                                session.peer_id,
-                                session.candidates.len()
-                            );
-                        } else if session.attempt < self.config.max_concurrent_attempts as u32 {
-                            // Retry discovery with exponential backoff
-                            session.attempt += 1;
-                            session.started_at = now;
-                            let backoff_duration = self.calculate_backoff(session.attempt);
-                            warn!(
-                                "Discovery timeout for peer {:?}, retrying (attempt {}), backoff: {:?}",
-                                session.peer_id, session.attempt, backoff_duration
-                            );
-                        } else {
-                            // Max attempts reached, fail
-                            session.phase = TraversalPhase::Failed;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::TraversalFailed {
-                                    peer_id: session.peer_id,
-                                    error: NatTraversalError::NoCandidatesFound,
-                                    fallback_available: true,
-                                },
-                            );
-                            error!(
-                                "NAT traversal failed for peer {:?}: no candidates found after {} attempts",
-                                session.peer_id, session.attempt
-                            );
-                        }
+                        // Defer discovery_manager access to after iter_mut loop
+                        timeout_discovery_peers.push(session.peer_id);
                     }
                     TraversalPhase::Coordination => {
                         // DEFER: coordination request (accesses connections DashMap)
@@ -5209,6 +5148,90 @@ impl NatTraversalEndpoint {
         }
         // Phase 1 complete - all DashMap entries are now released
 
+        // Phase 1b: Process deferred discovery_manager checks
+        // Each get_mut() locks only one shard, safe to lock discovery_manager
+        for (peer_id, time_remaining) in early_discovery_peers {
+            let discovered_candidates = self
+                .discovery_manager
+                .lock()
+                .get_candidates_for_peer(peer_id);
+
+            if !discovered_candidates.is_empty() {
+                if let Some(mut entry) = self.active_sessions.get_mut(&peer_id) {
+                    let session = entry.value_mut();
+                    session.candidates = discovered_candidates;
+                    session.phase = TraversalPhase::Coordination;
+                    session.started_at = now;
+                }
+                self.emit_event(
+                    &mut events,
+                    NatTraversalEvent::PhaseTransition {
+                        peer_id,
+                        from_phase: TraversalPhase::Discovery,
+                        to_phase: TraversalPhase::Coordination,
+                    },
+                );
+                info!(
+                    "Peer {:?} early-advanced from Discovery to Coordination ({:.1}s before timeout)",
+                    peer_id,
+                    time_remaining.as_secs_f64()
+                );
+            }
+        }
+
+        for peer_id in timeout_discovery_peers {
+            let discovered_candidates = self
+                .discovery_manager
+                .lock()
+                .get_candidates_for_peer(peer_id);
+
+            if !discovered_candidates.is_empty() {
+                if let Some(mut entry) = self.active_sessions.get_mut(&peer_id) {
+                    let session = entry.value_mut();
+                    session.candidates = discovered_candidates;
+                    session.phase = TraversalPhase::Coordination;
+                    session.started_at = now;
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::PhaseTransition {
+                            peer_id: session.peer_id,
+                            from_phase: TraversalPhase::Discovery,
+                            to_phase: TraversalPhase::Coordination,
+                        },
+                    );
+                    info!(
+                        "Peer {:?} advanced from Discovery to Coordination at timeout",
+                        session.peer_id,
+                    );
+                }
+            } else if let Some(mut entry) = self.active_sessions.get_mut(&peer_id) {
+                let session = entry.value_mut();
+                if session.attempt < self.config.max_concurrent_attempts as u32 {
+                    session.attempt += 1;
+                    session.started_at = now;
+                    let backoff_duration = self.calculate_backoff(session.attempt);
+                    warn!(
+                        "Discovery timeout for peer {:?}, retrying (attempt {}), backoff: {:?}",
+                        peer_id, session.attempt, backoff_duration
+                    );
+                } else {
+                    session.phase = TraversalPhase::Failed;
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::TraversalFailed {
+                            peer_id,
+                            error: NatTraversalError::NoCandidatesFound,
+                            fallback_available: true,
+                        },
+                    );
+                    error!(
+                        "NAT traversal failed for peer {:?}: no candidates found after {} attempts",
+                        peer_id, session.attempt
+                    );
+                }
+            }
+        }
+
         // Phase 2: Execute deferred work (no DashMap entries held)
 
         // Execute coordination requests
@@ -5318,11 +5341,9 @@ impl NatTraversalEndpoint {
 
                 // Check if this is a bootstrap node connection
                 // parking_lot::RwLock doesn't poison
-                let is_bootstrap = self
-                    .bootstrap_nodes
-                    .read()
-                    .iter()
-                    .any(|node| node.address == remote_addr);
+                let is_bootstrap = self.bootstrap_nodes.read().iter().any(|node| {
+                    normalize_socket_addr(node.address) == normalize_socket_addr(remote_addr)
+                });
 
                 if is_bootstrap {
                     // In a real implementation, we would check the connection for observed addresses
@@ -5724,7 +5745,7 @@ impl NatTraversalEndpoint {
         if let Some(entry) = self.connections.get(&peer_id) {
             let conn = entry.value();
             // Connection exists, check if it's to the expected address
-            if conn.remote_address() == address {
+            if normalize_socket_addr(conn.remote_address()) == normalize_socket_addr(address) {
                 info!(
                     "Path validation successful for peer {:?} at {}",
                     peer_id, address
@@ -5734,7 +5755,9 @@ impl NatTraversalEndpoint {
                 // DashMap provides lock-free .get_mut() that returns Option<RefMut<K, V>>
                 if let Some(mut session) = self.active_sessions.get_mut(&peer_id) {
                     for candidate in &mut session.candidates {
-                        if candidate.address == address {
+                        if normalize_socket_addr(candidate.address)
+                            == normalize_socket_addr(address)
+                        {
                             candidate.state = CandidateState::Valid;
                             break;
                         }
@@ -5889,27 +5912,27 @@ impl NatTraversalEndpoint {
                 );
 
                 // Find and update the active session with validated candidate
-                // DashMap provides lock-free .iter_mut() that returns RefMulti entries
-                let mut matching_peer_id = None;
-                for mut entry in self.active_sessions.iter_mut() {
-                    if entry
-                        .value()
-                        .candidates
-                        .iter()
-                        .any(|c| c.address == address)
-                    {
-                        // Update session phase to indicate successful validation
-                        entry.value_mut().phase = TraversalPhase::Connected;
-                        matching_peer_id = Some(*entry.key());
+                // Use read-only scan + targeted get_mut to avoid iter_mut() + callback re-entrancy
+                let matching_peer_id = self
+                    .active_sessions
+                    .iter()
+                    .find(|entry| {
+                        entry.value().candidates.iter().any(|c| {
+                            normalize_socket_addr(c.address) == normalize_socket_addr(address)
+                        })
+                    })
+                    .map(|entry| *entry.key());
 
-                        // Trigger event callback
-                        if let Some(ref callback) = self.event_callback {
-                            callback(NatTraversalEvent::CandidateValidated {
-                                peer_id: *entry.key(),
-                                candidate_address: address,
-                            });
-                        }
-                        break;
+                if let Some(peer_id) = matching_peer_id {
+                    if let Some(mut entry) = self.active_sessions.get_mut(&peer_id) {
+                        entry.value_mut().phase = TraversalPhase::Connected;
+                    }
+                    // Callback outside DashMap guard to prevent re-entrancy deadlock
+                    if let Some(ref callback) = self.event_callback {
+                        callback(NatTraversalEvent::CandidateValidated {
+                            peer_id,
+                            candidate_address: address,
+                        });
                     }
                 }
 
