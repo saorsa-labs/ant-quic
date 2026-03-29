@@ -453,45 +453,6 @@ impl MasqueRelayServer {
         let _ = self.close_session_by_client(client_addr).await;
     }
 
-    /// Forward a datagram (used for testing)
-    pub async fn forward_datagram(
-        &self,
-        client_addr: SocketAddr,
-        _target: SocketAddr,
-        payload: Bytes,
-    ) -> RelayResult<()> {
-        let session_id = {
-            let client_map = self.client_to_session.read().await;
-            client_map
-                .get(&client_addr)
-                .copied()
-                .ok_or(RelayError::SessionError {
-                    session_id: None,
-                    kind: SessionErrorKind::NotFound,
-                })?
-        };
-
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(&session_id).ok_or(RelayError::SessionError {
-            session_id: Some(session_id as u32),
-            kind: SessionErrorKind::NotFound,
-        })?;
-
-        // Check rate limit
-        if !session.check_rate_limit(payload.len()) {
-            self.stats.record_rate_limit();
-            return Err(RelayError::RateLimitExceeded {
-                retry_after_ms: 1000, // Wait 1 second before retrying
-            });
-        }
-
-        // Record statistics
-        self.stats.record_bytes(payload.len() as u64);
-        self.stats.record_datagram();
-
-        Ok(())
-    }
-
     /// Handle an incoming capsule from a client
     ///
     /// Returns an optional response capsule to send back.

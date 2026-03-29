@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::shared::ConnectionId;
+use crate::shared::{ConnectionId, normalize_socket_addr};
 use tracing::{debug, info, trace, warn};
 
 use super::{PortPredictor, PortPredictorConfig};
@@ -1903,11 +1903,10 @@ impl NatTraversalState {
         }
 
         // Check for duplicate addresses (different sequence, same address)
-        if self
-            .remote_candidates
-            .values()
-            .any(|c| c.address == address && c.state != CandidateState::Removed)
-        {
+        if self.remote_candidates.values().any(|c| {
+            normalize_socket_addr(c.address) == normalize_socket_addr(address)
+                && c.state != CandidateState::Removed
+        }) {
             return Err(NatTraversalError::DuplicateAddress);
         }
 
@@ -1958,7 +1957,7 @@ impl NatTraversalState {
             if self
                 .remote_candidates
                 .values()
-                .any(|c| c.address == predicted_addr)
+                .any(|c| normalize_socket_addr(c.address) == normalize_socket_addr(predicted_addr))
             {
                 continue;
             }
@@ -2475,7 +2474,7 @@ impl NatTraversalState {
         let sequence = self
             .remote_candidates
             .iter()
-            .find(|(_, c)| c.address == remote_addr)
+            .find(|(_, c)| normalize_socket_addr(c.address) == normalize_socket_addr(remote_addr))
             .map(|(seq, _)| *seq)
             .ok_or(NatTraversalError::UnknownCandidate)?;
         // Verify challenge matches and update timeout state
@@ -3411,7 +3410,11 @@ impl NatTraversalState {
         };
 
         // Check if candidate already exists
-        if !self.local_candidates.values().any(|c| c.address == address) {
+        if !self
+            .local_candidates
+            .values()
+            .any(|c| normalize_socket_addr(c.address) == normalize_socket_addr(address))
+        {
             self.local_candidates.insert(sequence, candidate);
         }
 
