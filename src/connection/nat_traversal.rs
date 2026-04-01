@@ -1430,7 +1430,10 @@ impl ResourceCleanupCoordinator {
             let is_expired = now.duration_since(validation.sent_at) > validation_timeout;
             if is_expired {
                 cleaned += 1;
-                trace!("Cleaned up expired validation for {}", validation.target_addr);
+                trace!(
+                    "Cleaned up expired validation for {}",
+                    validation.target_addr
+                );
             }
             !is_expired
         });

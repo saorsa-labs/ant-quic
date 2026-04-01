@@ -485,7 +485,11 @@ impl Default for TransportConfig {
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
-            keep_alive_interval: None,
+            // Send QUIC PING frames to prevent idle timeout from closing
+            // connections during gaps in application traffic (e.g., EVM payment
+            // processing between quote and chunk storage phases). Must be less
+            // than max_idle_timeout (30s).
+            keep_alive_interval: Some(Duration::from_secs(15)),
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),

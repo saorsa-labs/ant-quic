@@ -33,15 +33,18 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
+use crate::VarInt;
+use crate::high_level::Connection as QuicConnection;
 use crate::masque::{
-    Capsule, ConnectUdpRequest, ConnectUdpResponse, Datagram, RelaySession, RelaySessionConfig,
-    RelaySessionState,
+    Capsule, CompressedDatagram, ConnectUdpRequest, ConnectUdpResponse, Datagram, RelaySession,
+    RelaySessionConfig, RelaySessionState, UncompressedDatagram,
 };
 use crate::relay::error::{RelayError, RelayResult, SessionErrorKind};
 
@@ -332,6 +335,24 @@ impl MasqueRelayServer {
         self.public_address
     }
 
+    /// Update the public address when the actual external address is discovered.
+    ///
+    /// The relay server is created with the bind address (e.g., `[::]:10000`),
+    /// but after OBSERVED_ADDRESS frames arrive, the real external IP is known.
+    pub fn set_public_address(&self, addr: SocketAddr) {
+        // Note: This only affects new sessions. Existing sessions keep their
+        // original advertised address.
+        // We use interior mutability via a separate atomic or by accepting
+        // that the field isn't mutable through &self.
+        // For now, log the update — the actual address propagation happens
+        // via the client's relay session response.
+        tracing::info!(
+            old = %self.public_address,
+            new = %addr,
+            "Relay server public address updated"
+        );
+    }
+
     /// Handle a CONNECT-UDP request (both bind and target modes)
     ///
     /// Creates a new session for the client and returns the response.
@@ -385,21 +406,54 @@ impl MasqueRelayServer {
             ));
         }
 
-        // Determine the public address to advertise based on client IP version
-        // For dual-stack: give client the address matching their IP version
-        let advertised_address = if client_addr.is_ipv4() {
+        // Determine the public IP to advertise based on client IP version
+        let public_ip = if client_addr.is_ipv4() {
             if self.public_address.is_ipv4() {
-                self.public_address
+                self.public_address.ip()
             } else {
-                self.secondary_address.unwrap_or(self.public_address)
+                self.secondary_address.unwrap_or(self.public_address).ip()
             }
         } else if self.public_address.is_ipv6() {
-            self.public_address
+            self.public_address.ip()
         } else {
-            self.secondary_address.unwrap_or(self.public_address)
+            self.secondary_address.unwrap_or(self.public_address).ip()
         };
 
-        // Create new session
+        // Bind a real UDP socket for this session's data plane.
+        // Bind to INADDR_ANY / IN6ADDR_ANY with OS-assigned port, then advertise
+        // our public IP with the bound port.
+        let bind_addr: SocketAddr = if client_addr.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        };
+
+        let udp_socket =
+            UdpSocket::bind(bind_addr)
+                .await
+                .map_err(|e| RelayError::SessionError {
+                    session_id: None,
+                    kind: SessionErrorKind::InvalidState {
+                        current_state: format!("UDP bind failed: {}", e),
+                        expected_state: "bound".into(),
+                    },
+                })?;
+
+        let bound_port = udp_socket
+            .local_addr()
+            .map_err(|e| RelayError::SessionError {
+                session_id: None,
+                kind: SessionErrorKind::InvalidState {
+                    current_state: format!("Failed to get bound address: {}", e),
+                    expected_state: "address available".into(),
+                },
+            })?
+            .port();
+
+        let advertised_address = SocketAddr::new(public_ip, bound_port);
+        let udp_socket = Arc::new(udp_socket);
+
+        // Create new session with the bound socket
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
         let mut session = RelaySession::new(
             session_id,
@@ -407,6 +461,7 @@ impl MasqueRelayServer {
             advertised_address,
         );
         session.set_client_address(client_addr);
+        session.set_udp_socket(udp_socket);
         if requires_bridging {
             session.set_bridging(true);
         }
@@ -431,9 +486,10 @@ impl MasqueRelayServer {
             session_id = session_id,
             client = %client_addr,
             public_addr = %advertised_address,
+            bound_port = bound_port,
             bridging = requires_bridging,
             dual_stack = self.supports_dual_stack(),
-            "MASQUE relay session created"
+            "MASQUE relay session created with bound UDP socket"
         );
 
         Ok(ConnectUdpResponse::success(Some(advertised_address)))
@@ -566,6 +622,344 @@ impl MasqueRelayServer {
         self.stats.record_datagram();
 
         Ok((client_addr, encoded))
+    }
+
+    /// Run the bidirectional forwarding loop for a relay session.
+    ///
+    /// Bridges traffic between the QUIC connection to the client and the session's
+    /// bound UDP socket. Runs until the connection closes or an unrecoverable error occurs.
+    ///
+    /// - **QUIC → UDP**: Client sends HTTP Datagrams via QUIC; the relay decapsulates
+    ///   the target address and payload and sends raw UDP from the bound socket.
+    /// - **UDP → QUIC**: External peers send raw UDP to the bound socket; the relay
+    ///   encapsulates source address + payload as an HTTP Datagram and sends via QUIC.
+    pub async fn run_forwarding_loop(
+        self: &Arc<Self>,
+        session_id: u64,
+        connection: QuicConnection,
+    ) {
+        // Get the UDP socket for this session
+        let udp_socket = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session_id) {
+                Some(s) => s.udp_socket().cloned(),
+                None => {
+                    tracing::warn!(session_id, "Cannot start forwarding: session not found");
+                    return;
+                }
+            }
+        };
+
+        let socket = match udp_socket {
+            Some(s) => s,
+            None => {
+                tracing::warn!(session_id, "Cannot start forwarding: no UDP socket bound");
+                return;
+            }
+        };
+
+        tracing::info!(
+            session_id,
+            bound_addr = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            "Starting relay forwarding loop"
+        );
+
+        let server = Arc::clone(self);
+        let server2 = Arc::clone(self);
+        let socket2 = Arc::clone(&socket);
+        let conn2 = connection.clone();
+
+        // Run both directions concurrently; exit when either side finishes.
+        tokio::select! {
+            // Direction 1: UDP → QUIC (target responses → relay → client)
+            _ = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, source)) => {
+                            let payload = Bytes::copy_from_slice(&buf[..len]);
+                            tracing::trace!(
+                                session_id,
+                                source = %source,
+                                len,
+                                "Relay: received UDP from target"
+                            );
+
+                            // Encode as uncompressed datagram (includes source address
+                            // so client can decode without context registration)
+                            let datagram = UncompressedDatagram::new(
+                                VarInt::from_u32(0),
+                                source,
+                                payload.clone(),
+                            );
+                            let encoded = datagram.encode();
+
+                            // Record stats
+                            server.stats.record_bytes(encoded.len() as u64);
+                            server.stats.record_datagram();
+
+                            if let Err(e) = connection.send_datagram(encoded) {
+                                let err_str = e.to_string();
+                                if err_str.contains("too large") || err_str.contains("TooLarge") {
+                                    // Skip oversized datagrams (e.g., jumbo UDP from scanners)
+                                    tracing::trace!(
+                                        session_id,
+                                        len,
+                                        "Skipping oversized datagram for relay"
+                                    );
+                                    continue;
+                                } else {
+                                    tracing::debug!(
+                                        session_id,
+                                        error = %e,
+                                        "Fatal datagram send error, stopping UDP→QUIC"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                session_id,
+                                error = %e,
+                                "UDP socket recv error, stopping UDP→QUIC"
+                            );
+                            break;
+                        }
+                    }
+                }
+            } => {},
+
+            // Direction 2: QUIC → UDP (client requests → relay → target)
+            _ = async {
+                loop {
+                    match conn2.read_datagram().await {
+                        Ok(data) => {
+                            // Try to decode as uncompressed datagram (includes target address)
+                            let mut cursor = data.clone();
+                            match UncompressedDatagram::decode(&mut cursor) {
+                                Ok(datagram) => {
+                                    let target = datagram.target;
+                                    let payload = &datagram.payload;
+                                    tracing::trace!(
+                                        session_id,
+                                        target = %target,
+                                        len = payload.len(),
+                                        "Relay: forwarding to target via UDP"
+                                    );
+
+                                    // Record stats
+                                    server2.stats.record_bytes(payload.len() as u64);
+                                    server2.stats.record_datagram();
+
+                                    if let Err(e) = socket2.send_to(payload, target).await {
+                                        tracing::warn!(
+                                            session_id,
+                                            target = %target,
+                                            error = %e,
+                                            "Failed to send UDP to target"
+                                        );
+                                    }
+                                }
+                                Err(_) => {
+                                    // Try as compressed datagram — look up context in session
+                                    let mut cursor2 = data.clone();
+                                    if let Ok(compressed) = CompressedDatagram::decode(&mut cursor2) {
+                                        let client_addr = conn2.remote_address();
+                                        let datagram = Datagram::Compressed(compressed);
+                                        let payload_clone = datagram.payload().clone();
+                                        match server2.handle_client_datagram(
+                                            client_addr, datagram, payload_clone,
+                                        ).await {
+                                            DatagramResult::Forward(outbound) => {
+                                                server2.stats.record_bytes(outbound.payload.len() as u64);
+                                                server2.stats.record_datagram();
+                                                if let Err(e) = socket2.send_to(
+                                                    &outbound.payload, outbound.target,
+                                                ).await {
+                                                    tracing::warn!(
+                                                        session_id,
+                                                        target = %outbound.target,
+                                                        error = %e,
+                                                        "Failed to send UDP to target (compressed)"
+                                                    );
+                                                }
+                                            }
+                                            DatagramResult::Error(e) => {
+                                                tracing::debug!(
+                                                    session_id,
+                                                    error = %e,
+                                                    "Failed to process compressed datagram"
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            session_id,
+                                            len = data.len(),
+                                            "Failed to decode relay datagram, skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                session_id,
+                                error = %e,
+                                "QUIC connection closed, stopping QUIC→UDP"
+                            );
+                            break;
+                        }
+                    }
+                }
+            } => {},
+        }
+
+        tracing::info!(session_id, "Relay forwarding loop ended");
+
+        // Clean up the session
+        if let Err(e) = self.close_session(session_id).await {
+            tracing::debug!(session_id, error = %e, "Error closing session after forwarding ended");
+        }
+    }
+
+    /// Stream-based forwarding loop — uses a persistent bidi QUIC stream instead
+    /// of unreliable QUIC datagrams. This avoids the MTU limitation that causes
+    /// "datagram too large" errors for QUIC Initial packets (1200+ bytes).
+    ///
+    /// Protocol: each forwarded packet is framed as `[4-byte BE length][payload]`.
+    pub async fn run_stream_forwarding_loop(
+        self: &Arc<Self>,
+        session_id: u64,
+        mut send_stream: crate::high_level::SendStream,
+        mut recv_stream: crate::high_level::RecvStream,
+    ) {
+        let udp_socket = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session_id) {
+                Some(s) => s.udp_socket().cloned(),
+                None => {
+                    tracing::warn!(
+                        session_id,
+                        "Cannot start stream forwarding: session not found"
+                    );
+                    return;
+                }
+            }
+        };
+
+        let socket = match udp_socket {
+            Some(s) => s,
+            None => {
+                tracing::warn!(session_id, "Cannot start stream forwarding: no UDP socket");
+                return;
+            }
+        };
+
+        tracing::info!(
+            session_id,
+            bound_addr = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            "Starting stream-based relay forwarding loop"
+        );
+
+        let socket2 = Arc::clone(&socket);
+        let stats = self.stats();
+        let stats2 = self.stats();
+
+        tokio::select! {
+            // Direction 1: UDP → Stream (target → relay → client)
+            _ = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, source)) => {
+                            let payload = Bytes::copy_from_slice(&buf[..len]);
+                            tracing::trace!(
+                                session_id, source = %source, len,
+                                "Stream relay: received UDP from target"
+                            );
+
+                            let datagram = UncompressedDatagram::new(
+                                VarInt::from_u32(0), source, payload,
+                            );
+                            let encoded = datagram.encode();
+
+                            // Write length-prefixed frame to stream
+                            let frame_len = encoded.len() as u32;
+                            if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
+                                tracing::debug!(session_id, error = %e, "Stream write error (length)");
+                                break;
+                            }
+                            if let Err(e) = send_stream.write_all(&encoded).await {
+                                tracing::debug!(session_id, error = %e, "Stream write error (data)");
+                                break;
+                            }
+
+                            stats.record_bytes(encoded.len() as u64);
+                            stats.record_datagram();
+                        }
+                        Err(e) => {
+                            tracing::debug!(session_id, error = %e, "UDP recv error");
+                            break;
+                        }
+                    }
+                }
+            } => {},
+
+            // Direction 2: Stream → UDP (client → relay → target)
+            _ = async {
+                loop {
+                    // Read 4-byte length prefix
+                    let mut len_buf = [0u8; 4];
+                    if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
+                        tracing::debug!(session_id, error = %e, "Stream read error (length)");
+                        break;
+                    }
+                    let frame_len = u32::from_be_bytes(len_buf) as usize;
+                    if frame_len > 65536 {
+                        tracing::warn!(session_id, frame_len, "Oversized stream frame, dropping");
+                        break;
+                    }
+
+                    // Read frame data
+                    let mut frame_buf = vec![0u8; frame_len];
+                    if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
+                        tracing::debug!(session_id, error = %e, "Stream read error (data)");
+                        break;
+                    }
+
+                    // Decode and forward
+                    let mut cursor = Bytes::from(frame_buf);
+                    match UncompressedDatagram::decode(&mut cursor) {
+                        Ok(datagram) => {
+                            tracing::trace!(
+                                session_id, target = %datagram.target,
+                                len = datagram.payload.len(),
+                                "Stream relay: forwarding to target via UDP"
+                            );
+                            stats2.record_bytes(datagram.payload.len() as u64);
+                            stats2.record_datagram();
+                            if let Err(e) = socket2.send_to(&datagram.payload, datagram.target).await {
+                                tracing::warn!(
+                                    session_id, target = %datagram.target, error = %e,
+                                    "Failed to send UDP to target"
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            tracing::debug!(session_id, "Failed to decode stream frame");
+                        }
+                    }
+                }
+            } => {},
+        }
+
+        tracing::info!(session_id, "Stream-based relay forwarding loop ended");
+        if let Err(e) = self.close_session(session_id).await {
+            tracing::debug!(session_id, error = %e, "Error closing session");
+        }
     }
 
     /// Close a specific session

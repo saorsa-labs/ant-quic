@@ -81,6 +81,14 @@ pub(crate) enum EndpointEventInner {
     /// NAT traversal candidate validation succeeded
     #[allow(dead_code)]
     NatCandidateValidated { address: SocketAddr, challenge: u64 },
+    /// A peer advertised a new reachable address via ADD_ADDRESS.
+    /// The endpoint should propagate this so the DHT routing table is updated.
+    PeerAddressAdvertised {
+        /// The peer's current connection address
+        peer_addr: SocketAddr,
+        /// The new address the peer is advertising
+        advertised_addr: SocketAddr,
+    },
     /// Request to attempt connection to a target address (NAT callback mechanism)
     TryConnectTo {
         request_id: crate::VarInt,
@@ -230,5 +238,23 @@ pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
             }
         }
         SocketAddr::V4(_) => addr,
+    }
+}
+
+/// Return the dual-stack alternate of a socket address.
+///
+/// For an IPv4 address, returns its IPv4-mapped IPv6 form (::ffff:a.b.c.d).
+/// For an IPv4-mapped IPv6 address, returns the plain IPv4 form.
+/// For a native IPv6 address, returns it unchanged.
+pub fn dual_stack_alternate(addr: &SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::new(IpAddr::V4(v4), v6.port())
+            } else {
+                *addr
+            }
+        }
     }
 }

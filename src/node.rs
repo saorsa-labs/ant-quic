@@ -381,7 +381,9 @@ impl Node {
             // Events without direct NodeEvent equivalents are ignored
             P2pEvent::NatTraversalProgress { .. }
             | P2pEvent::BootstrapStatus { .. }
-            | P2pEvent::PeerAuthenticated { .. } => None,
+            | P2pEvent::PeerAuthenticated { .. }
+            | P2pEvent::PeerAddressUpdated { .. }
+            | P2pEvent::RelayEstablished { .. } => None,
         }
     }
 
@@ -513,13 +515,6 @@ impl Node {
     /// Check if connected to a peer
     pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.inner.is_connected(peer_id).await
-    }
-
-    /// Query the health status of a connection to a specific peer.
-    ///
-    /// Returns `None` if the peer is not connected.
-    pub async fn connection_health(&self, peer_id: &PeerId) -> Option<crate::ConnectionHealth> {
-        self.inner.connection_health(peer_id).await
     }
 
     // === Messaging ===

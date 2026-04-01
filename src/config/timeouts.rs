@@ -74,9 +74,6 @@ pub mod discovery {
 
     /// Long operation timeout
     pub const LONG_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// Health check interval
-    pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 }
 
 /// Connection related timeouts
@@ -114,9 +111,6 @@ pub mod monitoring {
 
     /// Recovery timeout for failed operations
     pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
-
-    /// Health check interval
-    pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
     /// Metrics retention period
     pub const RETENTION_PERIOD: Duration = Duration::from_secs(3600);

@@ -12,6 +12,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.
 - Token v2 helpers now distinguish binding tokens (`encode_binding_token`/`decode_binding_token`) from address-validation tokens (Retry/NEW_TOKEN).
 
+## [0.25.0] - 2026-04-02
+
+### Added
+
+- **Symmetric NAT hole-punch via peer ID routing** — PUNCH_ME_NOW coordinator now looks up target by authenticated peer ID first, falling back to wire_id. Essential for symmetric NAT where socket addresses differ per peer.
+- **MASQUE relay with secondary Quinn endpoint** — nodes behind symmetric NAT can set up a proactive relay: establish relay session, create secondary Quinn endpoint on `MasqueRelaySocket`, spawn accept loop, emit `ConnectionEstablished` events, then advertise to peers.
+- **`MasqueRelaySocket`** — new `AsyncUdpSocket` implementation using length-prefixed QUIC stream forwarding (datagrams have MTU too small for QUIC Initial packets).
+- **Coordinator rotation** — `connect_with_fallback` collects all coordinator candidates (bootstrap + connected peers) and rotates to next coordinator on hole-punch failure/timeout.
+- **Symmetric NAT detection** — `is_symmetric_nat()` detects via port diversity across connections.
+- **Reader-exit monitoring** — new `spawn_reader_exit_handler()` polls JoinSet for completed reader tasks and emits `PeerDisconnected` immediately, providing millisecond disconnect detection.
+- **`PeerAddressAdvertised` event** — new event variant for address advertisement notifications.
+- **`dual_stack_alternate()` address helper** — generates IPv4-mapped IPv6 or plain IPv4 alternate for dual-stack lookups.
+- **ADR-009** — architecture decision record for MASQUE relay data plane design.
+
+### Fixed
+
+- **Silent data loss on `send()`** — `send()` now awaits `stopped()` with a 5-second timeout after `finish()` to confirm peer ACK. Previously, dead connections silently ate data because `finish()` returns immediately without delivery confirmation.
+- **Dual-stack relay session key mismatch** — `establish_relay_session()` now normalizes `SocketAddr` before DashMap get/insert, preventing IPv4 vs `::ffff:x.x.x.x` key mismatches that caused duplicate relay sessions.
+- **Stream-based relay forwarding** — relay server now uses length-prefixed stream forwarding (`run_stream_forwarding_loop`) instead of QUIC datagrams, which have MTU too small for QUIC Initial packets.
+- **Relay accept loop fully wired** — inbound relayed connections now emit `ConnectionEstablished` events through the full pipeline (accept → reader tasks → `PeerConnected`). Previously silently dropped.
+
+### Removed
+
+- **Health-check PING/PONG protocol** — replaced by reader-exit monitoring which provides millisecond disconnect detection vs the previous 30-90 second detection via periodic PING/PONG probes.
+  - Removed `ConnectionHealth` enum and `connection_health()` from public API
+  - Removed `last_health_ping_sent` / `last_health_pong_received` from `PeerConnection`
+  - Removed `phantom_connections_evicted` from `EndpointStats`
+  - Stale connection reaper retained as safety net (Phase A: QUIC-dead cleanup only)
+
 ## [0.24.5] - 2026-04-01
 
 ### Fixed

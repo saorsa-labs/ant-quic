@@ -99,6 +99,7 @@ pub mod migration;
 pub mod relay_client;
 pub mod relay_server;
 pub mod relay_session;
+pub mod relay_socket;
 
 // Re-export primary types for convenience
 pub use capsule::{
@@ -123,3 +124,4 @@ pub use relay_server::{
     SessionInfo,
 };
 pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats};
+pub use relay_socket::MasqueRelaySocket;

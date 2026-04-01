@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::{ConnectionHealth, Node, PeerConnection};
+use ant_quic::{Node, PeerConnection};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -386,122 +386,6 @@ async fn test_connect_after_failure_succeeds() {
 // ============================================================================
 // Phase 1.3: Phantom Connection Detection & Recovery Tests
 // ============================================================================
-
-/// Test that two connected nodes have healthy connection status after
-/// the health check PING/PONG cycle runs.
-#[tokio::test]
-async fn test_connection_health_status() {
-    let node_a = create_localhost_node().await;
-    let node_b = create_localhost_node().await;
-
-    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
-
-    // Spawn accept on node_b
-    let accept_handle = tokio::spawn({
-        let node = node_b.clone();
-        async move { timeout(Duration::from_secs(5), node.accept()).await }
-    });
-
-    // Connect A → B
-    let conn = timeout(Duration::from_secs(10), node_a.connect_addr(addr_b))
-        .await
-        .expect("connect should not time out")
-        .expect("connect should succeed");
-
-    let _ = accept_handle.await;
-
-    // Immediately after connect, health should be Healthy (not yet probed)
-    let health = node_a.connection_health(&conn.peer_id).await;
-    assert_eq!(
-        health,
-        Some(ConnectionHealth::Healthy),
-        "Newly connected peer should be Healthy"
-    );
-
-    // Wait for at least one health check cycle (30s reaper interval + margin)
-    // The reaper will send a PING, and the reader task on the remote end
-    // responds with a PONG.
-    tokio::time::sleep(Duration::from_secs(35)).await;
-
-    // After one cycle, the peer should still be Healthy (PONG received)
-    let health_after = node_a.connection_health(&conn.peer_id).await;
-    assert!(
-        matches!(
-            health_after,
-            Some(ConnectionHealth::Healthy) | Some(ConnectionHealth::Checking)
-        ),
-        "After one health cycle, peer should be Healthy or Checking, got {:?}",
-        health_after
-    );
-
-    // node_a should still have exactly 1 peer (not evicted)
-    let peers = node_a.connected_peers().await;
-    assert_eq!(
-        peers.len(),
-        1,
-        "Healthy connection should not be evicted, but got {} peers",
-        peers.len()
-    );
-
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-}
-
-/// Test that connection_health returns None for unknown peers.
-#[tokio::test]
-async fn test_connection_health_unknown_peer() {
-    let node = create_localhost_node().await;
-
-    let unknown_peer = ant_quic::PeerId([0xDE; 32]);
-    let health = node.connection_health(&unknown_peer).await;
-    assert_eq!(health, None, "Unknown peer should return None");
-
-    node.shutdown().await;
-}
-
-/// Test that after disconnect, connection_health returns None.
-#[tokio::test]
-async fn test_connection_health_after_disconnect() {
-    let node_a = create_localhost_node().await;
-    let node_b = create_localhost_node().await;
-
-    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b addr"));
-
-    let accept_handle = tokio::spawn({
-        let node = node_b.clone();
-        async move { timeout(Duration::from_secs(5), node.accept()).await }
-    });
-
-    let conn = timeout(Duration::from_secs(10), node_a.connect_addr(addr_b))
-        .await
-        .expect("connect should not time out")
-        .expect("connect should succeed");
-
-    let _ = accept_handle.await;
-
-    // Verify connected
-    assert_eq!(
-        node_a.connection_health(&conn.peer_id).await,
-        Some(ConnectionHealth::Healthy),
-    );
-
-    // Disconnect
-    node_a
-        .disconnect(&conn.peer_id)
-        .await
-        .expect("disconnect should succeed");
-
-    // After disconnect, health should be None
-    let health = node_a.connection_health(&conn.peer_id).await;
-    assert_eq!(
-        health, None,
-        "Disconnected peer should return None, got {:?}",
-        health
-    );
-
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-}
 
 // ============================================================================
 // Phase 1.4: Integration Testing & Validation

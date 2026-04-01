@@ -35,6 +35,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::net::UdpSocket;
 
 use crate::VarInt;
 use crate::masque::{
@@ -170,6 +171,8 @@ pub struct RelaySession {
     stats: Arc<RelaySessionStats>,
     /// Whether this session is bridging between IPv4 and IPv6
     is_bridging: bool,
+    /// Bound UDP socket for this session (relay data plane)
+    udp_socket: Option<Arc<UdpSocket>>,
     /// Bytes forwarded in current rate limit window
     bytes_in_window: AtomicU64,
     /// Rate limit window start time (epoch millis for atomic storage)
@@ -192,6 +195,7 @@ impl RelaySession {
             last_activity: now,
             stats: Arc::new(RelaySessionStats::new()),
             is_bridging: false,
+            udp_socket: None,
             bytes_in_window: AtomicU64::new(0),
             window_start_ms: AtomicU64::new(now_ms()),
         }
@@ -245,6 +249,21 @@ impl RelaySession {
     /// Get session configuration
     pub fn config(&self) -> &RelaySessionConfig {
         &self.config
+    }
+
+    /// Set the bound UDP socket for this session's data plane
+    pub fn set_udp_socket(&mut self, socket: Arc<UdpSocket>) {
+        self.udp_socket = Some(socket);
+    }
+
+    /// Get the bound UDP socket if available
+    pub fn udp_socket(&self) -> Option<&Arc<UdpSocket>> {
+        self.udp_socket.as_ref()
+    }
+
+    /// Update the public address (e.g., after binding a UDP socket)
+    pub fn set_public_address(&mut self, addr: SocketAddr) {
+        self.public_address = addr;
     }
 
     /// Set bridging flag for IPv4↔IPv6 sessions

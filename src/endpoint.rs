@@ -339,6 +339,9 @@ pub struct Endpoint {
     /// Pending relay events to be sent to other connections
     /// These are generated when a coordinator receives a PUNCH_ME_NOW with target_peer_id
     pending_relay_events: Vec<(ConnectionHandle, ConnectionEvent)>,
+    /// Pending peer address updates from ADD_ADDRESS frames.
+    /// Each entry is (peer_connection_addr, new_advertised_addr).
+    pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
 }
 
 impl Endpoint {
@@ -377,6 +380,7 @@ impl Endpoint {
             address_discovery_enabled: true, // Default to enabled
             address_change_callback: None,
             pending_relay_events: Vec::new(),
+            pending_peer_address_updates: Vec::new(),
         }
     }
 
@@ -489,6 +493,14 @@ impl Endpoint {
         self.pending_relay_events.drain(..)
     }
 
+    /// Drain pending peer address updates from ADD_ADDRESS frames.
+    /// Returns (peer_connection_addr, advertised_addr) pairs.
+    pub fn drain_peer_address_updates(
+        &mut self,
+    ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
+        self.pending_peer_address_updates.drain(..)
+    }
+
     /// Set the peer ID for an existing connection
     pub fn set_connection_peer_id(&mut self, connection_handle: ConnectionHandle, peer_id: PeerId) {
         if let Some(connection) = self.connections.get_mut(connection_handle.0) {
@@ -599,6 +611,30 @@ impl Endpoint {
         }
     }
 
+    /// Get the remote address of a peer's connection by peer ID.
+    pub fn peer_connection_addr(&self, peer_id: &PeerId) -> Option<SocketAddr> {
+        let handle = self.peer_connections.get(peer_id)?;
+        let meta = self.connections.get(handle.0)?;
+        Some(meta.addresses.remote)
+    }
+
+    /// Find the connection handle for a given remote address.
+    pub fn connection_handle_for_addr(&self, addr: &SocketAddr) -> Option<ConnectionHandle> {
+        let normalized = crate::shared::normalize_socket_addr(*addr);
+        let alt = crate::shared::dual_stack_alternate(addr);
+
+        for (idx, meta) in self.connections.iter() {
+            let remote = meta.addresses.remote;
+            if remote == normalized {
+                return Some(ConnectionHandle(idx));
+            }
+            if remote == alt {
+                return Some(ConnectionHandle(idx));
+            }
+        }
+        None
+    }
+
     /// Get relay statistics for monitoring
     pub fn relay_stats(&self) -> &RelayStats {
         &self.relay_stats
@@ -681,6 +717,18 @@ impl Endpoint {
                 // This event serves as notification to the endpoint for potential coordination
                 // with other components or logging/metrics collection
                 debug!("NAT candidate {} validated successfully", address);
+            }
+            PeerAddressAdvertised {
+                peer_addr,
+                advertised_addr,
+            } => {
+                tracing::info!(
+                    "Peer {} advertised new address {}",
+                    peer_addr,
+                    advertised_addr
+                );
+                self.pending_peer_address_updates
+                    .push((peer_addr, advertised_addr));
             }
             TryConnectTo {
                 request_id,

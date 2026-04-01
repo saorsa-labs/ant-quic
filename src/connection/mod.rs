@@ -620,7 +620,18 @@ impl Connection {
             if nat_traversal.check_coordination_timeout(now) {
                 trace!("NAT traversal coordination timed out, may retry");
             }
+            // Clean up expired validations so slots are freed for new candidates
+            let expired = nat_traversal.check_validation_timeouts(now);
+            if !expired.is_empty() {
+                debug!(
+                    "Cleaned up {} expired NAT traversal validations",
+                    expired.len()
+                );
+            }
         }
+
+        // Send OBSERVED_ADDRESS frames to tell peers their external address
+        self.check_for_address_observations(now);
 
         // First priority: NAT traversal PATH_CHALLENGE packets (includes coordination)
         if let Some(challenge) = self.send_nat_traversal_challenge(now, buf) {
@@ -4785,6 +4796,14 @@ impl Connection {
                     normalized_addr, add_address.sequence, add_address.priority
                 );
 
+                // Notify the endpoint so the DHT routing table can be updated
+                self.endpoint_events.push_back(
+                    crate::shared::EndpointEventInner::PeerAddressAdvertised {
+                        peer_addr: self.path.remote,
+                        advertised_addr: normalized_addr,
+                    },
+                );
+
                 // Trigger validation of this new candidate
                 self.trigger_candidate_validation(normalized_addr, now)?;
                 Ok(())
@@ -5249,6 +5268,12 @@ impl Connection {
             return;
         }
 
+        // Only send if the peer negotiated address discovery support.
+        // Sending to a peer that didn't negotiate causes PROTOCOL_VIOLATION.
+        if self.peer_params.address_discovery.is_none() {
+            return;
+        }
+
         // Get the current path ID (0 for primary path)
         let path_id = 0u64; // TODO: Support multi-path scenarios
 
@@ -5302,13 +5327,10 @@ impl Connection {
 
         // Check if we already have an active validation for this address
         // (active_validations is keyed by challenge token, so we check values)
-        let already_validating = nat_state
-            .active_validations
-            .values()
-            .any(|v| {
-                crate::shared::normalize_socket_addr(v.target_addr)
-                    == crate::shared::normalize_socket_addr(candidate_address)
-            });
+        let already_validating = nat_state.active_validations.values().any(|v| {
+            crate::shared::normalize_socket_addr(v.target_addr)
+                == crate::shared::normalize_socket_addr(candidate_address)
+        });
         if already_validating {
             trace!("Validation already in progress for {}", candidate_address);
             return Ok(());

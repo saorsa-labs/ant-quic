@@ -510,6 +510,14 @@ impl Connection {
     /// [`ConnectionError::LocallyClosed`]: crate::ConnectionError::LocallyClosed
     /// [`Endpoint::wait_idle()`]: crate::high_level::Endpoint::wait_idle
     /// [`close()`]: Connection::close
+    /// Wake the connection driver to trigger immediate transmission of
+    /// any pending frames. Call after queuing frames at the low level
+    /// (e.g., PUNCH_ME_NOW) that bypass the stream API.
+    pub fn wake_transmit(&self) {
+        self.0.state.lock("wake_transmit").wake();
+    }
+
+    /// Close the connection immediately with the given error code and reason.
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         let conn = &mut *self.0.state.lock("close");
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);

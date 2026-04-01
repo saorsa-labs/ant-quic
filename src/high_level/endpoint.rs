@@ -356,6 +356,45 @@ impl Endpoint {
         }
     }
 
+    /// Register a peer ID for an existing connection, enabling PUNCH_ME_NOW relay
+    /// routing by peer identity instead of socket address.
+    pub fn register_connection_peer_id(
+        &self,
+        addr: SocketAddr,
+        peer_id: crate::nat_traversal_api::PeerId,
+    ) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            let handle = state.inner.connection_handle_for_addr(&addr);
+            if let Some(ch) = handle {
+                state.inner.set_connection_peer_id(ch, peer_id);
+                tracing::info!(
+                    "Registered peer ID {} for connection {} at low-level endpoint",
+                    hex::encode(&peer_id.0[..8]),
+                    addr
+                );
+            } else {
+                tracing::debug!(
+                    "No connection handle found for {} — peer ID not registered",
+                    addr
+                );
+            }
+        }
+    }
+
+    /// Set the channel for forwarding peer address updates to the upper layer.
+    pub fn set_peer_address_update_tx(&self, tx: mpsc::UnboundedSender<(SocketAddr, SocketAddr)>) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.peer_address_update_tx = Some(tx);
+        }
+    }
+
+    /// Get the remote address of a peer's connection by peer ID.
+    pub fn peer_connection_addr_by_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        let state = self.inner.state.lock().ok()?;
+        let pid = crate::nat_traversal_api::PeerId(*peer_id);
+        state.inner.peer_connection_addr(&pid)
+    }
+
     /// Get the local `SocketAddr` the underlying socket is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner
@@ -609,6 +648,8 @@ pub(crate) struct State {
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
+    /// Channel for forwarding peer address updates to the upper layer.
+    peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
 }
 
 #[derive(Debug)]
@@ -684,6 +725,17 @@ impl State {
                     "Cannot send relay event: connection {:?} not found in senders",
                     ch
                 );
+            }
+        }
+
+        // Forward peer address updates from ADD_ADDRESS frames to the
+        // NatTraversalEndpoint so it can update the DHT routing table.
+        let address_updates: Vec<(SocketAddr, SocketAddr)> =
+            self.inner.drain_peer_address_updates().collect();
+        for (peer_addr, advertised_addr) in address_updates {
+            did_work = true;
+            if let Some(ref tx) = self.peer_address_update_tx {
+                let _ = tx.send((peer_addr, advertised_addr));
             }
         }
 
@@ -844,6 +896,7 @@ impl EndpointRef {
                 recv_state,
                 runtime,
                 stats: EndpointStats::default(),
+                peer_address_update_tx: None,
             }),
         }))
     }

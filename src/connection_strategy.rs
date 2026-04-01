@@ -369,6 +369,14 @@ impl ConnectionStrategy {
         }
     }
 
+    /// Change the coordinator for the next hole-punch round.
+    pub fn set_coordinator(&mut self, coordinator: SocketAddr) {
+        if let ConnectionStage::HolePunching { coordinator: c, .. } = &mut self.stage {
+            *c = coordinator;
+        }
+        self.config.coordinator = Some(coordinator);
+    }
+
     /// Increment the hole-punch round
     pub fn increment_round(&mut self) {
         if let ConnectionStage::HolePunching {
