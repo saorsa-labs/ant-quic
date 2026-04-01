@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.
 - Token v2 helpers now distinguish binding tokens (`encode_binding_token`/`decode_binding_token`) from address-validation tokens (Retry/NEW_TOKEN).
 
+## [0.24.5] - 2026-04-01
+
+### Fixed
+
+- **NAT traversal: PeerId-based lookups replace SocketAddr keys** — SocketAddr is ephemeral and changes on NAT rebind. Using it as the key for `active_validations` and coordinator peer tracking caused hole-punching failures when peers' NAT mappings changed.
+  - `active_validations` now keyed by challenge token (`u64`) so PATH_RESPONSE succeeds even after NAT rebind
+  - `handle_validation_success` detects NAT rebinds and updates candidate address
+  - `BootstrapCoordinator.peer_index` tracks `Vec<SocketAddr>` per PeerId (most recent first) instead of single stale address
+  - Removed `address_observations: HashMap<SocketAddr, ...>` — all tracking is now per-PeerId
+  - `CoordinationEntry` no longer caches `address_hint` — looked up fresh from peer_index
+
+### Changed
+
+- Updated `saorsa-pqc` dependency to 0.5
+
 ## [0.21.1] - 2026-02-03
 
 ### Changed
