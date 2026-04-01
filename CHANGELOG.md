@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking Changes
 
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.
+
+## [0.25.1] - 2026-04-02
+
+### Fixed
+
+- Register peer ID at low-level endpoint for PUNCH_ME_NOW routing at all connection sites (connect, accept, hole-punch, relay). Ensures coordinators can route by peer identity instead of socket address, essential for symmetric NAT.
 - Token v2 helpers now distinguish binding tokens (`encode_binding_token`/`decode_binding_token`) from address-validation tokens (Retry/NEW_TOKEN).
 
 ## [0.25.0] - 2026-04-02

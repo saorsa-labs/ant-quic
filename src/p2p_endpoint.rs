@@ -606,6 +606,10 @@ impl P2pEndpoint {
                         stats_guard.active_connections += 1;
                         stats_guard.successful_connections += 1;
 
+                        // Note: peer ID registration at the low-level endpoint happens
+                        // in connect(), accept(), connect_with_fallback(), and
+                        // try_hole_punch() where self.inner is available.
+
                         // Broadcast event with connection direction
                         let _ = event_tx.send(P2pEvent::PeerConnected {
                             peer_id: *peer_id,
@@ -1023,6 +1027,11 @@ impl P2pEndpoint {
         self.inner
             .add_connection(peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
+
+        // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing.
+        // This enables coordinators to look up the connection by peer identity
+        // instead of socket address (essential for symmetric NAT).
+        self.inner.register_connection_peer_id(addr, peer_id);
 
         // Spawn handler (we initiated the connection = Client side)
         self.inner
@@ -1512,6 +1521,10 @@ impl P2pEndpoint {
                         remote_address,
                         side: _, // We initiated this NAT traversal, side is Client
                     } if evt_peer == peer_id => {
+                        // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
+                        self.inner
+                            .register_connection_peer_id(remote_address, peer_id);
+
                         // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
                         let peer_conn = PeerConnection {
                             peer_id,
@@ -1923,6 +1936,9 @@ impl P2pEndpoint {
             .add_connection(peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
+        // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
+        self.inner.register_connection_peer_id(addr, peer_id);
+
         // Spawn connection handler (Client side - we initiated)
         self.inner
             .spawn_connection_handler(peer_id, connection, Side::Client)
@@ -2000,6 +2016,11 @@ impl P2pEndpoint {
                         remote_address,
                         side: _,
                     } if evt_peer == peer_id || remote_address == target => {
+                        // Register peer ID at low-level endpoint so coordinators
+                        // can route PUNCH_ME_NOW by peer identity (symmetric NAT).
+                        self.inner
+                            .register_connection_peer_id(remote_address, evt_peer);
+
                         let peer_conn = PeerConnection {
                             peer_id: evt_peer,
                             remote_addr: TransportAddr::Udp(remote_address),
@@ -2132,6 +2153,10 @@ impl P2pEndpoint {
             .add_connection(relay_peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
+        // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
+        self.inner
+            .register_connection_peer_id(target, relay_peer_id);
+
         self.inner
             .spawn_connection_handler(relay_peer_id, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
@@ -2203,6 +2228,10 @@ impl P2pEndpoint {
                         resolved_peer_id = actual_peer_id;
                     }
                 }
+
+                // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
+                self.inner
+                    .register_connection_peer_id(remote_addr, resolved_peer_id);
 
                 // They initiated the connection to us = Server side
                 if let Err(e) =
