@@ -5301,20 +5301,38 @@ impl Connection {
             .ok_or_else(|| TransportError::PROTOCOL_VIOLATION("NAT traversal not enabled"))?;
 
         // Check if we already have an active validation for this address
-        if nat_state
+        // (active_validations is keyed by challenge token, so we check values)
+        let already_validating = nat_state
             .active_validations
-            .contains_key(&candidate_address)
-        {
+            .values()
+            .any(|v| {
+                crate::shared::normalize_socket_addr(v.target_addr)
+                    == crate::shared::normalize_socket_addr(candidate_address)
+            });
+        if already_validating {
             trace!("Validation already in progress for {}", candidate_address);
             return Ok(());
         }
 
+        // Find the candidate sequence for this address
+        let sequence = nat_state
+            .remote_candidates
+            .iter()
+            .find(|(_, c)| {
+                crate::shared::normalize_socket_addr(c.address)
+                    == crate::shared::normalize_socket_addr(candidate_address)
+            })
+            .map(|(seq, _)| *seq)
+            .unwrap_or(crate::VarInt::from_u32(0));
+
         // Generate a random challenge value
         let challenge = self.rng.r#gen::<u64>();
 
-        // Create path validation state
+        // Create path validation state keyed by challenge token
         let validation_state = nat_traversal::PathValidationState {
             challenge,
+            sequence,
+            target_addr: candidate_address,
             sent_at: now,
             retry_count: 0,
             max_retries: 3,
@@ -5323,10 +5341,10 @@ impl Connection {
             last_retry_at: None,
         };
 
-        // Store the validation attempt
+        // Store the validation attempt keyed by challenge token (not SocketAddr)
         nat_state
             .active_validations
-            .insert(candidate_address, validation_state);
+            .insert(challenge, validation_state);
 
         // NAT traversal PATH_CHALLENGE frames are sent via send_nat_traversal_challenge()
 

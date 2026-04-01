@@ -46,8 +46,13 @@ pub(super) struct NatTraversalState {
     pub(super) candidate_pairs: Vec<CandidatePair>,
     /// Index for fast pair lookup by remote address (maintained during generation)
     pub(super) pair_index: HashMap<SocketAddr, usize>,
-    /// Currently active path validation attempts
-    pub(super) active_validations: HashMap<SocketAddr, PathValidationState>,
+    /// Currently active path validation attempts, keyed by challenge token.
+    ///
+    /// Keyed by `u64` challenge token (not SocketAddr) so that validation
+    /// succeeds even if the peer's NAT rebinds between PATH_CHALLENGE and
+    /// PATH_RESPONSE. The challenge token is the stable correlator per
+    /// draft-seemann-quic-nat-traversal-02.
+    pub(super) active_validations: HashMap<u64, PathValidationState>,
     /// Coordination state for simultaneous hole punching
     pub(super) coordination: Option<CoordinationState>,
     /// Sequence number for address advertisements
@@ -122,11 +127,19 @@ pub enum CandidateState {
     Removed,
 }
 /// State of an individual path validation attempt
+///
+/// Keyed by challenge token (`u64`) in `active_validations`, not by SocketAddr.
+/// This ensures validation succeeds even if the peer's NAT rebinds between
+/// PATH_CHALLENGE and PATH_RESPONSE (the challenge token is the stable correlator).
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(super) struct PathValidationState {
-    /// Challenge value sent
+    /// Challenge value sent (also the key in active_validations)
     pub(super) challenge: u64,
+    /// Candidate sequence this validation is for
+    pub(super) sequence: VarInt,
+    /// The address we sent the PATH_CHALLENGE to
+    pub(super) target_addr: SocketAddr,
     /// When the challenge was sent
     pub(super) sent_at: Instant,
     /// Number of retransmissions
@@ -1375,7 +1388,7 @@ impl ResourceCleanupCoordinator {
     /// Perform cleanup of expired resources
     fn cleanup_expired_resources(
         &mut self,
-        active_validations: &mut HashMap<SocketAddr, PathValidationState>,
+        active_validations: &mut HashMap<u64, PathValidationState>,
         local_candidates: &mut HashMap<VarInt, AddressCandidate>,
         remote_candidates: &mut HashMap<VarInt, AddressCandidate>,
         candidate_pairs: &mut Vec<CandidatePair>,
@@ -1408,16 +1421,16 @@ impl ResourceCleanupCoordinator {
     /// Clean up expired path validations
     fn cleanup_expired_validations(
         &mut self,
-        active_validations: &mut HashMap<SocketAddr, PathValidationState>,
+        active_validations: &mut HashMap<u64, PathValidationState>,
         now: Instant,
     ) -> u64 {
         let mut cleaned = 0;
         let validation_timeout = self.config.validation_timeout;
-        active_validations.retain(|_addr, validation| {
+        active_validations.retain(|_challenge, validation| {
             let is_expired = now.duration_since(validation.sent_at) > validation_timeout;
             if is_expired {
                 cleaned += 1;
-                trace!("Cleaned up expired validation for {:?}", _addr);
+                trace!("Cleaned up expired validation for {}", validation.target_addr);
             }
             !is_expired
         });
@@ -1511,7 +1524,7 @@ impl ResourceCleanupCoordinator {
     /// Perform aggressive cleanup when under memory pressure
     fn aggressive_cleanup(
         &mut self,
-        active_validations: &mut HashMap<SocketAddr, PathValidationState>,
+        active_validations: &mut HashMap<u64, PathValidationState>,
         local_candidates: &mut HashMap<VarInt, AddressCandidate>,
         remote_candidates: &mut HashMap<VarInt, AddressCandidate>,
         candidate_pairs: &mut Vec<CandidatePair>,
@@ -1551,7 +1564,7 @@ impl ResourceCleanupCoordinator {
         });
 
         // Clean up old validations more aggressively
-        active_validations.retain(|_addr, validation| {
+        active_validations.retain(|_challenge, validation| {
             let keep = now.duration_since(validation.sent_at) <= self.config.validation_timeout / 2;
             if !keep {
                 cleaned += 1;
@@ -1574,7 +1587,7 @@ impl ResourceCleanupCoordinator {
     /// Perform final cleanup during shutdown
     fn shutdown_cleanup(
         &mut self,
-        active_validations: &mut HashMap<SocketAddr, PathValidationState>,
+        active_validations: &mut HashMap<u64, PathValidationState>,
         local_candidates: &mut HashMap<VarInt, AddressCandidate>,
         remote_candidates: &mut HashMap<VarInt, AddressCandidate>,
         candidate_pairs: &mut Vec<CandidatePair>,
@@ -1996,8 +2009,9 @@ impl NatTraversalState {
     pub(super) fn remove_candidate(&mut self, sequence: VarInt) -> bool {
         if let Some(candidate) = self.remote_candidates.get_mut(&sequence) {
             candidate.state = CandidateState::Removed;
-            // Cancel any active validation for this address
-            self.active_validations.remove(&candidate.address);
+            // Cancel any active validation for this candidate (look up by sequence, not address)
+            self.active_validations
+                .retain(|_, v| v.sequence != sequence);
             true
         } else {
             false
@@ -2414,13 +2428,17 @@ impl NatTraversalState {
         }
 
         // Update candidate state
+        let target_addr = candidate.address;
         candidate.state = CandidateState::Validating;
         candidate.attempt_count += 1;
         candidate.last_attempt = Some(now);
 
-        // Track validation state
+        // Track validation state keyed by challenge token (not SocketAddr)
+        // so NAT rebinding between challenge and response doesn't break lookup.
         let validation = PathValidationState {
             challenge,
+            sequence,
+            target_addr,
             sent_at: now,
             retry_count: 0,
             max_retries: 3, // TODO: Make configurable
@@ -2429,11 +2447,10 @@ impl NatTraversalState {
             last_retry_at: None,
         };
 
-        self.active_validations
-            .insert(candidate.address, validation);
+        self.active_validations.insert(challenge, validation);
         trace!(
-            "Started validation for candidate {} with challenge {}",
-            candidate.address, challenge
+            "Started validation for candidate {} (seq {}) with challenge {}",
+            target_addr, sequence, challenge
         );
         Ok(())
     }
@@ -2464,28 +2481,24 @@ impl NatTraversalState {
     }
 
     /// Handle successful validation response
+    ///
+    /// Looks up the validation by challenge token (not by address), so this
+    /// succeeds even if the peer's NAT rebinds between PATH_CHALLENGE and
+    /// PATH_RESPONSE.
     pub(super) fn handle_validation_success(
         &mut self,
         remote_addr: SocketAddr,
         challenge: u64,
         now: Instant,
     ) -> Result<VarInt, NatTraversalError> {
-        // Find the candidate with this address
-        let sequence = self
-            .remote_candidates
-            .iter()
-            .find(|(_, c)| normalize_socket_addr(c.address) == normalize_socket_addr(remote_addr))
-            .map(|(seq, _)| *seq)
-            .ok_or(NatTraversalError::UnknownCandidate)?;
-        // Verify challenge matches and update timeout state
+        // Look up validation by challenge token — stable across NAT rebinds.
+        // The old code looked up by SocketAddr which failed when addresses changed.
         let validation = self
             .active_validations
-            .get_mut(&remote_addr)
+            .get_mut(&challenge)
             .ok_or(NatTraversalError::NoActiveValidation)?;
 
-        if validation.challenge != challenge {
-            return Err(NatTraversalError::ChallengeMismatch);
-        }
+        let sequence = validation.sequence;
 
         // Calculate RTT and update adaptive timeout
         let rtt = now.duration_since(validation.sent_at);
@@ -2500,13 +2513,23 @@ impl NatTraversalState {
             .get_mut(&sequence)
             .ok_or(NatTraversalError::UnknownCandidate)?;
 
+        // If the response came from a different address than expected, update
+        // the candidate's address to reflect the peer's current NAT mapping.
+        if normalize_socket_addr(candidate.address) != normalize_socket_addr(remote_addr) {
+            debug!(
+                "NAT rebind detected during validation: expected {}, got {}. Updating candidate.",
+                candidate.address, remote_addr
+            );
+            candidate.address = remote_addr;
+        }
+
         candidate.state = CandidateState::Valid;
-        self.active_validations.remove(&remote_addr);
+        self.active_validations.remove(&challenge);
         self.stats.validations_succeeded += 1;
 
         trace!(
-            "Validation successful for {} with RTT {:?}",
-            remote_addr, rtt
+            "Validation successful for {} (seq {}) with RTT {:?}",
+            remote_addr, sequence, rtt
         );
         Ok(sequence)
     }
@@ -2920,11 +2943,13 @@ impl NatTraversalState {
     }
 
     /// Check for validation timeouts and handle retries
+    ///
+    /// Returns the target addresses of expired validations.
     pub(super) fn check_validation_timeouts(&mut self, now: Instant) -> Vec<SocketAddr> {
-        let mut expired_validations = Vec::new();
-        let mut retry_validations = Vec::new();
+        let mut expired_challenges = Vec::new();
+        let mut retry_challenges = Vec::new();
 
-        for (addr, validation) in &mut self.active_validations {
+        for (&challenge, validation) in &mut self.active_validations {
             let timeout = validation.timeout_state.get_timeout();
             let elapsed = now.duration_since(validation.sent_at);
 
@@ -2933,18 +2958,16 @@ impl NatTraversalState {
                     .timeout_state
                     .should_retry(validation.max_retries)
                 {
-                    // Schedule retry
-                    retry_validations.push(*addr);
+                    retry_challenges.push(challenge);
                 } else {
-                    // Mark as expired
-                    expired_validations.push(*addr);
+                    expired_challenges.push(challenge);
                 }
             }
         }
 
         // Handle retries
-        for addr in retry_validations {
-            if let Some(validation) = self.active_validations.get_mut(&addr) {
+        for challenge in retry_challenges {
+            if let Some(validation) = self.active_validations.get_mut(&challenge) {
                 validation.retry_count += 1;
                 validation.sent_at = now;
                 validation.last_retry_at = Some(now);
@@ -2952,28 +2975,30 @@ impl NatTraversalState {
 
                 trace!(
                     "Retrying validation for {} (attempt {})",
-                    addr,
+                    validation.target_addr,
                     validation.retry_count + 1
                 );
             }
         }
 
-        // Remove expired validations
-        for addr in &expired_validations {
-            self.active_validations.remove(addr);
-            self.network_monitor.record_timeout(now);
-            trace!("Validation expired for {}", addr);
+        // Remove expired validations, collect their target addresses
+        let mut expired_addrs = Vec::new();
+        for challenge in &expired_challenges {
+            if let Some(validation) = self.active_validations.remove(challenge) {
+                expired_addrs.push(validation.target_addr);
+                self.network_monitor.record_timeout(now);
+                trace!("Validation expired for {}", validation.target_addr);
+            }
         }
 
-        expired_validations
+        expired_addrs
     }
 
     /// Schedule validation retries for active validations that need retry
     pub(super) fn schedule_validation_retries(&mut self, now: Instant) -> Vec<SocketAddr> {
         let mut retry_addresses = Vec::new();
 
-        // Get all active validations that need retry
-        for (addr, validation) in &mut self.active_validations {
+        for validation in self.active_validations.values_mut() {
             let elapsed = now.duration_since(validation.sent_at);
             let timeout = validation.timeout_state.get_timeout();
 
@@ -2982,16 +3007,15 @@ impl NatTraversalState {
                     .timeout_state
                     .should_retry(validation.max_retries)
             {
-                // Update retry state
                 validation.retry_count += 1;
                 validation.last_retry_at = Some(now);
-                validation.sent_at = now; // Reset sent time for new attempt
+                validation.sent_at = now;
                 validation.timeout_state.update_timeout();
 
-                retry_addresses.push(*addr);
+                retry_addresses.push(validation.target_addr);
                 trace!(
                     "Scheduled retry {} for validation to {}",
-                    validation.retry_count, addr
+                    validation.retry_count, validation.target_addr
                 );
             }
         }
@@ -3219,18 +3243,21 @@ impl NatTraversalState {
         }
 
         // Handle validation timeouts
-        let mut expired_validations = Vec::new();
-        for (addr, validation) in &mut self.active_validations {
+        let mut expired_challenges = Vec::new();
+        for (&challenge, validation) in &mut self.active_validations {
             let timeout_at = validation.sent_at + validation.timeout_state.get_timeout();
             if now >= timeout_at {
                 validation.retry_count += 1;
                 if validation.retry_count >= validation.max_retries {
-                    debug!("Path validation failed for {}: max retries exceeded", addr);
-                    expired_validations.push(*addr);
+                    debug!(
+                        "Path validation failed for {}: max retries exceeded",
+                        validation.target_addr
+                    );
+                    expired_challenges.push(challenge);
                 } else {
                     debug!(
                         "Path validation timeout for {}, retrying ({}/{})",
-                        addr, validation.retry_count, validation.max_retries
+                        validation.target_addr, validation.retry_count, validation.max_retries
                     );
                     validation.sent_at = now;
                     validation.last_retry_at = Some(now);
@@ -3240,8 +3267,8 @@ impl NatTraversalState {
         }
 
         // Remove expired validations
-        for addr in expired_validations {
-            self.active_validations.remove(&addr);
+        for challenge in expired_challenges {
+            self.active_validations.remove(&challenge);
         }
 
         // Handle resource cleanup
@@ -3326,13 +3353,14 @@ impl NatTraversalState {
             Ok(None)
         }
     }
-    /// Perform bootstrap cleanup operations
+    /// Get the most recently observed address for a peer.
     ///
-    /// Get observed address for a peer
+    /// Returns the freshest address from the peer's observation history,
+    /// surviving NAT rebinds.
     pub(super) fn get_observed_address(&self, peer_id: [u8; 32]) -> Option<SocketAddr> {
         self.bootstrap_coordinator
             .as_ref()
-            .and_then(|coord| coord.peer_index.get(&peer_id).map(|p| p.observed_addr))
+            .and_then(|coord| coord.peer_index.get(&peer_id)?.most_recent_addr())
     }
 
     /// Record a successful TryConnectTo callback probe
@@ -3497,11 +3525,16 @@ pub(crate) struct SecurityStats {
 ///
 /// This manages the bootstrap node's role in observing client addresses,
 /// coordinating hole punching, and relaying coordination messages.
+///
+/// All lookups are by PeerId (stable, cryptographic identity), never by
+/// SocketAddr alone. This ensures NAT rebinding does not break coordination.
 #[derive(Debug)]
 pub(crate) struct BootstrapCoordinator {
-    /// Address observation cache for quick lookups
-    address_observations: HashMap<SocketAddr, AddressObservation>,
-    /// Quick lookup by peer id for the last observed address
+    /// Primary peer index: PeerId → observed addresses and metadata.
+    ///
+    /// This is the authoritative source for peer address information.
+    /// Addresses are updated on every new observation so coordination always
+    /// uses the most recent address, surviving NAT rebinds.
     peer_index: HashMap<PeerId, ObservedPeer>,
     /// Minimal coordination table keyed by round id
     coordination_table: HashMap<VarInt, CoordinationEntry>,
@@ -3513,17 +3546,61 @@ pub(crate) struct BootstrapCoordinator {
 // Removed legacy CoordinationSessionId type
 /// Peer identifier for bootstrap coordination
 type PeerId = [u8; 32];
-/// Observed peer summary (minimal index)
+/// Observed peer with full address history.
+///
+/// Stores all observed addresses for a peer (most recent first) so that
+/// NAT rebinding does not cause stale address lookups during coordination.
 #[derive(Debug, Clone)]
 struct ObservedPeer {
-    observed_addr: SocketAddr,
+    /// Observed addresses, most recent first. Capped at MAX_ADDRESSES_PER_PEER.
+    addresses: Vec<SocketAddr>,
+    /// Total observation count across all addresses
+    observation_count: u32,
+    /// When the most recent observation was made
+    last_updated: Instant,
 }
 
-/// Minimal coordination record linking two peers for a round
+/// Maximum number of addresses to track per peer
+const MAX_ADDRESSES_PER_PEER: usize = 8;
+
+impl ObservedPeer {
+    fn new(addr: SocketAddr, now: Instant) -> Self {
+        Self {
+            addresses: vec![addr],
+            observation_count: 1,
+            last_updated: now,
+        }
+    }
+
+    /// Add or promote an address observation. Most recent is always first.
+    fn observe_address(&mut self, addr: SocketAddr, now: Instant) {
+        self.observation_count += 1;
+        self.last_updated = now;
+
+        // Remove existing entry for this address (we'll re-insert at front)
+        self.addresses
+            .retain(|a| normalize_socket_addr(*a) != normalize_socket_addr(addr));
+
+        // Insert at front (most recent)
+        self.addresses.insert(0, addr);
+
+        // Cap the list
+        self.addresses.truncate(MAX_ADDRESSES_PER_PEER);
+    }
+
+    /// Get the most recently observed address
+    fn most_recent_addr(&self) -> Option<SocketAddr> {
+        self.addresses.first().copied()
+    }
+}
+
+/// Minimal coordination record linking two peers for a round.
+///
+/// Does NOT cache address hints — addresses are looked up fresh from
+/// peer_index at coordination time to avoid stale NAT mappings.
 #[derive(Debug, Clone)]
 struct CoordinationEntry {
     peer_b: Option<PeerId>,
-    address_hint: SocketAddr,
 }
 /// Record of observed peer information
 #[derive(Debug, Clone)]
@@ -3560,21 +3637,8 @@ pub(crate) struct ConnectionContext {
 
 // Transport parameters for NAT traversal removed (legacy)
 
-/// Address observation with validation
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct AddressObservation {
-    /// The observed address
-    address: SocketAddr,
-    /// When this address was first observed
-    first_observed: Instant,
-    /// How many times this address has been observed
-    observation_count: u32,
-    /// Validation state for this address
-    validation_state: AddressValidationResult,
-    /// Associated peer IDs for this address
-    associated_peers: Vec<PeerId>,
-}
+// AddressObservation removed — address tracking is now per-peer in ObservedPeer.
+// This prevents stale address lookups when NAT rebinds occur.
 
 // Removed coordination session scaffolding
 /// Pending coordination request awaiting peer participation (stub implementation)
@@ -3600,7 +3664,6 @@ impl BootstrapCoordinator {
     /// Create a new bootstrap coordinator
     pub(crate) fn new(_config: BootstrapConfig) -> Self {
         Self {
-            address_observations: HashMap::new(),
             peer_index: HashMap::new(),
             coordination_table: HashMap::new(),
             security_validator: SecurityValidationState::new(),
@@ -3611,6 +3674,10 @@ impl BootstrapCoordinator {
     ///
     /// This is called when a peer connects to this bootstrap node,
     /// allowing us to observe their public address.
+    ///
+    /// The observation is stored by PeerId (stable identity), not by
+    /// SocketAddr. When a peer's NAT rebinds, the new address is added
+    /// to the front of the peer's address list, keeping coordination fresh.
     pub(crate) fn observe_peer_address(
         &mut self,
         peer_id: PeerId,
@@ -3640,38 +3707,21 @@ impl BootstrapCoordinator {
             return Err(NatTraversalError::RateLimitExceeded);
         }
 
-        // Update address observation
-        let observation = self
-            .address_observations
-            .entry(observed_address)
-            .or_insert_with(|| AddressObservation {
-                address: observed_address,
-                first_observed: now,
-                observation_count: 0,
-                validation_state: AddressValidationResult::Valid,
-                associated_peers: Vec::new(),
-            });
+        // Update peer index — keyed by PeerId, not SocketAddr.
+        // New addresses are promoted to the front of the list so that
+        // coordination always uses the most recent NAT mapping.
+        self.peer_index
+            .entry(peer_id)
+            .and_modify(|peer| peer.observe_address(observed_address, now))
+            .or_insert_with(|| ObservedPeer::new(observed_address, now));
 
-        observation.observation_count += 1;
-        if !observation.associated_peers.contains(&peer_id) {
-            observation.associated_peers.push(peer_id);
-        }
-
-        // Update minimal peer index for quick lookups
-        self.peer_index.insert(
-            peer_id,
-            ObservedPeer {
-                observed_addr: observed_address,
-            },
-        );
-
-        // Note: Full peer registry and session scaffolding removed; we keep only minimal caches
         self.stats.total_observations += 1;
-        // active_peers removed from stats
 
         debug!(
             "Observed peer {:?} at address {} (total observations: {})",
-            peer_id, observed_address, self.stats.total_observations
+            hex::encode(&peer_id[..8]),
+            observed_address,
+            self.stats.total_observations
         );
 
         Ok(())
@@ -3679,15 +3729,15 @@ impl BootstrapCoordinator {
 
     /// Generate ADD_ADDRESS frame for a peer based on observation
     ///
-    /// This creates an ADD_ADDRESS frame to inform a peer of their
-    /// observed public address.
+    /// Returns the most recently observed address for this peer, which
+    /// survives NAT rebinds because the peer_index tracks address history.
     pub(crate) fn generate_add_address_frame(
         &self,
         peer_id: PeerId,
         sequence: VarInt,
         priority: VarInt,
     ) -> Option<crate::frame::AddAddress> {
-        let addr = self.peer_index.get(&peer_id)?.observed_addr;
+        let addr = self.peer_index.get(&peer_id)?.most_recent_addr()?;
         Some(crate::frame::AddAddress {
             sequence,
             address: addr,
@@ -3742,20 +3792,19 @@ impl BootstrapCoordinator {
                 );
             })?;
 
-        // Track coordination entry minimally
-        let _entry = self
+        // Track coordination entry — no address_hint stored (looked up fresh
+        // from peer_index to avoid stale NAT mappings).
+        let entry = self
             .coordination_table
             .entry(frame.round)
             .or_insert(CoordinationEntry {
                 peer_b: frame.target_peer_id,
-                address_hint: frame.address,
             });
         // Update target if provided later
         if let Some(peer_b) = frame.target_peer_id {
-            if _entry.peer_b.is_none() {
-                _entry.peer_b = Some(peer_b);
+            if entry.peer_b.is_none() {
+                entry.peer_b = Some(peer_b);
             }
-            _entry.address_hint = frame.address;
         }
 
         // If we have a target, echo back with swapped target to coordinate
