@@ -1033,6 +1033,14 @@ impl P2pEndpoint {
         // instead of socket address (essential for symmetric NAT).
         self.inner.register_connection_peer_id(addr, peer_id);
 
+        // Clone the connection for the reader task BEFORE passing to handler.
+        // We must NOT re-fetch via get_connection() because a concurrent accept()
+        // can replace the DashMap entry between add_connection() and here, causing
+        // spawn_reader_task to get the wrong connection object.  This was the root
+        // cause of the simultaneous-connect recv() hang: the reader task ended up
+        // on a connection the remote peer wasn't sending on.
+        let reader_conn = connection.clone();
+
         // Spawn handler (we initiated the connection = Client side)
         self.inner
             .spawn_connection_handler(peer_id, connection, Side::Client)
@@ -1050,10 +1058,9 @@ impl P2pEndpoint {
 
         // Spawn background reader task BEFORE storing peer in connected_peers
         // This prevents a race where recv() called immediately after connect()
-        // returns might miss early data if the peer sends before the task starts
-        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-            self.spawn_reader_task(peer_id, conn).await;
-        }
+        // returns might miss early data if the peer sends before the task starts.
+        // Use the cloned connection directly — do NOT re-fetch from the DashMap.
+        self.spawn_reader_task(peer_id, reader_conn).await;
 
         // Store peer (reader task is already running, so no data loss window)
         self.connected_peers
@@ -1939,6 +1946,10 @@ impl P2pEndpoint {
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner.register_connection_peer_id(addr, peer_id);
 
+        // Clone the connection for the reader task BEFORE handler consumes it.
+        // Do NOT re-fetch via get_connection() — see simultaneous-connect fix.
+        let reader_conn = connection.clone();
+
         // Spawn connection handler (Client side - we initiated)
         self.inner
             .spawn_connection_handler(peer_id, connection, Side::Client)
@@ -1952,10 +1963,9 @@ impl P2pEndpoint {
             last_activity: Instant::now(),
         };
 
-        // Spawn reader task before storing peer to prevent data loss race
-        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-            self.spawn_reader_task(peer_id, conn).await;
-        }
+        // Spawn reader task before storing peer to prevent data loss race.
+        // Use the cloned connection directly — do NOT re-fetch from the DashMap.
+        self.spawn_reader_task(peer_id, reader_conn).await;
 
         self.connected_peers
             .write()
@@ -2157,6 +2167,9 @@ impl P2pEndpoint {
         self.inner
             .register_connection_peer_id(target, relay_peer_id);
 
+        // Clone for reader task before handler consumes connection.
+        let reader_conn = connection.clone();
+
         self.inner
             .spawn_connection_handler(relay_peer_id, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
@@ -2169,10 +2182,8 @@ impl P2pEndpoint {
             last_activity: Instant::now(),
         };
 
-        // Spawn background reader task
-        if let Ok(Some(conn)) = self.inner.get_connection(&relay_peer_id) {
-            self.spawn_reader_task(relay_peer_id, conn).await;
-        }
+        // Spawn background reader task — use clone, not get_connection().
+        self.spawn_reader_task(relay_peer_id, reader_conn).await;
 
         // Store peer connection
         self.connected_peers
@@ -2233,6 +2244,12 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_addr, resolved_peer_id);
 
+                // Clone the connection for the reader task BEFORE handler consumes it.
+                // Do NOT re-fetch via get_connection() — a concurrent connect() can
+                // replace the DashMap entry, causing the reader to attach to the wrong
+                // QUIC connection (simultaneous-connect recv() hang).
+                let reader_conn = connection.clone();
+
                 // They initiated the connection to us = Server side
                 if let Err(e) =
                     self.inner
@@ -2252,10 +2269,9 @@ impl P2pEndpoint {
                 };
 
                 // Spawn background reader task BEFORE storing in connected_peers
-                // to prevent race where recv() misses early data
-                if let Ok(Some(conn)) = self.inner.get_connection(&resolved_peer_id) {
-                    self.spawn_reader_task(resolved_peer_id, conn).await;
-                }
+                // to prevent race where recv() misses early data.
+                // Use the cloned connection directly — do NOT re-fetch from the DashMap.
+                self.spawn_reader_task(resolved_peer_id, reader_conn).await;
 
                 self.connected_peers
                     .write()
