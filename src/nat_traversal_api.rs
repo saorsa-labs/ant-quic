@@ -520,12 +520,16 @@ pub struct BootstrapNode {
 }
 
 impl BootstrapNode {
-    /// Create a new bootstrap node
+    /// Create a new bootstrap node.
+    ///
+    /// Nodes start as discovery contacts only. They are promoted to NAT
+    /// traversal coordinators after we successfully establish a direct outbound
+    /// connection and record real reachability evidence.
     pub fn new(address: SocketAddr) -> Self {
         Self {
             address,
             last_seen: std::time::Instant::now(),
-            can_coordinate: true,
+            can_coordinate: false,
             rtt: None,
             coordination_count: 0,
         }
@@ -1250,7 +1254,7 @@ impl NatTraversalEndpoint {
                 .map(|&address| BootstrapNode {
                     address,
                     last_seen: std::time::Instant::now(),
-                    can_coordinate: true, // All nodes can coordinate in v0.13.0+
+                    can_coordinate: false,
                     rtt: None,
                     coordination_count: 0,
                 })
@@ -1330,12 +1334,13 @@ impl NatTraversalEndpoint {
                 ..MasqueRelayConfig::default()
             };
             // Use the local address as the public address (will be updated when external address is discovered)
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let server = Arc::new(MasqueRelayServer::new(relay_config, local_addr));
+            let _cleanup_handle = MasqueRelayServer::spawn_cleanup_task(&server);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
             );
-            Some(Arc::new(server))
+            Some(server)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -1703,7 +1708,7 @@ impl NatTraversalEndpoint {
                 .map(|&address| BootstrapNode {
                     address,
                     last_seen: std::time::Instant::now(),
-                    can_coordinate: true, // All nodes can coordinate in v0.13.0+
+                    can_coordinate: false,
                     rtt: None,
                     coordination_count: 0,
                 })
@@ -1799,12 +1804,13 @@ impl NatTraversalEndpoint {
                 ..MasqueRelayConfig::default()
             };
             // Use the local address as the public address (will be updated when external address is discovered)
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let server = Arc::new(MasqueRelayServer::new(relay_config, local_addr));
+            let _cleanup_handle = MasqueRelayServer::spawn_cleanup_task(&server);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
             );
-            Some(Arc::new(server))
+            Some(server)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -2753,13 +2759,48 @@ impl NatTraversalEndpoint {
             bootstrap_nodes.push(BootstrapNode {
                 address,
                 last_seen: std::time::Instant::now(),
-                can_coordinate: true,
+                can_coordinate: false,
                 rtt: None,
                 coordination_count: 0,
             });
             info!("Added bootstrap node: {}", address);
         }
         Ok(())
+    }
+
+    /// Mark a known peer as a proven coordinator after a successful direct
+    /// outbound connection.
+    pub fn record_bootstrap_direct_connection(&self, addr: &SocketAddr, rtt: Option<Duration>) {
+        let normalized = normalize_socket_addr(*addr);
+        let mut bootstrap_nodes = self.bootstrap_nodes.write();
+
+        if let Some(node) = bootstrap_nodes
+            .iter_mut()
+            .find(|node| normalize_socket_addr(node.address) == normalized)
+        {
+            node.can_coordinate = true;
+            node.last_seen = std::time::Instant::now();
+            if let Some(rtt) = rtt {
+                node.rtt = Some(rtt);
+            }
+            debug!(
+                "Marked bootstrap node {} as coordinator (rtt={:?})",
+                node.address, node.rtt
+            );
+        }
+    }
+
+    fn increment_coordination_count(&self, coordinator: SocketAddr) {
+        let normalized = normalize_socket_addr(coordinator);
+        let mut bootstrap_nodes = self.bootstrap_nodes.write();
+
+        if let Some(node) = bootstrap_nodes
+            .iter_mut()
+            .find(|node| normalize_socket_addr(node.address) == normalized)
+        {
+            node.coordination_count = node.coordination_count.saturating_add(1);
+            node.last_seen = std::time::Instant::now();
+        }
     }
 
     /// Remove a bootstrap node
@@ -3882,12 +3923,33 @@ impl NatTraversalEndpoint {
         // Normalize to prevent IPv4 vs IPv4-mapped-IPv6 key mismatches
         let relay_addr = crate::shared::normalize_socket_addr(relay_addr);
 
-        // Check if we already have an active session to this relay
-        // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
+        // Check if we already have an active session to this relay.
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
                 debug!("Reusing existing relay session to {}", relay_addr);
-                return Ok((session.public_address, None));
+                let connection = session.connection.clone();
+                let existing_public_address = session.public_address;
+                drop(session);
+
+                let (public_address, relay_socket) = self
+                    .open_relay_stream_and_handshake(
+                        connection.clone(),
+                        relay_addr,
+                        existing_public_address,
+                    )
+                    .await?;
+
+                self.relay_sessions.insert(
+                    relay_addr,
+                    RelaySession {
+                        connection,
+                        public_address,
+                        established_at: std::time::Instant::now(),
+                        relay_addr,
+                    },
+                );
+
+                return Ok((public_address, relay_socket));
             }
         }
 
@@ -3913,12 +3975,41 @@ impl NatTraversalEndpoint {
             self.connect_new_to_relay(relay_addr).await?
         };
 
-        // Open a bidirectional stream for the CONNECT-UDP handshake
+        let (public_address, relay_socket) = self
+            .open_relay_stream_and_handshake(connection.clone(), relay_addr, None)
+            .await?;
+
+        self.relay_sessions.insert(
+            relay_addr,
+            RelaySession {
+                connection,
+                public_address,
+                established_at: std::time::Instant::now(),
+                relay_addr,
+            },
+        );
+
+        Ok((public_address, relay_socket))
+    }
+
+    async fn open_relay_stream_and_handshake(
+        &self,
+        connection: InnerConnection,
+        relay_addr: SocketAddr,
+        fallback_public_address: Option<SocketAddr>,
+    ) -> Result<
+        (
+            Option<SocketAddr>,
+            Option<Arc<crate::masque::MasqueRelaySocket>>,
+        ),
+        NatTraversalError,
+    > {
+        // Open a bidirectional stream for the CONNECT-UDP handshake.
         let (mut send_stream, mut recv_stream) = connection.open_bi().await.map_err(|e| {
             NatTraversalError::ConnectionFailed(format!("Failed to open relay stream: {}", e))
         })?;
 
-        // Send CONNECT-UDP Bind request with length prefix (stream stays open for data)
+        // Send CONNECT-UDP Bind request with length prefix (stream stays open for data).
         let request = ConnectUdpRequest::bind_any();
         let request_bytes = request.encode();
 
@@ -3937,7 +4028,7 @@ impl NatTraversalEndpoint {
         })?;
         // Do NOT call finish() — stream stays open for data forwarding
 
-        // Read length-prefixed response
+        // Read length-prefixed response.
         let mut resp_len_buf = [0u8; 4];
         recv_stream
             .read_exact(&mut resp_len_buf)
@@ -3970,35 +4061,20 @@ impl NatTraversalEndpoint {
             )));
         }
 
-        let public_address = response.proxy_public_address;
+        let public_address = response.proxy_public_address.or(fallback_public_address);
 
         info!(
             "Relay session established with public address: {:?}",
             public_address
         );
 
-        // Create the MasqueRelaySocket from the open streams
         let relay_socket = public_address
             .map(|addr| crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr));
 
-        // Store the session
-        let session = RelaySession {
-            connection,
-            public_address,
-            established_at: std::time::Instant::now(),
-            relay_addr,
-        };
-
-        // DashMap provides lock-free .insert()
-        self.relay_sessions.insert(relay_addr, session);
-
-        // Notify the relay manager
         if let Some(ref manager) = self.relay_manager {
-            if let Ok(resp) =
-                ConnectUdpResponse::decode(&mut bytes::Bytes::from(response.encode().to_vec()))
-            {
-                let _ = manager.handle_connect_response(relay_addr, resp).await;
-            }
+            let _ = manager
+                .handle_connect_response(relay_addr, response.clone())
+                .await;
         }
 
         Ok((public_address, relay_socket))
@@ -5814,12 +5890,40 @@ impl NatTraversalEndpoint {
     fn select_coordinator(&self) -> Option<SocketAddr> {
         // parking_lot::RwLock doesn't poison - always succeeds
         let nodes = self.bootstrap_nodes.read();
-        // Simple round-robin or random selection
-        if !nodes.is_empty() {
-            let idx = rand::random::<usize>() % nodes.len();
-            return Some(nodes[idx].address);
+        let eligible: Vec<&BootstrapNode> =
+            nodes.iter().filter(|node| node.can_coordinate).collect();
+
+        if eligible.is_empty() {
+            return None;
         }
-        None
+
+        let scores: Vec<f64> = eligible
+            .iter()
+            .map(|node| {
+                let rtt_ms = node
+                    .rtt
+                    .map(|rtt| rtt.as_millis().max(1) as f64)
+                    .unwrap_or(1_000.0);
+                let rtt_score = 1.0 / rtt_ms;
+                let load_score = 1.0 / (node.coordination_count as f64 + 1.0);
+                (rtt_score * 3.0) + load_score
+            })
+            .collect();
+        let total_score: f64 = scores.iter().sum();
+
+        if total_score <= f64::EPSILON {
+            return eligible.first().map(|node| node.address);
+        }
+
+        let mut roll = rand::random::<f64>() * total_score;
+        for (node, score) in eligible.iter().zip(scores.iter()) {
+            if roll <= *score {
+                return Some(node.address);
+            }
+            roll -= *score;
+        }
+
+        eligible.last().map(|node| node.address)
     }
 
     /// Send coordination request to bootstrap node
@@ -5881,6 +5985,7 @@ impl NatTraversalEndpoint {
                 // Use round 1 for initial coordination
                 match conn.send_nat_punch_via_relay(peer_id.0, our_external_address, 1) {
                     Ok(()) => {
+                        self.increment_coordination_count(coordinator);
                         info!(
                             "Successfully queued PUNCH_ME_NOW for relay to peer {}",
                             hex::encode(&peer_id.0[..8])
@@ -5913,6 +6018,7 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let bootstrap_nodes = self.bootstrap_nodes.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
 
@@ -5949,6 +6055,17 @@ impl NatTraversalEndpoint {
                                     1,
                                 ) {
                                     Ok(()) => {
+                                        {
+                                            let mut nodes = bootstrap_nodes.write();
+                                            if let Some(node) = nodes.iter_mut().find(|node| {
+                                                normalize_socket_addr(node.address)
+                                                    == normalize_socket_addr(coordinator)
+                                            }) {
+                                                node.coordination_count =
+                                                    node.coordination_count.saturating_add(1);
+                                                node.last_seen = std::time::Instant::now();
+                                            }
+                                        }
                                         info!(
                                             "Sent PUNCH_ME_NOW to coordinator {} for peer {}",
                                             coordinator,
@@ -6126,13 +6243,15 @@ impl NatTraversalEndpoint {
             }
 
             // For testing: if we're in punching phase and have candidates, simulate success with the first one
-            if session.phase == TraversalPhase::Punching && !session.candidates.is_empty() {
-                let addr = session.candidates[0].address;
-                info!(
-                    "Simulating successful punch for testing: peer {:?} at {}",
-                    peer_id, addr
-                );
-                return Some(addr);
+            if session.phase == TraversalPhase::Punching {
+                if let Some(first_candidate) = session.candidates.first() {
+                    let addr = first_candidate.address;
+                    info!(
+                        "Simulating successful punch for testing: peer {:?} at {}",
+                        peer_id, addr
+                    );
+                    return Some(addr);
+                }
             }
 
             // No validated candidates, return first candidate as fallback
@@ -6200,7 +6319,9 @@ impl NatTraversalEndpoint {
     /// wasted resources on hole punching attempts.
     #[inline]
     fn has_existing_connection(&self, peer_id: &PeerId) -> bool {
-        self.connections.contains_key(peer_id)
+        self.connections
+            .get(peer_id)
+            .is_some_and(|conn| conn.close_reason().is_none())
     }
 
     /// Check if path validation succeeded
@@ -6236,15 +6357,9 @@ impl NatTraversalEndpoint {
 
     /// Check if connection is healthy
     fn is_connection_healthy(&self, peer_id: &PeerId) -> bool {
-        // In real implementation, check QUIC connection status
-        // DashMap provides lock-free .get()
-        if self.connections.get(peer_id).is_some() {
-            // Check if connection is still active
-            // Note: Connection doesn't have is_closed/is_drained methods
-            // We use the closed() future to check if still active
-            return true; // Assume healthy if connection exists in map
-        }
-        true
+        self.connections
+            .get(peer_id)
+            .is_some_and(|conn| conn.close_reason().is_none())
     }
 
     /// Convert discovery events to NAT traversal events with proper peer ID resolution
@@ -6887,10 +7002,71 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_node_management() {
-        let _config = NatTraversalConfig::default();
-        // Note: This will fail due to ServerConfig requirement in new() - for illustration only
-        // let endpoint = NatTraversalEndpoint::new(config, None).unwrap();
+    fn test_bootstrap_node_defaults_can_coordinate_false() {
+        let node = BootstrapNode::new("127.0.0.1:9000".parse().unwrap());
+        assert!(!node.can_coordinate);
+        assert_eq!(node.coordination_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_select_coordinator_quality_weighted() {
+        let config = NatTraversalConfig {
+            known_peers: Vec::new(),
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("endpoint should be created for coordinator test");
+
+        assert!(endpoint.select_coordinator().is_none());
+
+        {
+            let mut nodes = endpoint.bootstrap_nodes.write();
+            nodes.push(BootstrapNode {
+                address: "1.2.3.4:5000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: false,
+                rtt: Some(Duration::from_millis(10)),
+                coordination_count: 0,
+            });
+            nodes.push(BootstrapNode {
+                address: "5.6.7.8:6000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: true,
+                rtt: Some(Duration::from_millis(20)),
+                coordination_count: 0,
+            });
+            nodes.push(BootstrapNode {
+                address: "9.10.11.12:7000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: true,
+                rtt: Some(Duration::from_millis(500)),
+                coordination_count: 10,
+            });
+        }
+
+        let non_coordinator: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        for _ in 0..100 {
+            let selected = endpoint.select_coordinator();
+            assert!(selected.is_some());
+            assert_ne!(selected.unwrap(), non_coordinator);
+        }
+
+        let preferred: SocketAddr = "5.6.7.8:6000".parse().unwrap();
+        let mut preferred_count = 0;
+        let trials = 1000;
+        for _ in 0..trials {
+            if endpoint.select_coordinator() == Some(preferred) {
+                preferred_count += 1;
+            }
+        }
+        assert!(
+            preferred_count > 600,
+            "expected lower RTT / lower load coordinator to dominate selection, got {preferred_count}/{trials}"
+        );
+
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 
     #[test]

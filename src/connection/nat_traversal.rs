@@ -3565,6 +3565,8 @@ struct ObservedPeer {
 
 /// Maximum number of addresses to track per peer
 const MAX_ADDRESSES_PER_PEER: usize = 8;
+/// Maximum lifetime for a coordination entry before it is reaped.
+const COORDINATION_ENTRY_TTL: Duration = Duration::from_secs(60);
 
 impl ObservedPeer {
     fn new(addr: SocketAddr, now: Instant) -> Self {
@@ -3604,6 +3606,8 @@ impl ObservedPeer {
 #[derive(Debug, Clone)]
 struct CoordinationEntry {
     peer_b: Option<PeerId>,
+    created_at: Instant,
+    completed: bool,
 }
 /// Record of observed peer information
 #[derive(Debug, Clone)]
@@ -3795,6 +3799,9 @@ impl BootstrapCoordinator {
                 );
             })?;
 
+        self.cleanup_expired_sessions(now);
+        self.cleanup_completed_sessions();
+
         // Track coordination entry — no address_hint stored (looked up fresh
         // from peer_index to avoid stale NAT mappings).
         let entry = self
@@ -3802,6 +3809,8 @@ impl BootstrapCoordinator {
             .entry(frame.round)
             .or_insert(CoordinationEntry {
                 peer_b: frame.target_peer_id,
+                created_at: now,
+                completed: false,
             });
         // Update target if provided later
         if let Some(peer_b) = frame.target_peer_id {
@@ -3821,7 +3830,8 @@ impl BootstrapCoordinator {
             self.stats.total_coordinations += 1;
             Ok(Some(coordination_frame))
         } else {
-            // Response path: increment success metric
+            // Response path: mark the round complete and increment success metric.
+            entry.completed = true;
             self.stats.successful_coordinations += 1;
             Ok(None)
         }
@@ -3832,8 +3842,10 @@ impl BootstrapCoordinator {
 
     // Perform comprehensive security validation for coordination requests (legacy removed)
 
-    #[allow(dead_code)]
-    pub(crate) fn cleanup_expired_sessions(&mut self, _now: Instant) {}
+    pub(crate) fn cleanup_expired_sessions(&mut self, now: Instant) {
+        self.coordination_table
+            .retain(|_, entry| now.duration_since(entry.created_at) < COORDINATION_ENTRY_TTL);
+    }
 
     // Get bootstrap statistics (legacy removed)
 
@@ -3848,8 +3860,9 @@ impl BootstrapCoordinator {
     // Check if a session should advance its state (legacy removed)
     // Advance session state based on event (legacy removed)
 
-    #[allow(dead_code)]
-    fn cleanup_completed_sessions(&mut self, _now: Instant) {}
+    fn cleanup_completed_sessions(&mut self) {
+        self.coordination_table.retain(|_, entry| !entry.completed);
+    }
 
     // Legacy retry mechanism removed
 
@@ -3912,6 +3925,68 @@ mod tests {
             10,                      // max_candidates
             Duration::from_secs(30), // coordination_timeout
         )
+    }
+
+    #[test]
+    fn test_cleanup_expired_coordination_entries() {
+        let mut coordinator = BootstrapCoordinator::new(BootstrapConfig::default());
+        let now = Instant::now();
+        coordinator.coordination_table.insert(
+            VarInt::from_u32(1),
+            CoordinationEntry {
+                peer_b: None,
+                created_at: now - COORDINATION_ENTRY_TTL - Duration::from_secs(1),
+                completed: false,
+            },
+        );
+        coordinator.coordination_table.insert(
+            VarInt::from_u32(2),
+            CoordinationEntry {
+                peer_b: None,
+                created_at: now,
+                completed: false,
+            },
+        );
+
+        coordinator.cleanup_expired_sessions(now);
+
+        assert_eq!(coordinator.coordination_table.len(), 1);
+        assert!(
+            coordinator
+                .coordination_table
+                .contains_key(&VarInt::from_u32(2))
+        );
+    }
+
+    #[test]
+    fn test_cleanup_completed_coordination_entries() {
+        let mut coordinator = BootstrapCoordinator::new(BootstrapConfig::default());
+        let now = Instant::now();
+        coordinator.coordination_table.insert(
+            VarInt::from_u32(1),
+            CoordinationEntry {
+                peer_b: None,
+                created_at: now,
+                completed: true,
+            },
+        );
+        coordinator.coordination_table.insert(
+            VarInt::from_u32(2),
+            CoordinationEntry {
+                peer_b: None,
+                created_at: now,
+                completed: false,
+            },
+        );
+
+        coordinator.cleanup_completed_sessions();
+
+        assert_eq!(coordinator.coordination_table.len(), 1);
+        assert!(
+            coordinator
+                .coordination_table
+                .contains_key(&VarInt::from_u32(2))
+        );
     }
 
     #[test]

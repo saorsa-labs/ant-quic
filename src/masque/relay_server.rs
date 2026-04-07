@@ -1042,6 +1042,35 @@ impl MasqueRelayServer {
         count
     }
 
+    /// Spawn a background task that periodically cleans up expired relay sessions.
+    pub fn spawn_cleanup_task(server: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(server);
+        let interval_duration = server.config.cleanup_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_duration);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let Some(server) = weak.upgrade() else {
+                    break;
+                };
+
+                let cleaned = server.cleanup_expired_sessions().await;
+                if cleaned > 0 {
+                    let remaining = server.session_count().await;
+                    tracing::info!(
+                        cleaned = cleaned,
+                        remaining = remaining,
+                        "Reaped expired MASQUE relay sessions"
+                    );
+                }
+            }
+        })
+    }
+
     /// Get session count
     pub async fn session_count(&self) -> usize {
         let sessions = self.sessions.read().await;
@@ -1180,6 +1209,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, 503);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_task_stops_when_server_dropped() {
+        let config = MasqueRelayConfig {
+            cleanup_interval: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let server = Arc::new(MasqueRelayServer::new(config, test_addr(9000)));
+        let handle = MasqueRelayServer::spawn_cleanup_task(&server);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(server);
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cleanup task should stop after server drop")
+            .expect("cleanup task should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_task_reaps_expired_sessions() {
+        let config = MasqueRelayConfig {
+            cleanup_interval: Duration::from_millis(50),
+            session_config: RelaySessionConfig {
+                session_timeout: Duration::from_millis(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let server = Arc::new(MasqueRelayServer::new(config, test_addr(9000)));
+        let _handle = MasqueRelayServer::spawn_cleanup_task(&server);
+
+        let request = ConnectUdpRequest::bind_any();
+        let response = server
+            .handle_connect_request(&request, client_addr(1))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(server.session_count().await, 1);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(server.session_count().await, 0);
     }
 
     #[tokio::test]

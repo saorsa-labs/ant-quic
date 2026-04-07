@@ -4846,16 +4846,16 @@ impl Connection {
                 let punch_me_now_clone = punch_me_now.clone();
                 drop(nat_state); // Release the borrow
 
-                match self
-                    .nat_traversal
-                    .as_mut()
-                    .unwrap()
-                    .handle_punch_me_now_frame(
-                        from_peer_id,
-                        self.path.remote,
-                        &punch_me_now_clone,
-                        now,
-                    ) {
+                let Some(nat_traversal) = self.nat_traversal.as_mut() else {
+                    return Ok(());
+                };
+
+                match nat_traversal.handle_punch_me_now_frame(
+                    from_peer_id,
+                    self.path.remote,
+                    &punch_me_now_clone,
+                    now,
+                ) {
                     Ok(Some(coordination_frame)) => {
                         trace!("Node coordinating PUNCH_ME_NOW between peers");
 

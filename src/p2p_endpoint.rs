@@ -1089,6 +1089,8 @@ impl P2pEndpoint {
         // This enables coordinators to look up the connection by peer identity
         // instead of socket address (essential for symmetric NAT).
         self.inner.register_connection_peer_id(addr, peer_id);
+        self.inner
+            .record_bootstrap_direct_connection(&addr, Some(connection.rtt()));
 
         // Clone the connection for the reader task BEFORE passing to handler.
         // We must NOT re-fetch via get_connection() because a concurrent accept()
@@ -1929,11 +1931,11 @@ impl P2pEndpoint {
                         }
                         Ok(Err(e)) => {
                             debug!("Relay connection failed: {}", e);
-                            strategy.transition_to_failed(e.to_string());
+                            strategy.transition_to_next_relay(e.to_string());
                         }
                         Err(_) => {
                             debug!("Relay connection timed out");
-                            strategy.transition_to_failed("Timeout");
+                            strategy.transition_to_next_relay("Timeout");
                         }
                     }
                 }
@@ -1948,8 +1950,10 @@ impl P2pEndpoint {
                 }
 
                 ConnectionStage::Connected { via } => {
-                    // This shouldn't happen in the loop, but handle it
-                    unreachable!("Connected stage reached in loop: {:?}", via);
+                    return Err(EndpointError::Connection(format!(
+                        "Connection strategy reached terminal connected state without returning: {:?}",
+                        via
+                    )));
                 }
             }
         }
@@ -2017,6 +2021,8 @@ impl P2pEndpoint {
 
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner.register_connection_peer_id(addr, peer_id);
+        self.inner
+            .record_bootstrap_direct_connection(&addr, Some(connection.rtt()));
 
         // Clone the connection for the reader task BEFORE handler consumes it.
         // Do NOT re-fetch via get_connection() — see simultaneous-connect fix.
@@ -2302,7 +2308,6 @@ impl P2pEndpoint {
         stats.active_connections += 1;
         stats.successful_connections += 1;
         stats.direct_connections += 1;
-        stats.active_direct_incoming_connections += 1;
         let now = Instant::now();
 
         match socket_addr_scope(remote_addr) {
