@@ -92,7 +92,7 @@ fn bench_frame_decoding(c: &mut Criterion) {
                             // IPv4
                             let ip = [cursor[0], cursor[1], cursor[2], cursor[3]];
                             let port = u16::from_be_bytes([cursor[4], cursor[5]]);
-                            SocketAddr::from((ip, port))
+                            Some(SocketAddr::from((ip, port)))
                         }
                         6 => {
                             // IPv6
@@ -100,9 +100,9 @@ fn bench_frame_decoding(c: &mut Criterion) {
                             ip.copy_from_slice(&cursor[..16]);
                             let port = u16::from_be_bytes([cursor[16], cursor[17]]);
                             let ipv6 = std::net::Ipv6Addr::from(ip);
-                            SocketAddr::from((ipv6, port))
+                            Some(SocketAddr::from((ipv6, port)))
                         }
-                        _ => panic!("Invalid address type"),
+                        _ => None,
                     };
 
                     black_box((frame_type, seq_num, addr))
