@@ -201,7 +201,7 @@ impl BootstrapCache {
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
         drop(data);
 
-        select_relays_for_target(&peers, count, target.is_ipv4(), prefer_dual_stack)
+        select_relays_for_target(&peers, count, *target, prefer_dual_stack)
             .into_iter()
             .cloned()
             .collect()
@@ -711,22 +711,22 @@ mod tests {
         // Add some peers with capabilities
         let mut peer1 = CachedPeer::new(
             PeerId([1; 32]),
-            vec!["127.0.0.1:9001".parse().unwrap()],
+            vec!["203.0.113.1:9001".parse().unwrap()],
             PeerSource::Seed,
         );
         peer1
             .capabilities
-            .record_direct_observation("127.0.0.1:9001".parse().unwrap(), SystemTime::now());
+            .record_direct_observation("203.0.113.1:9001".parse().unwrap(), SystemTime::now());
         cache.upsert(peer1).await;
 
         let mut peer2 = CachedPeer::new(
             PeerId([2; 32]),
-            vec!["127.0.0.1:9002".parse().unwrap()],
+            vec!["198.51.100.2:9002".parse().unwrap()],
             PeerSource::Seed,
         );
         peer2
             .capabilities
-            .record_direct_observation("127.0.0.1:9002".parse().unwrap(), SystemTime::now());
+            .record_direct_observation("198.51.100.2:9002".parse().unwrap(), SystemTime::now());
         cache.upsert(peer2).await;
 
         cache
@@ -762,17 +762,20 @@ mod tests {
         let relays = cache.select_relay_peers(10).await;
         assert_eq!(relays.len(), 10); // All peers are candidates
 
-        // First 5 should have relay capability (prioritized)
+        // First 5 should have direct reachability evidence (prioritized)
         let relay_capable = relays
             .iter()
             .take(5)
-            .filter(|p| p.capabilities.supports_relay)
+            .filter(|p| p.capabilities.direct_reachability_scope.is_some())
             .count();
-        assert_eq!(relay_capable, 5, "Relay-capable peers should be first");
+        assert_eq!(
+            relay_capable, 5,
+            "Scoped direct-evidence peers should be first"
+        );
     }
 
     #[tokio::test]
-    async fn test_observe_direct_reachability_promotes_peer_capabilities() {
+    async fn test_observe_direct_reachability_preserves_local_scope_without_global_promotion() {
         let temp_dir = TempDir::new().unwrap();
         let cache = create_test_cache(&temp_dir).await;
         let peer_id = PeerId([9; 32]);
@@ -781,8 +784,12 @@ mod tests {
         cache.observe_direct_reachability(peer_id, addr).await;
 
         let peer = cache.get(&peer_id).await.expect("peer inserted");
-        assert!(peer.capabilities.supports_relay);
-        assert!(peer.capabilities.supports_coordination);
+        assert!(!peer.capabilities.supports_relay);
+        assert!(!peer.capabilities.supports_coordination);
+        assert_eq!(
+            peer.capabilities.direct_reachability_scope,
+            Some(crate::reachability::ReachabilityScope::LocalNetwork)
+        );
         assert!(peer.addresses.contains(&addr));
         assert!(
             peer.capabilities

@@ -73,10 +73,18 @@ pub struct ReachableAddressRecord {
 /// Peer capabilities and features
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerCapabilities {
-    /// Peer supports relay traffic (observed, not self-asserted)
+    /// Peer is suitable as a generally reusable relay helper.
+    ///
+    /// This is intentionally conservative: only fresh **global-scope** direct
+    /// evidence promotes the peer into this broad capability bucket. LAN and
+    /// loopback reachability are still preserved separately in
+    /// `reachable_addresses` / `direct_reachability_scope` for scoped callers.
     pub supports_relay: bool,
 
-    /// Peer supports NAT traversal coordination (observed, not self-asserted)
+    /// Peer is suitable as a generally reusable NAT traversal coordinator.
+    ///
+    /// Like `supports_relay`, this is intentionally conservative and only flips
+    /// true when we have fresh global-scope direct evidence.
     pub supports_coordination: bool,
 
     /// Protocol identifiers advertised by this peer (as hex strings for serialization)
@@ -127,8 +135,15 @@ impl PeerCapabilities {
                 verified_at: observed_at,
             });
         }
-        self.supports_relay = true;
-        self.supports_coordination = true;
+        self.direct_reachability_scope = self
+            .reachable_addresses
+            .iter()
+            .map(|entry| entry.scope)
+            .max();
+
+        let globally_reachable = self.has_global_direct_reachability();
+        self.supports_relay = globally_reachable;
+        self.supports_coordination = globally_reachable;
     }
 
     /// Whether peer-verified direct reachability evidence is still fresh.
@@ -138,6 +153,13 @@ impl PeerCapabilities {
                 .map(|age| age <= ttl)
                 .unwrap_or(false)
         })
+    }
+
+    /// Whether we have fresh global-scope direct evidence for this peer.
+    pub fn has_global_direct_reachability(&self) -> bool {
+        self.reachable_addresses
+            .iter()
+            .any(|entry| entry.scope == ReachabilityScope::Global)
     }
 
     /// Refresh derived relay/coordinator flags from fresh direct evidence.
@@ -154,9 +176,9 @@ impl PeerCapabilities {
             .map(|entry| entry.scope)
             .max();
 
-        let fresh = !self.reachable_addresses.is_empty();
-        self.supports_relay = fresh;
-        self.supports_coordination = fresh;
+        let globally_reachable = self.has_global_direct_reachability();
+        self.supports_relay = globally_reachable;
+        self.supports_coordination = globally_reachable;
     }
 
     /// Return all known addresses, preferring peer-verified reachable addresses.
@@ -431,6 +453,21 @@ impl CachedPeer {
         }
     }
 
+    /// Return candidate addresses ordered by freshest reachability evidence first.
+    ///
+    /// This prefers peer-verified reachable and externally observed addresses,
+    /// but still falls back to the persisted `addresses` list so unverified peers
+    /// remain dialable.
+    pub fn preferred_addresses(&self) -> Vec<SocketAddr> {
+        let mut addrs = self.capabilities.known_addresses();
+        for addr in &self.addresses {
+            if !addrs.contains(addr) {
+                addrs.push(*addr);
+            }
+        }
+        addrs
+    }
+
     /// Merge addresses from another peer entry
     pub fn merge_addresses(&mut self, other: &CachedPeer) {
         for addr in &other.addresses {
@@ -683,6 +720,40 @@ mod tests {
         assert_eq!(known[0], direct);
         assert!(known.contains(&external));
         assert_eq!(known.iter().filter(|addr| **addr == direct).count(), 1);
+    }
+
+    #[test]
+    fn test_local_direct_observation_does_not_claim_global_helper_capability() {
+        let mut caps = PeerCapabilities::default();
+        let direct: SocketAddr = "192.168.1.20:9000".parse().unwrap();
+
+        caps.record_direct_observation(direct, SystemTime::now());
+        caps.refresh_direct_capabilities(Duration::from_secs(60), SystemTime::now());
+
+        assert_eq!(
+            caps.direct_reachability_scope,
+            Some(ReachabilityScope::LocalNetwork)
+        );
+        assert!(!caps.supports_relay);
+        assert!(!caps.supports_coordination);
+    }
+
+    #[test]
+    fn test_preferred_addresses_include_cached_fallbacks() {
+        let mut peer = CachedPeer::new(
+            PeerId([7; 32]),
+            vec!["198.51.100.7:9000".parse().unwrap()],
+            PeerSource::Seed,
+        );
+        peer.capabilities
+            .record_direct_observation("192.168.1.20:9000".parse().unwrap(), SystemTime::now());
+        peer.capabilities
+            .record_external_address("203.0.113.20:9000".parse().unwrap());
+
+        let preferred = peer.preferred_addresses();
+        assert_eq!(preferred[0], "192.168.1.20:9000".parse().unwrap());
+        assert!(preferred.contains(&"203.0.113.20:9000".parse().unwrap()));
+        assert!(preferred.contains(&"198.51.100.7:9000".parse().unwrap()));
     }
 
     #[test]

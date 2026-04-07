@@ -497,9 +497,14 @@ impl P2pLinkTransport {
                             });
                             let mut caps = Capabilities::new_connected(socket_addr);
                             if traversal_method.is_direct() {
-                                caps.supports_relay = true;
-                                caps.supports_coordination = true;
-                                caps.direct_reachability_scope = socket_addr_scope(socket_addr);
+                                let scope = socket_addr_scope(socket_addr);
+                                caps.direct_reachability_scope = scope;
+                                let globally_reachable = matches!(
+                                    scope,
+                                    Some(crate::reachability::ReachabilityScope::Global)
+                                );
+                                caps.supports_relay = globally_reachable;
+                                caps.supports_coordination = globally_reachable;
                             }
                             // Update capabilities cache
                             if let Ok(mut state) = state.write() {

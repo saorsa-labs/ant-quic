@@ -1525,14 +1525,15 @@ impl P2pEndpoint {
             .await
             .ok_or(EndpointError::PeerNotFound(peer_id))?;
 
+        let preferred_addrs = cached_peer.preferred_addresses();
         debug!(
-            "Connecting to cached peer {:?} ({} addresses)",
+            "Connecting to cached peer {:?} ({} preferred addresses)",
             peer_id,
-            cached_peer.addresses.len()
+            preferred_addrs.len()
         );
 
         // Try dual-stack connection with PeerId (triggers token usage)
-        self.connect_dual_stack(&cached_peer.addresses, Some(peer_id))
+        self.connect_dual_stack(&preferred_addrs, Some(peer_id))
             .await
     }
 
@@ -1732,7 +1733,7 @@ impl P2pEndpoint {
                     // Use the first address of the best relay
                     // In a perfect world we'd check reachability of this address too,
                     // but for now we assume cached addresses are valid candidates.
-                    if let Some(relay_addr) = best_relay.addresses.first().copied() {
+                    if let Some(relay_addr) = best_relay.preferred_addresses().first().copied() {
                         config.relay_addrs.push(relay_addr);
                         debug!(
                             "Selected optimized relay from cache: {:?} for target {}",

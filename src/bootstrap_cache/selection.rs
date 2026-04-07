@@ -8,6 +8,7 @@
 //! Epsilon-greedy peer selection.
 
 use super::entry::CachedPeer;
+use crate::reachability::{ReachabilityScope, socket_addr_scope};
 use rand::Rng;
 use std::collections::HashSet;
 
@@ -29,6 +30,92 @@ impl Default for SelectionStrategy {
     fn default() -> Self {
         Self::EpsilonGreedy { epsilon: 0.1 }
     }
+}
+
+const fn scope_rank(scope: Option<ReachabilityScope>) -> u8 {
+    match scope {
+        Some(ReachabilityScope::Loopback) => 1,
+        Some(ReachabilityScope::LocalNetwork) => 2,
+        Some(ReachabilityScope::Global) => 3,
+        None => 0,
+    }
+}
+
+fn helper_preference_score(
+    peer: &CachedPeer,
+    require_relay: bool,
+    require_coordination: bool,
+) -> u8 {
+    if !require_relay && !require_coordination {
+        return 0;
+    }
+
+    let scope_score = scope_rank(peer.capabilities.direct_reachability_scope);
+    let global_bonus = u8::from(
+        (require_relay && peer.capabilities.supports_relay)
+            || (require_coordination && peer.capabilities.supports_coordination),
+    );
+
+    scope_score.saturating_mul(2).saturating_add(global_bonus)
+}
+
+fn scope_match_score(observed: ReachabilityScope, target_scope: Option<ReachabilityScope>) -> u8 {
+    match target_scope {
+        Some(ReachabilityScope::Global) => u8::from(observed == ReachabilityScope::Global) * 3,
+        Some(ReachabilityScope::LocalNetwork) => match observed {
+            ReachabilityScope::LocalNetwork => 3,
+            ReachabilityScope::Global => 2,
+            ReachabilityScope::Loopback => 0,
+        },
+        Some(ReachabilityScope::Loopback) => u8::from(observed == ReachabilityScope::Loopback) * 3,
+        None => scope_rank(Some(observed)),
+    }
+}
+
+fn best_relay_score(peer: &CachedPeer, target: std::net::SocketAddr) -> u8 {
+    let target_scope = socket_addr_scope(target);
+    let target_is_ipv4 = target.is_ipv4();
+
+    let direct_score = peer
+        .capabilities
+        .reachable_addresses
+        .iter()
+        .filter(|entry| entry.address.is_ipv4() == target_is_ipv4)
+        .filter_map(|entry| {
+            let scope_score = scope_match_score(entry.scope, target_scope);
+            (scope_score > 0).then_some(scope_score.saturating_add(4))
+        })
+        .max()
+        .unwrap_or(0);
+
+    let observed_score = peer
+        .capabilities
+        .external_addresses
+        .iter()
+        .filter(|addr| addr.is_ipv4() == target_is_ipv4)
+        .filter_map(|addr| {
+            let scope_score = socket_addr_scope(*addr)
+                .map(|scope| scope_match_score(scope, target_scope))
+                .unwrap_or(0);
+            (scope_score > 0).then_some(scope_score.saturating_add(2))
+        })
+        .max()
+        .unwrap_or(0);
+
+    let stored_score = peer
+        .addresses
+        .iter()
+        .filter(|addr| addr.is_ipv4() == target_is_ipv4)
+        .filter_map(|addr| {
+            let scope_score = socket_addr_scope(*addr)
+                .map(|scope| scope_match_score(scope, target_scope))
+                .unwrap_or(0);
+            (scope_score > 0).then_some(scope_score)
+        })
+        .max()
+        .unwrap_or(0);
+
+    direct_score.max(observed_score).max(stored_score)
 }
 
 /// Select peers using epsilon-greedy strategy
@@ -123,10 +210,11 @@ pub fn select_epsilon_greedy(peers: &[CachedPeer], count: usize, epsilon: f64) -
     selected
 }
 
-/// Select peers with specific capability preferences
+/// Select peers with specific capability preferences.
 ///
-/// Prefers peers with observed capability flags, but does not exclude
-/// unverified peers. This supports "measure, don't trust" selection.
+/// Prefers peers with stronger fresh direct-evidence scope first, using the
+/// conservative global helper flags as an additional bonus, but does not
+/// exclude unverified peers. This supports "measure, don't trust" selection.
 #[allow(dead_code)]
 pub fn select_with_capabilities(
     peers: &[CachedPeer],
@@ -138,23 +226,13 @@ pub fn select_with_capabilities(
         return Vec::new();
     }
 
-    fn preference_score(peer: &CachedPeer, require_relay: bool, require_coordination: bool) -> u8 {
-        let mut score = 0u8;
-        if require_relay && peer.capabilities.supports_relay {
-            score = score.saturating_add(1);
-        }
-        if require_coordination && peer.capabilities.supports_coordination {
-            score = score.saturating_add(1);
-        }
-        score
-    }
-
     let mut candidates: Vec<&CachedPeer> = peers.iter().collect();
 
-    // Prefer observed capabilities, but do not exclude unverified peers.
+    // Prefer stronger fresh direct-evidence scope first, with conservative
+    // global helper flags as an additional bonus. Do not exclude unverified peers.
     candidates.sort_by(|a, b| {
-        let a_pref = preference_score(a, require_relay, require_coordination);
-        let b_pref = preference_score(b, require_relay, require_coordination);
+        let a_pref = helper_preference_score(a, require_relay, require_coordination);
+        let b_pref = helper_preference_score(b, require_relay, require_coordination);
         b_pref
             .cmp(&a_pref)
             .then_with(|| {
@@ -172,41 +250,37 @@ pub fn select_with_capabilities(
     candidates.into_iter().take(count).collect()
 }
 
-/// Select relay peers that can reach a target IP version.
+/// Select relay peers that can reach a target address.
 ///
-/// Returns relays sorted by quality that can bridge traffic to the target.
-/// Dual-stack relays are preferred as they can reach any target.
+/// Returns relays sorted by how well their fresh/address-specific evidence fits
+/// the target scope and address family. Dual-stack support is an additional
+/// preference, not the primary signal.
 ///
 /// # Arguments
 /// * `peers` - Slice of cached peers to select from
 /// * `count` - Maximum number of relays to return
-/// * `target_is_ipv4` - Whether the target uses IPv4 (false = IPv6)
-/// * `prefer_dual_stack` - If true, prioritize dual-stack relays
+/// * `target` - The target address we want a relay path toward
+/// * `prefer_dual_stack` - If true, prioritize dual-stack relays as a tie-breaker
 pub fn select_relays_for_target(
     peers: &[CachedPeer],
     count: usize,
-    target_is_ipv4: bool,
+    target: std::net::SocketAddr,
     prefer_dual_stack: bool,
 ) -> Vec<&CachedPeer> {
     if peers.is_empty() || count == 0 {
         return Vec::new();
     }
 
+    let target_is_ipv4 = target.is_ipv4();
+
     let mut candidates: Vec<&CachedPeer> = peers
         .iter()
         .filter(|p| {
-            // Exclude peers we have evidence cannot reach the target IP version.
-            if p.capabilities.supports_dual_stack() {
-                return true;
-            }
-            if p.capabilities.known_addresses().is_empty() {
-                return true; // Unknown capability; allow testing.
-            }
-            if target_is_ipv4 {
-                p.capabilities.has_ipv4()
-            } else {
-                p.capabilities.has_ipv6()
-            }
+            let preferred = p.preferred_addresses();
+            preferred.is_empty()
+                || preferred
+                    .iter()
+                    .any(|addr| addr.is_ipv4() == target_is_ipv4)
         })
         .collect();
 
@@ -214,30 +288,21 @@ pub fn select_relays_for_target(
         return Vec::new();
     }
 
-    let ip_match = |peer: &CachedPeer| {
-        if peer.capabilities.known_addresses().is_empty() {
-            0u8
-        } else if target_is_ipv4 {
-            u8::from(peer.capabilities.has_ipv4())
-        } else {
-            u8::from(peer.capabilities.has_ipv6())
-        }
-    };
-
     candidates.sort_by(|a, b| {
-        if prefer_dual_stack {
-            let a_ds = a.capabilities.supports_dual_stack();
-            let b_ds = b.capabilities.supports_dual_stack();
-            if a_ds != b_ds {
-                return b_ds.cmp(&a_ds);
-            }
-        }
-
-        let a_pref = (u8::from(a.capabilities.supports_relay) * 2).saturating_add(ip_match(a));
-        let b_pref = (u8::from(b.capabilities.supports_relay) * 2).saturating_add(ip_match(b));
+        let a_pref = best_relay_score(a, target);
+        let b_pref = best_relay_score(b, target);
 
         b_pref
             .cmp(&a_pref)
+            .then_with(|| {
+                if prefer_dual_stack {
+                    b.capabilities
+                        .supports_dual_stack()
+                        .cmp(&a.capabilities.supports_dual_stack())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| {
                 b.capabilities
                     .direct_reachability_scope
@@ -266,15 +331,21 @@ pub fn select_dual_stack_relays(peers: &[CachedPeer], count: usize) -> Vec<&Cach
         return Vec::new();
     }
 
-    // Prefer observed relay capability, then quality.
     filtered.sort_by(|a, b| {
-        let a_pref = u8::from(a.capabilities.supports_relay);
-        let b_pref = u8::from(b.capabilities.supports_relay);
-        b_pref.cmp(&a_pref).then_with(|| {
-            b.quality_score
-                .partial_cmp(&a.quality_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        let a_pref = helper_preference_score(a, true, false);
+        let b_pref = helper_preference_score(b, true, false);
+        b_pref
+            .cmp(&a_pref)
+            .then_with(|| {
+                b.capabilities
+                    .direct_reachability_scope
+                    .cmp(&a.capabilities.direct_reachability_scope)
+            })
+            .then_with(|| {
+                b.quality_score
+                    .partial_cmp(&a.quality_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     filtered.into_iter().take(count).collect()
@@ -388,23 +459,24 @@ mod tests {
     }
 
     #[test]
-    fn test_select_with_capabilities() {
-        let mut peers = create_test_peers(10);
+    fn test_select_with_capabilities_prefers_broader_scope() {
+        let mut peers = create_test_peers(3);
 
-        // Mark some as relays
-        peers[0].capabilities.supports_relay = true;
-        peers[5].capabilities.supports_relay = true;
-        peers[9].capabilities.supports_relay = true;
+        peers[0].capabilities.direct_reachability_scope = Some(ReachabilityScope::LocalNetwork);
+        peers[1].capabilities.direct_reachability_scope = Some(ReachabilityScope::Global);
+        peers[1].capabilities.supports_relay = true;
+        peers[1].capabilities.supports_coordination = true;
 
-        let relays = select_with_capabilities(&peers, 5, true, false);
-        assert_eq!(relays.len(), 5);
-
-        // Relay-capable peers should be preferred, but not required.
-        let relay_count = relays
-            .iter()
-            .filter(|peer| peer.capabilities.supports_relay)
-            .count();
-        assert!(relay_count >= 3, "Expected relay peers to be prioritized");
+        let relays = select_with_capabilities(&peers, 3, true, false);
+        assert_eq!(relays.len(), 3);
+        assert_eq!(
+            relays[0].peer_id, peers[1].peer_id,
+            "global evidence should rank first"
+        );
+        assert_eq!(
+            relays[1].peer_id, peers[0].peer_id,
+            "local evidence should outrank unknown peers"
+        );
     }
 
     #[test]
@@ -449,7 +521,6 @@ mod tests {
     ) -> CachedPeer {
         let mut peer = CachedPeer::new(PeerId([id; 32]), vec![], PeerSource::Seed);
         peer.quality_score = quality;
-        peer.capabilities.supports_relay = true;
 
         for addr in ipv4_addrs {
             peer.capabilities
@@ -462,6 +533,21 @@ mod tests {
                 .push(addr.parse().unwrap());
         }
 
+        peer.capabilities.direct_reachability_scope = peer
+            .capabilities
+            .external_addresses
+            .iter()
+            .filter_map(|addr| socket_addr_scope(*addr))
+            .max();
+        let globally_reachable = peer
+            .capabilities
+            .external_addresses
+            .iter()
+            .filter_map(|addr| socket_addr_scope(*addr))
+            .any(|scope| scope == ReachabilityScope::Global);
+        peer.capabilities.supports_relay = globally_reachable;
+        peer.capabilities.supports_coordination = globally_reachable;
+
         peer
     }
 
@@ -469,14 +555,19 @@ mod tests {
     fn test_select_relays_for_ipv4_target() {
         let peers = vec![
             // Dual-stack relay (high quality)
-            create_relay_peer_with_addresses(1, 0.9, vec!["1.2.3.4:9000"], vec!["[::1]:9000"]),
+            create_relay_peer_with_addresses(
+                1,
+                0.9,
+                vec!["1.2.3.4:9000"],
+                vec!["[2001:db8::10]:9000"],
+            ),
             // IPv4-only relay (medium quality)
             create_relay_peer_with_addresses(2, 0.7, vec!["5.6.7.8:9001"], vec![]),
             // IPv6-only relay (high quality - should NOT be selected for IPv4 target)
             create_relay_peer_with_addresses(3, 0.95, vec![], vec!["[2001:db8::1]:9002"]),
         ];
 
-        let selected = select_relays_for_target(&peers, 10, true, false);
+        let selected = select_relays_for_target(&peers, 10, "8.8.8.8:443".parse().unwrap(), false);
         assert_eq!(selected.len(), 2);
 
         // Should include dual-stack and IPv4-only, NOT IPv6-only
@@ -490,14 +581,24 @@ mod tests {
     fn test_select_relays_for_ipv6_target() {
         let peers = vec![
             // Dual-stack relay
-            create_relay_peer_with_addresses(1, 0.9, vec!["1.2.3.4:9000"], vec!["[::1]:9000"]),
+            create_relay_peer_with_addresses(
+                1,
+                0.9,
+                vec!["1.2.3.4:9000"],
+                vec!["[2001:db8::10]:9000"],
+            ),
             // IPv4-only relay (should NOT be selected for IPv6 target)
             create_relay_peer_with_addresses(2, 0.95, vec!["5.6.7.8:9001"], vec![]),
             // IPv6-only relay
             create_relay_peer_with_addresses(3, 0.7, vec![], vec!["[2001:db8::1]:9002"]),
         ];
 
-        let selected = select_relays_for_target(&peers, 10, false, false);
+        let selected = select_relays_for_target(
+            &peers,
+            10,
+            "[2001:4860:4860::8888]:443".parse().unwrap(),
+            false,
+        );
         assert_eq!(selected.len(), 2);
 
         // Should include dual-stack and IPv6-only, NOT IPv4-only
@@ -511,17 +612,22 @@ mod tests {
     fn test_select_relays_prefer_dual_stack() {
         let peers = vec![
             // Dual-stack relay (lower quality)
-            create_relay_peer_with_addresses(1, 0.5, vec!["1.2.3.4:9000"], vec!["[::1]:9000"]),
+            create_relay_peer_with_addresses(
+                1,
+                0.5,
+                vec!["1.2.3.4:9000"],
+                vec!["[2001:db8::10]:9000"],
+            ),
             // IPv4-only relay (higher quality)
             create_relay_peer_with_addresses(2, 0.9, vec!["5.6.7.8:9001"], vec![]),
         ];
 
         // Without preference, higher quality first
-        let selected = select_relays_for_target(&peers, 10, true, false);
+        let selected = select_relays_for_target(&peers, 10, "8.8.8.8:443".parse().unwrap(), false);
         assert_eq!(selected[0].peer_id.0[0], 2); // IPv4-only first (higher quality)
 
         // With dual-stack preference, dual-stack first despite lower quality
-        let selected = select_relays_for_target(&peers, 10, true, true);
+        let selected = select_relays_for_target(&peers, 10, "8.8.8.8:443".parse().unwrap(), true);
         assert_eq!(selected[0].peer_id.0[0], 1); // Dual-stack first
     }
 
@@ -529,13 +635,23 @@ mod tests {
     fn test_select_dual_stack_relays() {
         let peers = vec![
             // Dual-stack relay
-            create_relay_peer_with_addresses(1, 0.9, vec!["1.2.3.4:9000"], vec!["[::1]:9000"]),
+            create_relay_peer_with_addresses(
+                1,
+                0.9,
+                vec!["1.2.3.4:9000"],
+                vec!["[2001:db8::10]:9000"],
+            ),
             // IPv4-only relay
             create_relay_peer_with_addresses(2, 0.8, vec!["5.6.7.8:9001"], vec![]),
             // IPv6-only relay
             create_relay_peer_with_addresses(3, 0.7, vec![], vec!["[2001:db8::1]:9002"]),
             // Another dual-stack relay
-            create_relay_peer_with_addresses(4, 0.6, vec!["10.0.0.1:9003"], vec!["[::2]:9003"]),
+            create_relay_peer_with_addresses(
+                4,
+                0.6,
+                vec!["9.9.9.9:9003"],
+                vec!["[2001:db8::2]:9003"],
+            ),
         ];
 
         let selected = select_dual_stack_relays(&peers, 10);
@@ -567,11 +683,12 @@ mod tests {
             .capabilities
             .external_addresses
             .push("5.6.7.8:9001".parse().unwrap());
+        non_relay.capabilities.direct_reachability_scope = Some(ReachabilityScope::LocalNetwork);
         peers.push(non_relay);
 
-        let selected = select_relays_for_target(&peers, 10, true, false);
+        let selected = select_relays_for_target(&peers, 10, "8.8.8.8:443".parse().unwrap(), false);
         assert_eq!(selected.len(), 2);
-        // Relay-capable peer should be preferred even if lower quality.
+        // Globally verified relay evidence should beat local-only fallback evidence.
         assert_eq!(selected[0].peer_id.0[0], 1);
     }
 
@@ -579,11 +696,11 @@ mod tests {
     fn test_select_relays_empty_when_no_match() {
         let peers = vec![
             // IPv6-only relay
-            create_relay_peer_with_addresses(1, 0.9, vec![], vec!["[::1]:9000"]),
+            create_relay_peer_with_addresses(1, 0.9, vec![], vec!["[2001:db8::1]:9000"]),
         ];
 
         // Looking for IPv4 target - should return empty
-        let selected = select_relays_for_target(&peers, 10, true, false);
+        let selected = select_relays_for_target(&peers, 10, "8.8.8.8:443".parse().unwrap(), false);
         assert!(selected.is_empty());
     }
 }

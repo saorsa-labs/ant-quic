@@ -623,10 +623,16 @@ pub enum NatHint {
 /// and dynamic metrics (how well the peer is performing).
 #[derive(Debug, Clone)]
 pub struct Capabilities {
-    /// Whether this peer can relay traffic for NAT traversal.
+    /// Whether this peer is a generally reusable relay helper.
+    ///
+    /// This is conservative and only flips true for fresh global-scope direct
+    /// evidence. Scoped local/loopback evidence is preserved separately in
+    /// `direct_reachability_scope`.
     pub supports_relay: bool,
 
-    /// Whether this peer can coordinate NAT hole-punching.
+    /// Whether this peer is a generally reusable NAT hole-punch coordinator.
+    ///
+    /// Like `supports_relay`, this is intentionally conservative and global-only.
     pub supports_coordination: bool,
 
     /// Observed external addresses for this peer.
