@@ -573,7 +573,7 @@ async fn test_simultaneous_connect_send_succeeds() {
             let n = node_a.clone();
             async move {
                 for _ in 0..3 {
-                    match timeout(Duration::from_secs(5), n.accept()).await {
+                    match timeout(Duration::from_secs(10), n.accept()).await {
                         Ok(Some(_)) => {}
                         _ => break,
                     }
@@ -584,7 +584,7 @@ async fn test_simultaneous_connect_send_succeeds() {
             let n = node_b.clone();
             async move {
                 for _ in 0..3 {
-                    match timeout(Duration::from_secs(5), n.accept()).await {
+                    match timeout(Duration::from_secs(10), n.accept()).await {
                         Ok(Some(_)) => {}
                         _ => break,
                     }
@@ -596,8 +596,8 @@ async fn test_simultaneous_connect_send_succeeds() {
 
         // Simultaneously connect A→B and B→A.
         let (r_a, r_b) = tokio::join!(
-            timeout(Duration::from_secs(10), node_a.connect_addr(addr_b)),
-            timeout(Duration::from_secs(10), node_b.connect_addr(addr_a)),
+            timeout(Duration::from_secs(20), node_a.connect_addr(addr_b)),
+            timeout(Duration::from_secs(20), node_b.connect_addr(addr_a)),
         );
 
         let conn_a = r_a

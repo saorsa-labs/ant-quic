@@ -58,6 +58,7 @@ use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
 use crate::p2p_endpoint::{EndpointError, P2pEndpoint, P2pEvent, PeerConnection};
+use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
 use crate::unified_config::load_or_generate_endpoint_keypair;
 
@@ -338,10 +339,12 @@ impl Node {
                 peer_id,
                 addr,
                 side: _,
+                traversal_method,
             } => Some(NodeEvent::PeerConnected {
                 peer_id,
                 addr,
-                direct: true, // P2pEvent doesn't distinguish, assume direct
+                method: traversal_method,
+                direct: traversal_method.is_direct(),
             }),
             P2pEvent::PeerDisconnected { peer_id, reason } => Some(NodeEvent::PeerDisconnected {
                 peer_id,
@@ -549,22 +552,15 @@ impl Node {
     /// ```
     pub async fn status(&self) -> NodeStatus {
         let stats = self.inner.stats().await;
-        let nat_stats = self.inner.nat_stats().ok();
         let connected_peers = self.inner.connected_peers().await;
 
-        // Determine NAT type from stats
-        let nat_type = self.detect_nat_type(&stats, nat_stats.as_ref());
+        // Determine NAT type from observed connection outcomes only.
+        let nat_type = self.detect_nat_type(&stats);
 
-        // Check if we have public IP
+        // Address knowledge and reachability are separate concepts.
+        // A global address is not proof of direct reachability.
         let local_addr = self.local_addr();
         let external_addr = self.external_addr();
-        let has_public_ip = match (local_addr, external_addr) {
-            (Some(local), Some(external)) => {
-                // Public if external matches local (ignoring port differences)
-                local.ip() == external.ip()
-            }
-            _ => false,
-        };
 
         // Collect ALL external addresses (both IPv4 and IPv6) from all
         // connections and QUIC paths. This is critical for dual-stack nodes
@@ -584,34 +580,48 @@ impl Node {
             0.0
         };
 
-        // Determine if we can help with traversal
-        let can_receive_direct =
-            has_public_ip || nat_type == NatType::FullCone || nat_type == NatType::None;
+        let has_global_address = external_addrs
+            .iter()
+            .copied()
+            .chain(local_addr)
+            .any(|addr| {
+                socket_addr_scope(addr)
+                    .is_some_and(|scope| scope == crate::ReachabilityScope::Global)
+            });
 
-        // Check relay status from NAT stats
-        // Currently, relay status is indicated by having relayed_connections > 0
-        // and active sessions that may be acting as relays
-        let (is_relaying, relay_sessions, relay_bytes_forwarded) = if let Some(ref nat) = nat_stats
-        {
-            // If we have any active sessions and are accepting connections,
-            // we're potentially relaying
-            let relaying = nat.relayed_connections > 0 && can_receive_direct;
+        // A node is directly reachable only after fresh, peer-verified direct
+        // inbound evidence. Scope is freshness-aware too, so an old global
+        // observation cannot keep inflating current reachability.
+        let fresh_scope = [
             (
-                relaying,
-                if relaying { nat.active_sessions } else { 0 },
-                0u64, // Not tracked yet - future enhancement
-            )
-        } else {
-            (false, 0, 0)
-        };
+                crate::ReachabilityScope::Global,
+                stats.last_direct_global_at,
+            ),
+            (
+                crate::ReachabilityScope::LocalNetwork,
+                stats.last_direct_local_at,
+            ),
+            (
+                crate::ReachabilityScope::Loopback,
+                stats.last_direct_loopback_at,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(scope, seen)| {
+            seen.filter(|instant| instant.elapsed() <= DIRECT_REACHABILITY_TTL)
+                .map(|_| scope)
+        });
+        let can_receive_direct =
+            stats.active_direct_incoming_connections > 0 || fresh_scope.is_some();
+        let direct_reachability_scope = fresh_scope;
 
-        // Check coordination status
-        // Any node with active sessions is acting as a coordinator
-        let (is_coordinating, coordination_sessions) = if let Some(ref nat) = nat_stats {
-            (nat.active_sessions > 0, nat.active_sessions)
-        } else {
-            (false, 0)
-        };
+        // Relay/coordinator activity must be backed by real runtime metrics.
+        // The NAT stats path is still placeholder-ish, so stay conservative here.
+        let is_relaying = false;
+        let relay_sessions = 0;
+        let relay_bytes_forwarded = 0u64;
+        let is_coordinating = false;
+        let coordination_sessions = 0;
 
         // Calculate average RTT from connected peers
         let mut total_rtt = Duration::ZERO;
@@ -640,7 +650,8 @@ impl Node {
             external_addrs,
             nat_type,
             can_receive_direct,
-            has_public_ip,
+            direct_reachability_scope,
+            has_global_address,
             connected_peers: connected_peers.len(),
             active_connections: stats.active_connections,
             pending_connections: 0, // Not tracked yet
@@ -706,51 +717,21 @@ impl Node {
     // === Private Helpers ===
 
     /// Detect NAT type from statistics
-    fn detect_nat_type(
-        &self,
-        stats: &crate::p2p_endpoint::EndpointStats,
-        nat_stats: Option<&crate::nat_traversal_api::NatTraversalStatistics>,
-    ) -> NatType {
-        // If we have lots of direct connections and no relayed, likely no/easy NAT
+    fn detect_nat_type(&self, stats: &crate::p2p_endpoint::EndpointStats) -> NatType {
+        // This remains a soft debug hint only. Do not treat it as direct
+        // reachability evidence.
         if stats.direct_connections > 0 && stats.relayed_connections == 0 {
-            if let Some(nat) = nat_stats {
-                // Calculate direct connection rate
-                let total = nat.direct_connections + nat.relayed_connections;
-                if total > 0 {
-                    let direct_rate = nat.direct_connections as f64 / total as f64;
-                    if direct_rate > 0.9 {
-                        return NatType::FullCone;
-                    }
-                }
-            }
-            return NatType::FullCone; // Assume easy NAT if all direct
+            return NatType::FullCone;
         }
 
-        // If we have mixed connections, harder NAT
         if stats.direct_connections > 0 && stats.relayed_connections > 0 {
-            if let Some(nat) = nat_stats {
-                // Calculate success rate from total attempts vs successful connections
-                let success_rate = if nat.total_attempts > 0 {
-                    nat.successful_connections as f64 / nat.total_attempts as f64
-                } else {
-                    0.0
-                };
-
-                if success_rate > 0.7 {
-                    return NatType::PortRestricted;
-                } else if success_rate > 0.3 {
-                    return NatType::AddressRestricted;
-                }
-            }
             return NatType::PortRestricted;
         }
 
-        // If mostly relayed, likely symmetric NAT
         if stats.relayed_connections > stats.direct_connections {
             return NatType::Symmetric;
         }
 
-        // Not enough data yet
         NatType::Unknown
     }
 }

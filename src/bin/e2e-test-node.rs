@@ -740,25 +740,34 @@ async fn handle_event(
             peer_id,
             addr,
             side,
+            traversal_method,
         } => {
             let direction = if side.is_client() {
                 "outbound"
             } else {
                 "inbound"
             };
+            let connection_type = match traversal_method {
+                ant_quic::TraversalMethod::Direct => "direct",
+                ant_quic::TraversalMethod::HolePunch
+                | ant_quic::TraversalMethod::PortPrediction => "nat_traversed",
+                ant_quic::TraversalMethod::Relay => "relayed",
+            };
             if json {
                 println!(
-                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}"}}"#,
+                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}","connection_type":"{}"}}"#,
                     format_peer_id(peer_id),
                     addr,
-                    direction
+                    direction,
+                    connection_type
                 );
             } else {
                 info!(
-                    "Peer connected: {} at {} ({})",
+                    "Peer connected: {} at {} ({} / {})",
                     format_peer_id(peer_id),
                     addr,
-                    direction
+                    direction,
+                    connection_type
                 );
             }
         }

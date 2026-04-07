@@ -56,6 +56,7 @@ use crate::link_transport::{
 };
 use crate::nat_traversal_api::PeerId;
 use crate::p2p_endpoint::{P2pEndpoint, P2pEvent};
+use crate::reachability::socket_addr_scope;
 use crate::unified_config::P2pConfig;
 
 // ============================================================================
@@ -487,13 +488,19 @@ impl P2pLinkTransport {
                             peer_id,
                             addr,
                             side: _,
+                            traversal_method,
                         } => {
                             // Extract SocketAddr for Capabilities (currently UDP-only)
                             let socket_addr = addr.as_socket_addr().unwrap_or_else(|| {
                                 // Fallback for non-UDP transports - use unspecified address
                                 SocketAddr::from(([0, 0, 0, 0], 0))
                             });
-                            let caps = Capabilities::new_connected(socket_addr);
+                            let mut caps = Capabilities::new_connected(socket_addr);
+                            if traversal_method.is_direct() {
+                                caps.supports_relay = true;
+                                caps.supports_coordination = true;
+                                caps.direct_reachability_scope = socket_addr_scope(socket_addr);
+                            }
                             // Update capabilities cache
                             if let Ok(mut state) = state.write() {
                                 state.capabilities.insert(peer_id, caps.clone());
@@ -530,6 +537,9 @@ impl P2pLinkTransport {
                             if let Ok(mut state) = state.write() {
                                 if let Some(caps) = state.capabilities.get_mut(&peer_id) {
                                     caps.is_connected = false;
+                                    caps.supports_relay = false;
+                                    caps.supports_coordination = false;
+                                    caps.direct_reachability_scope = None;
                                 }
                             }
                             Some(LinkEvent::PeerDisconnected {

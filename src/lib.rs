@@ -168,6 +168,9 @@ pub mod node_status;
 /// Unified events for P2P nodes
 pub mod node_event;
 
+/// Reachability scope and traversal metadata shared across APIs
+pub mod reachability;
+
 // Core implementation modules
 /// Configuration structures and validation
 pub mod config;
@@ -325,6 +328,7 @@ pub use nat_traversal_api::{
     BootstrapNode, CandidateAddress, NatTraversalConfig, NatTraversalEndpoint, NatTraversalError,
     NatTraversalEvent, NatTraversalStatistics, PeerId,
 };
+pub use reachability::{ReachabilityScope, TraversalMethod};
 
 // ============================================================================
 // SIMPLE API EXPORTS - Zero Configuration P2P (RECOMMENDED)
@@ -340,7 +344,7 @@ pub use node_config::{NodeConfig, NodeConfigBuilder};
 pub use node_status::{NatType, NodeStatus};
 
 /// Unified events for P2P nodes
-pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent, TraversalMethod};
+pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 
 // ============================================================================
 // P2P API EXPORTS (for advanced use)

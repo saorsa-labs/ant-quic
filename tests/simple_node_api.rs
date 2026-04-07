@@ -557,7 +557,7 @@ mod nat_type_tests {
 
     #[test]
     fn test_nat_type_display() {
-        assert_eq!(format!("{}", NatType::None), "None (Public IP)");
+        assert_eq!(format!("{}", NatType::None), "None (No NAT detected)");
         assert_eq!(format!("{}", NatType::FullCone), "Full Cone");
         assert_eq!(
             format!("{}", NatType::AddressRestricted),

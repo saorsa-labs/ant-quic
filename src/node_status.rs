@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::nat_traversal_api::PeerId;
+pub use crate::reachability::ReachabilityScope;
 
 /// Detected NAT type for the node
 ///
@@ -36,9 +37,10 @@ use crate::nat_traversal_api::PeerId;
 /// The node automatically detects its NAT type and adjusts traversal strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NatType {
-    /// No NAT detected - direct public connectivity
+    /// No NAT detected.
     ///
-    /// The node has a public IP address and can accept connections directly.
+    /// This indicates the observed path did not require NAT traversal. It does
+    /// not, by itself, prove current direct reachability to other peers.
     None,
 
     /// Full cone NAT - easiest to traverse
@@ -75,7 +77,7 @@ pub enum NatType {
 impl std::fmt::Display for NatType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::None => write!(f, "None (Public IP)"),
+            Self::None => write!(f, "None (No NAT detected)"),
             Self::FullCone => write!(f, "Full Cone"),
             Self::AddressRestricted => write!(f, "Address Restricted"),
             Self::PortRestricted => write!(f, "Port Restricted"),
@@ -93,7 +95,7 @@ impl std::fmt::Display for NatType {
 /// # Status Categories
 ///
 /// - **Identity**: peer_id, local_addr, external_addrs
-/// - **NAT Status**: nat_type, can_receive_direct, has_public_ip
+/// - **NAT Status**: nat_type, can_receive_direct, direct_reachability_scope, has_global_address
 /// - **Connections**: connected_peers, active_connections, pending_connections
 /// - **NAT Traversal**: direct_connections, relayed_connections, hole_punch_success_rate
 /// - **Relay**: is_relaying, relay_sessions, relay_bytes_forwarded
@@ -120,13 +122,17 @@ pub struct NodeStatus {
 
     /// Whether this node can receive direct connections
     ///
-    /// `true` if the node has a public IP or is behind a traversable NAT.
+    /// `true` only after this node has peer-verified evidence that another
+    /// node reached it directly without coordinator or relay assistance.
     pub can_receive_direct: bool,
 
-    /// Whether this node has a public IP
+    /// Broadest scope in which direct inbound reachability has been verified.
+    pub direct_reachability_scope: Option<ReachabilityScope>,
+
+    /// Whether this node has a globally routable address candidate.
     ///
-    /// `true` if local_addr matches an external_addr (no NAT).
-    pub has_public_ip: bool,
+    /// This is an address property, not proof of reachability.
+    pub has_global_address: bool,
 
     // --- Connections ---
     /// Number of connected peers
@@ -153,8 +159,8 @@ pub struct NodeStatus {
     // --- Relay Status (NEW - key visibility) ---
     /// Whether this node is currently acting as a relay for others
     ///
-    /// `true` if this node has public connectivity and is forwarding
-    /// traffic for peers behind restrictive NATs.
+    /// `true` if this node has fresh peer-verified direct reachability and is
+    /// forwarding traffic for peers behind restrictive NATs.
     pub is_relaying: bool,
 
     /// Number of active relay sessions
@@ -167,7 +173,8 @@ pub struct NodeStatus {
     /// Whether this node is coordinating NAT traversal
     ///
     /// `true` if this node is helping peers coordinate hole punching.
-    /// All nodes with public connectivity act as coordinators.
+    /// Fresh peer-verified direct reachability is the signal other peers should
+    /// use when deciding whether this node is a viable coordinator.
     pub is_coordinating: bool,
 
     /// Number of active coordination sessions
@@ -191,7 +198,8 @@ impl Default for NodeStatus {
             external_addrs: Vec::new(),
             nat_type: NatType::Unknown,
             can_receive_direct: false,
-            has_public_ip: false,
+            direct_reachability_scope: None,
+            has_global_address: false,
             connected_peers: 0,
             active_connections: 0,
             pending_connections: 0,
@@ -217,10 +225,10 @@ impl NodeStatus {
 
     /// Check if node can help with NAT traversal
     ///
-    /// Returns true if the node has public connectivity and can
+    /// Returns true if the node has peer-verified direct reachability and can
     /// act as coordinator/relay for other peers.
     pub fn can_help_traversal(&self) -> bool {
-        self.has_public_ip || self.can_receive_direct
+        self.can_receive_direct
     }
 
     /// Get the total number of connections (direct + relayed)
@@ -247,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_nat_type_display() {
-        assert_eq!(format!("{}", NatType::None), "None (Public IP)");
+        assert_eq!(format!("{}", NatType::None), "None (No NAT detected)");
         assert_eq!(format!("{}", NatType::FullCone), "Full Cone");
         assert_eq!(
             format!("{}", NatType::AddressRestricted),
@@ -268,7 +276,8 @@ mod tests {
         let status = NodeStatus::default();
         assert_eq!(status.nat_type, NatType::Unknown);
         assert!(!status.can_receive_direct);
-        assert!(!status.has_public_ip);
+        assert_eq!(status.direct_reachability_scope, None);
+        assert!(!status.has_global_address);
         assert_eq!(status.connected_peers, 0);
         assert!(!status.is_relaying);
         assert!(!status.is_coordinating);
@@ -288,11 +297,14 @@ mod tests {
         let mut status = NodeStatus::default();
         assert!(!status.can_help_traversal());
 
-        status.has_public_ip = true;
-        assert!(status.can_help_traversal());
+        status.has_global_address = true;
+        assert!(
+            !status.can_help_traversal(),
+            "Global address alone must not imply direct reachability"
+        );
 
-        status.has_public_ip = false;
         status.can_receive_direct = true;
+        status.direct_reachability_scope = Some(ReachabilityScope::Global);
         assert!(status.can_help_traversal());
     }
 
@@ -374,5 +386,17 @@ mod tests {
         assert_eq!(status.external_addrs.len(), 2);
         assert!(status.external_addrs.contains(&addr1));
         assert!(status.external_addrs.contains(&addr2));
+    }
+
+    #[test]
+    fn test_direct_reachability_scope_tracks_observer_scope() {
+        let mut status = NodeStatus::default();
+        status.can_receive_direct = true;
+        status.direct_reachability_scope = Some(ReachabilityScope::LocalNetwork);
+
+        assert_eq!(
+            status.direct_reachability_scope,
+            Some(ReachabilityScope::LocalNetwork)
+        );
     }
 }

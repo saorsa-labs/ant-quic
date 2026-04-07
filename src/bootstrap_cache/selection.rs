@@ -155,11 +155,18 @@ pub fn select_with_capabilities(
     candidates.sort_by(|a, b| {
         let a_pref = preference_score(a, require_relay, require_coordination);
         let b_pref = preference_score(b, require_relay, require_coordination);
-        b_pref.cmp(&a_pref).then_with(|| {
-            b.quality_score
-                .partial_cmp(&a.quality_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b_pref
+            .cmp(&a_pref)
+            .then_with(|| {
+                b.capabilities
+                    .direct_reachability_scope
+                    .cmp(&a.capabilities.direct_reachability_scope)
+            })
+            .then_with(|| {
+                b.quality_score
+                    .partial_cmp(&a.quality_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     candidates.into_iter().take(count).collect()
@@ -192,7 +199,7 @@ pub fn select_relays_for_target(
             if p.capabilities.supports_dual_stack() {
                 return true;
             }
-            if p.capabilities.external_addresses.is_empty() {
+            if p.capabilities.known_addresses().is_empty() {
                 return true; // Unknown capability; allow testing.
             }
             if target_is_ipv4 {
@@ -208,7 +215,7 @@ pub fn select_relays_for_target(
     }
 
     let ip_match = |peer: &CachedPeer| {
-        if peer.capabilities.external_addresses.is_empty() {
+        if peer.capabilities.known_addresses().is_empty() {
             0u8
         } else if target_is_ipv4 {
             u8::from(peer.capabilities.has_ipv4())
@@ -229,11 +236,18 @@ pub fn select_relays_for_target(
         let a_pref = (u8::from(a.capabilities.supports_relay) * 2).saturating_add(ip_match(a));
         let b_pref = (u8::from(b.capabilities.supports_relay) * 2).saturating_add(ip_match(b));
 
-        b_pref.cmp(&a_pref).then_with(|| {
-            b.quality_score
-                .partial_cmp(&a.quality_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b_pref
+            .cmp(&a_pref)
+            .then_with(|| {
+                b.capabilities
+                    .direct_reachability_scope
+                    .cmp(&a.capabilities.direct_reachability_scope)
+            })
+            .then_with(|| {
+                b.quality_score
+                    .partial_cmp(&a.quality_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     candidates.into_iter().take(count).collect()

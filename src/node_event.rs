@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 
 use crate::nat_traversal_api::PeerId;
 use crate::node_status::NatType;
+pub use crate::reachability::TraversalMethod;
 use crate::transport::TransportAddr;
 
 /// Reason for peer disconnection
@@ -86,7 +87,9 @@ pub enum NodeEvent {
         peer_id: PeerId,
         /// The peer's address (supports all transport types)
         addr: TransportAddr,
-        /// Whether this is a direct connection (vs relayed)
+        /// How the connection was established.
+        method: TraversalMethod,
+        /// Whether this is a direct connection (vs relayed or assisted)
         direct: bool,
     },
 
@@ -187,30 +190,6 @@ pub enum NodeEvent {
     },
 }
 
-/// Method used for NAT traversal
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TraversalMethod {
-    /// Direct connection (no NAT or easy NAT)
-    Direct,
-    /// Hole punching succeeded
-    HolePunch,
-    /// Connection via relay
-    Relay,
-    /// Port prediction for symmetric NAT
-    PortPrediction,
-}
-
-impl std::fmt::Display for TraversalMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Direct => write!(f, "direct"),
-            Self::HolePunch => write!(f, "hole punch"),
-            Self::Relay => write!(f, "relay"),
-            Self::PortPrediction => write!(f, "port prediction"),
-        }
-    }
-}
-
 impl NodeEvent {
     /// Check if this is a connection event
     pub fn is_connection_event(&self) -> bool {
@@ -307,6 +286,7 @@ mod tests {
         let event = NodeEvent::PeerConnected {
             peer_id: test_peer_id(),
             addr: TransportAddr::Udp(test_addr()),
+            method: TraversalMethod::Direct,
             direct: true,
         };
 
@@ -421,6 +401,7 @@ mod tests {
         let event = NodeEvent::PeerConnected {
             peer_id: test_peer_id(),
             addr: TransportAddr::Udp(test_addr()),
+            method: TraversalMethod::Direct,
             direct: true,
         };
 

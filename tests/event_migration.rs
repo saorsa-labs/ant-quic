@@ -70,6 +70,7 @@ fn test_peer_connected_event_construction_udp() {
         peer_id,
         addr: TransportAddr::Udp(socket_addr),
         side: ant_quic::Side::Client,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     // Verify we can destructure it correctly
@@ -77,6 +78,7 @@ fn test_peer_connected_event_construction_udp() {
         peer_id: p,
         addr,
         side,
+        traversal_method: _,
     } = event
     {
         assert_eq!(p.0, [0x42; 32]);
@@ -122,6 +124,7 @@ fn test_event_clone_for_broadcast() {
         peer_id: PeerId([0xaa; 32]),
         addr: TransportAddr::Udp(socket_addr),
         side: ant_quic::Side::Server,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     // Clone is required for broadcast channel
@@ -134,11 +137,13 @@ fn test_event_clone_for_broadcast() {
                 peer_id: p1,
                 addr: a1,
                 side: s1,
+                ..
             },
             P2pEvent::PeerConnected {
                 peer_id: p2,
                 addr: a2,
                 side: s2,
+                ..
             },
         ) => {
             assert_eq!(p1.0, p2.0);
@@ -160,6 +165,7 @@ fn test_multi_transport_events() {
         peer_id: PeerId([0x01; 32]),
         addr: TransportAddr::Udp(udp_addr),
         side: ant_quic::Side::Client,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     // BLE event
@@ -170,6 +176,7 @@ fn test_multi_transport_events() {
             service_uuid: None,
         },
         side: ant_quic::Side::Server,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     // Verify we can distinguish between them
@@ -196,6 +203,7 @@ fn test_transport_aware_event_handling() {
             peer_id: PeerId([0x01; 32]),
             addr: TransportAddr::Udp("10.0.0.1:8080".parse().expect("valid")),
             side: ant_quic::Side::Client,
+            traversal_method: ant_quic::TraversalMethod::Direct,
         },
         P2pEvent::PeerConnected {
             peer_id: PeerId([0x02; 32]),
@@ -204,6 +212,7 @@ fn test_transport_aware_event_handling() {
                 service_uuid: None,
             },
             side: ant_quic::Side::Server,
+            traversal_method: ant_quic::TraversalMethod::Direct,
         },
         P2pEvent::ExternalAddressDiscovered {
             addr: TransportAddr::Udp("203.0.113.1:9000".parse().expect("valid")),
@@ -242,6 +251,7 @@ fn test_backward_compatibility_with_as_socket_addr() {
         peer_id: PeerId([0xff; 32]),
         addr: TransportAddr::Udp(socket_addr),
         side: ant_quic::Side::Client,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     // Simulate legacy code that expects SocketAddr
@@ -288,6 +298,7 @@ fn test_event_debug_formatting() {
         peer_id: PeerId([0x55; 32]),
         addr: TransportAddr::Udp("192.168.0.100:9001".parse().expect("valid")),
         side: ant_quic::Side::Client,
+        traversal_method: ant_quic::TraversalMethod::Direct,
     };
 
     let debug = format!("{:?}", event);

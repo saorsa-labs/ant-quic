@@ -14,7 +14,7 @@ use super::selection::select_epsilon_greedy;
 use crate::nat_traversal_api::PeerId;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, info, warn};
 
@@ -107,7 +107,18 @@ impl BootstrapCache {
 
     /// Get a specific peer from the cache
     pub async fn get_peer(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        self.data.read().await.peers.get(&peer_id.0).cloned()
+        let mut data = self.data.write().await;
+        let peer = data.peers.get_mut(&peer_id.0)?;
+        peer.capabilities
+            .refresh_direct_capabilities(self.config.reachability_ttl, SystemTime::now());
+        peer.calculate_quality(&self.config.weights);
+        Some(peer.clone())
+    }
+
+    fn refresh_cached_peer(&self, peer: &mut CachedPeer, now: SystemTime) {
+        peer.capabilities
+            .refresh_direct_capabilities(self.config.reachability_ttl, now);
+        peer.calculate_quality(&self.config.weights);
     }
 
     /// Select peers for bootstrap using epsilon-greedy strategy.
@@ -115,8 +126,13 @@ impl BootstrapCache {
     /// Returns up to `count` peers, balancing exploitation of known-good peers
     /// with exploration of untested peers based on the configured epsilon.
     pub async fn select_peers(&self, count: usize) -> Vec<CachedPeer> {
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
+        drop(data);
 
         select_epsilon_greedy(&peers, count, self.config.epsilon)
             .into_iter()
@@ -128,8 +144,13 @@ impl BootstrapCache {
     ///
     /// Returns peers sorted by quality score, preferring observed relay capability.
     pub async fn select_relay_peers(&self, count: usize) -> Vec<CachedPeer> {
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
+        drop(data);
 
         super::selection::select_with_capabilities(&peers, count, true, false)
             .into_iter()
@@ -141,8 +162,13 @@ impl BootstrapCache {
     ///
     /// Returns peers sorted by quality score, preferring observed coordination capability.
     pub async fn select_coordinators(&self, count: usize) -> Vec<CachedPeer> {
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
+        drop(data);
 
         super::selection::select_with_capabilities(&peers, count, false, true)
             .into_iter()
@@ -167,8 +193,13 @@ impl BootstrapCache {
     ) -> Vec<CachedPeer> {
         use super::selection::select_relays_for_target;
 
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
+        drop(data);
 
         select_relays_for_target(&peers, count, target.is_ipv4(), prefer_dual_stack)
             .into_iter()
@@ -182,8 +213,13 @@ impl BootstrapCache {
     pub async fn select_dual_stack_relays(&self, count: usize) -> Vec<CachedPeer> {
         use super::selection::select_dual_stack_relays;
 
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
         let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
+        drop(data);
 
         select_dual_stack_relays(&peers, count)
             .into_iter()
@@ -287,9 +323,44 @@ impl BootstrapCache {
         }
     }
 
+    /// Record that a peer was directly reachable from this node.
+    ///
+    /// This is observer-scoped evidence. A peer is considered suitable for
+    /// relay/bootstrap/coordinator selection only after a direct connection to
+    /// one of its addresses succeeds without coordinator or relay assistance.
+    pub async fn observe_direct_reachability(&self, peer_id: PeerId, address: SocketAddr) {
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+
+        let peer = data
+            .peers
+            .entry(peer_id.0)
+            .or_insert_with(|| CachedPeer::new(peer_id, vec![address], PeerSource::Connection));
+
+        if !peer.addresses.contains(&address) {
+            peer.addresses.push(address);
+        }
+
+        peer.last_seen = now;
+        peer.last_attempt = Some(now);
+        peer.stats.success_count = peer.stats.success_count.saturating_add(1);
+        peer.capabilities.record_direct_observation(address, now);
+        self.refresh_cached_peer(peer, now);
+
+        let count = data.peers.len();
+        drop(data);
+
+        let _ = self
+            .event_tx
+            .send(CacheEvent::Updated { peer_count: count });
+    }
+
     /// Get a specific peer.
     pub async fn get(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        self.data.read().await.peers.get(&peer_id.0).cloned()
+        let mut data = self.data.write().await;
+        let peer = data.peers.get_mut(&peer_id.0)?;
+        self.refresh_cached_peer(peer, SystemTime::now());
+        Some(peer.clone())
     }
 
     /// Update the address validation token for a peer
@@ -383,7 +454,11 @@ impl BootstrapCache {
 
     /// Get cache statistics.
     pub async fn stats(&self) -> CacheStats {
-        let data = self.data.read().await;
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
 
         let relay_count = data
             .peers
@@ -457,7 +532,12 @@ impl BootstrapCache {
 
     /// Get all cached peers (for export/debug).
     pub async fn all_peers(&self) -> Vec<CachedPeer> {
-        self.data.read().await.peers.values().cloned().collect()
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        for peer in data.peers.values_mut() {
+            self.refresh_cached_peer(peer, now);
+        }
+        data.peers.values().cloned().collect()
     }
 
     /// Get the configuration.
@@ -634,7 +714,9 @@ mod tests {
             vec!["127.0.0.1:9001".parse().unwrap()],
             PeerSource::Seed,
         );
-        peer1.capabilities.supports_relay = true;
+        peer1
+            .capabilities
+            .record_direct_observation("127.0.0.1:9001".parse().unwrap(), SystemTime::now());
         cache.upsert(peer1).await;
 
         let mut peer2 = CachedPeer::new(
@@ -642,7 +724,9 @@ mod tests {
             vec!["127.0.0.1:9002".parse().unwrap()],
             PeerSource::Seed,
         );
-        peer2.capabilities.supports_coordination = true;
+        peer2
+            .capabilities
+            .record_direct_observation("127.0.0.1:9002".parse().unwrap(), SystemTime::now());
         cache.upsert(peer2).await;
 
         cache
@@ -651,8 +735,8 @@ mod tests {
 
         let stats = cache.stats().await;
         assert_eq!(stats.total_peers, 3);
-        assert_eq!(stats.relay_peers, 1);
-        assert_eq!(stats.coordinator_peers, 1);
+        assert_eq!(stats.relay_peers, 2);
+        assert_eq!(stats.coordinator_peers, 2);
         assert_eq!(stats.untested_peers, 3);
     }
 
@@ -663,12 +747,12 @@ mod tests {
 
         // Add mix of relay and non-relay peers
         for i in 0..10u8 {
-            let mut peer = CachedPeer::new(
-                PeerId([i; 32]),
-                vec![format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap()],
-                PeerSource::Seed,
-            );
-            peer.capabilities.supports_relay = i % 2 == 0;
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap();
+            let mut peer = CachedPeer::new(PeerId([i; 32]), vec![addr], PeerSource::Seed);
+            if i % 2 == 0 {
+                peer.capabilities
+                    .record_direct_observation(addr, SystemTime::now());
+            }
             peer.quality_score = i as f64 / 10.0;
             cache.upsert(peer).await;
         }
@@ -685,5 +769,27 @@ mod tests {
             .filter(|p| p.capabilities.supports_relay)
             .count();
         assert_eq!(relay_capable, 5, "Relay-capable peers should be first");
+    }
+
+    #[tokio::test]
+    async fn test_observe_direct_reachability_promotes_peer_capabilities() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = create_test_cache(&temp_dir).await;
+        let peer_id = PeerId([9; 32]);
+        let addr: SocketAddr = "192.168.1.50:9000".parse().unwrap();
+
+        cache.observe_direct_reachability(peer_id, addr).await;
+
+        let peer = cache.get(&peer_id).await.expect("peer inserted");
+        assert!(peer.capabilities.supports_relay);
+        assert!(peer.capabilities.supports_coordination);
+        assert!(peer.addresses.contains(&addr));
+        assert!(
+            peer.capabilities
+                .reachable_addresses
+                .iter()
+                .any(|entry| entry.address == addr)
+        );
+        assert!(peer.success_rate() > 0.0);
     }
 }

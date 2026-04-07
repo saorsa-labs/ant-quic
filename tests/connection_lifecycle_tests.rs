@@ -291,21 +291,6 @@ mod connection_lifecycle {
 
         shutdown_with_timeout(node).await;
     }
-
-    /// Test NAT statistics
-    #[tokio::test]
-    async fn test_nat_statistics() {
-        let config = test_node_config(vec![]);
-        let node = P2pEndpoint::new(config)
-            .await
-            .expect("Failed to create node");
-
-        // Get NAT stats - synchronous call
-        let _nat_stats = node.nat_stats();
-        println!("NAT stats received");
-
-        shutdown_with_timeout(node).await;
-    }
 }
 
 // ============================================================================

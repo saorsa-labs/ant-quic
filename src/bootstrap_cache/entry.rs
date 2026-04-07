@@ -8,6 +8,7 @@
 //! Cached peer entry types.
 
 use crate::nat_traversal_api::PeerId;
+use crate::reachability::{ReachabilityScope, socket_addr_scope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -58,6 +59,17 @@ fn default_quality_score() -> f64 {
     0.5
 }
 
+/// Peer-verified directly reachable address evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReachableAddressRecord {
+    /// Address that was directly reachable.
+    pub address: SocketAddr,
+    /// Scope in which the address was verified.
+    pub scope: ReachabilityScope,
+    /// Most recent successful direct observation time.
+    pub verified_at: SystemTime,
+}
+
 /// Peer capabilities and features
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerCapabilities {
@@ -77,17 +89,99 @@ pub struct PeerCapabilities {
     /// External addresses reported by peer
     #[serde(default)]
     pub external_addresses: Vec<SocketAddr>,
+
+    /// Directly reachable addresses observed by this node.
+    ///
+    /// Unlike `external_addresses`, these addresses have been verified by an
+    /// actual direct connection without coordinator or relay assistance. They
+    /// may be global, LAN, or loopback addresses depending on the observer.
+    #[serde(default)]
+    pub reachable_addresses: Vec<ReachableAddressRecord>,
+
+    /// Broadest scope among currently fresh direct reachability evidence.
+    pub direct_reachability_scope: Option<ReachabilityScope>,
 }
 
 impl PeerCapabilities {
+    /// Record an externally observed address if we have not seen it before.
+    pub fn record_external_address(&mut self, addr: SocketAddr) {
+        if !self.external_addresses.contains(&addr) {
+            self.external_addresses.push(addr);
+        }
+    }
+
+    /// Record a fresh, peer-verified direct observation.
+    pub fn record_direct_observation(&mut self, addr: SocketAddr, observed_at: SystemTime) {
+        let scope = socket_addr_scope(addr).unwrap_or(ReachabilityScope::LocalNetwork);
+        if let Some(existing) = self
+            .reachable_addresses
+            .iter_mut()
+            .find(|entry| entry.address == addr)
+        {
+            existing.verified_at = observed_at;
+            existing.scope = scope;
+        } else {
+            self.reachable_addresses.push(ReachableAddressRecord {
+                address: addr,
+                scope,
+                verified_at: observed_at,
+            });
+        }
+        self.supports_relay = true;
+        self.supports_coordination = true;
+    }
+
+    /// Whether peer-verified direct reachability evidence is still fresh.
+    pub fn has_fresh_direct_reachability(&self, ttl: Duration, now: SystemTime) -> bool {
+        self.reachable_addresses.iter().any(|entry| {
+            now.duration_since(entry.verified_at)
+                .map(|age| age <= ttl)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Refresh derived relay/coordinator flags from fresh direct evidence.
+    pub fn refresh_direct_capabilities(&mut self, ttl: Duration, now: SystemTime) {
+        self.reachable_addresses.retain(|entry| {
+            now.duration_since(entry.verified_at)
+                .map(|age| age <= ttl)
+                .unwrap_or(false)
+        });
+
+        self.direct_reachability_scope = self
+            .reachable_addresses
+            .iter()
+            .map(|entry| entry.scope)
+            .max();
+
+        let fresh = !self.reachable_addresses.is_empty();
+        self.supports_relay = fresh;
+        self.supports_coordination = fresh;
+    }
+
+    /// Return all known addresses, preferring peer-verified reachable addresses.
+    pub fn known_addresses(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self
+            .reachable_addresses
+            .iter()
+            .map(|entry| entry.address)
+            .collect();
+        for addr in &self.external_addresses {
+            if !addrs.contains(addr) {
+                addrs.push(*addr);
+            }
+        }
+        addrs
+    }
+
     /// Check if this peer has any IPv4 addresses
     pub fn has_ipv4(&self) -> bool {
-        self.external_addresses.iter().any(|addr| addr.is_ipv4())
+        self.known_addresses().iter().any(|addr| addr.is_ipv4())
     }
 
     /// Check if this peer has any IPv6 addresses
     pub fn has_ipv6(&self) -> bool {
-        self.external_addresses.iter().any(|addr| addr.is_ipv6())
+        self.known_addresses().iter().any(|addr| addr.is_ipv6())
     }
 
     /// Check if this peer supports dual-stack (both IPv4 and IPv6)
@@ -100,10 +194,9 @@ impl PeerCapabilities {
 
     /// Get addresses filtered by IP version
     pub fn addresses_by_version(&self, ipv4: bool) -> Vec<SocketAddr> {
-        self.external_addresses
-            .iter()
+        self.known_addresses()
+            .into_iter()
             .filter(|addr| addr.is_ipv4() == ipv4)
-            .copied()
             .collect()
     }
 
@@ -309,12 +402,6 @@ impl CachedPeer {
         }
         if self.capabilities.supports_dual_stack() {
             cap_bonus += 0.2; // Dual-stack relays are valuable for bridging
-        }
-        if matches!(
-            self.capabilities.nat_type,
-            Some(NatType::None) | Some(NatType::FullCone)
-        ) {
-            cap_bonus += 0.3; // Easy to connect
         }
         let cap_score = cap_bonus.min(1.0);
 
@@ -580,5 +667,36 @@ mod tests {
 
         let v6_addrs = caps.addresses_by_version(false);
         assert_eq!(v6_addrs.len(), 1);
+    }
+
+    #[test]
+    fn test_known_addresses_prefer_directly_reachable_addresses() {
+        let mut caps = PeerCapabilities::default();
+        let direct: SocketAddr = "192.168.1.20:9000".parse().unwrap();
+        let external: SocketAddr = "203.0.113.10:9000".parse().unwrap();
+
+        caps.record_direct_observation(direct, SystemTime::now());
+        caps.record_external_address(external);
+        caps.record_external_address(direct);
+
+        let known = caps.known_addresses();
+        assert_eq!(known[0], direct);
+        assert!(known.contains(&external));
+        assert_eq!(known.iter().filter(|addr| **addr == direct).count(), 1);
+    }
+
+    #[test]
+    fn test_refresh_direct_capabilities_prunes_stale_addresses() {
+        let mut caps = PeerCapabilities::default();
+        let direct: SocketAddr = "192.168.1.20:9000".parse().unwrap();
+        let now = SystemTime::now();
+
+        caps.record_direct_observation(direct, now - Duration::from_secs(120));
+        caps.refresh_direct_capabilities(Duration::from_secs(60), now);
+
+        assert!(caps.reachable_addresses.is_empty());
+        assert!(!caps.supports_relay);
+        assert!(!caps.supports_coordination);
+        assert_eq!(caps.direct_reachability_scope, None);
     }
 }

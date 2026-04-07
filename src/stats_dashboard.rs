@@ -188,6 +188,7 @@ impl StatsDashboard {
                 peer_id,
                 remote_address,
                 side: _, // Direction not tracked in dashboard stats yet
+                traversal_method: _,
             } => {
                 let mut connections = self.connections.write().await;
                 connections.insert(

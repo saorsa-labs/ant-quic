@@ -26,6 +26,9 @@ pub struct BootstrapCacheConfig {
     /// Time after which peers are considered stale (default: 7 days)
     pub stale_threshold: Duration,
 
+    /// Freshness window for peer-verified direct reachability evidence.
+    pub reachability_ttl: Duration,
+
     /// Interval between background save operations (default: 5 minutes)
     pub save_interval: Duration,
 
@@ -65,9 +68,10 @@ impl Default for BootstrapCacheConfig {
             max_peers: 30_000,
             epsilon: 0.1,
             stale_threshold: Duration::from_secs(7 * 24 * 3600), // 7 days
-            save_interval: Duration::from_secs(5 * 60),          // 5 minutes
-            quality_update_interval: Duration::from_secs(3600),  // 1 hour
-            cleanup_interval: Duration::from_secs(6 * 3600),     // 6 hours
+            reachability_ttl: crate::reachability::DIRECT_REACHABILITY_TTL,
+            save_interval: Duration::from_secs(5 * 60), // 5 minutes
+            quality_update_interval: Duration::from_secs(3600), // 1 hour
+            cleanup_interval: Duration::from_secs(6 * 3600), // 6 hours
             min_peers_to_save: 10,
             enable_file_locking: true,
             weights: QualityWeights::default(),
@@ -115,6 +119,12 @@ impl BootstrapCacheConfigBuilder {
     /// Set epsilon for exploration rate (clamped to 0.0-1.0)
     pub fn epsilon(mut self, epsilon: f64) -> Self {
         self.config.epsilon = epsilon.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set freshness window for peer-verified direct reachability evidence.
+    pub fn reachability_ttl(mut self, ttl: Duration) -> Self {
+        self.config.reachability_ttl = ttl;
         self
     }
 

@@ -163,6 +163,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 use crate::nat_traversal_api::PeerId;
+use crate::reachability::ReachabilityScope;
 use crate::transport::TransportAddr;
 
 // ============================================================================
@@ -631,6 +632,9 @@ pub struct Capabilities {
     /// Observed external addresses for this peer.
     pub observed_addrs: Vec<SocketAddr>,
 
+    /// Broadest direct reachability scope verified for this connected peer.
+    pub direct_reachability_scope: Option<ReachabilityScope>,
+
     /// Protocols this peer advertises support for.
     pub protocols: Vec<ProtocolId>,
 
@@ -668,6 +672,7 @@ impl Default for Capabilities {
             supports_relay: false,
             supports_coordination: false,
             observed_addrs: Vec::new(),
+            direct_reachability_scope: None,
             protocols: Vec::new(),
             last_seen: SystemTime::UNIX_EPOCH,
             rtt_ms_p50: 0,
@@ -687,6 +692,7 @@ impl Capabilities {
     pub fn new_connected(addr: SocketAddr) -> Self {
         Self {
             observed_addrs: vec![addr],
+            direct_reachability_scope: None,
             last_seen: SystemTime::now(),
             is_connected: true,
             ..Default::default()

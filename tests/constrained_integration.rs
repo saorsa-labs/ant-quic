@@ -756,6 +756,8 @@ fn test_peer_connection_transport_addr() {
     let peer_conn_udp = PeerConnection {
         peer_id: ant_quic::PeerId([0x11; 32]),
         remote_addr: udp_addr.clone(),
+        traversal_method: ant_quic::TraversalMethod::Direct,
+        side: ant_quic::Side::Client,
         authenticated: true,
         connected_at: Instant::now(),
         last_activity: Instant::now(),
@@ -774,6 +776,8 @@ fn test_peer_connection_transport_addr() {
     let peer_conn_ble = PeerConnection {
         peer_id: ant_quic::PeerId([0x22; 32]),
         remote_addr: ble_addr.clone(),
+        traversal_method: ant_quic::TraversalMethod::Direct,
+        side: ant_quic::Side::Client,
         authenticated: false,
         connected_at: Instant::now(),
         last_activity: Instant::now(),

@@ -802,12 +802,18 @@ async fn handle_event_with_state(
             peer_id,
             addr,
             side,
+            traversal_method,
         } => {
-            // Track peer state with connection direction
-            let connection_type = if side.is_client() {
-                "outbound" // We connected to them
+            let direction = if side.is_client() {
+                "outbound"
             } else {
-                "inbound" // They connected to us
+                "inbound"
+            };
+            let connection_type = match traversal_method {
+                ant_quic::TraversalMethod::Direct => "direct",
+                ant_quic::TraversalMethod::HolePunch
+                | ant_quic::TraversalMethod::PortPrediction => "nat_traversed",
+                ant_quic::TraversalMethod::Relay => "relayed",
             };
             let state = PeerState {
                 peer_id: *peer_id,
@@ -818,17 +824,33 @@ async fn handle_event_with_state(
                 connection_type: connection_type.to_string(),
             };
             peer_states.write().await.insert(*peer_id, state);
-            stats.direct_connections.fetch_add(1, Ordering::SeqCst);
+            match traversal_method {
+                ant_quic::TraversalMethod::Direct => {
+                    stats.direct_connections.fetch_add(1, Ordering::SeqCst);
+                }
+                ant_quic::TraversalMethod::Relay => {
+                    stats.relayed_connections.fetch_add(1, Ordering::SeqCst);
+                }
+                ant_quic::TraversalMethod::HolePunch
+                | ant_quic::TraversalMethod::PortPrediction => {}
+            }
 
             if json {
                 println!(
-                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}"}}"#,
+                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}","connection_type":"{}"}}"#,
                     format_peer_id(peer_id),
                     addr,
+                    direction,
                     connection_type
                 );
             } else {
-                info!("Peer connected: {} at {}", format_peer_id(peer_id), addr);
+                info!(
+                    "Peer connected: {} at {} ({} / {})",
+                    format_peer_id(peer_id),
+                    addr,
+                    direction,
+                    connection_type
+                );
             }
         }
         P2pEvent::PeerDisconnected { peer_id, reason } => {
