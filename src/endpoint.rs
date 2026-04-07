@@ -1688,12 +1688,23 @@ impl Endpoint {
     /// We leave some space unused so that `new_cid` can be relied upon to finish quickly. We don't
     /// bother to check when CID longer than 4 bytes are used because 2^40 connections is a lot.
     fn cids_exhausted(&self) -> bool {
-        self.local_cid_generator.cid_len() <= 4
-            && self.local_cid_generator.cid_len() != 0
-            && (2usize.pow(self.local_cid_generator.cid_len() as u32 * 8)
-                - self.index.connection_ids.len())
-                < 2usize.pow(self.local_cid_generator.cid_len() as u32 * 8 - 2)
+        is_cid_space_exhausted(
+            self.local_cid_generator.cid_len(),
+            self.index.connection_ids.len() as u128,
+        )
     }
+}
+
+fn is_cid_space_exhausted(cid_len: usize, allocated_cids: u128) -> bool {
+    if cid_len == 0 || cid_len > 4 {
+        return false;
+    }
+
+    let bits = cid_len as u32 * 8;
+    let total_space = 1u128 << bits;
+    let remaining = total_space.saturating_sub(allocated_cids);
+
+    remaining < (total_space >> 2)
 }
 
 impl fmt::Debug for Endpoint {
@@ -2141,4 +2152,32 @@ struct FourTuple {
     remote: SocketAddr,
     // A single socket can only listen on a single port, so no need to store it explicitly
     local_ip: Option<IpAddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cid_space_exhausted;
+
+    #[test]
+    fn cid_space_check_ignores_zero_and_large_lengths() {
+        assert!(!is_cid_space_exhausted(0, 0));
+        assert!(!is_cid_space_exhausted(5, 0));
+    }
+
+    #[test]
+    fn cid_space_check_preserves_quarter_remaining_threshold() {
+        // 1-byte CID space has 256 values; we exhaust it once fewer than 64 remain.
+        assert!(!is_cid_space_exhausted(1, 192));
+        assert!(is_cid_space_exhausted(1, 193));
+    }
+
+    #[test]
+    fn cid_space_check_handles_four_byte_space_without_overflow() {
+        let total_space = 1u128 << 32;
+        let quarter_space = total_space >> 2;
+
+        assert!(!is_cid_space_exhausted(4, total_space - quarter_space));
+        assert!(is_cid_space_exhausted(4, total_space - quarter_space + 1));
+        assert!(is_cid_space_exhausted(4, total_space - 1));
+    }
 }
