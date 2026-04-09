@@ -63,7 +63,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::Side;
-use crate::bootstrap_cache::{BootstrapCache, BootstrapTokenStore};
+use crate::bootstrap_cache::{
+    BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
+};
 use crate::bounded_pending_buffer::BoundedPendingBuffer;
 use crate::connection_router::{ConnectionRouter, RouterConfig};
 use crate::connection_strategy::{
@@ -107,6 +109,37 @@ fn peer_id_from_transport_addr(addr: &TransportAddr) -> PeerId {
     id[..8].copy_from_slice(&hash.to_le_bytes());
     id[8..16].copy_from_slice(&hash.to_be_bytes());
     PeerId(id)
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerHintRecord {
+    addrs: Vec<SocketAddr>,
+    capabilities: PeerCapabilities,
+}
+
+impl PeerHintRecord {
+    fn merge(&mut self, addrs: Vec<SocketAddr>, capabilities: Option<PeerCapabilities>) {
+        for addr in addrs {
+            if !self.addrs.contains(&addr) {
+                self.addrs.push(addr);
+            }
+        }
+        if let Some(caps) = capabilities {
+            if caps.supports_relay {
+                self.capabilities.supports_relay = true;
+            }
+            if caps.supports_coordination {
+                self.capabilities.supports_coordination = true;
+            }
+            self.capabilities.protocols.extend(caps.protocols);
+            if caps.nat_type.is_some() {
+                self.capabilities.nat_type = caps.nat_type;
+            }
+            for addr in caps.external_addresses {
+                self.capabilities.record_external_address(addr);
+            }
+        }
+    }
 }
 
 /// Derive a synthetic PeerId by hashing a `SocketAddr`.
@@ -162,6 +195,13 @@ pub struct P2pEndpoint {
 
     /// Bootstrap cache for peer persistence
     pub bootstrap_cache: Arc<BootstrapCache>,
+
+    /// Advanced externally supplied peer hints keyed by authenticated peer ID.
+    ///
+    /// This is intentionally separate from the persisted bootstrap cache so
+    /// higher layers can feed fresh discovery/assist hints without having to
+    /// reach into internal strategy types.
+    peer_hint_records: Arc<RwLock<HashMap<PeerId, PeerHintRecord>>>,
 
     /// Transport registry for multi-transport support
     ///
@@ -1068,6 +1108,7 @@ impl P2pEndpoint {
             shutdown: CancellationToken::new(),
             pending_data: Arc::new(RwLock::new(BoundedPendingBuffer::default())),
             bootstrap_cache,
+            peer_hint_records: Arc::new(RwLock::new(HashMap::new())),
             transport_registry,
             router: Arc::new(RwLock::new(router)),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
@@ -1358,6 +1399,35 @@ impl P2pEndpoint {
         }
     }
 
+    async fn hinted_addrs_for_peer(&self, peer_id: PeerId) -> Vec<SocketAddr> {
+        self.peer_hint_records
+            .read()
+            .await
+            .get(&peer_id)
+            .map(|record| record.addrs.clone())
+            .unwrap_or_default()
+    }
+
+    async fn hinted_assist_addrs(&self, relay: bool, coordination: bool) -> Vec<SocketAddr> {
+        let hints = self.peer_hint_records.read().await;
+        let mut candidates = Vec::new();
+
+        for record in hints.values() {
+            let matches = (relay && record.capabilities.supports_relay)
+                || (coordination && record.capabilities.supports_coordination);
+            if !matches {
+                continue;
+            }
+            for addr in &record.addrs {
+                if !candidates.contains(addr) {
+                    candidates.push(*addr);
+                }
+            }
+        }
+
+        candidates
+    }
+
     async fn coordinator_candidates(&self) -> Vec<SocketAddr> {
         let mut candidates = Vec::new();
 
@@ -1365,6 +1435,20 @@ impl P2pEndpoint {
             && !candidates.contains(&addr)
         {
             candidates.push(addr);
+        }
+
+        for addr in self.hinted_assist_addrs(false, true).await {
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
+        }
+
+        for peer in self.bootstrap_cache.select_coordinators(6).await {
+            for addr in peer.preferred_addresses() {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
         }
 
         {
@@ -1473,6 +1557,14 @@ impl P2pEndpoint {
                 .collect();
             for stale_id in &stale_peer_ids {
                 peers.remove(stale_id);
+            }
+        }
+
+        if let Some(peer_id) = peer_id {
+            for addr in self.hinted_addrs_for_peer(peer_id).await {
+                if !explicit_addrs.contains(&addr) {
+                    explicit_addrs.push(addr);
+                }
             }
         }
 
@@ -1963,6 +2055,54 @@ impl P2pEndpoint {
         self.connect_orchestrated(Some(peer_id), addrs).await
     }
 
+    /// Merge externally discovered hints for an authenticated peer.
+    ///
+    /// This advanced API lets higher layers feed durable peer identity,
+    /// candidate addresses, and assist-role capability hints into the endpoint
+    /// without reaching into internal orchestration types.
+    pub async fn upsert_peer_hints(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<SocketAddr>,
+        capabilities: Option<PeerCapabilities>,
+    ) {
+        {
+            let mut hints = self.peer_hint_records.write().await;
+            hints
+                .entry(peer_id)
+                .or_default()
+                .merge(addrs.clone(), capabilities.clone());
+        }
+
+        if addrs.is_empty() && capabilities.is_none() {
+            return;
+        }
+
+        let mut cached_peer = self
+            .bootstrap_cache
+            .get_peer(&peer_id)
+            .await
+            .unwrap_or_else(|| CachedPeer::new(peer_id, Vec::new(), PeerSource::Merge));
+
+        for addr in addrs {
+            if !cached_peer.addresses.contains(&addr) {
+                cached_peer.addresses.push(addr);
+            }
+        }
+
+        if let Some(caps) = capabilities {
+            cached_peer.capabilities.protocols.extend(caps.protocols);
+            if caps.nat_type.is_some() {
+                cached_peer.capabilities.nat_type = caps.nat_type;
+            }
+            for addr in caps.external_addresses {
+                cached_peer.capabilities.record_external_address(addr);
+            }
+        }
+
+        self.bootstrap_cache.upsert(cached_peer).await;
+    }
+
     /// Connect to a peer by ID using NAT traversal.
     ///
     /// Compatibility-oriented wrapper retained for older callers. Prefer
@@ -2247,6 +2387,24 @@ impl P2pEndpoint {
                             "Selected optimized relay from cache: {:?} for target {}",
                             relay_addr, addr
                         );
+                    }
+                }
+            }
+
+            // Next prefer externally hinted relay peers.
+            if config.relay_addrs.is_empty() {
+                let target_addr = target_ipv4.or(target_ipv6);
+                for relay_addr in self.hinted_assist_addrs(true, false).await {
+                    if Some(relay_addr) == target_addr {
+                        continue;
+                    }
+                    if let Some(target) = target_addr
+                        && relay_addr.is_ipv4() != target.is_ipv4()
+                    {
+                        continue;
+                    }
+                    if !config.relay_addrs.contains(&relay_addr) {
+                        config.relay_addrs.push(relay_addr);
                     }
                 }
             }
@@ -4315,6 +4473,7 @@ impl Clone for P2pEndpoint {
             shutdown: self.shutdown.clone(),
             pending_data: Arc::clone(&self.pending_data),
             bootstrap_cache: Arc::clone(&self.bootstrap_cache),
+            peer_hint_records: Arc::clone(&self.peer_hint_records),
             transport_registry: Arc::clone(&self.transport_registry),
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),
@@ -4856,6 +5015,41 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_peer_hints_feeds_coordinator_candidates() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x5a; 32]);
+        let hinted_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid addr");
+        let caps = PeerCapabilities {
+            supports_coordination: true,
+            ..PeerCapabilities::default()
+        };
+
+        endpoint
+            .upsert_peer_hints(peer_id, vec![hinted_addr], Some(caps))
+            .await;
+
+        let candidates = endpoint.coordinator_candidates().await;
+        assert!(
+            candidates.contains(&hinted_addr),
+            "hinted coordinator address should be considered for orchestration"
+        );
+
+        endpoint.shutdown().await;
     }
 
     fn mdns_peer_record(addr: SocketAddr, claimed_peer_id: PeerId) -> MdnsPeerRecord {

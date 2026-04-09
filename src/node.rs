@@ -48,6 +48,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::bootstrap_cache::PeerCapabilities;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -520,6 +521,21 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Merge externally discovered peer hints into the node's transport view.
+    ///
+    /// This is the advanced discovery bridge for callers that learn peer
+    /// addresses or assist-role capability hints from higher layers.
+    pub async fn upsert_peer_hints(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<SocketAddr>,
+        capabilities: Option<PeerCapabilities>,
+    ) {
+        self.inner
+            .upsert_peer_hints(peer_id, addrs, capabilities)
+            .await;
+    }
+
     /// Accept an incoming connection
     ///
     /// Waits for and accepts the next incoming connection.
@@ -971,6 +987,42 @@ mod tests {
         .await
         .expect("connect should not time out")
         .expect("dialer should connect using explicit address hint");
+        assert_eq!(peer_conn.peer_id, listener.peer_id());
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept should complete")
+            .expect("listener should accept");
+        assert_eq!(accepted.peer_id, dialer.peer_id());
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_peer_uses_upserted_peer_hints() {
+        let listener = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let dialer = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let listener_addr = listener.local_addr().expect("listener addr");
+        let listener_addr = if listener_addr.ip().is_unspecified() {
+            SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                listener_addr.port(),
+            )
+        } else {
+            listener_addr
+        };
+
+        dialer
+            .upsert_peer_hints(listener.peer_id(), vec![listener_addr], None)
+            .await;
+
+        let peer_conn =
+            tokio::time::timeout(Duration::from_secs(10), dialer.connect(listener.peer_id()))
+                .await
+                .expect("connect should not time out")
+                .expect("dialer should connect using upserted peer hints");
         assert_eq!(peer_conn.peer_id, listener.peer_id());
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())

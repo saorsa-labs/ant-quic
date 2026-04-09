@@ -7,12 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-04-09
+
 ### Added
 
 - **Peer-ID dialing with address hints**: added `connect_peer_with_addrs(peer_id, addrs)` on `P2pEndpoint` and `Node` for higher layers that already have a durable authenticated `PeerId` plus candidate socket addresses.
+- **Advanced peer-hint ingestion**: added `upsert_peer_hints(peer_id, addrs, capabilities)` on `P2pEndpoint` and `Node` so higher layers can feed discovered peer addresses and assist-role hints into ant-quic without reaching into internal strategy types.
 
 ### Fixed
 
+- **Hint-aware orchestration**: externally supplied peer hints now participate in peer-oriented dialing, coordinator candidate selection, and relay fallback candidate selection.
 - **Release hygiene**: crate packaging now excludes assistant scratch files and legacy non-Rust artifacts from published tarballs.
 - **Relay advertisements**: the built-in MASQUE relay server now refreshes its advertised public address when QUIC address discovery or router-assisted port mapping yields a better external address.
 - **Coordinator-control cleanup**: expired pending requests, inbound offers, live requests, rate-limit entries, and stale rejections are now scavenged automatically.
@@ -20,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - Cut missing `0.26.0` and `0.26.1` changelog sections and align the unified-connectivity plan text with the current `connect_peer(peer_id)` API.
+- Document the advanced peer-hint ingestion bridge alongside the unified outbound connect surface.
 
 ## [0.26.1] - 2026-04-09
 

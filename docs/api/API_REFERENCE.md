@@ -54,11 +54,22 @@ let connection = endpoint.connect_peer(peer_id).await?;
 
 // Advanced: connect by peer identity plus explicit address hints
 let connection = endpoint.connect_peer_with_addrs(peer_id, candidate_addrs).await?;
+
+// Advanced: continuously merge higher-layer discovery hints
+let capabilities = ant_quic::bootstrap_cache::PeerCapabilities {
+    supports_coordination: true,
+    ..Default::default()
+};
+endpoint
+    .upsert_peer_hints(peer_id, candidate_addrs, Some(capabilities))
+    .await;
 ```
 
 `connect_addr()` is not a separate direct-only strategy. It is the canonical address-based connect entrypoint and goes through the endpoint's normal routing/orchestration path, including connection reuse, direct establishment, and fallback handling when applicable. Richer peer-oriented behavior comes from `connect_known_peers()` and `connect_peer()`.
 
 `connect_peer_with_addrs()` is the advanced variant for higher layers that already have a durable `PeerId` plus candidate socket addresses from imported peer cards, peer caches, or external discovery. It still uses the same authenticated orchestration path as `connect_peer()`; the address list is only a dialing hint.
+
+`upsert_peer_hints()` is the advanced discovery bridge for callers that learn peer addresses or assist-role hints (for example from imported cards, caches, gossip, or rendezvous). It lets higher layers feed that metadata into ant-quic while keeping actual path selection inside the transport.
 
 ### Accepting Connections
 
