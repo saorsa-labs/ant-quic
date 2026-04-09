@@ -8,7 +8,8 @@
 //! Unified events for P2P nodes
 //!
 //! This module provides [`NodeEvent`] - a single event type that covers
-//! all significant node activities including connections, NAT detection,
+//! all significant node activities including connections, best-effort NAT
+//! behavior hints,
 //! relay sessions, and data transfer.
 //!
 //! # Example
@@ -26,7 +27,7 @@
 //!                 println!("Connected to: {:?}", peer_id);
 //!             }
 //!             NodeEvent::NatTypeDetected { nat_type } => {
-//!                 println!("NAT type: {:?}", nat_type);
+//!                 println!("NAT behavior hint: {:?}", nat_type);
 //!             }
 //!             _ => {}
 //!         }
@@ -143,9 +144,10 @@ pub enum NodeEvent {
         external_addr: Option<SocketAddr>,
     },
 
-    /// NAT type detected
+    /// Best-effort NAT behavior hint updated.
     NatTypeDetected {
-        /// The detected NAT type
+        /// Compatibility-oriented NAT behavior hint derived from native QUIC
+        /// observations rather than STUN-style NAT classification.
         nat_type: NatType,
     },
 

@@ -30,7 +30,7 @@
 //!
 //!     // Check status
 //!     let status = node.status().await;
-//!     println!("NAT type: {}", status.nat_type);
+//!     println!("NAT behavior hint: {}", status.nat_type);
 //!     println!("Can receive direct: {}", status.can_receive_direct);
 //!     println!("Acting as relay: {}", status.is_relaying);
 //!
@@ -577,13 +577,14 @@ impl Node {
     /// Get a snapshot of the node's current status
     ///
     /// This provides a practical snapshot of the node's state,
-    /// including NAT type, connectivity, relay/coordinator hints, and performance.
+    /// including a best-effort NAT behavior hint, connectivity,
+    /// relay/coordinator hints, and performance.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let status = node.status().await;
-    /// println!("NAT type: {}", status.nat_type);
+    /// println!("NAT behavior hint: {}", status.nat_type);
     /// println!("Connected peers: {}", status.connected_peers);
     /// println!("Acting as relay: {}", status.is_relaying);
     /// ```
@@ -591,7 +592,9 @@ impl Node {
         let stats = self.inner.stats().await;
         let connected_peers = self.inner.connected_peers().await;
 
-        // Determine NAT type from observed connection outcomes only.
+        // Derive a best-effort NAT behavior hint from native connectivity
+        // outcomes only. This is observational telemetry, not authoritative
+        // NAT classification.
         let nat_type = self.detect_nat_type(&stats);
 
         // Address knowledge and reachability are separate concepts.
@@ -769,7 +772,10 @@ impl Node {
 
     // === Private Helpers ===
 
-    /// Detect NAT type from statistics
+    /// Derive a coarse NAT behavior hint from native QUIC connection outcomes.
+    ///
+    /// This does not classify NAT mapping/filtering behavior in the RFC 4787 /
+    /// RFC 5780 sense.
     fn detect_nat_type(&self, stats: &crate::p2p_endpoint::EndpointStats) -> NatType {
         // This remains a soft debug hint only. Do not treat it as direct
         // reachability evidence.

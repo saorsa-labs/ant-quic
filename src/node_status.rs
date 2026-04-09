@@ -8,7 +8,7 @@
 //! Consolidated node status for observability
 //!
 //! This module provides [`NodeStatus`] - a consolidated best-effort snapshot
-//! of a node's current state, including NAT type, connectivity,
+//! of a node's current state, including a best-effort NAT behavior hint, connectivity,
 //! relay/coordinator hints, and performance metrics.
 //!
 //! # Example
@@ -19,7 +19,7 @@
 //! let node = Node::new().await?;
 //! let status = node.status();
 //!
-//! println!("NAT type: {:?}", status.nat_type);
+//! println!("NAT behavior hint: {:?}", status.nat_type);
 //! println!("Can receive direct: {}", status.can_receive_direct);
 //! println!("Relay service enabled: {}", status.relay_service_enabled);
 //! println!("Acting as relay: {}", status.is_relaying);
@@ -32,45 +32,51 @@ use std::time::Duration;
 use crate::nat_traversal_api::PeerId;
 pub use crate::reachability::ReachabilityScope;
 
-/// Detected NAT type for the node
+/// Best-effort NAT behavior hint for the node.
 ///
-/// NAT type affects connectivity - some types are easier to traverse than others.
-/// The node automatically detects its NAT type and adjusts traversal strategies.
+/// In the current implementation this is derived from native QUIC
+/// reachability and address-mapping observations, not from classic
+/// STUN-based NAT behavior discovery. Treat it as a debug/telemetry hint,
+/// not authoritative NAT classification.
+///
+/// These labels are compatibility-oriented and should not be read as a full
+/// RFC 3489/RFC 5780 NAT classification unless explicitly backed by
+/// protocol-level behavior measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NatType {
-    /// No NAT detected.
+    /// Compatibility-oriented label for paths that appeared not to require NAT traversal.
     ///
     /// This indicates the observed path did not require NAT traversal. It does
     /// not, by itself, prove current direct reachability to other peers.
     None,
 
-    /// Full cone NAT - easiest to traverse
+    /// Compatibility-oriented label for direct-only native connectivity observations.
     ///
-    /// Any external host can send packets to the internal IP:port once
-    /// the internal host has sent a packet to any external host.
+    /// The current implementation does not prove RFC-style full-cone mapping
+    /// or filtering behaviour before surfacing this value.
     FullCone,
 
-    /// Address-restricted cone NAT
+    /// Compatibility-oriented label reserved for address-restricted behaviour.
     ///
-    /// External hosts can send packets only if the internal host
-    /// has previously sent to that specific external IP.
+    /// The current node-level heuristic does not distinguish this variant from
+    /// other cone-like behaviours.
     AddressRestricted,
 
-    /// Port-restricted cone NAT
+    /// Compatibility-oriented label for mixed direct and relay-assisted outcomes.
     ///
-    /// External hosts can send packets only if the internal host
-    /// has previously sent to that specific external IP:port.
+    /// The current implementation does not prove RFC-style port-restricted
+    /// filtering behaviour before surfacing this value.
     PortRestricted,
 
-    /// Symmetric NAT - hardest to traverse
+    /// Compatibility-oriented label for likely endpoint-dependent mapping behaviour.
     ///
-    /// Each outgoing connection gets a different external port.
-    /// Requires prediction algorithms or relay fallback.
+    /// This is derived from native QUIC observations and is used as a relay
+    /// optimization hint, not a complete NAT classification.
     Symmetric,
 
-    /// NAT type not yet determined
+    /// NAT behavior hint not yet determined
     ///
-    /// The node hasn't completed NAT detection yet.
+    /// The node has not yet gathered enough native connectivity evidence.
     #[default]
     Unknown,
 }
@@ -119,7 +125,10 @@ pub struct NodeStatus {
     pub external_addrs: Vec<SocketAddr>,
 
     // --- NAT Status ---
-    /// Detected NAT type
+    /// Best-effort NAT behavior hint.
+    ///
+    /// This is observational telemetry derived from native QUIC reachability
+    /// outcomes and address observations, not authoritative NAT classification.
     pub nat_type: NatType,
 
     /// Whether this node can receive direct connections

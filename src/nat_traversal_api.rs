@@ -2138,11 +2138,15 @@ impl NatTraversalEndpoint {
         None
     }
 
-    /// Detect symmetric NAT by checking port diversity across peer connections.
+    /// Detect likely endpoint-dependent mapping behavior from native QUIC observations.
     ///
-    /// Returns `true` if at least 2 different external ports are observed from
-    /// different peers, indicating that the NAT assigns a different port per
-    /// destination (symmetric NAT behaviour).
+    /// Returns `true` if at least 2 different external ports are observed via
+    /// `OBSERVED_ADDRESS` reports from different peers, indicating that the
+    /// current path likely uses destination-dependent port mapping.
+    ///
+    /// This is used as a native QUIC optimization hint for proactive relay
+    /// setup. It is not a full NAT classification and does not prove filtering
+    /// behavior or long-term mapping stability.
     pub(crate) fn is_symmetric_nat(&self) -> bool {
         let mut observed_ports = std::collections::HashSet::new();
 

@@ -494,18 +494,30 @@ symmetric_nat_retry_count = 5
 
 ### Debug Tools
 
-#### NAT Type Detection
+#### Native Reachability / Mapping Hints
 
-```bash
-# Run NAT type detection
-cargo run --example detect_nat_type
+ant-quic does not currently ship a standalone `detect_nat_type` example and
+does not perform classic STUN-style NAT classification. Instead, inspect the
+native QUIC behavior hints exposed by `Node::status()`:
 
-# Output example:
-# NAT Type: Symmetric
-# External IP: 203.0.113.1
-# Port allocation: Random
-# Hairpinning: Not supported
+```rust,ignore
+let status = node.status().await;
+
+println!("NAT behavior hint: {:?}", status.nat_type);
+println!("External addresses: {:?}", status.external_addrs);
+println!(
+    "Direct reachability scope: {:?}",
+    status.direct_reachability_scope
+);
+println!("Port mapping active: {}", status.port_mapping_active);
+println!("Relay sessions: {}", status.relay_sessions);
 ```
+
+Treat this output as operational telemetry:
+- externally observed addresses reported by peers
+- whether direct reachability has been verified recently
+- whether router-assisted port mapping is active
+- whether native observations suggest endpoint-dependent mapping and relay is more likely to help
 
 #### Connection Diagnostics
 
