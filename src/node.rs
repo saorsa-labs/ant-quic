@@ -504,6 +504,22 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Connect to a peer by durable peer ID plus explicit address hints.
+    ///
+    /// Use this when the caller has candidate addresses for the peer and wants
+    /// the transport to combine those hints with peer-authenticated fallback
+    /// orchestration.
+    pub async fn connect_peer_with_addrs(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<PeerConnection, NodeError> {
+        self.inner
+            .connect_peer_with_addrs(peer_id, addrs)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Accept an incoming connection
     ///
     /// Waits for and accepts the next incoming connection.
@@ -932,6 +948,39 @@ mod tests {
         assert!(peers.is_empty());
 
         node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_peer_with_addrs_uses_explicit_hint() {
+        let listener = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let dialer = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let listener_addr = listener.local_addr().expect("listener addr");
+        let listener_addr = if listener_addr.ip().is_unspecified() {
+            SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                listener_addr.port(),
+            )
+        } else {
+            listener_addr
+        };
+        let peer_conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            dialer.connect_peer_with_addrs(listener.peer_id(), vec![listener_addr]),
+        )
+        .await
+        .expect("connect should not time out")
+        .expect("dialer should connect using explicit address hint");
+        assert_eq!(peer_conn.peer_id, listener.peer_id());
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept should complete")
+            .expect("listener should accept");
+        assert_eq!(accepted.peer_id, dialer.peer_id());
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
     }
 
     #[tokio::test]

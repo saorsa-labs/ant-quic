@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Peer-ID dialing with address hints**: added `connect_peer_with_addrs(peer_id, addrs)` on `P2pEndpoint` and `Node` for higher layers that already have a durable authenticated `PeerId` plus candidate socket addresses.
+
 ### Fixed
 
 - **Release hygiene**: crate packaging now excludes assistant scratch files and legacy non-Rust artifacts from published tarballs.

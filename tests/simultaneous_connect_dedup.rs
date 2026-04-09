@@ -510,6 +510,62 @@ async fn test_connect_peer_reuses_existing_connect_addr_connection() {
     let _ = accept_handle.await;
 }
 
+#[tokio::test]
+async fn test_connect_peer_with_addrs_establishes_authenticated_connection_from_hint() {
+    let node_a = create_localhost_node().await;
+    let node_b = create_localhost_node().await;
+
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
+    let peer_b = node_b.peer_id();
+
+    let accept_handle = tokio::spawn({
+        let node = node_b.clone();
+        async move {
+            for _ in 0..3 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    let conn_hint = timeout(
+        Duration::from_secs(10),
+        node_a.connect_peer_with_addrs(peer_b, vec![addr_b]),
+    )
+    .await
+    .expect("connect_peer_with_addrs should not time out")
+    .expect("connect_peer_with_addrs should succeed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let conn_peer = timeout(Duration::from_secs(10), node_a.connect(peer_b))
+        .await
+        .expect("connect(peer_id) should not time out")
+        .expect("connect(peer_id) should reuse the authenticated connection");
+
+    assert_eq!(
+        conn_hint.peer_id, peer_b,
+        "connect_peer_with_addrs should authenticate and connect to node_b"
+    );
+    assert_eq!(
+        conn_peer.peer_id, peer_b,
+        "subsequent connect(peer_id) should resolve to node_b"
+    );
+
+    let peers_a = node_a.connected_peers().await;
+    assert_eq!(
+        peers_a.len(),
+        1,
+        "node_a should have exactly 1 connected peer after hinted and peer-ID dials"
+    );
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = accept_handle.await;
+}
+
 /// Run simultaneous connect multiple times to catch race conditions.
 #[tokio::test]
 async fn test_simultaneous_connect_repeated() {

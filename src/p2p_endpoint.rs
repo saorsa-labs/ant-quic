@@ -1950,6 +1950,19 @@ impl P2pEndpoint {
         self.connect_orchestrated(Some(peer_id), Vec::new()).await
     }
 
+    /// Connect to a peer by durable peer ID plus explicit address hints.
+    ///
+    /// This is the advanced peer-oriented variant for callers that already
+    /// know candidate socket addresses for a peer but still want the transport
+    /// to authenticate that peer by ID and run the unified orchestration path.
+    pub async fn connect_peer_with_addrs(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<PeerConnection, EndpointError> {
+        self.connect_orchestrated(Some(peer_id), addrs).await
+    }
+
     /// Connect to a peer by ID using NAT traversal.
     ///
     /// Compatibility-oriented wrapper retained for older callers. Prefer

@@ -172,8 +172,12 @@ Where:
 - `connect_peer(peer_id)` is the **primary** API for normal consumers
 - `connect_addr(addr)` is a convenience wrapper for address-only bootstrap
 - `connect_known_peers()` is a bootstrap/discovery convenience
+- advanced integrations that already have a durable `PeerId` plus candidate
+  socket addresses may also use `connect_peer_with_addrs(peer_id, addrs)`,
+  which still routes through the same orchestrator rather than exposing a
+  separate strategy surface
 
-All three must route to the same internal connectivity orchestrator.
+All of these entrypoints must route to the same internal connectivity orchestrator.
 
 ### `Node`
 
