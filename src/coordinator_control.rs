@@ -386,6 +386,7 @@ mod tests {
         let local_a = peer(0x01);
         let local_b = peer(0x02);
         let target = peer(0x33);
+        let now_ms = now_unix_ms();
 
         let _ = clear_live_request(local_a, target);
         let _ = clear_live_request(local_b, target);
@@ -398,7 +399,7 @@ mod tests {
             LiveRequest {
                 request_id: 100,
                 round: 1,
-                expires_at_unix_ms: 1_000,
+                expires_at_unix_ms: now_ms + 60_000,
                 expected_coordinator: None,
             },
         );
@@ -408,7 +409,7 @@ mod tests {
             LiveRequest {
                 request_id: 200,
                 round: 1,
-                expires_at_unix_ms: 2_000,
+                expires_at_unix_ms: now_ms + 61_000,
                 expected_coordinator: None,
             },
         );

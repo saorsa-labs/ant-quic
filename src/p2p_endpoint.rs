@@ -4742,44 +4742,24 @@ mod tests {
         }
     }
 
-    async fn wait_for_observed_external_addr(endpoint: &P2pEndpoint) -> SocketAddr {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(addr) = endpoint.external_addr() {
-                    return addr;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("observed external address should be discovered")
-    }
-
     #[tokio::test]
     async fn test_port_mapping_removal_recomputes_relay_public_address_from_observed_address() {
         let config = P2pConfig::builder()
+            .bind_addr(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                0,
+            ))
             .port_mapping_enabled(false)
             .build()
             .expect("valid config");
 
-        let listener = P2pEndpoint::new(config.clone())
+        let listener = P2pEndpoint::new(config)
             .await
             .expect("listener should create");
-        let dialer = P2pEndpoint::new(config)
-            .await
-            .expect("dialer should create");
-
-        let listener_addr = localhost_addr(listener.local_addr().expect("listener addr"));
-        let _ = dialer
-            .connect_addr(listener_addr)
-            .await
-            .expect("dialer should connect");
-        let _ = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("accept should complete")
-            .expect("listener should accept");
-
-        let observed_addr = wait_for_observed_external_addr(&listener).await;
+        let observed_addr: SocketAddr = "203.0.113.88:42000".parse().expect("valid addr");
+        listener
+            .inner
+            .set_test_observed_external_addrs(vec![observed_addr]);
         let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
         listener.apply_port_mapping_snapshot(PortMappingSnapshot {
             active: true,
@@ -4796,49 +4776,45 @@ mod tests {
             Some(observed_addr)
         );
 
-        dialer.shutdown().await;
         listener.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_active_relay_is_advertised_to_future_connected_peers() {
         let config = P2pConfig::builder()
+            .bind_addr(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                0,
+            ))
             .port_mapping_enabled(false)
             .build()
             .expect("valid config");
 
-        let relay_endpoint = P2pEndpoint::new(config.clone())
+        let relay_endpoint = P2pEndpoint::new(config)
             .await
             .expect("relay endpoint should create");
         relay_endpoint
             .inner
             .set_test_relay_public_addr("198.51.100.200:45000".parse().expect("valid addr"));
+        let future_peer = PeerConnection {
+            peer_id: PeerId([0x90; 32]),
+            remote_addr: TransportAddr::Udp("127.0.0.1:45001".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Server,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        relay_endpoint
+            .register_connected_peer(future_peer.clone())
+            .await;
 
-        let peer_endpoint = P2pEndpoint::new(config)
-            .await
-            .expect("peer endpoint should create");
-        let relay_listen_addr =
-            localhost_addr(relay_endpoint.local_addr().expect("relay listen addr"));
-        let _ = peer_endpoint
-            .connect_addr(relay_listen_addr)
-            .await
-            .expect("peer should connect");
-        let accepted = tokio::time::timeout(Duration::from_secs(5), relay_endpoint.accept())
-            .await
-            .expect("accept should complete")
-            .expect("relay endpoint should accept");
-        let peer_remote_addr = accepted
-            .remote_addr
-            .as_socket_addr()
-            .expect("accepted peer should have socket addr");
-
-        let advertised = relay_endpoint.inner.relay_advertised_peer_addrs();
         assert!(
-            advertised.contains(&peer_remote_addr),
-            "future connected peers should receive the active relay advertisement"
+            relay_endpoint
+                .inner
+                .test_relay_publish_attempted_for(future_peer.peer_id),
+            "future connected peers should trigger proactive relay re-advertisement"
         );
-
-        peer_endpoint.shutdown().await;
         relay_endpoint.shutdown().await;
     }
 

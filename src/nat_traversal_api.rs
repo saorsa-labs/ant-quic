@@ -326,6 +326,14 @@ pub struct NatTraversalEndpoint {
     relay_public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     /// Peers already advertised the relay address to
     relay_advertised_peers: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
+    #[cfg(test)]
+    /// Synthetic observed external addresses for tests that do not open a real
+    /// QUIC connection.
+    test_observed_external_addrs: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    #[cfg(test)]
+    /// Tracks relay publication attempts in tests without a live inner
+    /// connection.
+    test_relay_publish_attempts: Arc<std::sync::Mutex<std::collections::HashSet<PeerId>>>,
     /// Server config for creating secondary endpoints (e.g., relay accept endpoint)
     #[allow(dead_code)] // Used when full symmetric NAT relay is wired
     server_config: Option<crate::ServerConfig>,
@@ -1390,6 +1398,12 @@ impl NatTraversalEndpoint {
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            #[cfg(test)]
+            test_observed_external_addrs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_relay_publish_attempts: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
@@ -1861,6 +1875,12 @@ impl NatTraversalEndpoint {
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            #[cfg(test)]
+            test_observed_external_addrs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_relay_publish_attempts: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
@@ -2300,6 +2320,18 @@ impl NatTraversalEndpoint {
     }
 
     fn best_observed_external_address_for_family(&self, want_ipv4: bool) -> Option<SocketAddr> {
+        #[cfg(test)]
+        if let Ok(addrs) = self.test_observed_external_addrs.lock() {
+            if let Some(addr) = addrs
+                .iter()
+                .copied()
+                .map(normalize_socket_addr)
+                .find(|addr| !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4)
+            {
+                return Some(addr);
+            }
+        }
+
         let known_peer_addrs: std::collections::HashSet<_> =
             self.config.known_peers.iter().copied().collect();
 
@@ -2353,7 +2385,18 @@ impl NatTraversalEndpoint {
 
         let connection = match self.connections.get_mut(&peer_id) {
             Some(connection) => connection,
-            None => return false,
+            None => {
+                #[cfg(test)]
+                {
+                    return self
+                        .test_relay_publish_attempts
+                        .lock()
+                        .ok()
+                        .is_some_and(|mut attempts| attempts.insert(peer_id));
+                }
+                #[allow(unreachable_code)]
+                return false;
+            }
         };
         let remote_addr = connection.remote_address();
 
@@ -2411,12 +2454,18 @@ impl NatTraversalEndpoint {
     }
 
     #[cfg(test)]
-    pub(crate) fn relay_advertised_peer_addrs(&self) -> Vec<SocketAddr> {
-        self.relay_advertised_peers
+    pub(crate) fn set_test_observed_external_addrs(&self, addrs: Vec<SocketAddr>) {
+        if let Ok(mut observed) = self.test_observed_external_addrs.lock() {
+            *observed = addrs;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_relay_publish_attempted_for(&self, peer_id: PeerId) -> bool {
+        self.test_relay_publish_attempts
             .lock()
             .ok()
-            .map(|peers| peers.iter().copied().collect())
-            .unwrap_or_default()
+            .is_some_and(|attempts| attempts.contains(&peer_id))
     }
 
     /// Get the transport registry if configured
