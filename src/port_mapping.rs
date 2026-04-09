@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use crate::unified_config::PortMappingConfig;
 
 const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(2);
+const ZERO_LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const PORT_MAPPING_DESCRIPTION: &str = "ant-quic";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -222,34 +223,50 @@ async fn run_port_mapping_lifecycle<D, F>(
             continue;
         }
 
-        let Some(renewal_delay) = renewal_interval(config.lease_duration_secs) else {
-            shutdown.cancelled().await;
-            break;
-        };
+        let renewal_delay = renewal_interval(config.lease_duration_secs);
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(renewal_delay) => {}
         }
 
-        let Some(mapping) = active_mapping.as_ref() else {
+        let Some(mapping) = active_mapping.as_mut() else {
             continue;
         };
 
-        if let Err(error) = renew_mapping(mapping, config).await {
-            warn!(
-                error = %error,
-                external_addr = %mapping.external_addr,
-                "Router port-mapping renewal failed; dropping mapping state and retrying"
-            );
-            let failed_mapping = active_mapping.take();
-            publish_snapshot(
-                &mut published_snapshot,
-                PortMappingSnapshot::default(),
-                &mut on_update,
-            );
-            if let Some(mapping) = failed_mapping.as_ref() {
-                let _ = cleanup_mapping(mapping).await;
+        match renew_mapping(mapping, config).await {
+            Ok(changed) => {
+                if changed {
+                    publish_snapshot(
+                        &mut published_snapshot,
+                        PortMappingSnapshot {
+                            active: true,
+                            external_addr: Some(mapping.external_addr),
+                        },
+                        &mut on_update,
+                    );
+                    info!(
+                        internal_addr = %mapping.local_addr,
+                        external_addr = %mapping.external_addr,
+                        "Best-effort router port mapping external address refreshed"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    external_addr = %mapping.external_addr,
+                    "Router port-mapping renewal failed; dropping mapping state and retrying"
+                );
+                let failed_mapping = active_mapping.take();
+                publish_snapshot(
+                    &mut published_snapshot,
+                    PortMappingSnapshot::default(),
+                    &mut on_update,
+                );
+                if let Some(mapping) = failed_mapping.as_ref() {
+                    let _ = cleanup_mapping(mapping).await;
+                }
             }
         }
     }
@@ -318,9 +335,9 @@ where
 }
 
 async fn renew_mapping(
-    mapping: &ActivePortMapping,
+    mapping: &mut ActivePortMapping,
     config: PortMappingConfig,
-) -> Result<(), PortMappingError> {
+) -> Result<bool, PortMappingError> {
     mapping
         .gateway
         .add_port(
@@ -329,7 +346,16 @@ async fn renew_mapping(
             config.lease_duration_secs,
             PORT_MAPPING_DESCRIPTION,
         )
-        .await
+        .await?;
+
+    let refreshed_addr = SocketAddr::new(
+        mapping.gateway.get_external_ip().await?,
+        mapping.external_addr.port(),
+    );
+    let changed = mapping.external_addr != refreshed_addr;
+    mapping.external_addr = refreshed_addr;
+
+    Ok(changed)
 }
 
 async fn cleanup_mapping(mapping: &ActivePortMapping) -> Result<(), PortMappingError> {
@@ -381,13 +407,11 @@ async fn determine_lan_ipv4(
     }
 }
 
-fn renewal_interval(lease_duration_secs: u32) -> Option<Duration> {
+fn renewal_interval(lease_duration_secs: u32) -> Duration {
     if lease_duration_secs == 0 {
-        None
+        ZERO_LEASE_REFRESH_INTERVAL
     } else {
-        Some(Duration::from_secs(u64::from(
-            (lease_duration_secs / 2).max(1),
-        )))
+        Duration::from_secs(u64::from((lease_duration_secs / 2).max(1)))
     }
 }
 
@@ -416,7 +440,7 @@ mod tests {
 
     struct TestGateway {
         gateway_addr: SocketAddr,
-        external_ip: IpAddr,
+        external_ip: Mutex<IpAddr>,
         add_port_results: Mutex<VecDeque<Result<(), String>>>,
         add_any_port_results: Mutex<VecDeque<Result<u16, String>>>,
         add_port_calls: Mutex<Vec<u16>>,
@@ -428,7 +452,7 @@ mod tests {
         fn new(gateway_addr: SocketAddr, external_ip: IpAddr) -> Self {
             Self {
                 gateway_addr,
-                external_ip,
+                external_ip: Mutex::new(external_ip),
                 add_port_results: Mutex::new(VecDeque::new()),
                 add_any_port_results: Mutex::new(VecDeque::new()),
                 add_port_calls: Mutex::new(Vec::new()),
@@ -450,7 +474,7 @@ mod tests {
         }
 
         async fn get_external_ip(&self) -> Result<IpAddr, PortMappingError> {
-            Ok(self.inner.external_ip)
+            Ok(*self.inner.external_ip.lock().expect("lock external_ip"))
         }
 
         async fn add_port(
@@ -738,6 +762,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_renewal_refreshes_external_ip() {
+        let gateway = Arc::new(TestGateway::new(
+            "127.0.0.1:1900".parse().expect("valid gateway"),
+            "203.0.113.31".parse().expect("valid external IP"),
+        ));
+        gateway
+            .add_port_results
+            .lock()
+            .expect("lock add_port_results")
+            .extend([Ok(()), Ok(())]);
+
+        let discoverer = TestDiscoverer {
+            gateway: Arc::clone(&gateway),
+            failures_before_success: AtomicUsize::new(0),
+        };
+        let shutdown = CancellationToken::new();
+        let (updates, on_update) = collect_updates();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig {
+                lease_duration_secs: 2,
+                ..PortMappingConfig::default()
+            },
+            31012,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let initial = wait_for_updates(&updates, 1).await;
+        assert_eq!(
+            initial[0].external_addr,
+            Some("203.0.113.31:31012".parse().expect("valid mapped addr"))
+        );
+
+        *gateway.external_ip.lock().expect("lock external_ip") =
+            "203.0.113.99".parse().expect("valid external IP");
+
+        let refreshed = wait_for_updates(&updates, 2).await;
+        assert_eq!(
+            refreshed[1].external_addr,
+            Some("203.0.113.99:31012".parse().expect("valid refreshed addr"))
+        );
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+    }
+
+    #[tokio::test]
     async fn test_discovery_failures_are_non_fatal_until_shutdown() {
         let gateway = Arc::new(TestGateway::new(
             "127.0.0.1:1900".parse().expect("valid gateway"),
@@ -767,6 +840,11 @@ mod tests {
             snapshots.is_empty(),
             "discovery failure should remain non-fatal and not publish active snapshots"
         );
+    }
+
+    #[test]
+    fn test_zero_lease_still_refreshes_periodically() {
+        assert_eq!(renewal_interval(0), ZERO_LEASE_REFRESH_INTERVAL);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@
 //! ```
 
 use bytes::Bytes;
+use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -182,9 +183,9 @@ pub struct MasqueRelayServer {
     /// Server configuration
     config: MasqueRelayConfig,
     /// Primary public address advertised to clients
-    public_address: SocketAddr,
+    public_address: ParkingRwLock<SocketAddr>,
     /// Secondary public address (other IP version for dual-stack)
-    secondary_address: Option<SocketAddr>,
+    secondary_address: ParkingRwLock<Option<SocketAddr>>,
     /// Active sessions by session ID
     sessions: RwLock<HashMap<u64, RelaySession>>,
     /// Mapping from client address to session ID
@@ -204,8 +205,8 @@ impl MasqueRelayServer {
     pub fn new(config: MasqueRelayConfig, public_address: SocketAddr) -> Self {
         Self {
             config,
-            public_address,
-            secondary_address: None,
+            public_address: ParkingRwLock::new(public_address),
+            secondary_address: ParkingRwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
             client_to_session: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -250,8 +251,8 @@ impl MasqueRelayServer {
 
         Self {
             config,
-            public_address: primary,
-            secondary_address: Some(secondary),
+            public_address: ParkingRwLock::new(primary),
+            secondary_address: ParkingRwLock::new(Some(secondary)),
             sessions: RwLock::new(HashMap::new()),
             client_to_session: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -263,9 +264,10 @@ impl MasqueRelayServer {
 
     /// Check if this server supports dual-stack (IPv4 and IPv6)
     pub fn supports_dual_stack(&self) -> bool {
-        if let Some(secondary) = self.secondary_address {
+        let primary = *self.public_address.read();
+        if let Some(secondary) = *self.secondary_address.read() {
             // Ensure we have both IPv4 and IPv6
-            self.public_address.is_ipv4() != secondary.is_ipv4()
+            primary.is_ipv4() != secondary.is_ipv4()
         } else {
             false
         }
@@ -293,21 +295,22 @@ impl MasqueRelayServer {
     ///
     /// Returns the IPv4 address for IPv4 targets, IPv6 for IPv6 targets.
     pub fn address_for_target(&self, target: &SocketAddr) -> SocketAddr {
-        if let Some(secondary) = self.secondary_address {
+        let primary = *self.public_address.read();
+        if let Some(secondary) = *self.secondary_address.read() {
             let target_v4 = target.is_ipv4();
-            if self.public_address.is_ipv4() == target_v4 {
-                self.public_address
+            if primary.is_ipv4() == target_v4 {
+                primary
             } else {
                 secondary
             }
         } else {
-            self.public_address
+            primary
         }
     }
 
     /// Get secondary address if dual-stack
     pub fn secondary_address(&self) -> Option<SocketAddr> {
-        self.secondary_address
+        *self.secondary_address.read()
     }
 
     /// Get count of bridged (cross-IP-version) connections
@@ -332,7 +335,7 @@ impl MasqueRelayServer {
 
     /// Get public address
     pub fn public_address(&self) -> SocketAddr {
-        self.public_address
+        *self.public_address.read()
     }
 
     /// Update the public address when the actual external address is discovered.
@@ -340,14 +343,29 @@ impl MasqueRelayServer {
     /// The relay server is created with the bind address (e.g., `[::]:10000`),
     /// but after OBSERVED_ADDRESS frames arrive, the real external IP is known.
     pub fn set_public_address(&self, addr: SocketAddr) {
-        // Note: This only affects new sessions. Existing sessions keep their
-        // original advertised address.
-        // We use interior mutability via a separate atomic or by accepting
-        // that the field isn't mutable through &self.
-        // For now, log the update — the actual address propagation happens
-        // via the client's relay session response.
+        let mut public_address = self.public_address.write();
+        let mut secondary_address = self.secondary_address.write();
+        let old = if public_address.is_ipv4() == addr.is_ipv4() {
+            let old = *public_address;
+            *public_address = addr;
+            old
+        } else if let Some(current_secondary) = *secondary_address {
+            if current_secondary.is_ipv4() == addr.is_ipv4() {
+                let old = current_secondary;
+                *secondary_address = Some(addr);
+                old
+            } else {
+                let old = *public_address;
+                *public_address = addr;
+                old
+            }
+        } else {
+            let old = *public_address;
+            *public_address = addr;
+            old
+        };
         tracing::info!(
-            old = %self.public_address,
+            old = %old,
             new = %addr,
             "Relay server public address updated"
         );
@@ -407,16 +425,18 @@ impl MasqueRelayServer {
         }
 
         // Determine the public IP to advertise based on client IP version
+        let public_address = self.public_address();
+        let secondary_address = self.secondary_address();
         let public_ip = if client_addr.is_ipv4() {
-            if self.public_address.is_ipv4() {
-                self.public_address.ip()
+            if public_address.is_ipv4() {
+                public_address.ip()
             } else {
-                self.secondary_address.unwrap_or(self.public_address).ip()
+                secondary_address.unwrap_or(public_address).ip()
             }
-        } else if self.public_address.is_ipv6() {
-            self.public_address.ip()
+        } else if public_address.is_ipv6() {
+            public_address.ip()
         } else {
-            self.secondary_address.unwrap_or(self.public_address).ip()
+            secondary_address.unwrap_or(public_address).ip()
         };
 
         // Bind a real UDP socket for this session's data plane.
@@ -964,27 +984,17 @@ impl MasqueRelayServer {
 
     /// Close a specific session
     pub async fn close_session(&self, session_id: u64) -> RelayResult<()> {
-        let client_addr = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(&session_id)
-                .ok_or(RelayError::SessionError {
-                    session_id: Some(session_id as u32),
-                    kind: SessionErrorKind::NotFound,
-                })?;
-
-            let addr = session.client_address();
-            session.close();
-            addr
-        };
-
-        // Remove from maps
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&session_id);
-        }
+        let mut sessions = self.sessions.write().await;
+        let mut client_map = self.client_to_session.write().await;
+        let mut session = sessions
+            .remove(&session_id)
+            .ok_or(RelayError::SessionError {
+                session_id: Some(session_id as u32),
+                kind: SessionErrorKind::NotFound,
+            })?;
+        let client_addr = session.client_address();
+        session.close();
         if let Some(addr) = client_addr {
-            let mut client_map = self.client_to_session.write().await;
             client_map.remove(&addr);
         }
 
@@ -1146,6 +1156,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_public_address_updates_future_advertisements() {
+        let config = MasqueRelayConfig::default();
+        let server = MasqueRelayServer::new(config, test_addr(9000));
+        let refreshed_addr: SocketAddr = "198.51.100.77:9000".parse().expect("valid addr");
+        server.set_public_address(refreshed_addr);
+
+        let response = server
+            .handle_connect_request(&ConnectUdpRequest::bind_any(), client_addr(9))
+            .await
+            .expect("connect request should succeed");
+
+        assert_eq!(
+            response
+                .proxy_public_address
+                .expect("proxy public address should be present")
+                .ip(),
+            refreshed_addr.ip()
+        );
+    }
+
+    #[tokio::test]
     async fn test_connect_request_creates_session() {
         let config = MasqueRelayConfig::default();
         let server = MasqueRelayServer::new(config, test_addr(9000));
@@ -1275,10 +1306,11 @@ mod tests {
     async fn test_close_session() {
         let config = MasqueRelayConfig::default();
         let server = MasqueRelayServer::new(config, test_addr(9000));
+        let client = client_addr(1);
 
         let request = ConnectUdpRequest::bind_any();
         let response = server
-            .handle_connect_request(&request, client_addr(1))
+            .handle_connect_request(&request, client)
             .await
             .unwrap();
         assert_eq!(response.status, 200);
@@ -1291,6 +1323,10 @@ mod tests {
         // Close session
         server.close_session(session_ids[0]).await.unwrap();
         assert_eq!(server.session_count().await, 0);
+        assert!(
+            !server.client_to_session.read().await.contains_key(&client),
+            "client-to-session map should be cleared when closing a session"
+        );
     }
 
     #[tokio::test]

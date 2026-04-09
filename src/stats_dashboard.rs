@@ -206,7 +206,7 @@ impl StatsDashboard {
                     },
                 );
             }
-            NatTraversalEvent::TraversalFailed { peer_id, .. } => {
+            NatTraversalEvent::ConnectionLost { peer_id, .. } => {
                 let mut connections = self.connections.write().await;
                 connections.remove(peer_id);
             }
@@ -604,4 +604,64 @@ fn render_mini_graph_float(data: &[f64], height: usize, width: usize) -> String 
     ));
 
     output
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::{Side, nat_traversal_api::NatTraversalError};
+
+    #[tokio::test]
+    async fn traversal_failed_does_not_remove_live_connection() {
+        let dashboard = StatsDashboard::new(DashboardConfig::default());
+        let peer_id = PeerId([0x11; 32]);
+        let remote_address: SocketAddr = "127.0.0.1:9001".parse().expect("valid addr");
+
+        dashboard
+            .handle_nat_event(&NatTraversalEvent::ConnectionEstablished {
+                peer_id,
+                remote_address,
+                side: Side::Client,
+            })
+            .await;
+        dashboard
+            .handle_nat_event(&NatTraversalEvent::TraversalFailed {
+                peer_id,
+                error: NatTraversalError::Timeout,
+                fallback_available: true,
+            })
+            .await;
+
+        assert!(
+            dashboard.connections.read().await.contains_key(&peer_id),
+            "TraversalFailed should not evict an already-established connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_lost_removes_live_connection() {
+        let dashboard = StatsDashboard::new(DashboardConfig::default());
+        let peer_id = PeerId([0x22; 32]);
+        let remote_address: SocketAddr = "127.0.0.1:9002".parse().expect("valid addr");
+
+        dashboard
+            .handle_nat_event(&NatTraversalEvent::ConnectionEstablished {
+                peer_id,
+                remote_address,
+                side: Side::Client,
+            })
+            .await;
+        dashboard
+            .handle_nat_event(&NatTraversalEvent::ConnectionLost {
+                peer_id,
+                reason: "closed".to_string(),
+            })
+            .await;
+
+        assert!(
+            !dashboard.connections.read().await.contains_key(&peer_id),
+            "ConnectionLost should evict the tracked connection"
+        );
+    }
 }

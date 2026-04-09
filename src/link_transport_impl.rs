@@ -487,7 +487,7 @@ impl P2pLinkTransport {
                         P2pEvent::PeerConnected {
                             peer_id,
                             addr,
-                            side,
+                            side: _,
                             traversal_method,
                         } => {
                             // Extract SocketAddr for Capabilities (currently UDP-only)
@@ -503,10 +503,8 @@ impl P2pLinkTransport {
                                     scope,
                                     Some(crate::reachability::ReachabilityScope::Global)
                                 );
-                                if side.is_client() {
-                                    caps.supports_relay = globally_reachable;
-                                    caps.supports_coordination = globally_reachable;
-                                }
+                                caps.supports_relay = globally_reachable;
+                                caps.supports_coordination = globally_reachable;
                             }
                             // Update capabilities cache
                             if let Ok(mut state) = state.write() {

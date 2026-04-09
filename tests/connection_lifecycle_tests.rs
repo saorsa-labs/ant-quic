@@ -291,6 +291,56 @@ mod connection_lifecycle {
 
         shutdown_with_timeout(node).await;
     }
+
+    /// Test that endpoint stats track active connections through connect/disconnect.
+    #[tokio::test]
+    async fn test_connection_statistics_follow_connection_lifecycle() {
+        let listener = P2pEndpoint::new(test_node_config(vec![]))
+            .await
+            .expect("Failed to create listener");
+        let listener_addr =
+            normalize_local_addr(listener.local_addr().expect("Listener should have address"));
+        let connector = P2pEndpoint::new(test_node_config(vec![listener_addr]))
+            .await
+            .expect("Failed to create connector");
+
+        let accept_handle = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                timeout(SHORT_TIMEOUT, listener.accept())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        });
+
+        let peer_conn = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr))
+            .await
+            .expect("connect should not time out")
+            .expect("connect should succeed");
+        let _accepted = accept_handle.await.expect("accept task should complete");
+
+        let connector_stats = connector.stats().await;
+        assert_eq!(
+            connector_stats.active_connections, 1,
+            "connector should report one active connection after connect"
+        );
+
+        connector
+            .disconnect(&peer_conn.peer_id)
+            .await
+            .expect("disconnect should succeed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let connector_stats = connector.stats().await;
+        assert_eq!(
+            connector_stats.active_connections, 0,
+            "connector should report zero active connections after disconnect"
+        );
+
+        shutdown_with_timeout(connector).await;
+        shutdown_with_timeout(listener).await;
+    }
 }
 
 // ============================================================================

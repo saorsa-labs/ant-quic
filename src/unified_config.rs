@@ -652,6 +652,17 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Control whether a random external port may be used if same-port mapping fails.
+    pub fn port_mapping_allow_random_external_port(
+        mut self,
+        allow_random_external_port: bool,
+    ) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.port_mapping.allow_random_external_port = allow_random_external_port;
+        self.nat = Some(nat);
+        self
+    }
+
     /// Set timeout configuration
     pub fn timeouts(mut self, timeouts: TimeoutConfig) -> Self {
         self.timeouts = Some(timeouts);
@@ -1174,12 +1185,13 @@ mod tests {
         let config = P2pConfig::builder()
             .port_mapping_enabled(false)
             .port_mapping_lease_duration_secs(120)
+            .port_mapping_allow_random_external_port(false)
             .build()
             .expect("Failed to build config");
 
         assert!(!config.nat.port_mapping.enabled);
         assert_eq!(config.nat.port_mapping.lease_duration_secs, 120);
-        assert!(config.nat.port_mapping.allow_random_external_port);
+        assert!(!config.nat.port_mapping.allow_random_external_port);
     }
 
     #[test]

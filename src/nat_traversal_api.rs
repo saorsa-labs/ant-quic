@@ -3088,24 +3088,31 @@ impl NatTraversalEndpoint {
                 };
 
                 if from_peer_id != pending.target {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if *initiator != pending.initiator {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if *target != pending.target {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if *round != pending.round {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if pending.expires_at_unix_ms < now_unix_ms() {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if pending.initiator_addrs.is_empty() {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
                 if target_addrs.is_empty() {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
 
@@ -3126,16 +3133,23 @@ impl NatTraversalEndpoint {
                 normalized_target_addrs.dedup();
 
                 if normalized_initiator_addrs.is_empty() || normalized_target_addrs.is_empty() {
+                    let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
 
                 let initiator_conn = match self.get_connection(initiator)? {
                     Some(c) => c,
-                    None => return Ok(true),
+                    None => {
+                        let _ = remove_pending_request(envelope.request_id);
+                        return Ok(true);
+                    }
                 };
                 let target_conn = match self.get_connection(target)? {
                     Some(c) => c,
-                    None => return Ok(true),
+                    None => {
+                        let _ = remove_pending_request(envelope.request_id);
+                        return Ok(true);
+                    }
                 };
 
                 let _ = remove_pending_request(envelope.request_id);
@@ -3374,6 +3388,31 @@ impl NatTraversalEndpoint {
         Ok(())
     }
 
+    fn materialize_authenticated_connection(
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection: InnerConnection,
+    ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
+        let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
+            NatTraversalError::ProtocolError(
+                "authenticated QUIC connection did not expose a peer identity".to_string(),
+            )
+        })?;
+
+        if let Some(entry) = connections.get(&peer_id) {
+            if entry.is_alive() {
+                let existing = entry.value().clone();
+                drop(entry);
+                connection.close(0u32.into(), b"duplicate authenticated connection");
+                return Ok((peer_id, existing));
+            }
+            drop(entry);
+            let _ = connections.remove(&peer_id);
+        }
+
+        connections.insert(peer_id, connection.clone());
+        Ok((peer_id, connection))
+    }
+
     fn send_coordination_request_v2(
         &self,
         peer_id: PeerId,
@@ -3483,30 +3522,53 @@ impl NatTraversalEndpoint {
                     );
 
                     let connections = self.connections.clone();
+                    let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
 
                     tokio::spawn(async move {
                         let connect_timeout = Duration::from_secs(10);
                         match timeout(connect_timeout, connecting).await {
                             Ok(Ok(connection)) => {
-                                let bootstrap_peer_id =
-                                    Self::generate_peer_id_from_address(coordinator);
-
-                                if connections.contains_key(&bootstrap_peer_id) {
-                                    debug!(
-                                        "Coordinator connection already exists for {}, discarding duplicate",
-                                        coordinator
-                                    );
-                                    connection.close(0u32.into(), b"duplicate coordinator");
-                                    return;
-                                }
-
-                                connections.insert(bootstrap_peer_id, connection.clone());
+                                let (coordinator_peer_id, coordinator_connection) =
+                                    match Self::materialize_authenticated_connection(
+                                        connections.as_ref(),
+                                        connection,
+                                    ) {
+                                        Ok(result) => result,
+                                        Err(error) => {
+                                            warn!(
+                                                "Failed to register coordinator {} with authenticated identity: {}",
+                                                coordinator, error
+                                            );
+                                            record_rejection(
+                                                local_peer_id,
+                                                peer_id,
+                                                request_id,
+                                                round,
+                                                None,
+                                                RejectionReason::InternalError,
+                                            );
+                                            return;
+                                        }
+                                    };
+                                low_level_endpoint
+                                    .register_connection_peer_id(coordinator, coordinator_peer_id);
+                                remember_live_request(
+                                    local_peer_id,
+                                    peer_id,
+                                    LiveRequest {
+                                        request_id,
+                                        round,
+                                        expires_at_unix_ms,
+                                        expected_coordinator: Some(coordinator_peer_id),
+                                    },
+                                );
 
                                 let send_result: Result<(), ()> = async {
                                     let bytes =
                                         encode_coordinator_control(&envelope).map_err(|_| ())?;
-                                    let mut stream = connection.open_uni().await.map_err(|_| ())?;
+                                    let mut stream =
+                                        coordinator_connection.open_uni().await.map_err(|_| ())?;
                                     stream.write_all(&bytes).await.map_err(|_| ())?;
                                     stream.finish().map_err(|_| ())?;
                                     Ok(())
@@ -3519,7 +3581,7 @@ impl NatTraversalEndpoint {
                                         peer_id,
                                         request_id,
                                         round,
-                                        None,
+                                        Some(coordinator_peer_id),
                                         RejectionReason::InternalError,
                                     );
                                 }
@@ -5574,11 +5636,11 @@ impl NatTraversalEndpoint {
         PeerId(peer_id)
     }
 
-    /// Generate a peer ID from a socket address
+    /// Generate a deterministic temporary peer ID from a socket address.
     ///
-    /// WARNING: This is a fallback method that should only be used when
-    /// we cannot extract the peer's actual ID from their Ed25519 public key.
-    /// This generates a non-persistent ID that will change on each connection.
+    /// This is a fallback only for legacy/error paths where the authenticated
+    /// peer identity is unavailable. It is stable for a given address but must
+    /// not be treated as durable identity.
     fn generate_peer_id_from_address(addr: SocketAddr) -> PeerId {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -5590,14 +5652,8 @@ impl NatTraversalEndpoint {
         let mut peer_id = [0u8; 32];
         peer_id[0..8].copy_from_slice(&hash.to_be_bytes());
 
-        // Add some randomness to avoid collisions
-        // NOTE: This makes the peer ID non-persistent across connections
-        for i in 8..32 {
-            peer_id[i] = rand::random();
-        }
-
         warn!(
-            "Generated temporary peer ID from address {}. This ID is not persistent!",
+            "Generated temporary address-derived peer ID for {}. This ID is not durable identity.",
             addr
         );
         PeerId(peer_id)
@@ -6820,6 +6876,7 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let low_level_endpoint = endpoint.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
 
@@ -6830,27 +6887,25 @@ impl NatTraversalEndpoint {
                             Ok(Ok(connection)) => {
                                 info!("Connected to coordinator {}", coordinator);
 
-                                // Generate a peer ID for the bootstrap node
-                                let bootstrap_peer_id =
-                                    Self::generate_peer_id_from_address(coordinator);
-
-                                // Check if another task already established a coordinator connection
-                                if connections.contains_key(&bootstrap_peer_id) {
-                                    debug!(
-                                        "Coordinator connection already exists for {}, discarding duplicate",
-                                        coordinator
-                                    );
-                                    // Close the duplicate connection to free resources
-                                    connection.close(0u32.into(), b"duplicate coordinator");
-                                    return;
-                                }
-
-                                // Store the connection
-                                // DashMap provides lock-free .insert()
-                                connections.insert(bootstrap_peer_id, connection.clone());
+                                let (coordinator_peer_id, coordinator_connection) =
+                                    match Self::materialize_authenticated_connection(
+                                        connections.as_ref(),
+                                        connection,
+                                    ) {
+                                        Ok(result) => result,
+                                        Err(error) => {
+                                            warn!(
+                                                "Failed to register coordinator {} with authenticated identity: {}",
+                                                coordinator, error
+                                            );
+                                            return;
+                                        }
+                                    };
+                                low_level_endpoint
+                                    .register_connection_peer_id(coordinator, coordinator_peer_id);
 
                                 // Now send the PUNCH_ME_NOW via this new connection
-                                match connection.send_nat_punch_via_relay(
+                                match coordinator_connection.send_nat_punch_via_relay(
                                     target_peer_id.0,
                                     external_addr,
                                     1,

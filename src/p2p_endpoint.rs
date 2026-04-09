@@ -568,13 +568,104 @@ async fn do_cleanup_connection(
     peer_id: &PeerId,
     reason: DisconnectReason,
 ) -> bool {
-    let removed = connected_peers.write().await.remove(peer_id);
     let _ = inner.remove_connection(peer_id);
 
     // Abort the background reader task for this peer
     if let Some(handle) = reader_handles.write().await.remove(peer_id) {
         handle.abort();
     }
+
+    let removed = remove_connected_peer(connected_peers, stats, event_tx, peer_id, reason).await;
+    if removed {
+        info!("Cleaned up connection for peer {:?}", peer_id);
+    }
+    removed
+}
+
+/// Record connection-established stats and emit the user-facing `PeerConnected` event.
+///
+/// This is the single source of truth for `P2pEndpoint` connection accounting once a
+/// `PeerConnection` has been stored in `connected_peers`.
+async fn record_connection_established(
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_conn: &PeerConnection,
+    previous: Option<&PeerConnection>,
+) {
+    let had_active_direct_incoming =
+        previous.is_some_and(|prev| prev.traversal_method.is_direct() && prev.side.is_server());
+    let has_active_direct_incoming =
+        peer_conn.traversal_method.is_direct() && peer_conn.side.is_server();
+    let should_emit = previous.is_none_or(|prev| {
+        prev.remote_addr != peer_conn.remote_addr
+            || prev.traversal_method != peer_conn.traversal_method
+            || prev.side != peer_conn.side
+            || prev.authenticated != peer_conn.authenticated
+    });
+
+    {
+        let mut s = stats.write().await;
+        if previous.is_none() {
+            s.active_connections += 1;
+            s.successful_connections += 1;
+        }
+
+        if previous.is_none_or(|prev| prev.traversal_method != peer_conn.traversal_method) {
+            match peer_conn.traversal_method {
+                TraversalMethod::Direct => {
+                    s.direct_connections += 1;
+                }
+                TraversalMethod::Relay => {
+                    s.relayed_connections += 1;
+                }
+                TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+            }
+        }
+
+        if !had_active_direct_incoming && has_active_direct_incoming {
+            s.active_direct_incoming_connections += 1;
+        } else if had_active_direct_incoming && !has_active_direct_incoming {
+            s.active_direct_incoming_connections =
+                s.active_direct_incoming_connections.saturating_sub(1);
+        }
+
+        if has_active_direct_incoming {
+            if let Some(remote_addr) = peer_conn.remote_addr.as_socket_addr() {
+                let now = Instant::now();
+                match socket_addr_scope(remote_addr) {
+                    Some(ReachabilityScope::Loopback) => {
+                        s.last_direct_loopback_at = Some(now);
+                    }
+                    Some(ReachabilityScope::LocalNetwork) => {
+                        s.last_direct_local_at = Some(now);
+                    }
+                    Some(ReachabilityScope::Global) => {
+                        s.last_direct_global_at = Some(now);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    if should_emit {
+        let _ = event_tx.send(P2pEvent::PeerConnected {
+            peer_id: peer_conn.peer_id,
+            addr: peer_conn.remote_addr.clone(),
+            side: peer_conn.side,
+            traversal_method: peer_conn.traversal_method,
+        });
+    }
+}
+
+async fn remove_connected_peer(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: &PeerId,
+    reason: DisconnectReason,
+) -> bool {
+    let removed = connected_peers.write().await.remove(peer_id);
 
     if let Some(peer_conn) = removed {
         {
@@ -590,63 +681,23 @@ async fn do_cleanup_connection(
             peer_id: *peer_id,
             reason,
         });
-
-        info!("Cleaned up connection for peer {:?}", peer_id);
         true
     } else {
         false
     }
 }
 
-/// Record connection-established stats and emit the user-facing `PeerConnected` event.
-///
-/// This is the single source of truth for `P2pEndpoint` connection accounting once a
-/// `PeerConnection` has been stored in `connected_peers`.
-async fn record_connection_established(
+async fn store_connected_peer(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
-    peer_conn: &PeerConnection,
+    peer_conn: PeerConnection,
 ) {
-    {
-        let mut s = stats.write().await;
-        s.active_connections += 1;
-        s.successful_connections += 1;
-
-        match peer_conn.traversal_method {
-            TraversalMethod::Direct => {
-                s.direct_connections += 1;
-                if peer_conn.side.is_server() {
-                    s.active_direct_incoming_connections += 1;
-                    if let Some(remote_addr) = peer_conn.remote_addr.as_socket_addr() {
-                        let now = Instant::now();
-                        match socket_addr_scope(remote_addr) {
-                            Some(ReachabilityScope::Loopback) => {
-                                s.last_direct_loopback_at = Some(now);
-                            }
-                            Some(ReachabilityScope::LocalNetwork) => {
-                                s.last_direct_local_at = Some(now);
-                            }
-                            Some(ReachabilityScope::Global) => {
-                                s.last_direct_global_at = Some(now);
-                            }
-                            None => {}
-                        }
-                    }
-                }
-            }
-            TraversalMethod::Relay => {
-                s.relayed_connections += 1;
-            }
-            TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
-        }
-    }
-
-    let _ = event_tx.send(P2pEvent::PeerConnected {
-        peer_id: peer_conn.peer_id,
-        addr: peer_conn.remote_addr.clone(),
-        side: peer_conn.side,
-        traversal_method: peer_conn.traversal_method,
-    });
+    let previous = connected_peers
+        .write()
+        .await
+        .insert(peer_conn.peer_id, peer_conn.clone());
+    record_connection_established(stats, event_tx, &peer_conn, previous.as_ref()).await;
 }
 
 /// Bridge low-level NAT traversal events into endpoint-level progress/accounting.
@@ -1469,13 +1520,8 @@ impl P2pEndpoint {
 
                 // Store peer
                 drop(router); // Release lock before acquiring connected_peers lock
-                self.connected_peers
-                    .write()
-                    .await
-                    .insert(actual_peer_id, peer_conn.clone());
-
+                self.register_connected_peer(peer_conn.clone()).await;
                 self.observe_direct_peer_reachability(actual_peer_id, &addr);
-                self.publish_connection_established(&peer_conn).await;
 
                 Ok(peer_conn)
             }
@@ -1858,21 +1904,13 @@ impl P2pEndpoint {
                     last_activity: Instant::now(),
                 };
 
-                self.connected_peers
-                    .write()
-                    .await
-                    .insert(peer_id, peer_conn.clone());
-
                 let endpoint = self.clone();
-                let published = peer_conn.clone();
-                let bg_conn = conn.clone();
-                let bg_remote = remote_address;
                 tokio::spawn(async move {
-                    endpoint.spawn_reader_task(peer_id, bg_conn).await;
-                    endpoint
-                        .observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(bg_remote));
-                    endpoint.publish_connection_established(&published).await;
+                    endpoint.spawn_reader_task(peer_id, conn).await;
                 });
+
+                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                self.register_connected_peer(peer_conn.clone()).await;
 
                 return Ok(peer_conn);
             }
@@ -1924,20 +1962,11 @@ impl P2pEndpoint {
                             });
                         }
 
-                        self.connected_peers
-                            .write()
-                            .await
-                            .insert(peer_id, peer_conn.clone());
-
                         self.observe_direct_peer_reachability(
                             peer_id,
                             &TransportAddr::Udp(remote_address),
                         );
-                        let endpoint = self.clone();
-                        let published = peer_conn.clone();
-                        tokio::spawn(async move {
-                            endpoint.publish_connection_established(&published).await;
-                        });
+                        self.register_connected_peer(peer_conn.clone()).await;
 
                         return Ok(peer_conn);
                     }
@@ -1983,17 +2012,8 @@ impl P2pEndpoint {
                     endpoint.spawn_reader_task(peer_id, conn).await;
                 });
 
-                self.connected_peers
-                    .write()
-                    .await
-                    .insert(peer_id, peer_conn.clone());
-
                 self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
-                let endpoint = self.clone();
-                let published = peer_conn.clone();
-                tokio::spawn(async move {
-                    endpoint.publish_connection_established(&published).await;
-                });
+                self.register_connected_peer(peer_conn.clone()).await;
 
                 return Ok(peer_conn);
             }
@@ -2481,13 +2501,8 @@ impl P2pEndpoint {
         // Use the cloned connection directly — do NOT re-fetch from the DashMap.
         self.spawn_reader_task(peer_id, reader_conn).await;
 
-        self.connected_peers
-            .write()
-            .await
-            .insert(peer_id, peer_conn.clone());
-
         self.observe_direct_peer_reachability(peer_id, &peer_conn.remote_addr);
-        self.publish_connection_established(&peer_conn).await;
+        self.register_connected_peer(peer_conn.clone()).await;
 
         Ok(peer_conn)
     }
@@ -2579,20 +2594,11 @@ impl P2pEndpoint {
                             });
                         }
 
-                        self.connected_peers
-                            .write()
-                            .await
-                            .insert(evt_peer, peer_conn.clone());
-
                         self.observe_direct_peer_reachability(
                             evt_peer,
                             &TransportAddr::Udp(remote_address),
                         );
-                        let endpoint = self.clone();
-                        let published = peer_conn.clone();
-                        tokio::spawn(async move {
-                            endpoint.publish_connection_established(&published).await;
-                        });
+                        self.register_connected_peer(peer_conn.clone()).await;
 
                         let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                         return Ok(peer_conn);
@@ -2640,17 +2646,8 @@ impl P2pEndpoint {
                     endpoint.spawn_reader_task(peer_id, conn).await;
                 });
 
-                self.connected_peers
-                    .write()
-                    .await
-                    .insert(peer_id, peer_conn.clone());
-
                 self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
-                let endpoint = self.clone();
-                let published = peer_conn.clone();
-                tokio::spawn(async move {
-                    endpoint.publish_connection_established(&published).await;
-                });
+                self.register_connected_peer(peer_conn.clone()).await;
 
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                 return Ok(peer_conn);
@@ -2798,12 +2795,7 @@ impl P2pEndpoint {
         self.spawn_reader_task(relay_peer_id, reader_conn).await;
 
         // Store peer connection
-        self.connected_peers
-            .write()
-            .await
-            .insert(relay_peer_id, peer_conn.clone());
-
-        self.publish_connection_established(&peer_conn).await;
+        self.register_connected_peer(peer_conn.clone()).await;
 
         info!(
             "MASQUE relay connection succeeded to {} via {}",
@@ -2824,8 +2816,14 @@ impl P2pEndpoint {
         }
     }
 
-    async fn publish_connection_established(&self, peer_conn: &PeerConnection) {
-        record_connection_established(self.stats.as_ref(), &self.event_tx, peer_conn).await;
+    async fn register_connected_peer(&self, peer_conn: PeerConnection) {
+        store_connected_peer(
+            self.connected_peers.as_ref(),
+            self.stats.as_ref(),
+            &self.event_tx,
+            peer_conn,
+        )
+        .await;
     }
 
     /// Check if we're connected to a specific address
@@ -2908,13 +2906,8 @@ impl P2pEndpoint {
                 // Use the cloned connection directly — do NOT re-fetch from the DashMap.
                 self.spawn_reader_task(resolved_peer_id, reader_conn).await;
 
-                self.connected_peers
-                    .write()
-                    .await
-                    .insert(resolved_peer_id, peer_conn.clone());
-
                 self.observe_direct_peer_reachability(resolved_peer_id, &peer_conn.remote_addr);
-                self.publish_connection_established(&peer_conn).await;
+                self.register_connected_peer(peer_conn.clone()).await;
 
                 Some(peer_conn)
             }
@@ -3611,6 +3604,7 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let constrained_peer_addrs = Arc::clone(&self.constrained_peer_addrs);
         let constrained_connections = Arc::clone(&self.constrained_connections);
+        let stats = Arc::clone(&self.stats);
         let shutdown = self.shutdown.clone();
 
         /// Register a new constrained peer in all lookup maps and emit a connect event.
@@ -3624,6 +3618,7 @@ impl P2pEndpoint {
                 HashMap<ConstrainedConnectionId, (PeerId, TransportAddr)>,
             >,
             connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+            stats: &RwLock<EndpointStats>,
             event_tx: &broadcast::Sender<P2pEvent>,
         ) {
             constrained_connections
@@ -3634,8 +3629,10 @@ impl P2pEndpoint {
                 .write()
                 .await
                 .insert(connection_id, (peer_id, addr.clone()));
-            connected_peers.write().await.insert(
-                peer_id,
+            store_connected_peer(
+                connected_peers,
+                stats,
+                event_tx,
                 PeerConnection {
                     peer_id,
                     remote_addr: addr.clone(),
@@ -3645,13 +3642,8 @@ impl P2pEndpoint {
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
                 },
-            );
-            let _ = event_tx.send(P2pEvent::PeerConnected {
-                peer_id,
-                addr: addr.clone(),
-                side,
-                traversal_method: TraversalMethod::Direct,
-            });
+            )
+            .await;
         }
 
         tokio::spawn(async move {
@@ -3718,6 +3710,7 @@ impl P2pEndpoint {
                             &constrained_connections,
                             &constrained_peer_addrs,
                             &connected_peers,
+                            &stats,
                             &event_tx,
                         )
                         .await;
@@ -3738,6 +3731,7 @@ impl P2pEndpoint {
                                 &constrained_connections,
                                 &constrained_peer_addrs,
                                 &connected_peers,
+                                &stats,
                                 &event_tx,
                             )
                             .await;
@@ -3747,11 +3741,14 @@ impl P2pEndpoint {
                         let peer_info = constrained_peer_addrs.write().await.remove(&connection_id);
                         if let Some((peer_id, addr)) = peer_info {
                             constrained_connections.write().await.remove(&peer_id);
-                            connected_peers.write().await.remove(&peer_id);
-                            let _ = event_tx.send(P2pEvent::PeerDisconnected {
-                                peer_id,
-                                reason: DisconnectReason::RemoteClosed,
-                            });
+                            let _ = remove_connected_peer(
+                                &connected_peers,
+                                &stats,
+                                &event_tx,
+                                &peer_id,
+                                DisconnectReason::RemoteClosed,
+                            )
+                            .await;
                             debug!(
                                 "Constrained poller: peer {:?} at {} disconnected",
                                 peer_id, addr
@@ -3960,7 +3957,7 @@ mod tests {
             last_activity: Instant::now(),
         };
 
-        record_connection_established(&stats, &event_tx, &peer_conn).await;
+        record_connection_established(&stats, &event_tx, &peer_conn, None).await;
 
         let stats = stats.read().await;
         assert_eq!(stats.active_connections, 1);
@@ -4002,7 +3999,7 @@ mod tests {
             last_activity: Instant::now(),
         };
 
-        record_connection_established(&stats, &event_tx, &peer_conn).await;
+        record_connection_established(&stats, &event_tx, &peer_conn, None).await;
 
         let stats = stats.read().await;
         assert_eq!(stats.active_connections, 1);
@@ -4050,6 +4047,100 @@ mod tests {
         assert_eq!(stats.nat_traversal_successes, 1);
         assert_eq!(stats.active_connections, 0);
         assert_eq!(stats.successful_connections, 0);
+        drop(stats);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_record_connection_established_replacement_does_not_double_count() {
+        let stats = RwLock::new(EndpointStats {
+            active_connections: 1,
+            successful_connections: 1,
+            relayed_connections: 1,
+            ..EndpointStats::default()
+        });
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(4);
+        let previous = PeerConnection {
+            peer_id: PeerId([0x44; 32]),
+            remote_addr: TransportAddr::Udp("203.0.113.20:9443".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        let replacement = PeerConnection {
+            peer_id: previous.peer_id,
+            remote_addr: TransportAddr::Udp("127.0.0.1:9443".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Server,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        record_connection_established(&stats, &event_tx, &replacement, Some(&previous)).await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.successful_connections, 1);
+        assert_eq!(stats.direct_connections, 1);
+        assert_eq!(stats.relayed_connections, 1);
+        assert_eq!(stats.active_direct_incoming_connections, 1);
+        drop(stats);
+
+        match event_rx.recv().await.expect("peer connected event") {
+            P2pEvent::PeerConnected {
+                peer_id,
+                addr,
+                side,
+                traversal_method,
+            } => {
+                assert_eq!(peer_id, replacement.peer_id);
+                assert_eq!(addr, replacement.remote_addr);
+                assert_eq!(side, Side::Server);
+                assert_eq!(traversal_method, TraversalMethod::Direct);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_connection_established_identical_replacement_is_quiet() {
+        let stats = RwLock::new(EndpointStats {
+            active_connections: 1,
+            successful_connections: 1,
+            direct_connections: 1,
+            active_direct_incoming_connections: 1,
+            ..EndpointStats::default()
+        });
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(4);
+        let previous = PeerConnection {
+            peer_id: PeerId([0x55; 32]),
+            remote_addr: TransportAddr::Udp("127.0.0.1:9555".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Server,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        let replacement = PeerConnection {
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+            ..previous.clone()
+        };
+
+        record_connection_established(&stats, &event_tx, &replacement, Some(&previous)).await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.successful_connections, 1);
+        assert_eq!(stats.direct_connections, 1);
+        assert_eq!(stats.active_direct_incoming_connections, 1);
         drop(stats);
 
         assert!(matches!(
