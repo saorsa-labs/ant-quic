@@ -101,6 +101,35 @@ Known peers are seed inputs into the symmetric peer graph. They are not privileg
 `SocketAddr` values in configuration are contact hints only. Durable peer identity
 is always `PeerId`, derived from the authenticated ML-DSA-65 public key.
 
+### DiscoveryPolicy and MdnsConfig
+
+Scoped first-party mDNS is available when ant-quic is built with the
+`mdns-discovery` feature:
+
+```rust
+use ant_quic::unified_config::{
+    AutoConnectPolicy, DiscoveryPolicy, MdnsConfig, MdnsMode,
+};
+
+let config = P2pConfig::builder()
+    .discovery(DiscoveryPolicy {
+        static_known_peers: true,
+        mdns: Some(MdnsConfig {
+            enabled: true,
+            service: Some("ant-quic".into()),
+            namespace: Some("workspace-a".into()),
+            mode: MdnsMode::Both,
+            auto_connect: AutoConnectPolicy::Disabled,
+            metadata: std::collections::BTreeMap::new(),
+        }),
+        auto_connect: AutoConnectPolicy::Disabled,
+    })
+    .build()?;
+```
+
+mDNS records are locator claims only. The authenticated QUIC handshake remains
+the durable source of truth for `PeerId`.
+
 ### NatConfig
 
 ```rust
@@ -180,6 +209,10 @@ let external: Option<SocketAddr> = endpoint.external_addr();
 // Port mapping contributes an extra external candidate when active
 let mapped: Option<SocketAddr> = endpoint.port_mapping_addr();
 let all_candidates: Vec<SocketAddr> = endpoint.all_external_addrs();
+
+// Query first-party mDNS browse/advertise state
+let mdns = endpoint.mdns_snapshot();
+let mdns_peer_count = mdns.discovered_peers.len();
 ```
 
 Address discovery primarily comes from seeded peer connectivity. Applications generally call `connect_known_peers()` to establish that context, then use `connect_addr()` for address-based dialing or `connect_peer()` for peer-oriented dialing while the endpoint applies its normal routing/orchestration behavior.
@@ -275,6 +308,26 @@ Format:
 ```
 
 ## Events
+
+Relevant structured endpoint events now include:
+
+- `ExternalAddressDiscovered`
+- `PortMappingEstablished`
+- `PortMappingRenewed`
+- `PortMappingFailed`
+- `PortMappingRemoved`
+- `MdnsServiceAdvertised`
+- `MdnsPeerDiscovered`
+- `MdnsPeerUpdated`
+- `MdnsPeerRemoved`
+- `MdnsPeerEligible`
+- `MdnsPeerIneligible`
+- `MdnsAutoConnectAttempted`
+- `MdnsAutoConnectSucceeded`
+- `MdnsAutoConnectFailed`
+
+These endpoint events are mirrored through `NodeEvent` on the higher-level
+`Node` API.
 
 ### P2pEvent
 

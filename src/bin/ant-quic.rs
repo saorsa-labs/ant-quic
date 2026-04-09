@@ -32,11 +32,17 @@
 //! ```bash
 //! ant-quic --known-peers 1.2.3.4:9000 --connect-peer-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 //! ```
+//!
+//! Enable scoped mDNS browse/advertise:
+//! ```bash
+//! ant-quic --mdns --mdns-service ant-quic --mdns-namespace workspace-a
+//! ```
 
 use ant_quic::host_identity::{HostIdentity, auto_storage};
 use ant_quic::transport::TransportAddr;
+use ant_quic::unified_config::{AutoConnectPolicy, MdnsConfig, MdnsMode};
 use ant_quic::{MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPhase};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -145,6 +151,30 @@ struct Args {
     #[arg(long)]
     no_port_mapping: bool,
 
+    /// Enable first-party mDNS browse/advertise support
+    #[arg(long, conflicts_with = "no_mdns")]
+    mdns: bool,
+
+    /// Disable first-party mDNS browse/advertise support
+    #[arg(long, conflicts_with = "mdns")]
+    no_mdns: bool,
+
+    /// mDNS service/application scope
+    #[arg(long)]
+    mdns_service: Option<String>,
+
+    /// Optional mDNS namespace/workspace scope
+    #[arg(long)]
+    mdns_namespace: Option<String>,
+
+    /// mDNS participation mode
+    #[arg(long, value_enum)]
+    mdns_mode: Option<CliMdnsMode>,
+
+    /// Whether eligible mDNS discoveries should auto-connect
+    #[arg(long, value_enum)]
+    mdns_auto_connect: Option<CliMdnsAutoConnect>,
+
     /// Show full public key (not just first 8 bytes)
     #[arg(long)]
     full_key: bool,
@@ -248,6 +278,38 @@ enum CacheAction {
         #[arg(long, default_value = "~/.ant-quic")]
         data_dir: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliMdnsMode {
+    Browse,
+    Advertise,
+    Both,
+}
+
+impl From<CliMdnsMode> for MdnsMode {
+    fn from(value: CliMdnsMode) -> Self {
+        match value {
+            CliMdnsMode::Browse => Self::BrowseOnly,
+            CliMdnsMode::Advertise => Self::AdvertiseOnly,
+            CliMdnsMode::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliMdnsAutoConnect {
+    Disabled,
+    Enabled,
+}
+
+impl From<CliMdnsAutoConnect> for AutoConnectPolicy {
+    fn from(value: CliMdnsAutoConnect) -> Self {
+        match value {
+            CliMdnsAutoConnect::Disabled => Self::Disabled,
+            CliMdnsAutoConnect::Enabled => Self::Enabled,
+        }
+    }
 }
 
 // v0.13.0: Mode enum removed - all nodes are symmetric P2P nodes
@@ -382,6 +444,50 @@ async fn main() -> anyhow::Result<()> {
         info!("Best-effort router port mapping disabled");
     } else {
         info!("Best-effort router port mapping enabled");
+    }
+
+    let mdns_requested = args.mdns
+        || args.mdns_service.is_some()
+        || args.mdns_namespace.is_some()
+        || args.mdns_mode.is_some()
+        || args.mdns_auto_connect.is_some();
+    if args.no_mdns && mdns_requested {
+        anyhow::bail!("--no-mdns cannot be combined with other mDNS configuration flags");
+    }
+
+    if args.no_mdns {
+        builder = builder.mdns_enabled(false);
+        info!("First-party mDNS disabled");
+    } else if mdns_requested {
+        #[cfg(not(feature = "mdns-discovery"))]
+        anyhow::bail!("mDNS flags require ant-quic to be built with the mdns-discovery feature");
+
+        #[cfg(feature = "mdns-discovery")]
+        {
+            let mdns_config = MdnsConfig {
+                enabled: true,
+                service: Some(
+                    args.mdns_service
+                        .clone()
+                        .unwrap_or_else(|| "ant-quic".to_string()),
+                ),
+                namespace: args.mdns_namespace.clone(),
+                mode: args.mdns_mode.unwrap_or(CliMdnsMode::Both).into(),
+                auto_connect: args
+                    .mdns_auto_connect
+                    .unwrap_or(CliMdnsAutoConnect::Disabled)
+                    .into(),
+                metadata: std::collections::BTreeMap::new(),
+            };
+            builder = builder.mdns(mdns_config.clone());
+            info!(
+                service = mdns_config.service.as_deref().unwrap_or_default(),
+                namespace = mdns_config.namespace.as_deref().unwrap_or_default(),
+                mode = ?mdns_config.mode,
+                auto_connect = ?mdns_config.auto_connect,
+                "First-party mDNS enabled"
+            );
+        }
     }
     // v0.13.0: No mode-based NAT config - all nodes are symmetric
 
@@ -941,6 +1047,208 @@ async fn handle_event_with_state(
                 );
             }
         }
+        P2pEvent::PortMappingEstablished { external_addr } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_established","external_addr":"{}"}}"#,
+                    external_addr
+                );
+            } else {
+                info!("Port mapping established: {}", external_addr);
+            }
+        }
+        P2pEvent::PortMappingRenewed { external_addr } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_renewed","external_addr":"{}"}}"#,
+                    external_addr
+                );
+            } else {
+                info!("Port mapping renewed: {}", external_addr);
+            }
+        }
+        P2pEvent::PortMappingFailed { error } => {
+            if json {
+                println!(r#"{{"event":"port_mapping_failed","error":"{}"}}"#, error);
+            } else {
+                warn!("Port mapping failed: {}", error);
+            }
+        }
+        P2pEvent::PortMappingRemoved { external_addr } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_removed","external_addr":{}}}"#,
+                    external_addr
+                        .map(|addr| format!("\"{}\"", addr))
+                        .unwrap_or_else(|| "null".to_string())
+                );
+            } else if let Some(addr) = external_addr {
+                info!("Port mapping removed: {}", addr);
+            } else {
+                info!("Port mapping removed");
+            }
+        }
+        P2pEvent::MdnsServiceAdvertised {
+            service,
+            namespace,
+            instance_fullname,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_service_advertised","service":"{}","namespace":{},"instance_fullname":"{}"}}"#,
+                    service,
+                    namespace
+                        .as_ref()
+                        .map(|value| format!("\"{}\"", value))
+                        .unwrap_or_else(|| "null".to_string()),
+                    instance_fullname
+                );
+            } else {
+                info!(
+                    "mDNS service advertised: {} ({})",
+                    instance_fullname,
+                    namespace
+                        .clone()
+                        .unwrap_or_else(|| "no namespace".to_string())
+                );
+            }
+        }
+        P2pEvent::MdnsPeerDiscovered { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_discovered","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    peer.addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                info!(
+                    "mDNS peer discovered: {} -> {:?}",
+                    peer.fullname, peer.addresses
+                );
+            }
+        }
+        P2pEvent::MdnsPeerUpdated { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_updated","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    peer.addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                info!(
+                    "mDNS peer updated: {} -> {:?}",
+                    peer.fullname, peer.addresses
+                );
+            }
+        }
+        P2pEvent::MdnsPeerRemoved { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_removed","fullname":"{}"}}"#,
+                    peer.fullname
+                );
+            } else {
+                info!("mDNS peer removed: {}", peer.fullname);
+            }
+        }
+        P2pEvent::MdnsPeerEligible { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_eligible","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    peer.addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                info!(
+                    "mDNS peer eligible: {} -> {:?}",
+                    peer.fullname, peer.addresses
+                );
+            }
+        }
+        P2pEvent::MdnsPeerIneligible { peer, reason } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_ineligible","fullname":"{}","reason":"{}"}}"#,
+                    peer.fullname, reason
+                );
+            } else {
+                info!("mDNS peer ineligible: {} ({})", peer.fullname, reason);
+            }
+        }
+        P2pEvent::MdnsAutoConnectAttempted { peer, addresses } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_auto_connect_attempted","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                info!(
+                    "mDNS auto-connect attempted: {} -> {:?}",
+                    peer.fullname, addresses
+                );
+            }
+        }
+        P2pEvent::MdnsAutoConnectSucceeded {
+            peer,
+            authenticated_peer_id,
+            remote_addr,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_auto_connect_succeeded","fullname":"{}","peer_id":"{}","remote_addr":"{}"}}"#,
+                    peer.fullname,
+                    hex::encode(authenticated_peer_id.0),
+                    remote_addr
+                );
+            } else {
+                info!(
+                    "mDNS auto-connect succeeded: {} authenticated as {} via {}",
+                    peer.fullname,
+                    hex::encode(authenticated_peer_id.0),
+                    remote_addr
+                );
+            }
+        }
+        P2pEvent::MdnsAutoConnectFailed {
+            peer,
+            addresses,
+            error,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_auto_connect_failed","fullname":"{}","addresses":"{}","error":"{}"}}"#,
+                    peer.fullname,
+                    addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    error
+                );
+            } else {
+                warn!(
+                    "mDNS auto-connect failed: {} via {:?} ({})",
+                    peer.fullname, addresses, error
+                );
+            }
+        }
         P2pEvent::DataReceived { peer_id, bytes } => {
             stats
                 .bytes_received
@@ -963,10 +1271,11 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
     let stats = endpoint.stats().await;
     let port_mapping_active = endpoint.port_mapping_active();
     let port_mapping_addr = endpoint.port_mapping_addr();
+    let mdns = endpoint.mdns_snapshot();
 
     if json {
         println!(
-            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{},"port_mapping_active":{},"port_mapping_addr":{}}}"#,
+            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{},"port_mapping_active":{},"port_mapping_addr":{},"mdns_browsing":{},"mdns_advertising":{},"mdns_discovered_peers":{}}}"#,
             stats.active_connections,
             stats.successful_connections,
             stats.failed_connections,
@@ -982,6 +1291,9 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
             port_mapping_addr
                 .map(|addr| format!("\"{}\"", addr))
                 .unwrap_or_else(|| "null".to_string()),
+            mdns.browsing,
+            mdns.advertising,
+            mdns.discovered_peers.len(),
         );
     } else {
         info!("=== Statistics ===");
@@ -1012,6 +1324,9 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
         if let Some(mapped_addr) = port_mapping_addr {
             info!("  Port mapping address: {}", mapped_addr);
         }
+        info!("  mDNS browsing: {}", mdns.browsing);
+        info!("  mDNS advertising: {}", mdns.advertising);
+        info!("  mDNS discovered peers: {}", mdns.discovered_peers.len());
     }
 }
 

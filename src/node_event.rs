@@ -36,6 +36,7 @@
 
 use std::net::SocketAddr;
 
+use crate::mdns::MdnsPeerRecord;
 use crate::nat_traversal_api::PeerId;
 use crate::node_status::NatType;
 pub use crate::reachability::TraversalMethod;
@@ -118,6 +119,30 @@ pub enum NodeEvent {
         addr: TransportAddr,
     },
 
+    /// Best-effort router port mapping was established.
+    PortMappingEstablished {
+        /// The mapped external address.
+        external_addr: SocketAddr,
+    },
+
+    /// Best-effort router port mapping was renewed.
+    PortMappingRenewed {
+        /// The mapped external address.
+        external_addr: SocketAddr,
+    },
+
+    /// Best-effort router port mapping failed.
+    PortMappingFailed {
+        /// Human-readable failure detail.
+        error: String,
+    },
+
+    /// Best-effort router port mapping was removed or became inactive.
+    PortMappingRemoved {
+        /// The last mapped external address, when known.
+        external_addr: Option<SocketAddr>,
+    },
+
     /// NAT type detected
     NatTypeDetected {
         /// The detected NAT type
@@ -168,6 +193,77 @@ pub enum NodeEvent {
         success: bool,
     },
 
+    // --- mDNS Events ---
+    /// The local endpoint is advertising itself via first-party mDNS.
+    MdnsServiceAdvertised {
+        /// Service/application scope being advertised.
+        service: String,
+        /// Namespace/workspace scope, if configured.
+        namespace: Option<String>,
+        /// Full DNS-SD instance name being advertised.
+        instance_fullname: String,
+    },
+
+    /// A peer was discovered via first-party mDNS.
+    MdnsPeerDiscovered {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A previously discovered mDNS peer was updated.
+    MdnsPeerUpdated {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A previously discovered mDNS peer was removed.
+    MdnsPeerRemoved {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A discovered mDNS peer passed local eligibility checks.
+    MdnsPeerEligible {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A discovered mDNS peer was rejected by local eligibility checks.
+    MdnsPeerIneligible {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Human-readable reason for rejection.
+        reason: String,
+    },
+
+    /// An mDNS-driven auto-connect attempt was scheduled.
+    MdnsAutoConnectAttempted {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Candidate addresses routed through the unified connect path.
+        addresses: Vec<SocketAddr>,
+    },
+
+    /// An mDNS-driven auto-connect attempt succeeded.
+    MdnsAutoConnectSucceeded {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Authenticated peer identity learned from QUIC.
+        authenticated_peer_id: PeerId,
+        /// Connected remote transport address.
+        remote_addr: TransportAddr,
+    },
+
+    /// An mDNS-driven auto-connect attempt failed.
+    MdnsAutoConnectFailed {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Candidate addresses routed through the unified connect path.
+        addresses: Vec<SocketAddr>,
+        /// Human-readable failure detail.
+        error: String,
+    },
+
     // --- Data Events ---
     /// Data received from a peer
     DataReceived {
@@ -206,6 +302,10 @@ impl NodeEvent {
         matches!(
             self,
             Self::ExternalAddressDiscovered { .. }
+                | Self::PortMappingEstablished { .. }
+                | Self::PortMappingRenewed { .. }
+                | Self::PortMappingFailed { .. }
+                | Self::PortMappingRemoved { .. }
                 | Self::NatTypeDetected { .. }
                 | Self::NatTraversalComplete { .. }
         )
@@ -242,6 +342,10 @@ impl NodeEvent {
             Self::RelaySessionEnded { peer_id, .. } => Some(peer_id),
             Self::DataReceived { peer_id, .. } => Some(peer_id),
             Self::DataSent { peer_id, .. } => Some(peer_id),
+            Self::MdnsAutoConnectSucceeded {
+                authenticated_peer_id,
+                ..
+            } => Some(authenticated_peer_id),
             _ => None,
         }
     }

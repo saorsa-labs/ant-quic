@@ -140,6 +140,15 @@ pub struct NodeStatus {
     /// The currently mapped public address, if router port mapping is active.
     pub port_mapping_addr: Option<SocketAddr>,
 
+    /// Whether first-party mDNS browsing is currently active.
+    pub mdns_browsing: bool,
+
+    /// Whether first-party mDNS advertisement is currently active.
+    pub mdns_advertising: bool,
+
+    /// Number of currently eligible peers surfaced by first-party mDNS.
+    pub mdns_discovered_peers: usize,
+
     // --- Connections ---
     /// Number of connected peers
     pub connected_peers: usize,
@@ -212,6 +221,9 @@ impl Default for NodeStatus {
             has_global_address: false,
             port_mapping_active: false,
             port_mapping_addr: None,
+            mdns_browsing: false,
+            mdns_advertising: false,
+            mdns_discovered_peers: 0,
             connected_peers: 0,
             active_connections: 0,
             pending_connections: 0,
@@ -292,6 +304,9 @@ mod tests {
         assert!(!status.has_global_address);
         assert!(!status.port_mapping_active);
         assert_eq!(status.port_mapping_addr, None);
+        assert!(!status.mdns_browsing);
+        assert!(!status.mdns_advertising);
+        assert_eq!(status.mdns_discovered_peers, 0);
         assert_eq!(status.connected_peers, 0);
         assert!(!status.is_relaying);
         assert!(!status.is_coordinating);
@@ -424,5 +439,17 @@ mod tests {
 
         assert!(status.port_mapping_active);
         assert_eq!(status.port_mapping_addr, Some(mapped_addr));
+    }
+
+    #[test]
+    fn test_mdns_status_fields() {
+        let mut status = NodeStatus::default();
+        status.mdns_browsing = true;
+        status.mdns_advertising = true;
+        status.mdns_discovered_peers = 2;
+
+        assert!(status.mdns_browsing);
+        assert!(status.mdns_advertising);
+        assert_eq!(status.mdns_discovered_peers, 2);
     }
 }

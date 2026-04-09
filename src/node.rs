@@ -353,6 +353,16 @@ impl Node {
             P2pEvent::ExternalAddressDiscovered { addr } => {
                 Some(NodeEvent::ExternalAddressDiscovered { addr })
             }
+            P2pEvent::PortMappingEstablished { external_addr } => {
+                Some(NodeEvent::PortMappingEstablished { external_addr })
+            }
+            P2pEvent::PortMappingRenewed { external_addr } => {
+                Some(NodeEvent::PortMappingRenewed { external_addr })
+            }
+            P2pEvent::PortMappingFailed { error } => Some(NodeEvent::PortMappingFailed { error }),
+            P2pEvent::PortMappingRemoved { external_addr } => {
+                Some(NodeEvent::PortMappingRemoved { external_addr })
+            }
             P2pEvent::DataReceived { peer_id, bytes } => Some(NodeEvent::DataReceived {
                 peer_id,
                 stream_id: 0, // P2pEvent doesn't track stream IDs
@@ -381,6 +391,43 @@ impl Node {
                     bytes: data.len(),
                 })
             }
+            P2pEvent::MdnsServiceAdvertised {
+                service,
+                namespace,
+                instance_fullname,
+            } => Some(NodeEvent::MdnsServiceAdvertised {
+                service,
+                namespace,
+                instance_fullname,
+            }),
+            P2pEvent::MdnsPeerDiscovered { peer } => Some(NodeEvent::MdnsPeerDiscovered { peer }),
+            P2pEvent::MdnsPeerUpdated { peer } => Some(NodeEvent::MdnsPeerUpdated { peer }),
+            P2pEvent::MdnsPeerRemoved { peer } => Some(NodeEvent::MdnsPeerRemoved { peer }),
+            P2pEvent::MdnsPeerEligible { peer } => Some(NodeEvent::MdnsPeerEligible { peer }),
+            P2pEvent::MdnsPeerIneligible { peer, reason } => {
+                Some(NodeEvent::MdnsPeerIneligible { peer, reason })
+            }
+            P2pEvent::MdnsAutoConnectAttempted { peer, addresses } => {
+                Some(NodeEvent::MdnsAutoConnectAttempted { peer, addresses })
+            }
+            P2pEvent::MdnsAutoConnectSucceeded {
+                peer,
+                authenticated_peer_id,
+                remote_addr,
+            } => Some(NodeEvent::MdnsAutoConnectSucceeded {
+                peer,
+                authenticated_peer_id,
+                remote_addr,
+            }),
+            P2pEvent::MdnsAutoConnectFailed {
+                peer,
+                addresses,
+                error,
+            } => Some(NodeEvent::MdnsAutoConnectFailed {
+                peer,
+                addresses,
+                error,
+            }),
             // Events without direct NodeEvent equivalents are ignored
             P2pEvent::NatTraversalProgress { .. }
             | P2pEvent::BootstrapStatus { .. }
@@ -579,6 +626,7 @@ impl Node {
                     .is_some_and(|scope| scope == crate::ReachabilityScope::Global)
             });
         let port_mapping = self.inner.port_mapping_snapshot();
+        let mdns = self.inner.mdns_snapshot();
 
         // A node is directly reachable only after fresh, peer-verified direct
         // inbound evidence. Scope is freshness-aware too, so an old global
@@ -650,6 +698,9 @@ impl Node {
             has_global_address,
             port_mapping_active: port_mapping.active,
             port_mapping_addr: port_mapping.external_addr,
+            mdns_browsing: mdns.browsing,
+            mdns_advertising: mdns.advertising,
+            mdns_discovered_peers: mdns.discovered_peers.len(),
             connected_peers: connected_peers.len(),
             active_connections: stats.active_connections,
             pending_connections: 0, // Not tracked yet

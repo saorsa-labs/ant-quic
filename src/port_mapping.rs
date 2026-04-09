@@ -20,6 +20,14 @@ pub(crate) struct PortMappingSnapshot {
     pub external_addr: Option<SocketAddr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PortMappingEvent {
+    Established { snapshot: PortMappingSnapshot },
+    Renewed { snapshot: PortMappingSnapshot },
+    Failed { error: String },
+    Removed { external_addr: Option<SocketAddr> },
+}
+
 #[derive(Debug, thiserror::Error)]
 enum PortMappingError {
     #[error("gateway discovery failed: {0}")]
@@ -160,7 +168,7 @@ pub(crate) fn spawn_best_effort_port_mapping<F>(
     shutdown: CancellationToken,
     on_update: F,
 ) where
-    F: FnMut(PortMappingSnapshot) + Send + 'static,
+    F: FnMut(PortMappingEvent) + Send + 'static,
 {
     tokio::spawn(async move {
         run_port_mapping_lifecycle(
@@ -182,10 +190,11 @@ async fn run_port_mapping_lifecycle<D, F>(
     mut on_update: F,
 ) where
     D: GatewayDiscoverer,
-    F: FnMut(PortMappingSnapshot) + Send,
+    F: FnMut(PortMappingEvent) + Send,
 {
     let mut published_snapshot = PortMappingSnapshot::default();
     let mut active_mapping: Option<ActivePortMapping> = None;
+    let mut last_failure: Option<String> = None;
 
     loop {
         if shutdown.is_cancelled() {
@@ -195,11 +204,13 @@ async fn run_port_mapping_lifecycle<D, F>(
         if active_mapping.is_none() {
             match establish_mapping(&discoverer, config, internal_port).await {
                 Ok(mapping) => {
+                    last_failure = None;
                     let snapshot = PortMappingSnapshot {
                         active: true,
                         external_addr: Some(mapping.external_addr),
                     };
                     publish_snapshot(&mut published_snapshot, snapshot, &mut on_update);
+                    on_update(PortMappingEvent::Established { snapshot });
                     info!(
                         internal_addr = %mapping.local_addr,
                         external_addr = %mapping.external_addr,
@@ -208,6 +219,13 @@ async fn run_port_mapping_lifecycle<D, F>(
                     active_mapping = Some(mapping);
                 }
                 Err(error) => {
+                    let error_message = error.to_string();
+                    if last_failure.as_deref() != Some(error_message.as_str()) {
+                        on_update(PortMappingEvent::Failed {
+                            error: error_message.clone(),
+                        });
+                        last_failure = Some(error_message);
+                    }
                     debug!(error = %error, "Best-effort router port mapping unavailable");
                     publish_snapshot(
                         &mut published_snapshot,
@@ -236,23 +254,25 @@ async fn run_port_mapping_lifecycle<D, F>(
 
         match renew_mapping(mapping, config).await {
             Ok(changed) => {
+                last_failure = None;
+                let snapshot = PortMappingSnapshot {
+                    active: true,
+                    external_addr: Some(mapping.external_addr),
+                };
                 if changed {
-                    publish_snapshot(
-                        &mut published_snapshot,
-                        PortMappingSnapshot {
-                            active: true,
-                            external_addr: Some(mapping.external_addr),
-                        },
-                        &mut on_update,
-                    );
+                    publish_snapshot(&mut published_snapshot, snapshot, &mut on_update);
                     info!(
                         internal_addr = %mapping.local_addr,
                         external_addr = %mapping.external_addr,
                         "Best-effort router port mapping external address refreshed"
                     );
                 }
+                on_update(PortMappingEvent::Renewed { snapshot });
             }
             Err(error) => {
+                on_update(PortMappingEvent::Failed {
+                    error: error.to_string(),
+                });
                 warn!(
                     error = %error,
                     external_addr = %mapping.external_addr,
@@ -266,6 +286,9 @@ async fn run_port_mapping_lifecycle<D, F>(
                 );
                 if let Some(mapping) = failed_mapping.as_ref() {
                     let _ = cleanup_mapping(mapping).await;
+                    on_update(PortMappingEvent::Removed {
+                        external_addr: Some(mapping.external_addr),
+                    });
                 }
             }
         }
@@ -279,6 +302,9 @@ async fn run_port_mapping_lifecycle<D, F>(
                 "Best-effort router port-mapping cleanup failed during shutdown"
             );
         }
+        on_update(PortMappingEvent::Removed {
+            external_addr: Some(mapping.external_addr),
+        });
     }
 
     publish_snapshot(
@@ -418,13 +444,12 @@ fn renewal_interval(lease_duration_secs: u32) -> Duration {
 fn publish_snapshot<F>(
     published_snapshot: &mut PortMappingSnapshot,
     next_snapshot: PortMappingSnapshot,
-    on_update: &mut F,
+    _on_update: &mut F,
 ) where
-    F: FnMut(PortMappingSnapshot),
+    F: FnMut(PortMappingEvent),
 {
     if *published_snapshot != next_snapshot {
         *published_snapshot = next_snapshot;
-        on_update(next_snapshot);
     }
 }
 
@@ -550,37 +575,37 @@ mod tests {
         }
     }
 
-    fn collect_updates() -> (
-        Arc<Mutex<Vec<PortMappingSnapshot>>>,
-        impl FnMut(PortMappingSnapshot) + Send + 'static,
+    fn collect_events() -> (
+        Arc<Mutex<Vec<PortMappingEvent>>>,
+        impl FnMut(PortMappingEvent) + Send + 'static,
     ) {
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let updates_clone = Arc::clone(&updates);
-        let on_update = move |snapshot: PortMappingSnapshot| {
-            updates_clone
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_update = move |event: PortMappingEvent| {
+            events_clone
                 .lock()
-                .expect("lock port-mapping updates")
-                .push(snapshot);
+                .expect("lock port-mapping events")
+                .push(event);
         };
-        (updates, on_update)
+        (events, on_update)
     }
 
-    async fn wait_for_updates(
-        updates: &Arc<Mutex<Vec<PortMappingSnapshot>>>,
+    async fn wait_for_events(
+        events: &Arc<Mutex<Vec<PortMappingEvent>>>,
         min_len: usize,
-    ) -> Vec<PortMappingSnapshot> {
+    ) -> Vec<PortMappingEvent> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let snapshot = updates.lock().expect("lock updates").clone();
-            if snapshot.len() >= min_len {
-                return snapshot;
+            let current = events.lock().expect("lock events").clone();
+            if current.len() >= min_len {
+                return current;
             }
 
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for {} port-mapping updates; got {:?}",
+                "timed out waiting for {} port-mapping events; got {:?}",
                 min_len,
-                snapshot
+                current
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -634,7 +659,7 @@ mod tests {
             failures_before_success: AtomicUsize::new(0),
         };
         let shutdown = CancellationToken::new();
-        let (updates, on_update) = collect_updates();
+        let (events, on_update) = collect_events();
 
         let task = tokio::spawn(run_port_mapping_lifecycle(
             discoverer,
@@ -644,12 +669,14 @@ mod tests {
             on_update,
         ));
 
-        let snapshots = wait_for_updates(&updates, 1).await;
+        let events = wait_for_events(&events, 1).await;
         assert_eq!(
-            snapshots[0],
-            PortMappingSnapshot {
-                active: true,
-                external_addr: Some("203.0.113.10:31000".parse().expect("valid mapped addr")),
+            events[0],
+            PortMappingEvent::Established {
+                snapshot: PortMappingSnapshot {
+                    active: true,
+                    external_addr: Some("203.0.113.10:31000".parse().expect("valid mapped addr")),
+                },
             }
         );
 
@@ -686,7 +713,7 @@ mod tests {
             failures_before_success: AtomicUsize::new(0),
         };
         let shutdown = CancellationToken::new();
-        let (updates, on_update) = collect_updates();
+        let (events, on_update) = collect_events();
 
         let task = tokio::spawn(run_port_mapping_lifecycle(
             discoverer,
@@ -696,11 +723,12 @@ mod tests {
             on_update,
         ));
 
-        let snapshots = wait_for_updates(&updates, 1).await;
-        assert_eq!(
-            snapshots[0].external_addr,
-            Some("203.0.113.20:41000".parse().expect("valid mapped addr"))
-        );
+        let events = wait_for_events(&events, 1).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PortMappingEvent::Established { snapshot }
+                if snapshot.external_addr == Some("203.0.113.20:41000".parse().expect("valid mapped addr"))
+        )));
         assert_eq!(
             *gateway
                 .add_any_port_calls
@@ -730,7 +758,7 @@ mod tests {
             failures_before_success: AtomicUsize::new(0),
         };
         let shutdown = CancellationToken::new();
-        let (_updates, on_update) = collect_updates();
+        let (_events, on_update) = collect_events();
 
         let task = tokio::spawn(run_port_mapping_lifecycle(
             discoverer,
@@ -778,7 +806,7 @@ mod tests {
             failures_before_success: AtomicUsize::new(0),
         };
         let shutdown = CancellationToken::new();
-        let (updates, on_update) = collect_updates();
+        let (events, on_update) = collect_events();
 
         let task = tokio::spawn(run_port_mapping_lifecycle(
             discoverer,
@@ -791,20 +819,22 @@ mod tests {
             on_update,
         ));
 
-        let initial = wait_for_updates(&updates, 1).await;
-        assert_eq!(
-            initial[0].external_addr,
-            Some("203.0.113.31:31012".parse().expect("valid mapped addr"))
-        );
+        let initial = wait_for_events(&events, 1).await;
+        assert!(initial.iter().any(|event| matches!(
+            event,
+            PortMappingEvent::Established { snapshot }
+                if snapshot.external_addr == Some("203.0.113.31:31012".parse().expect("valid mapped addr"))
+        )));
 
         *gateway.external_ip.lock().expect("lock external_ip") =
             "203.0.113.99".parse().expect("valid external IP");
 
-        let refreshed = wait_for_updates(&updates, 2).await;
-        assert_eq!(
-            refreshed[1].external_addr,
-            Some("203.0.113.99:31012".parse().expect("valid refreshed addr"))
-        );
+        let refreshed = wait_for_events(&events, 2).await;
+        assert!(refreshed.iter().any(|event| matches!(
+            event,
+            PortMappingEvent::Renewed { snapshot }
+                if snapshot.external_addr == Some("203.0.113.99:31012".parse().expect("valid refreshed addr"))
+        )));
 
         shutdown.cancel();
         task.await.expect("port-mapping task should exit cleanly");
@@ -821,7 +851,7 @@ mod tests {
             failures_before_success: AtomicUsize::new(10),
         };
         let shutdown = CancellationToken::new();
-        let (updates, on_update) = collect_updates();
+        let (events, on_update) = collect_events();
 
         let task = tokio::spawn(run_port_mapping_lifecycle(
             discoverer,
@@ -835,10 +865,12 @@ mod tests {
         shutdown.cancel();
         task.await.expect("port-mapping task should exit cleanly");
 
-        let snapshots = updates.lock().expect("lock updates").clone();
+        let snapshots = events.lock().expect("lock events").clone();
         assert!(
-            snapshots.is_empty(),
-            "discovery failure should remain non-fatal and not publish active snapshots"
+            snapshots
+                .iter()
+                .all(|event| matches!(event, PortMappingEvent::Failed { .. })),
+            "discovery failure should remain non-fatal and only publish failure events"
         );
     }
 

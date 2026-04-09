@@ -166,6 +166,8 @@ pub mod node_config;
 pub mod node_status;
 
 mod coordinator_control;
+/// First-party mDNS discovery state and query types
+pub mod mdns;
 /// Unified events for P2P nodes
 pub mod node_event;
 mod port_mapping;

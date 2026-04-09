@@ -49,8 +49,8 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -76,11 +76,12 @@ use crate::crypto::raw_public_keys::key_utils::{
     derive_peer_id_from_public_key, generate_ml_dsa_keypair,
 };
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
+use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
 };
-use crate::port_mapping::{PortMappingSnapshot, spawn_best_effort_port_mapping};
+use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effort_port_mapping};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
@@ -192,6 +193,12 @@ pub struct P2pEndpoint {
 
     /// Best-effort router port-mapping state.
     port_mapping_state: Arc<ParkingRwLock<PortMappingSnapshot>>,
+
+    /// First-party mDNS runtime state.
+    mdns_state: Arc<ParkingRwLock<MdnsSnapshot>>,
+
+    /// Tracks in-flight mDNS auto-connect attempts by service fullname.
+    mdns_auto_connect_inflight: Arc<ParkingRwLock<HashSet<String>>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
@@ -451,6 +458,100 @@ pub enum P2pEvent {
     RelayEstablished {
         /// The relay's public address (relay_IP:PORT)
         relay_addr: SocketAddr,
+    },
+
+    /// Best-effort router port mapping was established.
+    PortMappingEstablished {
+        /// The currently mapped external address.
+        external_addr: SocketAddr,
+    },
+
+    /// Best-effort router port mapping was renewed.
+    PortMappingRenewed {
+        /// The currently mapped external address.
+        external_addr: SocketAddr,
+    },
+
+    /// Best-effort router port mapping failed.
+    PortMappingFailed {
+        /// Human-readable failure detail.
+        error: String,
+    },
+
+    /// Best-effort router port mapping was removed or became inactive.
+    PortMappingRemoved {
+        /// The last mapped external address, when known.
+        external_addr: Option<SocketAddr>,
+    },
+
+    /// The local endpoint is advertising itself via first-party mDNS.
+    MdnsServiceAdvertised {
+        /// Service/application scope being advertised.
+        service: String,
+        /// Namespace/workspace scope, if configured.
+        namespace: Option<String>,
+        /// Full DNS-SD instance name being advertised.
+        instance_fullname: String,
+    },
+
+    /// A peer was discovered via first-party mDNS.
+    MdnsPeerDiscovered {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A previously discovered mDNS peer was updated.
+    MdnsPeerUpdated {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A previously discovered mDNS peer was removed.
+    MdnsPeerRemoved {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A discovered mDNS peer passed local eligibility checks.
+    MdnsPeerEligible {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+    },
+
+    /// A discovered mDNS peer was rejected by local eligibility checks.
+    MdnsPeerIneligible {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Human-readable reason for rejection.
+        reason: String,
+    },
+
+    /// An mDNS-driven auto-connect attempt was scheduled.
+    MdnsAutoConnectAttempted {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Candidate addresses routed through the unified connect path.
+        addresses: Vec<SocketAddr>,
+    },
+
+    /// An mDNS-driven auto-connect attempt succeeded.
+    MdnsAutoConnectSucceeded {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Authenticated peer identity learned from QUIC.
+        authenticated_peer_id: PeerId,
+        /// Connected remote transport address.
+        remote_addr: TransportAddr,
+    },
+
+    /// An mDNS-driven auto-connect attempt failed.
+    MdnsAutoConnectFailed {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Candidate addresses routed through the unified connect path.
+        addresses: Vec<SocketAddr>,
+        /// Human-readable failure detail.
+        error: String,
     },
 
     /// Bootstrap connection status
@@ -976,6 +1077,8 @@ impl P2pEndpoint {
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
             manual_known_peer_udp_addrs: Arc::new(RwLock::new(Vec::new())),
             port_mapping_state: Arc::new(ParkingRwLock::new(PortMappingSnapshot::default())),
+            mdns_state: Arc::new(ParkingRwLock::new(MdnsSnapshot::default())),
+            mdns_auto_connect_inflight: Arc::new(ParkingRwLock::new(HashSet::new())),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -994,6 +1097,7 @@ impl P2pEndpoint {
         // millisecond disconnect detection vs the 30-second reaper interval.
         endpoint.spawn_reader_exit_handler();
         endpoint.spawn_port_mapping_task();
+        endpoint.spawn_mdns_task();
 
         Ok(endpoint)
     }
@@ -1059,6 +1163,11 @@ impl P2pEndpoint {
     /// Returns the currently mapped public address, if router port mapping is active.
     pub fn port_mapping_addr(&self) -> Option<SocketAddr> {
         self.port_mapping_snapshot().external_addr
+    }
+
+    /// Returns the current first-party mDNS runtime snapshot.
+    pub fn mdns_snapshot(&self) -> MdnsSnapshot {
+        self.mdns_state.read().clone()
     }
 
     /// Get the transport registry for this endpoint
@@ -3215,6 +3324,11 @@ impl P2pEndpoint {
         } else {
             Vec::new()
         };
+        let mdns_discovered_peers = if self.mdns_auto_connect_enabled() {
+            self.mdns_snapshot().discovered_peers
+        } else {
+            Vec::new()
+        };
         let manual_udp_known_peers = self.manual_known_peer_udp_addrs.read().await.clone();
         let runtime_udp_known_peers = self.runtime_known_peer_udp_addrs();
         let auto_runtime_udp_known_peers = if self.config.discovery.auto_connect
@@ -3280,6 +3394,41 @@ impl P2pEndpoint {
             }
         }
 
+        for peer in &mdns_discovered_peers {
+            if peer
+                .addresses
+                .iter()
+                .all(|addr| connected_udp_addrs.contains(addr))
+            {
+                continue;
+            }
+
+            match self
+                .connect_orchestrated(None, peer.addresses.clone())
+                .await
+            {
+                Ok(_) => {
+                    connected += 1;
+                    for addr in &peer.addresses {
+                        connected_udp_addrs.insert(*addr);
+                    }
+                    info!(
+                        fullname = %peer.fullname,
+                        addresses = ?peer.addresses,
+                        "Connected to eligible mDNS-discovered peer"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        fullname = %peer.fullname,
+                        addresses = ?peer.addresses,
+                        error = %error,
+                        "Failed to connect to eligible mDNS-discovered peer"
+                    );
+                }
+            }
+        }
+
         {
             let mut stats = self.stats.write().await;
             stats.connected_bootstrap_nodes = connected;
@@ -3304,7 +3453,8 @@ impl P2pEndpoint {
                         .any(|known| known == **addr)
                         && !manual_udp_known_peers.contains(addr)
                 })
-                .count();
+                .count()
+            + mdns_discovered_peers.len();
 
         let _ = self
             .event_tx
@@ -3450,8 +3600,217 @@ impl P2pEndpoint {
             self.config.nat.port_mapping,
             local_addr.port(),
             self.shutdown.clone(),
-            move |snapshot| endpoint.apply_port_mapping_snapshot(snapshot),
+            move |event| endpoint.apply_port_mapping_event(event),
         );
+    }
+
+    fn mdns_auto_connect_enabled(&self) -> bool {
+        self.config.discovery.mdns.as_ref().is_some_and(|mdns| {
+            mdns.enabled && mdns.auto_connect == crate::unified_config::AutoConnectPolicy::Enabled
+        })
+    }
+
+    fn spawn_mdns_task(&self) {
+        let Some(mdns) = self.config.discovery.mdns.clone() else {
+            return;
+        };
+        if !mdns.enabled {
+            return;
+        }
+
+        let Some(local_addr) = self.local_addr() else {
+            warn!("Skipping first-party mDNS because local bind address is unavailable");
+            return;
+        };
+
+        #[cfg(not(feature = "mdns-discovery"))]
+        {
+            warn!(
+                service = mdns.service.as_deref().unwrap_or_default(),
+                "mDNS was configured but the mdns-discovery feature is not enabled"
+            );
+            return;
+        }
+
+        #[cfg(feature = "mdns-discovery")]
+        {
+            {
+                let mut snapshot = self.mdns_state.write();
+                snapshot.browsing = mdns.mode.browse_enabled();
+                snapshot.service = mdns.service.clone();
+                snapshot.namespace = mdns.namespace.clone();
+            }
+
+            let endpoint = self.clone();
+            spawn_mdns_runtime(
+                mdns,
+                self.peer_id,
+                local_addr.port(),
+                self.shutdown.clone(),
+                move |event| endpoint.apply_mdns_runtime_event(event),
+            );
+        }
+    }
+
+    fn apply_mdns_runtime_event(&self, event: MdnsRuntimeEvent) {
+        match event {
+            MdnsRuntimeEvent::ServiceAdvertised {
+                service,
+                namespace,
+                instance_fullname,
+            } => {
+                {
+                    let mut snapshot = self.mdns_state.write();
+                    snapshot.advertising = true;
+                    snapshot.service = Some(service.clone());
+                    snapshot.namespace = namespace.clone();
+                    snapshot.advertised_instance_fullname = Some(instance_fullname.clone());
+                }
+                let _ = self.event_tx.send(P2pEvent::MdnsServiceAdvertised {
+                    service,
+                    namespace,
+                    instance_fullname,
+                });
+            }
+            MdnsRuntimeEvent::PeerDiscovered(peer) => {
+                self.upsert_mdns_peer(&peer);
+                let _ = self.event_tx.send(P2pEvent::MdnsPeerDiscovered { peer });
+            }
+            MdnsRuntimeEvent::PeerUpdated(peer) => {
+                self.upsert_mdns_peer(&peer);
+                let _ = self.event_tx.send(P2pEvent::MdnsPeerUpdated { peer });
+            }
+            MdnsRuntimeEvent::PeerRemoved(peer) => {
+                self.remove_mdns_peer(&peer.fullname);
+                let _ = self.event_tx.send(P2pEvent::MdnsPeerRemoved { peer });
+            }
+            MdnsRuntimeEvent::PeerEligible(peer) => {
+                self.upsert_mdns_peer(&peer);
+                let _ = self
+                    .event_tx
+                    .send(P2pEvent::MdnsPeerEligible { peer: peer.clone() });
+                if self.mdns_auto_connect_enabled() {
+                    self.schedule_mdns_auto_connect(peer);
+                }
+            }
+            MdnsRuntimeEvent::PeerIneligible { peer, reason } => {
+                self.remove_mdns_peer(&peer.fullname);
+                let _ = self
+                    .event_tx
+                    .send(P2pEvent::MdnsPeerIneligible { peer, reason });
+            }
+        }
+    }
+
+    fn upsert_mdns_peer(&self, peer: &MdnsPeerRecord) {
+        let mut snapshot = self.mdns_state.write();
+        if let Some(existing) = snapshot
+            .discovered_peers
+            .iter_mut()
+            .find(|existing| existing.fullname == peer.fullname)
+        {
+            *existing = peer.clone();
+        } else {
+            snapshot.discovered_peers.push(peer.clone());
+            snapshot
+                .discovered_peers
+                .sort_by(|left, right| left.fullname.cmp(&right.fullname));
+        }
+    }
+
+    fn remove_mdns_peer(&self, fullname: &str) {
+        let mut snapshot = self.mdns_state.write();
+        snapshot
+            .discovered_peers
+            .retain(|peer| peer.fullname != fullname);
+    }
+
+    fn schedule_mdns_auto_connect(&self, peer: MdnsPeerRecord) {
+        if peer.addresses.is_empty() {
+            return;
+        }
+
+        {
+            let mut inflight = self.mdns_auto_connect_inflight.write();
+            if !inflight.insert(peer.fullname.clone()) {
+                return;
+            }
+        }
+
+        let endpoint = self.clone();
+        tokio::spawn(async move {
+            let fullname = peer.fullname.clone();
+            let addresses = peer.addresses.clone();
+
+            if endpoint
+                .find_live_connection_for_addrs(&addresses)
+                .await
+                .is_none()
+            {
+                let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectAttempted {
+                    peer: peer.clone(),
+                    addresses: addresses.clone(),
+                });
+
+                match endpoint.connect_orchestrated(None, addresses.clone()).await {
+                    Ok(connection) => {
+                        let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectSucceeded {
+                            peer,
+                            authenticated_peer_id: connection.peer_id,
+                            remote_addr: connection.remote_addr,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectFailed {
+                            peer,
+                            addresses,
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            }
+
+            endpoint
+                .mdns_auto_connect_inflight
+                .write()
+                .remove(&fullname);
+        });
+    }
+
+    fn apply_port_mapping_event(&self, event: PortMappingEvent) {
+        match event {
+            PortMappingEvent::Established { snapshot } => {
+                self.apply_port_mapping_snapshot(snapshot);
+                if let Some(mapped_addr) = snapshot.external_addr {
+                    let _ = self.event_tx.send(P2pEvent::PortMappingEstablished {
+                        external_addr: mapped_addr,
+                    });
+                    let _ = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
+                        addr: TransportAddr::Udp(mapped_addr),
+                    });
+                }
+            }
+            PortMappingEvent::Renewed { snapshot } => {
+                self.apply_port_mapping_snapshot(snapshot);
+                if let Some(mapped_addr) = snapshot.external_addr {
+                    let _ = self.event_tx.send(P2pEvent::PortMappingRenewed {
+                        external_addr: mapped_addr,
+                    });
+                    let _ = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
+                        addr: TransportAddr::Udp(mapped_addr),
+                    });
+                }
+            }
+            PortMappingEvent::Failed { error } => {
+                let _ = self.event_tx.send(P2pEvent::PortMappingFailed { error });
+            }
+            PortMappingEvent::Removed { external_addr } => {
+                self.apply_port_mapping_snapshot(PortMappingSnapshot::default());
+                let _ = self
+                    .event_tx
+                    .send(P2pEvent::PortMappingRemoved { external_addr });
+            }
+        }
     }
 
     fn apply_port_mapping_snapshot(&self, snapshot: PortMappingSnapshot) {
@@ -3462,22 +3821,21 @@ impl P2pEndpoint {
             previous
         };
 
-        if let Some(previous_addr) = previous_addr {
-            if snapshot.external_addr != Some(previous_addr) {
-                let _ = self.inner.remove_local_external_candidate(previous_addr);
-            }
+        if let Some(previous_addr) = previous_addr
+            && snapshot.external_addr != Some(previous_addr)
+        {
+            let _ = self.inner.remove_local_external_candidate(previous_addr);
         }
 
-        if snapshot.active {
-            if let Some(mapped_addr) = snapshot.external_addr {
-                if let Err(error) = self.inner.add_local_external_candidate(mapped_addr) {
-                    warn!(
-                        error = %error,
-                        mapped_addr = %mapped_addr,
-                        "Failed to add router-mapped address to the NAT candidate set"
-                    );
-                }
-            }
+        if snapshot.active
+            && let Some(mapped_addr) = snapshot.external_addr
+            && let Err(error) = self.inner.add_local_external_candidate(mapped_addr)
+        {
+            warn!(
+                error = %error,
+                mapped_addr = %mapped_addr,
+                "Failed to add router-mapped address to the NAT candidate set"
+            );
         }
     }
 
@@ -3922,6 +4280,8 @@ impl Clone for P2pEndpoint {
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
             manual_known_peer_udp_addrs: Arc::clone(&self.manual_known_peer_udp_addrs),
             port_mapping_state: Arc::clone(&self.port_mapping_state),
+            mdns_state: Arc::clone(&self.mdns_state),
+            mdns_auto_connect_inflight: Arc::clone(&self.mdns_auto_connect_inflight),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
@@ -4299,6 +4659,281 @@ mod tests {
 
             endpoint.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_event_surfaces_lifecycle_and_external_address() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        if let Ok(endpoint) = P2pEndpoint::new(config).await {
+            let mut events = endpoint.subscribe();
+            let mapped_addr: SocketAddr = "198.51.100.88:42000".parse().expect("valid addr");
+
+            endpoint.apply_port_mapping_event(PortMappingEvent::Established {
+                snapshot: PortMappingSnapshot {
+                    active: true,
+                    external_addr: Some(mapped_addr),
+                },
+            });
+            endpoint.apply_port_mapping_event(PortMappingEvent::Failed {
+                error: "simulated failure".to_string(),
+            });
+            endpoint.apply_port_mapping_event(PortMappingEvent::Removed {
+                external_addr: Some(mapped_addr),
+            });
+
+            let collected: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert!(collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::PortMappingEstablished { external_addr }
+                    if *external_addr == mapped_addr
+            )));
+            assert!(collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::ExternalAddressDiscovered { addr }
+                    if addr.as_socket_addr() == Some(mapped_addr)
+            )));
+            assert!(collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::PortMappingFailed { error } if error == "simulated failure"
+            )));
+            assert!(collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::PortMappingRemoved { external_addr }
+                    if *external_addr == Some(mapped_addr)
+            )));
+
+            endpoint.shutdown().await;
+        }
+    }
+
+    fn localhost_addr(addr: SocketAddr) -> SocketAddr {
+        if addr.ip().is_unspecified() {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+        } else {
+            addr
+        }
+    }
+
+    fn mdns_peer_record(addr: SocketAddr, claimed_peer_id: PeerId) -> MdnsPeerRecord {
+        MdnsPeerRecord {
+            service: "ant-quic".to_string(),
+            fullname: format!(
+                "peer-{}._ant-quic._udp.local.",
+                hex::encode(&claimed_peer_id.0[..4])
+            ),
+            hostname: "peer.local.".to_string(),
+            namespace: Some("workspace-a".to_string()),
+            claimed_peer_id: Some(claimed_peer_id),
+            addresses: vec![addr],
+            metadata: std::collections::BTreeMap::from([
+                ("namespace".to_string(), "workspace-a".to_string()),
+                ("peer_id".to_string(), hex::encode(claimed_peer_id.0)),
+            ]),
+            eligible: true,
+            ineligible_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mdns_discover_only_surfaces_without_auto_connecting() {
+        let node_b = crate::Node::bind(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .await
+        .expect("node_b should bind");
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::BrowseOnly,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::Disabled,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let addr_b = localhost_addr(node_b.local_addr().expect("node_b addr"));
+        endpoint_a.apply_mdns_runtime_event(MdnsRuntimeEvent::PeerEligible(mdns_peer_record(
+            addr_b,
+            node_b.peer_id(),
+        )));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(endpoint_a.connected_peers().await.len(), 0);
+        assert_eq!(endpoint_a.mdns_snapshot().discovered_peers.len(), 1);
+
+        endpoint_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity() {
+        let node_b = crate::Node::bind(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .await
+        .expect("node_b should bind");
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::BrowseOnly,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::Enabled,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let mut events = endpoint_a.subscribe();
+        let accept_handle = tokio::spawn({
+            let node = node_b.clone();
+            async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), node.accept()).await;
+            }
+        });
+
+        let fake_claim = PeerId([0xee; 32]);
+        let addr_b = localhost_addr(node_b.local_addr().expect("node_b addr"));
+        endpoint_a.apply_mdns_runtime_event(MdnsRuntimeEvent::PeerEligible(mdns_peer_record(
+            addr_b, fake_claim,
+        )));
+
+        let success = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await.expect("event should arrive") {
+                    P2pEvent::MdnsAutoConnectSucceeded {
+                        authenticated_peer_id,
+                        ..
+                    } => break authenticated_peer_id,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("mDNS auto-connect success event should arrive");
+
+        assert_eq!(success, node_b.peer_id());
+        assert_ne!(success, fake_claim);
+        assert_eq!(endpoint_a.connected_peers().await.len(), 1);
+
+        endpoint_a.shutdown().await;
+        node_b.shutdown().await;
+        let _ = accept_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_discovered_peer_coexists_with_static_known_peer_dedup() {
+        let node_b = crate::Node::bind(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .await
+        .expect("node_b should bind");
+        let addr_b = localhost_addr(node_b.local_addr().expect("node_b addr"));
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .known_peer(addr_b)
+                .port_mapping_enabled(false)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::BrowseOnly,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::Enabled,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let accept_handle = tokio::spawn({
+            let node = node_b.clone();
+            async move {
+                for _ in 0..2 {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), node.accept()).await;
+                }
+            }
+        });
+
+        endpoint_a.apply_mdns_runtime_event(MdnsRuntimeEvent::PeerDiscovered(mdns_peer_record(
+            addr_b,
+            node_b.peer_id(),
+        )));
+
+        let connected =
+            tokio::time::timeout(Duration::from_secs(10), endpoint_a.connect_known_peers())
+                .await
+                .expect("connect_known_peers should not time out")
+                .expect("connect_known_peers should succeed");
+
+        assert_eq!(connected, 1);
+        assert_eq!(endpoint_a.connected_peers().await.len(), 1);
+
+        endpoint_a.shutdown().await;
+        node_b.shutdown().await;
+        let _ = accept_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_shutdown_is_idempotent() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::Both,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::Disabled,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        endpoint.shutdown().await;
+        endpoint.shutdown().await;
+
+        assert!(!endpoint.is_running());
     }
 
     // ==========================================================================

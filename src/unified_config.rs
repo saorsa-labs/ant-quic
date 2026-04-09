@@ -23,6 +23,7 @@
 //!     .build()?;
 //! ```
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,17 +45,59 @@ pub enum AutoConnectPolicy {
     Enabled,
 }
 
-/// Lightweight placeholder configuration for optional mDNS discovery.
+/// Mode controlling whether the local node browses, advertises, or does both via mDNS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MdnsMode {
+    /// Browse for peers and advertise this local endpoint.
+    #[default]
+    Both,
+    /// Browse for peers without advertising the local endpoint.
+    BrowseOnly,
+    /// Advertise the local endpoint without browsing for peers.
+    AdvertiseOnly,
+}
+
+impl MdnsMode {
+    /// Returns whether browsing is enabled in this mode.
+    pub const fn browse_enabled(self) -> bool {
+        matches!(self, Self::Both | Self::BrowseOnly)
+    }
+
+    /// Returns whether advertising is enabled in this mode.
+    pub const fn advertise_enabled(self) -> bool {
+        matches!(self, Self::Both | Self::AdvertiseOnly)
+    }
+}
+
+/// Configuration for optional first-party mDNS discovery/runtime integration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MdnsConfig {
     /// Whether mDNS discovery is enabled.
     pub enabled: bool,
-    /// Optional service name scope.
+
+    /// Service/application scope to browse and advertise.
+    ///
+    /// This becomes the mDNS service type label. It should be a short DNS-SD
+    /// service identifier such as `ant-quic` or `x0x`.
     pub service: Option<String>,
+
     /// Optional namespace/workspace scope.
+    ///
+    /// When set, discovered services must advertise the same namespace before
+    /// they are treated as eligible dial candidates.
     pub namespace: Option<String>,
+
+    /// Whether the local node should browse, advertise, or do both.
+    pub mode: MdnsMode,
+
     /// Whether discovered peers should auto-connect.
     pub auto_connect: AutoConnectPolicy,
+
+    /// Optional application metadata to publish in TXT records.
+    ///
+    /// Internal ant-quic keys such as `peer_id` and `namespace` are reserved
+    /// and will override user-provided values if they conflict.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Public discovery policy scaffold for the unified connectivity plan.
@@ -480,6 +523,10 @@ pub enum ConfigError {
     #[error("max_message_size must be at least 1")]
     InvalidMaxMessageSize,
 
+    /// Invalid discovery configuration
+    #[error("Invalid discovery configuration: {0}")]
+    InvalidDiscovery(String),
+
     /// PQC configuration error
     #[error("PQC configuration error: {0}")]
     PqcError(String),
@@ -611,6 +658,78 @@ impl P2pConfigBuilder {
         let mut discovery = self
             .discovery
             .unwrap_or_else(DiscoveryPolicy::current_default);
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Enable or disable first-party mDNS discovery/runtime integration.
+    pub fn mdns_enabled(mut self, enabled: bool) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.enabled = enabled;
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set the mDNS service/application scope.
+    pub fn mdns_service(mut self, service: impl Into<String>) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.service = Some(service.into());
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set the optional mDNS namespace/workspace scope.
+    pub fn mdns_namespace(mut self, namespace: impl Into<String>) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.namespace = Some(namespace.into());
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set whether mDNS should browse, advertise, or do both.
+    pub fn mdns_mode(mut self, mode: MdnsMode) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.mode = mode;
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set the auto-connect policy for mDNS discoveries.
+    pub fn mdns_auto_connect(mut self, auto_connect: AutoConnectPolicy) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.auto_connect = auto_connect;
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set optional TXT metadata to publish with the mDNS service.
+    pub fn mdns_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        let mut mdns = discovery.mdns.unwrap_or_default();
+        mdns.metadata = metadata;
         discovery.mdns = Some(mdns);
         self.discovery = Some(discovery);
         self
@@ -868,12 +987,15 @@ impl P2pConfigBuilder {
         // v0.13.0+: No role validation - all nodes are symmetric
         // Nodes can operate without known peers (they can be connected to by others)
 
+        let discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        validate_discovery_policy(&discovery)?;
+
         Ok(P2pConfig {
             bind_addr: self.bind_addr,
             known_peers: self.known_peers,
-            discovery: self
-                .discovery
-                .unwrap_or_else(DiscoveryPolicy::current_default),
+            discovery,
             trust: self.trust.unwrap_or_default(),
             max_connections,
             // v0.2: auth removed
@@ -892,6 +1014,52 @@ impl P2pConfigBuilder {
             max_concurrent_uni_streams: self.max_concurrent_uni_streams.unwrap_or(100),
         })
     }
+}
+
+fn validate_discovery_policy(discovery: &DiscoveryPolicy) -> Result<(), ConfigError> {
+    if let Some(mdns) = discovery.mdns.as_ref()
+        && mdns.enabled
+    {
+        let service = mdns
+            .service
+            .as_deref()
+            .map(str::trim)
+            .filter(|service| !service.is_empty())
+            .ok_or_else(|| {
+                ConfigError::InvalidDiscovery(
+                    "mDNS requires a non-empty service name when enabled".to_string(),
+                )
+            })?;
+
+        validate_mdns_service_name(service)?;
+    }
+
+    Ok(())
+}
+
+fn validate_mdns_service_name(service: &str) -> Result<(), ConfigError> {
+    if service.len() > 15 {
+        return Err(ConfigError::InvalidDiscovery(format!(
+            "mDNS service '{service}' exceeds the DNS-SD 15-byte service-type limit"
+        )));
+    }
+
+    if service.starts_with('-') || service.ends_with('-') {
+        return Err(ConfigError::InvalidDiscovery(format!(
+            "mDNS service '{service}' must not start or end with '-'"
+        )));
+    }
+
+    if !service
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(ConfigError::InvalidDiscovery(format!(
+            "mDNS service '{service}' must contain only lowercase ASCII letters, digits, and '-'"
+        )));
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -1192,6 +1360,51 @@ mod tests {
         assert!(!config.nat.port_mapping.enabled);
         assert_eq!(config.nat.port_mapping.lease_duration_secs, 120);
         assert!(!config.nat.port_mapping.allow_random_external_port);
+    }
+
+    #[test]
+    fn test_mdns_builder_overrides() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("role".to_string(), "dev".to_string());
+
+        let config = P2pConfig::builder()
+            .mdns_enabled(true)
+            .mdns_service("ant-quic")
+            .mdns_namespace("workspace-a")
+            .mdns_mode(MdnsMode::BrowseOnly)
+            .mdns_auto_connect(AutoConnectPolicy::Enabled)
+            .mdns_metadata(metadata.clone())
+            .build()
+            .expect("valid mDNS config should build");
+
+        let mdns = config.discovery.mdns.expect("mDNS config should exist");
+        assert!(mdns.enabled);
+        assert_eq!(mdns.service.as_deref(), Some("ant-quic"));
+        assert_eq!(mdns.namespace.as_deref(), Some("workspace-a"));
+        assert_eq!(mdns.mode, MdnsMode::BrowseOnly);
+        assert_eq!(mdns.auto_connect, AutoConnectPolicy::Enabled);
+        assert_eq!(mdns.metadata, metadata);
+    }
+
+    #[test]
+    fn test_mdns_enabled_requires_service_name() {
+        let error = P2pConfig::builder()
+            .mdns_enabled(true)
+            .build()
+            .expect_err("enabled mDNS without a service name should fail");
+
+        assert!(matches!(error, ConfigError::InvalidDiscovery(_)));
+    }
+
+    #[test]
+    fn test_mdns_service_name_validation() {
+        let error = P2pConfig::builder()
+            .mdns_enabled(true)
+            .mdns_service("Ant Quic")
+            .build()
+            .expect_err("invalid service name should fail");
+
+        assert!(matches!(error, ConfigError::InvalidDiscovery(_)));
     }
 
     #[test]

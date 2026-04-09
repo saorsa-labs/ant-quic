@@ -284,6 +284,21 @@ compatible local gateways:
 Treat UPnP IGD as a router-local reachability assist layer, not as the primary
 NAT traversal protocol.
 
+### Scoped mDNS Discovery
+
+ant-quic also supports first-party scoped mDNS when built with the
+`mdns-discovery` feature:
+
+- `service` controls the DNS-SD service/application scope
+- `namespace` constrains discoveries to the current workspace/network scope
+- `mode` chooses `browse`, `advertise`, or `both`
+- `auto_connect` chooses discover-only vs automatic dialing
+- `metadata` publishes optional TXT key/value pairs alongside the built-in
+  `peer_id`, `service`, and `namespace` fields
+
+mDNS results are pre-auth locator claims only. The authenticated QUIC handshake
+still decides the durable `PeerId`.
+
 ### Runtime Configuration
 
 Configure via command-line arguments:
@@ -302,6 +317,19 @@ ant-quic --listen [::]:0 \
 ant-quic --listen [::]:0 \
          --known-peers quic.saorsalabs.com:9000 \
          --no-port-mapping
+
+# Enable scoped mDNS browse+advertise without auto-connect
+ant-quic --listen [::]:0 \
+         --mdns \
+         --mdns-service ant-quic \
+         --mdns-namespace workspace-a
+
+# Enable scoped mDNS browse-only with auto-connect
+ant-quic --listen [::]:0 \
+         --mdns-service ant-quic \
+         --mdns-namespace workspace-a \
+         --mdns-mode browse \
+         --mdns-auto-connect enabled
 ```
 
 ### Programmatic Configuration
@@ -310,9 +338,18 @@ Configure the policy surface through `P2pConfig` and `NatConfig`:
 
 ```rust
 use ant_quic::{NatConfig, P2pConfig, PortMappingConfig};
+use ant_quic::unified_config::{AutoConnectPolicy, MdnsConfig, MdnsMode};
 
 let config = P2pConfig::builder()
     .known_peer("peer.example.com:9000".parse()?)
+    .mdns(MdnsConfig {
+        enabled: true,
+        service: Some("ant-quic".into()),
+        namespace: Some("workspace-a".into()),
+        mode: MdnsMode::Both,
+        auto_connect: AutoConnectPolicy::Disabled,
+        metadata: std::collections::BTreeMap::new(),
+    })
     .nat(NatConfig {
         port_mapping: PortMappingConfig {
             enabled: true,

@@ -2,9 +2,17 @@
 
 ## Status
 
-Proposed implementation plan with partial groundwork already landed in code.
-Phase 3.5 router-assisted port mapping is now landed in its first UPnP IGD
-implementation cut.
+Implementation plan with the main UPnP + mDNS pieces now landed in code.
+
+- Phase 3.5 router-assisted port mapping is landed with first-party UPnP IGD,
+  renewal, shutdown cleanup, additive candidate propagation, and structured
+  lifecycle events.
+- Phase 4 scoped first-party mDNS is landed behind the `mdns-discovery`
+  feature flag, including browse/advertise runtime, service/namespace scoping,
+  discover-only vs auto-connect policy, and structured discovery events/state.
+- Future provider-generalization work such as PCP/NAT-PMP or a broader peer
+  directory abstraction is still follow-up work, not a blocker for the current
+  LAN-scoped mDNS + UPnP expectations.
 
 ## Goal
 
@@ -44,22 +52,19 @@ not complete yet.
 - `src/port_mapping.rs` now provides a first-party best-effort UPnP IGD
   lifecycle with renewal, shutdown cleanup, and candidate/status propagation.
 
-### Not present yet
+### Still not present
 
-- there is **no first-party mDNS provider implementation** in `ant-quic` yet
-- there is **no browse/advertise runtime** for mDNS in the library or binary
-- there is **no internal peer directory/provider abstraction** landed yet
-- service/namespace scoping exists in config shape only, not in runtime wiring
-- application-facing mDNS policy is therefore still a plan, not a finished feature
+- there is **not yet** a generalized cross-provider peer directory abstraction;
+  the current landed mDNS directory is scoped to first-party LAN discovery
 - future PCP/NAT-PMP extensions are still plan-only; the current landed router
-  assist runtime is UPnP IGD-first
+  assist runtime remains UPnP IGD-first
 
 ### Immediate implication for consumers
 
-Consumers such as `x0x` may keep an app-local mDNS implementation until
-`ant-quic` lands a real first-party provider. The cutover point is **provider
-runtime + scoping + trust/eligibility hooks**, not just the presence of config
-fields.
+Consumers such as `x0x` can now cut over to `ant-quic` for service-scoped,
+namespace-scoped LAN discovery if the `mdns-discovery` feature is enabled. The
+remaining future work is about broader provider abstraction, not the core
+first-party mDNS runtime itself.
 
 ## Core principles
 
@@ -191,16 +196,14 @@ P2pConfig::builder()
             enabled: true,
             service: Some("x0x".into()),
             namespace: Some("workspace-123".into()),
+            mode: MdnsMode::Both,
             auto_connect: AutoConnectPolicy::Disabled,
+            metadata: BTreeMap::new(),
         }),
         auto_connect: AutoConnectPolicy::Disabled,
     })
     .build()?
 ```
-
-What is still missing is the runtime provider that actually performs scoped
-browse/advertise behavior and enforces policy through the unified peer
-directory.
 
 This allows the application to express:
 
@@ -339,6 +342,10 @@ including events such as:
 - relay public address learned
 - migration to direct path succeeded
 - port mapping established / renewed / failed / removed
+- mDNS service advertised
+- mDNS peer discovered / updated / removed
+- mDNS peer eligible / ineligible
+- mDNS auto-connect attempted / succeeded / failed
 
 ## Implementation phases
 
@@ -480,16 +487,16 @@ The first cut of this phase is now implemented:
      - landed runtime implementation
      - future PCP/NAT-PMP extensions
 
-### Phase 4 — optional mDNS integration
+### Phase 4 — optional mDNS integration (landed)
 
-Note: the config scaffold already exists (`DiscoveryPolicy` + `MdnsConfig`).
-What remains is the actual provider/runtime implementation.
+This phase is now landed behind the `mdns-discovery` feature flag:
 
-1. add first-party optional mDNS provider
-2. support service/namespace scoping
-3. support discover-only vs auto-connect modes
-4. ensure handshake-authenticated `PeerId` remains the identity authority
-5. only then retire app-local mDNS implementations in consumers such as `x0x`
+1. first-party optional mDNS provider/runtime is present
+2. service/namespace scoping is enforced in the runtime
+3. discover-only vs auto-connect modes are implemented
+4. handshake-authenticated `PeerId` remains the identity authority
+5. consumers such as `x0x` can cut over when they want first-party scoped LAN
+   discovery without keeping an app-local mDNS stack
 
 #### Phase 4 detailed implementation checklist
 
