@@ -605,6 +605,60 @@ mod tests {
     }
 
     #[test]
+    fn test_multiple_local_instances_on_same_host_can_coexist() {
+        let local_peer_id = PeerId([0x78; 32]);
+        let mut directory = base_directory(local_peer_id);
+        let remote_peer_a = PeerId([0x79; 32]);
+        let remote_peer_b = PeerId([0x7a; 32]);
+        let shared_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 35));
+
+        let first = directory.apply_resolved(resolved_service(
+            "peer-c._ant-quic._udp.local.",
+            9000,
+            vec![shared_ip],
+            &[
+                ("peer_id", &hex::encode(remote_peer_a.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+        let second = directory.apply_resolved(resolved_service(
+            "peer-d._ant-quic._udp.local.",
+            9001,
+            vec![shared_ip],
+            &[
+                ("peer_id", &hex::encode(remote_peer_b.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+
+        assert!(matches!(
+            first.as_slice(),
+            [
+                MdnsRuntimeEvent::PeerDiscovered(_),
+                MdnsRuntimeEvent::PeerEligible(_)
+            ]
+        ));
+        assert!(matches!(
+            second.as_slice(),
+            [
+                MdnsRuntimeEvent::PeerDiscovered(_),
+                MdnsRuntimeEvent::PeerEligible(_)
+            ]
+        ));
+
+        let snapshot = directory.snapshot(true, false);
+        assert_eq!(snapshot.discovered_peers.len(), 2);
+        assert!(snapshot.discovered_peers.iter().any(|peer| {
+            peer.fullname == "peer-c._ant-quic._udp.local."
+                && peer.addresses == vec![SocketAddr::new(shared_ip, 9000)]
+        }));
+        assert!(snapshot.discovered_peers.iter().any(|peer| {
+            peer.fullname == "peer-d._ant-quic._udp.local."
+                && peer.addresses == vec![SocketAddr::new(shared_ip, 9001)]
+        }));
+    }
+
+    #[test]
     fn test_updates_existing_peer_when_addresses_change() {
         let local_peer_id = PeerId([0x88; 32]);
         let mut directory = base_directory(local_peer_id);
