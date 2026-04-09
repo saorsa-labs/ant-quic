@@ -1581,6 +1581,7 @@ impl NatTraversalEndpoint {
         let shutdown_clone = endpoint.shutdown.clone();
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
+        let relay_server_for_poll = endpoint.relay_server.clone();
 
         let local_peer_id_for_poll = endpoint.local_peer_id;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
@@ -1590,6 +1591,7 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx_clone,
                 connections_clone,
+                relay_server_for_poll,
                 event_callback_for_poll,
                 local_peer_id_for_poll,
                 relay_setup_attempted_clone,
@@ -2050,6 +2052,7 @@ impl NatTraversalEndpoint {
         let shutdown_clone = endpoint.shutdown.clone();
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
+        let relay_server_for_poll = endpoint.relay_server.clone();
 
         let local_peer_id_for_poll = endpoint.local_peer_id;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
@@ -2059,6 +2062,7 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx_clone,
                 connections_clone,
+                relay_server_for_poll,
                 event_callback_for_poll,
                 local_peer_id_for_poll,
                 relay_setup_attempted_clone,
@@ -2288,6 +2292,31 @@ impl NatTraversalEndpoint {
     /// Get the event callback
     pub fn get_event_callback(&self) -> Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>> {
         self.event_callback.as_ref()
+    }
+
+    fn apply_relay_server_public_address(
+        relay_server: Option<&Arc<MasqueRelayServer>>,
+        public_addr: SocketAddr,
+    ) {
+        let public_addr = normalize_socket_addr(public_addr);
+        if public_addr.ip().is_unspecified() {
+            return;
+        }
+
+        if let Some(server) = relay_server {
+            server.set_public_address(public_addr);
+        }
+    }
+
+    pub(crate) fn update_relay_server_public_address(&self, public_addr: SocketAddr) {
+        Self::apply_relay_server_public_address(self.relay_server.as_ref(), public_addr);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relay_server_public_address(&self) -> Option<SocketAddr> {
+        self.relay_server
+            .as_ref()
+            .map(|server| server.public_address())
     }
 
     /// Get the transport registry if configured
@@ -4369,6 +4398,7 @@ impl NatTraversalEndpoint {
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
+        relay_server: Option<Arc<MasqueRelayServer>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         local_peer_id: PeerId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
@@ -4403,6 +4433,8 @@ impl NatTraversalEndpoint {
                     observed
                 );
                 if let Some(observed_addr) = observed {
+                    Self::apply_relay_server_public_address(relay_server.as_ref(), observed_addr);
+
                     // Emit event if this is the first time this peer reported this address
                     if emitted_discovery.insert((*peer_id, observed_addr)) {
                         info!(
@@ -4460,6 +4492,10 @@ impl NatTraversalEndpoint {
                         bootstrap_node,
                     } => {
                         debug!("{}", event);
+                        Self::apply_relay_server_public_address(
+                            relay_server.as_ref(),
+                            candidate.address,
+                        );
 
                         // Notify that our external address was discovered
                         let _ = event_tx.send(NatTraversalEvent::ExternalAddressDiscovered {
@@ -7850,6 +7886,23 @@ mod tests {
             endpoint.transport_registry().is_none(),
             "Endpoint without registry config should have None"
         );
+    }
+
+    #[tokio::test]
+    async fn test_relay_server_public_address_can_be_refreshed() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let refreshed_addr: SocketAddr = "198.51.100.44:49000".parse().expect("valid addr");
+        endpoint.update_relay_server_public_address(refreshed_addr);
+
+        assert_eq!(endpoint.relay_server_public_address(), Some(refreshed_addr));
     }
 
     #[test]

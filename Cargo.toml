@@ -16,13 +16,23 @@ description = "QUIC transport protocol with advanced NAT traversal for P2P netwo
 keywords = ["quic", "nat-traversal", "p2p", "autonomi", "networking"]
 categories = ["network-programming", "asynchronous"]
 exclude = [
+    ".claude-flow/",
+    ".minimax/",
+    ".planning.archived/",
     ".github/",
     ".githooks/",
     ".serena/",
     ".codecov.yml",
     ".DS_Store",
     "*.DS_Store",
+    "agents_to_run.sh",
+    "dave.md",
     "release-build/",
+    "go_ssb_readme.md",
+    "holepunch.proto",
+    "holepuncher.go",
+    "rust_ssb_readme.md",
+    "svc.go",
     "docs/rfcs/*.pdf",
     "docs/diagrams/",
     "docs/planning/",

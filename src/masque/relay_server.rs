@@ -345,6 +345,9 @@ impl MasqueRelayServer {
     pub fn set_public_address(&self, addr: SocketAddr) {
         let mut public_address = self.public_address.write();
         let mut secondary_address = self.secondary_address.write();
+        if *public_address == addr || secondary_address.is_some_and(|current| current == addr) {
+            return;
+        }
         let old = if public_address.is_ipv4() == addr.is_ipv4() {
             let old = *public_address;
             *public_address = addr;

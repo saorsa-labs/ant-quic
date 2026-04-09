@@ -3837,6 +3837,10 @@ impl P2pEndpoint {
             previous
         };
 
+        if let Some(mapped_addr) = snapshot.external_addr {
+            self.inner.update_relay_server_public_address(mapped_addr);
+        }
+
         if let Some(previous_addr) = previous_addr
             && snapshot.external_addr != Some(previous_addr)
         {
@@ -4672,6 +4676,10 @@ mod tests {
             assert!(endpoint.port_mapping_active());
             assert_eq!(endpoint.port_mapping_addr(), Some(mapped_addr));
             assert!(endpoint.all_external_addrs().contains(&mapped_addr));
+            assert_eq!(
+                endpoint.inner.relay_server_public_address(),
+                Some(mapped_addr)
+            );
 
             endpoint.shutdown().await;
         }

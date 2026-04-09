@@ -162,14 +162,14 @@ replacement for the core connectivity engine.
 ### Target public API
 
 ```rust
-endpoint.connect(peer_id).await
+endpoint.connect_peer(peer_id).await
 endpoint.connect_addr(addr).await
 endpoint.connect_known_peers().await
 ```
 
 Where:
 
-- `connect(peer_id)` is the **primary** API for normal consumers
+- `connect_peer(peer_id)` is the **primary** API for normal consumers
 - `connect_addr(addr)` is a convenience wrapper for address-only bootstrap
 - `connect_known_peers()` is a bootstrap/discovery convenience
 
@@ -274,7 +274,7 @@ The exact type can evolve, but it should unify all outbound connection paths.
 
 ## Unified connection flow
 
-For `endpoint.connect(peer_id).await`, the orchestrator should:
+For `endpoint.connect_peer(peer_id).await`, the orchestrator should:
 
 1. reuse an existing live connection if present
 2. look up all known addresses for the target peer

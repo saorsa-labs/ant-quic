@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release hygiene**: crate packaging now excludes assistant scratch files and legacy non-Rust artifacts from published tarballs.
+- **Relay advertisements**: the built-in MASQUE relay server now refreshes its advertised public address when QUIC address discovery or router-assisted port mapping yields a better external address.
+- **Coordinator-control cleanup**: expired pending requests, inbound offers, live requests, rate-limit entries, and stale rejections are now scavenged automatically.
+
+### Documentation
+
+- Cut missing `0.26.0` and `0.26.1` changelog sections and align the unified-connectivity plan text with the current `connect_peer(peer_id)` API.
+
+## [0.26.1] - 2026-04-09
+
+### Fixed
+
+- **Minimal mDNS feature matrix**: stabilized the reduced-feature test matrix so first-party mDNS coverage stays green across supported feature combinations.
+
+## [0.26.0] - 2026-04-09
+
 ### Changed
 
 - **Unified outbound connect surface**: `P2pEndpoint` now presents a primary peer-oriented connect API plus `connect_addr(...)` convenience, with path selection handled internally.
