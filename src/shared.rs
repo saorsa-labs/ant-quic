@@ -73,11 +73,12 @@ pub(crate) enum EndpointEventInner {
     /// Stop routing connection ID for this sequence number to the connection
     /// When `bool == true`, a new connection ID will be issued to peer
     RetireConnectionId(Instant, u64, bool),
-    /// Request to relay a PunchMeNow frame to a target peer
-    RelayPunchMeNow([u8; 32], crate::frame::PunchMeNow),
     /// Request to send an AddAddress frame to the peer
     #[allow(dead_code)]
     SendAddressFrame(crate::frame::AddAddress),
+    /// Request to relay a PUNCH_ME_NOW frame to a target peer
+    #[allow(dead_code)]
+    RelayPunchMeNow([u8; 32], crate::frame::PunchMeNow),
     /// NAT traversal candidate validation succeeded
     #[allow(dead_code)]
     NatCandidateValidated { address: SocketAddr, challenge: u64 },

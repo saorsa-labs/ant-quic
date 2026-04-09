@@ -85,6 +85,11 @@ All nodes are equal. Any connected peer can:
 - Coordinate NAT traversal for other peers
 - Act as relay when direct connection fails
 
+Public dialing uses the unified connectivity surface:
+- `connect_known_peers()` seeds initial connectivity and address discovery
+- `connect_addr()` routes address-based dialing through the full orchestration path
+- `connect_peer()` routes identity-based dialing through the same orchestration path
+
 ## Project Structure
 
 - `src/`: Core library (QUIC, NAT traversal, crypto, metrics)
@@ -137,11 +142,11 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
     println!("Peer ID: {:?}", endpoint.peer_id());
 
-    // Connect to known peers for address discovery
-    endpoint.connect_bootstrap().await?;
+    // Seed connectivity and address discovery from configured known peers
+    endpoint.connect_known_peers().await?;
 
     // Your external address is now discoverable
-    if let Some(addr) = endpoint.external_address() {
+    if let Some(addr) = endpoint.external_addr() {
         println!("External address: {}", addr);
     }
 

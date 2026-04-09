@@ -34,6 +34,64 @@ use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::host_identity::HostIdentity;
 use crate::transport::{TransportAddr, TransportProvider, TransportRegistry};
 
+/// Policy controlling whether discovered peers should be connected automatically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoConnectPolicy {
+    /// Do not automatically connect to newly discovered peers.
+    #[default]
+    Disabled,
+    /// Allow automatically connecting to discovered peers.
+    Enabled,
+}
+
+/// Lightweight placeholder configuration for optional mDNS discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MdnsConfig {
+    /// Whether mDNS discovery is enabled.
+    pub enabled: bool,
+    /// Optional service name scope.
+    pub service: Option<String>,
+    /// Optional namespace/workspace scope.
+    pub namespace: Option<String>,
+    /// Whether discovered peers should auto-connect.
+    pub auto_connect: AutoConnectPolicy,
+}
+
+/// Public discovery policy scaffold for the unified connectivity plan.
+///
+/// This is intentionally lightweight for now: runtime behavior remains backward
+/// compatible and still primarily uses `known_peers` as the active discovery
+/// input. These fields provide the public configuration shape needed for future
+/// provider-based discovery wiring.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryPolicy {
+    /// Whether statically configured known peers are enabled as a discovery source.
+    pub static_known_peers: bool,
+    /// Optional mDNS discovery configuration.
+    pub mdns: Option<MdnsConfig>,
+    /// Default auto-connect policy for discovered peers.
+    pub auto_connect: AutoConnectPolicy,
+}
+
+impl DiscoveryPolicy {
+    /// Create a discovery policy with current backward-compatible behavior.
+    pub fn current_default() -> Self {
+        Self {
+            static_known_peers: true,
+            mdns: None,
+            auto_connect: AutoConnectPolicy::Disabled,
+        }
+    }
+}
+
+/// Lightweight trust policy scaffold for the unified connectivity plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrustPolicy {
+    /// Require authenticated peers but apply no additional discovery scoping.
+    #[default]
+    AuthenticateOnly,
+}
+
 /// Configuration for ant-quic P2P endpoints
 ///
 /// This struct provides all configuration options for P2P networking including
@@ -51,9 +109,23 @@ pub struct P2pConfig {
     /// with enhanced security through port randomization.
     pub bind_addr: Option<TransportAddr>,
 
-    /// Known peers for initial discovery and NAT traversal coordination
-    /// These can be any nodes in the network - all nodes are symmetric.
+    /// Known peers for initial discovery/bootstrap input and NAT traversal coordination.
+    ///
+    /// These are preconfigured contact hints that seed discovery and initial
+    /// connectivity. They are not transport-strategy knobs and do not imply any
+    /// privileged peer role.
     pub known_peers: Vec<TransportAddr>,
+
+    /// Discovery policy scaffold for future provider-based discovery wiring.
+    ///
+    /// Defaults to the current behavior where static `known_peers` are enabled
+    /// as the primary discovery/bootstrap input.
+    pub discovery: DiscoveryPolicy,
+
+    /// Trust policy for discovered/authenticated peers.
+    ///
+    /// Defaults to `AuthenticateOnly`, matching current behavior.
+    pub trust: TrustPolicy,
 
     /// Maximum number of concurrent connections
     pub max_connections: usize,
@@ -127,6 +199,9 @@ pub struct P2pConfig {
 /// coordinates hole punching, and handles NAT traversal failures.
 #[derive(Debug, Clone)]
 pub struct NatConfig {
+    /// Best-effort router port-mapping policy for improved inbound reachability.
+    pub port_mapping: PortMappingConfig,
+
     /// Maximum number of address candidates to track
     pub max_candidates: usize,
 
@@ -151,9 +226,36 @@ pub struct NatConfig {
     pub prefer_rfc_nat_traversal: bool,
 }
 
+/// Best-effort policy for router-assisted port mapping.
+///
+/// This is intentionally framed as a policy surface instead of exposing raw
+/// UPnP knobs directly. The initial implementation uses UPnP IGD internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMappingConfig {
+    /// Whether best-effort router port mapping is enabled.
+    pub enabled: bool,
+
+    /// Lease duration requested from the gateway, in seconds.
+    pub lease_duration_secs: u32,
+
+    /// Whether a random external port may be used if same-port mapping fails.
+    pub allow_random_external_port: bool,
+}
+
+impl Default for PortMappingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lease_duration_secs: 3600,
+            allow_random_external_port: true,
+        }
+    }
+}
+
 impl Default for NatConfig {
     fn default() -> Self {
         Self {
+            port_mapping: PortMappingConfig::default(),
             max_candidates: 10,
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
@@ -260,6 +362,8 @@ impl Default for P2pConfig {
             bind_addr: None,
             known_peers: Vec::new(),
             max_connections: 256,
+            discovery: DiscoveryPolicy::current_default(),
+            trust: TrustPolicy::default(),
             // v0.2: auth removed
             nat: NatConfig::default(),
             timeouts: TimeoutConfig::default(),
@@ -299,7 +403,7 @@ impl P2pConfig {
             known_peers: self
                 .known_peers
                 .iter()
-                .filter_map(|addr| addr.as_socket_addr())
+                .filter_map(|addr: &TransportAddr| addr.as_socket_addr())
                 .collect(),
             max_candidates: self.nat.max_candidates,
             coordination_timeout: self.timeouts.nat_traversal.coordination_timeout,
@@ -311,7 +415,7 @@ impl P2pConfig {
             bind_addr: self
                 .bind_addr
                 .as_ref()
-                .and_then(|addr| addr.as_socket_addr()),
+                .and_then(|addr: &TransportAddr| addr.as_socket_addr()),
             prefer_rfc_nat_traversal: self.nat.prefer_rfc_nat_traversal,
             pqc: Some(self.pqc.clone()),
             timeouts: self.timeouts.clone(),
@@ -344,6 +448,8 @@ impl P2pConfig {
 pub struct P2pConfigBuilder {
     bind_addr: Option<TransportAddr>,
     known_peers: Vec<TransportAddr>,
+    discovery: Option<DiscoveryPolicy>,
+    trust: Option<TrustPolicy>,
     max_connections: Option<usize>,
     // v0.2: auth removed
     nat: Option<NatConfig>,
@@ -414,10 +520,11 @@ impl P2pConfigBuilder {
         self
     }
 
-    /// Add a known peer for initial discovery
+    /// Add a known peer for initial discovery/bootstrap input.
     ///
     /// In v0.13.0+ all nodes are symmetric - these are just starting points for
-    /// network connectivity. The node will discover additional peers through gossip.
+    /// network connectivity and discovery. They are contact hints, not strategy
+    /// controls or privileged infrastructure roles.
     ///
     /// Accepts any type implementing `Into<TransportAddr>`:
     /// - `SocketAddr` - Auto-converts to `TransportAddr::Udp`
@@ -447,7 +554,7 @@ impl P2pConfigBuilder {
         self
     }
 
-    /// Add multiple known peers at once
+    /// Add multiple known peers at once.
     ///
     /// Convenient method to add a collection of peers in one call.
     /// Each item in the iterator is converted via `Into<TransportAddr>`.
@@ -493,6 +600,28 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Set the public discovery policy scaffold.
+    pub fn discovery(mut self, discovery: DiscoveryPolicy) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Configure optional mDNS discovery within the public discovery policy scaffold.
+    pub fn mdns(mut self, mdns: MdnsConfig) -> Self {
+        let mut discovery = self
+            .discovery
+            .unwrap_or_else(DiscoveryPolicy::current_default);
+        discovery.mdns = Some(mdns);
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// Set the trust policy scaffold.
+    pub fn trust_policy(mut self, trust: TrustPolicy) -> Self {
+        self.trust = Some(trust);
+        self
+    }
+
     /// Set maximum connections
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = Some(max);
@@ -503,6 +632,22 @@ impl P2pConfigBuilder {
 
     /// Set NAT traversal configuration
     pub fn nat(mut self, nat: NatConfig) -> Self {
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Enable or disable best-effort router port mapping.
+    pub fn port_mapping_enabled(mut self, enabled: bool) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.port_mapping.enabled = enabled;
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Set the requested router port-mapping lease duration in seconds.
+    pub fn port_mapping_lease_duration_secs(mut self, lease_duration_secs: u32) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.port_mapping.lease_duration_secs = lease_duration_secs;
         self.nat = Some(nat);
         self
     }
@@ -715,6 +860,10 @@ impl P2pConfigBuilder {
         Ok(P2pConfig {
             bind_addr: self.bind_addr,
             known_peers: self.known_peers,
+            discovery: self
+                .discovery
+                .unwrap_or_else(DiscoveryPolicy::current_default),
+            trust: self.trust.unwrap_or_default(),
             max_connections,
             // v0.2: auth removed
             nat: self.nat.unwrap_or_default(),
@@ -1002,11 +1151,35 @@ mod tests {
     #[test]
     fn test_nat_config_default() {
         let nat = NatConfig::default();
+        assert!(nat.port_mapping.enabled);
+        assert_eq!(nat.port_mapping.lease_duration_secs, 3600);
+        assert!(nat.port_mapping.allow_random_external_port);
         assert_eq!(nat.max_candidates, 10);
         assert!(nat.enable_symmetric_nat);
         assert!(nat.enable_relay_fallback);
         assert_eq!(nat.max_concurrent_attempts, 3);
         assert!(nat.prefer_rfc_nat_traversal);
+    }
+
+    #[test]
+    fn test_port_mapping_config_default() {
+        let port_mapping = PortMappingConfig::default();
+        assert!(port_mapping.enabled);
+        assert_eq!(port_mapping.lease_duration_secs, 3600);
+        assert!(port_mapping.allow_random_external_port);
+    }
+
+    #[test]
+    fn test_port_mapping_builder_overrides() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .port_mapping_lease_duration_secs(120)
+            .build()
+            .expect("Failed to build config");
+
+        assert!(!config.nat.port_mapping.enabled);
+        assert_eq!(config.nat.port_mapping.lease_duration_secs, 120);
+        assert!(config.nat.port_mapping.allow_random_external_port);
     }
 
     #[test]

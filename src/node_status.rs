@@ -7,9 +7,9 @@
 
 //! Consolidated node status for observability
 //!
-//! This module provides [`NodeStatus`] - a single snapshot of everything
-//! about a node's current state, including NAT type, connectivity,
-//! relay status, and performance metrics.
+//! This module provides [`NodeStatus`] - a consolidated best-effort snapshot
+//! of a node's current state, including NAT type, connectivity,
+//! relay/coordinator hints, and performance metrics.
 //!
 //! # Example
 //!
@@ -89,8 +89,8 @@ impl std::fmt::Display for NatType {
 
 /// Comprehensive node status snapshot
 ///
-/// This struct provides a complete view of the node's current state,
-/// including identity, connectivity, NAT status, relay status, and performance.
+/// This struct provides a consolidated snapshot of the node's current state,
+/// including identity, connectivity, NAT status, relay/coordinator hints, and performance.
 ///
 /// # Status Categories
 ///
@@ -134,6 +134,12 @@ pub struct NodeStatus {
     /// This is an address property, not proof of reachability.
     pub has_global_address: bool,
 
+    /// Whether best-effort router port mapping is currently active.
+    pub port_mapping_active: bool,
+
+    /// The currently mapped public address, if router port mapping is active.
+    pub port_mapping_addr: Option<SocketAddr>,
+
     // --- Connections ---
     /// Number of connected peers
     pub connected_peers: usize,
@@ -157,27 +163,31 @@ pub struct NodeStatus {
     pub hole_punch_success_rate: f64,
 
     // --- Relay Status (NEW - key visibility) ---
-    /// Whether this node is currently acting as a relay for others
+    /// Whether this node is currently acting as a relay for others.
     ///
-    /// `true` if this node has fresh peer-verified direct reachability and is
-    /// forwarding traffic for peers behind restrictive NATs.
+    /// This is currently conservative/best-effort rather than an authoritative
+    /// runtime relay accounting signal.
     pub is_relaying: bool,
 
-    /// Number of active relay sessions
+    /// Number of active relay sessions.
+    ///
+    /// Currently reported conservatively; this is not yet a complete runtime metric.
     pub relay_sessions: usize,
 
     /// Total bytes forwarded as relay
     pub relay_bytes_forwarded: u64,
 
     // --- Coordinator Status (NEW - key visibility) ---
-    /// Whether this node is coordinating NAT traversal
+    /// Whether this node is coordinating NAT traversal.
     ///
-    /// `true` if this node is helping peers coordinate hole punching.
-    /// Fresh peer-verified direct reachability is the signal other peers should
-    /// use when deciding whether this node is a viable coordinator.
+    /// This is currently conservative/best-effort rather than an authoritative
+    /// runtime coordination signal. Fresh peer-verified direct reachability is
+    /// still the stronger indicator for coordinator viability.
     pub is_coordinating: bool,
 
-    /// Number of active coordination sessions
+    /// Number of active coordination sessions.
+    ///
+    /// Currently reported conservatively; this is not yet a complete runtime metric.
     pub coordination_sessions: usize,
 
     // --- Performance ---
@@ -200,6 +210,8 @@ impl Default for NodeStatus {
             can_receive_direct: false,
             direct_reachability_scope: None,
             has_global_address: false,
+            port_mapping_active: false,
+            port_mapping_addr: None,
             connected_peers: 0,
             active_connections: 0,
             pending_connections: 0,
@@ -278,6 +290,8 @@ mod tests {
         assert!(!status.can_receive_direct);
         assert_eq!(status.direct_reachability_scope, None);
         assert!(!status.has_global_address);
+        assert!(!status.port_mapping_active);
+        assert_eq!(status.port_mapping_addr, None);
         assert_eq!(status.connected_peers, 0);
         assert!(!status.is_relaying);
         assert!(!status.is_coordinating);
@@ -398,5 +412,17 @@ mod tests {
             status.direct_reachability_scope,
             Some(ReachabilityScope::LocalNetwork)
         );
+    }
+
+    #[test]
+    fn test_port_mapping_status_fields() {
+        let mut status = NodeStatus::default();
+        let mapped_addr: SocketAddr = "198.51.100.77:41000".parse().unwrap();
+
+        status.port_mapping_active = true;
+        status.port_mapping_addr = Some(mapped_addr);
+
+        assert!(status.port_mapping_active);
+        assert_eq!(status.port_mapping_addr, Some(mapped_addr));
     }
 }

@@ -56,41 +56,37 @@ impl ChatNode {
         })
     }
 
-    async fn connect_to_bootstrap(
+    async fn connect_known_peer(
         &self,
-        bootstrap_addr: SocketAddr,
+        known_peer_addr: SocketAddr,
     ) -> Result<PeerId, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Connecting to bootstrap node at {}", bootstrap_addr);
+        info!("Connecting to known peer at {}", known_peer_addr);
 
-        // Use the same logic as the ant-quic binary
-        let bootstrap_peer_id = self
+        // Use the unified address-based outbound path
+        let known_peer_id = self
             .node
-            .connect_to_bootstrap(bootstrap_addr)
+            .connect_addr(known_peer_addr)
             .await
-            .map_err(|e| format!("Failed to connect to bootstrap: {e}"))?;
+            .map_err(|e| format!("Failed to connect to known peer: {e}"))?;
 
-        // Send join message to bootstrap
+        // Send join message to the connected peer
         let join_msg = ChatMessage::join(self.nickname.clone(), self.peer_id);
         let data = join_msg.serialize()?;
         self.node
-            .send_to_peer(&bootstrap_peer_id, &data)
+            .send_to_peer(&known_peer_id, &data)
             .await
-            .map_err(|e| format!("Failed to send join message to bootstrap: {e}"))?;
+            .map_err(|e| format!("Failed to send join message to known peer: {e}"))?;
 
-        Ok(bootstrap_peer_id)
+        Ok(known_peer_id)
     }
 
-    async fn connect_to_peer(
+    async fn connect_peer(
         &self,
         peer_id: PeerId,
-        coordinator: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!(
-            "Connecting to peer {:?} via coordinator {}",
-            peer_id, coordinator
-        );
+        info!("Connecting to peer {:?}", peer_id);
 
-        let addr = self.node.connect_to_peer(peer_id, coordinator).await?;
+        let addr = self.node.connect_peer(peer_id).await?;
         info!("Connected to peer at {}", addr);
 
         // Send join message
@@ -221,10 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <coordinator|client> [bootstrap_addrs...]",
+            "Usage: {} <coordinator|client> [known_peer_addrs...]",
             args[0]
         );
-        eprintln!("       bootstrap_addrs: comma-separated list of addresses");
+        eprintln!("       known_peer_addrs: comma-separated list of addresses");
         eprintln!(
             "Example: {} client 192.168.1.10:9000,192.168.1.11:9000",
             args[0]
@@ -233,12 +229,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mode = &args[1];
-    let bootstrap_addrs: Vec<SocketAddr> = if args.len() > 2 {
+    let known_peer_addrs: Vec<SocketAddr> = if args.len() > 2 {
         args[2]
             .split(',')
             .filter_map(|addr| {
                 addr.trim().parse::<SocketAddr>().ok().or_else(|| {
-                    eprintln!("Warning: Invalid bootstrap address: {}", addr.trim());
+                    eprintln!("Warning: Invalid known peer address: {}", addr.trim());
                     None
                 })
             })
@@ -247,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         vec![
             "127.0.0.1:9000"
                 .parse()
-                .map_err(|e| format!("Failed to parse default bootstrap address: {}", e))?,
+                .map_err(|e| format!("Failed to parse default known peer address: {}", e))?,
         ]
     };
 
@@ -269,26 +265,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let chat_node = ChatNode::new(role, bootstrap_addrs.clone(), nickname.clone()).await?;
+    let chat_node = ChatNode::new(role, known_peer_addrs.clone(), nickname.clone()).await?;
     info!("Started {} with peer ID: {:?}", nickname, chat_node.peer_id);
 
-    // Connect to bootstrap nodes if we're a client
-    if matches!(role, EndpointRole::Client) && !bootstrap_addrs.is_empty() {
-        info!("Connecting to {} bootstrap nodes", bootstrap_addrs.len());
-        for bootstrap_addr in &bootstrap_addrs {
-            info!("Connecting to bootstrap node at {}", bootstrap_addr);
-            match chat_node.connect_to_bootstrap(*bootstrap_addr).await {
-                Ok(bootstrap_peer_id) => {
+    // Connect to known peers if we're a client
+    if matches!(role, EndpointRole::Client) && !known_peer_addrs.is_empty() {
+        info!("Connecting to {} known peers", known_peer_addrs.len());
+        for known_peer_addr in &known_peer_addrs {
+            info!("Connecting to known peer at {}", known_peer_addr);
+            match chat_node.connect_known_peer(*known_peer_addr).await {
+                Ok(known_peer_id) => {
                     info!(
-                        "Connected to bootstrap node {} with peer ID: {:?}",
-                        bootstrap_addr, bootstrap_peer_id
+                        "Connected to known peer {} with peer ID: {:?}",
+                        known_peer_addr, known_peer_id
                     );
-                    // Add bootstrap node to our peer list
+                    // Add known peer to our peer list
                     chat_node.peers.lock().await.insert(
-                        bootstrap_peer_id,
+                        known_peer_id,
                         PeerInfo {
-                            peer_id: bootstrap_peer_id.0, // Use the inner byte array
-                            nickname: format!("Bootstrap-{bootstrap_addr}"),
+                            peer_id: known_peer_id.0, // Use the inner byte array
+                            nickname: format!("KnownPeer-{known_peer_addr}"),
                             status: "connected".to_string(),
                             joined_at: std::time::SystemTime::now(),
                         },
@@ -296,8 +292,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(e) => {
                     error!(
-                        "Failed to connect to bootstrap node {}: {}",
-                        bootstrap_addr, e
+                        "Failed to connect to known peer {}: {}",
+                        known_peer_addr, e
                     );
                 }
             }
@@ -315,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Simple CLI interface
     println!("Chat node started. Commands:");
-    println!("  /connect <peer_id_hex> <coordinator_addr> - Connect to a peer via coordinator");
+    println!("  /connect <peer_id_hex> - Connect to a peer by identity");
     println!("  /peers - List connected peers");
     println!("  /quit - Exit");
     println!("  <text> - Send message to all peers");
@@ -333,22 +329,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         if line.starts_with("/connect ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                // Parse peer ID and coordinator address
+            if parts.len() >= 2 {
+                // Parse peer ID
                 if let Ok(peer_id_bytes) = hex::decode(parts[1]) {
                     if peer_id_bytes.len() == 32 {
                         let mut peer_id_array = [0u8; 32];
                         peer_id_array.copy_from_slice(&peer_id_bytes);
                         let peer_id = PeerId(peer_id_array);
 
-                        if let Ok(coordinator_addr) = parts[2].parse::<SocketAddr>() {
-                            if let Err(e) =
-                                chat_node.connect_to_peer(peer_id, coordinator_addr).await
-                            {
-                                error!("Failed to connect: {}", e);
-                            }
-                        } else {
-                            error!("Invalid coordinator address: {}", parts[2]);
+                        if let Err(e) = chat_node.connect_peer(peer_id).await {
+                            error!("Failed to connect: {}", e);
                         }
                     } else {
                         error!("Peer ID must be 32 bytes (64 hex chars)");
@@ -357,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     error!("Invalid peer ID hex: {}", parts[1]);
                 }
             } else {
-                println!("Usage: /connect <peer_id_hex> <coordinator_addr>");
+                println!("Usage: /connect <peer_id_hex>");
             }
         } else if line == "/peers" {
             let peers = chat_node.peers.lock().await;

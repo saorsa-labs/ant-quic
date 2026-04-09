@@ -68,10 +68,11 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
 
 **Solutions:**
 
-1. **Increase connection timeout**
+1. **Verify the endpoint is seeded with reachable peers**
    ```rust
    let config = P2pConfig::builder()
-       .connection_timeout(Duration::from_secs(60))
+       .known_peer("peer1.example.com:9000".parse()?)
+       .known_peer("peer2.example.com:9000".parse()?)
        .build()?;
    ```
 
@@ -115,11 +116,11 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
    RUST_LOG=ant_quic::address_discovery=debug cargo run
    ```
 
-2. **Increase candidate discovery timeout**
+2. **Increase the number of tracked candidates**
    ```rust
    let config = P2pConfig::builder()
        .nat(NatConfig {
-           discovery_timeout: Duration::from_secs(10),
+           port_mapping: PortMappingConfig::default(),
            max_candidates: 15,
            enable_symmetric_nat: true,
            ..Default::default()
@@ -137,12 +138,11 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
        .build()?;
    ```
 
-4. **Check NAT type**
+4. **Check observed external addresses**
    ```rust
-   // Log discovered addresses to understand NAT behavior
-   let addresses = endpoint.discovered_addresses();
-   for addr in addresses {
-       println!("Discovered: {} (check if port varies)", addr);
+   // Log observed addresses to understand NAT behavior
+   for addr in endpoint.all_external_addrs() {
+       println!("Observed: {} (check if port varies)", addr);
    }
    ```
 
@@ -155,12 +155,13 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
 
 **Solutions:**
 
-1. **Increase coordination timeout**
+1. **Increase candidate breadth and seed from multiple peers**
    ```rust
    let config = P2pConfig::builder()
+       .known_peer("us-east.example.com:9000".parse()?)
+       .known_peer("eu-west.example.com:9000".parse()?)
        .nat(NatConfig {
-           coordination_timeout: Duration::from_secs(20),
-           hole_punch_retries: 8,
+           max_candidates: 15,
            ..Default::default()
        })
        .build()?;
@@ -179,19 +180,28 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
 3. **Verify peer connectivity**
    ```rust
    // Test connection to known peer
-   let connection = endpoint.connect("peer.example.com:9000".parse()?).await;
+   let connection = endpoint.connect_addr("peer.example.com:9000".parse()?).await;
    match connection {
        Ok(_) => println!("Known peer reachable"),
        Err(e) => eprintln!("Known peer unreachable: {}", e),
    }
    ```
 
+4. **Check router-assist status separately**
+   ```rust
+   println!("Port mapping active: {}", endpoint.port_mapping_active());
+   println!("Port mapping addr: {:?}", endpoint.port_mapping_addr());
+   println!("All external candidates: {:?}", endpoint.all_external_addrs());
+   ```
+   If router assist is unavailable or misleading on a specific network, compare
+   behavior with `ant-quic --no-port-mapping`.
+
 ## Address Discovery Issues
 
 ### Problem: No addresses being discovered
 
 **Symptoms:**
-- `discovered_addresses()` returns empty
+- `external_addr()` / `all_external_addrs()` remain empty
 - No OBSERVED_ADDRESS frames in logs
 - NAT traversal using only local addresses
 
@@ -200,11 +210,11 @@ This guide helps diagnose and resolve common issues with ant-quic's v0.13.0+ NAT
 1. **Connect to known peers first**
    ```rust
    // Address discovery requires at least one connection
-   endpoint.connect_bootstrap().await?;
+   endpoint.connect_known_peers().await?;
 
-   // Then check addresses
-   let addresses = endpoint.discovered_addresses();
-   println!("Discovered {} addresses", addresses.len());
+   // Then check observed addresses
+   let addresses = endpoint.all_external_addrs();
+   println!("Observed {} addresses", addresses.len());
    ```
 
 2. **Verify transport parameter negotiation**
@@ -492,7 +502,7 @@ Add-MpPreference -ExclusionPath "C:\path\to\ant-quic.exe"
 
 **Problem**: Network interface detection fails
 ```rust
-// Fallback to manual configuration
+// Fall back to manual bind-address configuration
 let config = P2pConfig::builder()
     .bind_addr("192.168.1.100:9000".parse()?)
     .build()?;
@@ -516,13 +526,13 @@ let config = P2pConfig::builder()
 **A**: Check discovered addresses - if the port changes between connections to different peers, you're likely behind a symmetric NAT.
 
 ### Q: Why do connections fail even with address discovery?
-**A**: Some network configurations (CGNAT, strict firewalls) may still block direct connections. Consider using a relay as fallback.
+**A**: Some network configurations (CGNAT, strict firewalls) may still block direct connectivity. ant-quic will automatically progress from direct attempts to NAT traversal and relay fallback inside its unified outbound connect path.
 
 ### Q: Can I disable PQC for debugging?
 **A**: No. In v0.13.0+, PQC is always enabled. Use debug logging instead to diagnose PQC issues.
 
 ### Q: How can I improve connection reliability?
-**A**: Use multiple known peers, enable address discovery, increase timeouts, and implement retry logic with exponential backoff.
+**A**: Use multiple known peers in different networks/regions, let the endpoint connect to them early (`connect_known_peers()`), ensure address discovery is working, and tune timeouts only when necessary. Normal applications should not manually choose direct-vs-relay strategy.
 
 ### Q: Can QUIC bi/uni streams drop data like datagrams?
 **A**: No. Streams are fully reliable and ordered — any missing stream payload is a protocol/library bug. If this happens, grab `ConnectionStats` (for both peers), enable `RUST_LOG=ant_quic=trace`, and file an issue that includes: (1) how many stream messages you sent, (2) which ones failed to arrive, and (3) whether you were concurrently reading datagrams. This helps us reproduce race conditions such as the multi-client `tokio::select!` loops covered by `tests/multi_client_mixed_traffic.rs`.

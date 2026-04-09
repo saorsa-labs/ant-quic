@@ -39,7 +39,7 @@ ant-quic should be the **smallest useful substrate** that can reliably connect m
 
 ## Decision
 
-Implement **native QUIC NAT traversal** using QUIC extension frames, eliminating external infrastructure:
+Implement **native QUIC NAT traversal** as the primary reachability mechanism using QUIC extension frames, eliminating external infrastructure. In addition, accept **router-assisted port mapping** (UPnP IGD first, with PCP/NAT-PMP as possible future follow-ons) as an additive local optimization for compatible home/edge routers.
 
 ### Extension Frames
 
@@ -60,16 +60,29 @@ Implement **native QUIC NAT traversal** using QUIC extension frames, eliminating
 
 ### How It Works
 
-1. **Address Discovery**: Peers report observed external addresses via OBSERVED_ADDRESS (no STUN needed)
-2. **Candidate Exchange**: Peers share candidates via ADD_ADDRESS frames
-3. **Hole Punching**: Coordinated via PUNCH_ME_NOW (any peer can coordinate)
-4. **Validation**: Test candidate pairs, promote successful paths
-5. **Fallback**: If direct fails, use MASQUE relay (see ADR-006)
+1. **Router Assist (Best Effort)**: On compatible local gateways, request/renew a UDP port mapping via UPnP IGD to improve inbound reachability
+2. **Address Discovery**: Peers report observed external addresses via OBSERVED_ADDRESS (no STUN needed)
+3. **Candidate Exchange**: Peers share candidates via ADD_ADDRESS frames
+4. **Hole Punching**: Coordinated via PUNCH_ME_NOW (any peer can coordinate)
+5. **Validation**: Test candidate pairs, promote successful paths
+6. **Fallback**: If direct fails, use MASQUE relay (see ADR-006)
 
-### Three-Layer Connectivity Strategy
+Router-assisted mapping is **additive only**:
+- it can contribute a better external candidate address
+- it does not replace peer-assisted QUIC NAT traversal
+- it does not by itself prove peer-verified direct reachability
+- it must fail open into the normal NAT traversal + relay flow
+
+Current first-cut runtime status:
+- implemented via `PortMappingConfig` under `NatConfig`
+- enabled by default, with CLI opt-out via `--no-port-mapping`
+- mapped public addresses feed candidate/status surfaces, but do not flip direct-reachability truth on their own
+
+### Layered Connectivity Strategy
 
 | Layer | Method | Success Rate | Used When |
 |-------|--------|--------------|-----------|
+| 0 | Router-assisted port mapping (UPnP IGD) | Environment-dependent | Compatible home/edge router on local network |
 | 1 | Direct QUIC | ~20% | No NAT, public IPs |
 | 2 | Native NAT traversal | High* | Most NAT types |
 | 3 | MASQUE relay (ADR-006) | ~100% | Symmetric NAT, CGNAT |
@@ -93,11 +106,13 @@ For symmetric NATs that use different ports per destination:
 - **Simpler operations**: Nothing to deploy except nodes themselves
 - **Native QUIC integration**: Leverages existing QUIC machinery
 - **Symmetric**: Any connected peer can assist
+- **Better home reachability**: UPnP IGD can improve inbound reachability on compatible consumer routers
 
 ### Trade-offs
 - **Non-standard**: Custom extension frames (based on IETF drafts)
-- **Requires seed peer**: Must connect to at least one peer first
-- **Symmetric NAT limits**: Some challenging NAT configurations may require relay fallback
+- **Requires seed peer**: Must connect to at least one peer first for pure native traversal
+- **Router variance**: UPnP IGD support and behavior differ across consumer routers
+- **Symmetric NAT limits**: Some challenging NAT configurations may still require relay fallback
 
 ### Standards Basis
 
@@ -113,8 +128,9 @@ Based on IETF drafts (not yet RFCs):
 2. **libp2p AutoNAT**: Higher-level protocol over QUIC
    - Rejected: Additional complexity layer, still needs coordination
 
-3. **UPnP/PCP**: Router port mapping protocols
-   - Rejected: Not universally supported, security concerns
+3. **UPnP/PCP as the primary NAT strategy**
+   - Rejected: Not universally supported, router compatibility varies, and it should not become the core connectivity dependency
+   - Accepted in narrower form: UPnP IGD is useful as an additive local-router optimization layered under the native QUIC traversal strategy
 
 4. **Always relay**: Route all traffic through known peers
    - Rejected: Inefficient, creates bottlenecks

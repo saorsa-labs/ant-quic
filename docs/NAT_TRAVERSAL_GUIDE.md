@@ -4,6 +4,11 @@
 
 This guide provides detailed information on testing and configuring NAT traversal in ant-quic, including setup instructions for different NAT types and troubleshooting common issues.
 
+The connectivity architecture now also treats **UPnP IGD** as a
+best-effort local-router assist layer for compatible home networks. It is
+additive to native QUIC NAT traversal and MASQUE relay fallback, not a
+replacement for them.
+
 ## Table of Contents
 
 1. [NAT Types Overview](#nat-types-overview)
@@ -260,50 +265,64 @@ let config = P2pConfig::builder()
     .build()?;
 ```
 
+### Router-Assisted Port Mapping
+
+ant-quic's connectivity stack now includes **best-effort UPnP IGD** on
+compatible local gateways:
+
+- it is meant to be **default-on** for home-friendly deployments
+- it has a simple explicit **off switch**: `--no-port-mapping`
+- a successful mapping contributes an additional public candidate address
+- it does **not** replace native QUIC address observation, hole punching, or
+  MASQUE relay fallback
+- it does **not** by itself prove `can_receive_direct`; peer-verified inbound
+  success is still the stronger signal
+- runtime surfaces expose `endpoint.port_mapping_active()` and
+  `endpoint.port_mapping_addr()` so operators can distinguish router assist from
+  peer-observed reachability
+
+Treat UPnP IGD as a router-local reachability assist layer, not as the primary
+NAT traversal protocol.
+
 ### Runtime Configuration
 
 Configure via command-line arguments:
 
 ```bash
-# v0.13.0+: All nodes are symmetric P2P nodes
-# Connect to known peers
-ant-quic --connect quic.saorsalabs.com:9000 \
-         --nat-traversal \
-         --max-candidates 20 \
-         --punch-timeout 10000
+# Seed connectivity from known peers and print periodic stats
+ant-quic --listen [::]:0 \
+         --known-peers quic.saorsalabs.com:9000 \
+         --stats
 
-# Listen for incoming connections
-ant-quic --listen 0.0.0.0:9000 \
-         --enable-relay
+# Connect to a specific address through the unified outbound path
+ant-quic --listen [::]:0 \
+         --connect 203.0.113.10:9000
+
+# Disable best-effort router assist on demand
+ant-quic --listen [::]:0 \
+         --known-peers quic.saorsalabs.com:9000 \
+         --no-port-mapping
 ```
 
-### Configuration File
+### Programmatic Configuration
 
-Create `config.toml`:
+Configure the policy surface through `P2pConfig` and `NatConfig`:
 
-```toml
-[nat_traversal]
-enabled = true
-# v0.13.0+: No role field - all nodes are symmetric P2P nodes
-max_candidates = 10
-punch_timeout_ms = 5000
-enable_address_prediction = true
-prediction_range = 100
+```rust
+use ant_quic::{NatConfig, P2pConfig, PortMappingConfig};
 
-[discovery]
-enable_local_discovery = true
-enable_stun_like_discovery = true
-# v0.13.0+: Uses known_peers instead of bootstrap_nodes
-known_peers = [
-    "quic.saorsalabs.com:9000",
-    "backup.example.com:9000"
-]
-
-[protocols]
-enable_add_address = true      # 0x3d7e90-91
-enable_punch_me_now = true     # 0x3d7e92-93
-enable_remove_address = true   # 0x3d7e94
-enable_observed_address = true # 0x9f81a6-a7
+let config = P2pConfig::builder()
+    .known_peer("peer.example.com:9000".parse()?)
+    .nat(NatConfig {
+        port_mapping: PortMappingConfig {
+            enabled: true,
+            lease_duration_secs: 1800,
+            allow_random_external_port: true,
+        },
+        max_candidates: 10,
+        ..Default::default()
+    })
+    .build()?;
 ```
 
 ## Testing Procedures
@@ -477,14 +496,19 @@ wireshark nat_traversal.pcap
 
 ### Optimize Candidate Discovery
 
-```rust
-// Configure aggressive candidate discovery
-let mut config = NatTraversalConfig::default();
-config.enable_local_discovery = true;
-config.enable_upnp_igd = true;
-config.prediction_algorithm = PredictionAlgorithm::Adaptive;
-config.parallel_attempts = 5;
-```
+Use a combination of:
+
+- multiple known peers to improve external address observation
+- sufficient candidate breadth (`NatConfig::max_candidates`)
+- best-effort UPnP IGD on compatible home routers to add a router-assisted
+  public candidate early
+- normal native QUIC NAT traversal and relay fallback after that
+
+A practical tuning mindset is:
+
+1. prefer more good candidates over hard-coded strategy toggles
+2. treat UPnP IGD as additive signal generation, not a magic replacement layer
+3. measure direct success, NAT-traversed success, and relay usage separately
 
 ### Reduce Hole Punching Latency
 

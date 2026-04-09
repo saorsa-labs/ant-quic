@@ -1264,6 +1264,19 @@ impl CandidateDiscoveryManager {
         }
     }
 
+    /// Remove a previously discovered external address from an active session.
+    pub fn remove_external_address(&mut self, peer_id: PeerId, external_addr: SocketAddr) -> bool {
+        let Some(session) = self.active_sessions.get_mut(&peer_id) else {
+            return false;
+        };
+
+        let original_len = session.discovered_candidates.len();
+        session
+            .discovered_candidates
+            .retain(|candidate| candidate.address != external_addr);
+        original_len != session.discovered_candidates.len()
+    }
+
     /// Add an external address for all active sessions
     ///
     /// This is useful when we discover our external address from any connected peer -

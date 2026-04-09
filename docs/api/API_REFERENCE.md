@@ -17,6 +17,8 @@ This document provides a comprehensive API reference for ant-quic v0.13.0+.
 
 The primary entry point for all P2P operations. All nodes are symmetric - every node can both initiate and accept connections.
 
+`P2pEndpoint` is the canonical connectivity surface. `Node` is a convenience façade over the same endpoint-level behavior for applications that want a simpler top-level API.
+
 ### Creating an Endpoint
 
 ```rust
@@ -34,7 +36,6 @@ let config = P2pConfig::builder()
     .known_peer("peer1.example.com:9000".parse()?)
     .known_peer("peer2.example.com:9000".parse()?)
     .max_connections(100)
-    .connection_timeout(Duration::from_secs(30))
     .build()?;
 let endpoint = P2pEndpoint::new(config).await?;
 ```
@@ -42,12 +43,17 @@ let endpoint = P2pEndpoint::new(config).await?;
 ### Connecting to Peers
 
 ```rust
-// Direct connection
-let connection = endpoint.connect(peer_addr).await?;
+// Seed connectivity from configured known peers
+endpoint.connect_known_peers().await?;
 
-// Via known peer (for NAT traversal coordination)
-let connection = endpoint.connect_via_peer(peer_id, known_peer_addr).await?;
+// Connect to a specific address through the unified outbound path
+let connection = endpoint.connect_addr(peer_addr).await?;
+
+// Connect to an authenticated peer identity
+let connection = endpoint.connect_peer(peer_id).await?;
 ```
+
+`connect_addr()` is not a separate direct-only strategy. It is the canonical address-based connect entrypoint and goes through the endpoint's normal routing/orchestration path, including connection reuse, direct establishment, and fallback handling when applicable. Richer peer-oriented behavior comes from `connect_known_peers()` and `connect_peer()`.
 
 ### Accepting Connections
 
@@ -82,26 +88,56 @@ send.finish()?;
 ```rust
 let config = P2pConfig::builder()
     .bind_addr(SocketAddr)          // Local address to bind
-    .known_peer(SocketAddr)         // Known peer for discovery (repeatable)
+    .known_peer(SocketAddr)         // Known peer contact hint for initial connectivity (repeatable)
     .nat(NatConfig)                 // NAT traversal configuration
     .pqc(PqcConfig)                 // Post-quantum crypto configuration
     .mtu(MtuConfig)                 // MTU configuration
     .max_connections(usize)         // Maximum concurrent connections
-    .connection_timeout(Duration)   // Connection establishment timeout
-    .idle_timeout(Duration)         // Idle connection timeout
     .build()?;
 ```
+
+Known peers are seed inputs into the symmetric peer graph. They are not privileged bootstrap servers and do not imply a separate protocol role.
+
+`SocketAddr` values in configuration are contact hints only. Durable peer identity
+is always `PeerId`, derived from the authenticated ML-DSA-65 public key.
 
 ### NatConfig
 
 ```rust
 pub struct NatConfig {
-    pub max_candidates: usize,           // Max address candidates (default: 10)
-    pub coordination_timeout: Duration,  // Hole punch timeout (default: 15s)
-    pub discovery_timeout: Duration,     // Discovery timeout (default: 5s)
-    pub enable_symmetric_nat: bool,      // Enable port prediction (default: true)
-    pub hole_punch_retries: u32,         // Punch attempts (default: 5)
+    pub port_mapping: PortMappingConfig,
+    pub max_candidates: usize,
+    pub enable_symmetric_nat: bool,
+    pub enable_relay_fallback: bool,
+    pub enable_relay_service: bool,
+    pub relay_nodes: Vec<SocketAddr>,
+    pub max_concurrent_attempts: usize,
+    pub prefer_rfc_nat_traversal: bool,
 }
+```
+
+Several NAT fields are now effectively always-on in symmetric mode. They remain configurable for compatibility and tuning, but normal endpoint dialing uses one unified orchestration path rather than user-selected fallback strategies.
+
+`port_mapping` is the additive best-effort router-assist policy. The current
+runtime uses UPnP IGD internally, starts after the bound UDP port is known,
+renews leases in the background, and never blocks endpoint startup.
+
+### PortMappingConfig
+
+```rust
+pub struct PortMappingConfig {
+    pub enabled: bool,                    // default: true
+    pub lease_duration_secs: u32,         // default: 3600
+    pub allow_random_external_port: bool, // default: true
+}
+```
+
+Common ergonomic entrypoint:
+
+```rust
+let config = P2pConfig::builder()
+    .port_mapping_enabled(false)
+    .build()?;
 ```
 
 ### PqcConfig
@@ -132,18 +168,21 @@ pub struct MtuConfig {
 ### Address Discovery
 
 ```rust
-// Connect to known peers and discover external address
-endpoint.connect_bootstrap().await?;
+// Connect to known peers and allow external address observation
+endpoint.connect_known_peers().await?;
+
+// Connect to a specific address through the canonical address entrypoint
+let _connection = endpoint.connect_addr(target_addr).await?;
 
 // Get discovered external address
-let external: Option<SocketAddr> = endpoint.external_address();
+let external: Option<SocketAddr> = endpoint.external_addr();
 
-// Get all discovered addresses
-let addresses: Vec<SocketAddr> = endpoint.discovered_addresses();
-
-// Get local candidates
-let candidates: Vec<CandidateAddress> = endpoint.get_local_candidates();
+// Port mapping contributes an extra external candidate when active
+let mapped: Option<SocketAddr> = endpoint.port_mapping_addr();
+let all_candidates: Vec<SocketAddr> = endpoint.all_external_addrs();
 ```
+
+Address discovery primarily comes from seeded peer connectivity. Applications generally call `connect_known_peers()` to establish that context, then use `connect_addr()` for address-based dialing or `connect_peer()` for peer-oriented dialing while the endpoint applies its normal routing/orchestration behavior.
 
 ### CandidateAddress
 
@@ -310,7 +349,7 @@ pub enum NatTraversalError {
 ### Complete P2P Node
 
 ```rust
-use ant_quic::{P2pEndpoint, P2pConfig, P2pEvent, NatConfig};
+use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, P2pEvent, PortMappingConfig};
 use std::time::Duration;
 
 #[tokio::main]
@@ -320,8 +359,8 @@ async fn main() -> anyhow::Result<()> {
         .bind_addr("0.0.0.0:9000".parse()?)
         .known_peer("quic.saorsalabs.com:9000".parse()?)
         .nat(NatConfig {
+            port_mapping: PortMappingConfig::default(),
             max_candidates: 15,
-            coordination_timeout: Duration::from_secs(20),
             enable_symmetric_nat: true,
             ..Default::default()
         })
@@ -332,10 +371,13 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
     println!("Peer ID: {}", endpoint.peer_id().to_hex());
 
-    // Discover external address
-    endpoint.connect_bootstrap().await?;
-    if let Some(addr) = endpoint.external_address() {
+    // Seed peer connectivity and external address observation
+    endpoint.connect_known_peers().await?;
+    if let Some(addr) = endpoint.external_addr() {
         println!("External: {}", addr);
+    }
+    if let Some(mapped) = endpoint.port_mapping_addr() {
+        println!("Router-mapped candidate: {}", mapped);
     }
 
     // Subscribe to events
@@ -368,13 +410,15 @@ async fn main() -> anyhow::Result<()> {
 ### Statistics Monitoring
 
 ```rust
-let stats = endpoint.stats();
+let stats = endpoint.stats().await;
 println!("Active connections: {}", stats.active_connections);
 println!("Discovered addresses: {}", stats.discovered_addresses);
 println!("Successful punches: {}", stats.successful_hole_punches);
 println!("Failed punches: {}", stats.failed_hole_punches);
 println!("Bytes sent: {}", stats.bytes_sent);
 println!("Bytes received: {}", stats.bytes_received);
+println!("Port mapping active: {}", endpoint.port_mapping_active());
+println!("Port mapping addr: {:?}", endpoint.port_mapping_addr());
 ```
 
 ## Removed API (v0.13.0)
@@ -389,11 +433,10 @@ The following types were **removed** in v0.13.0:
 | `NatTraversalRole` | All nodes are symmetric |
 | `PqcMode` | PQC always enabled |
 | `HybridPreference` | No mode selection |
-| `bootstrap_nodes` | Use `known_peer()` |
+| `bootstrap_nodes` | Use `known_peer()` / `known_peers()` seed inputs |
 
 ## Support
 
 - GitHub Issues: https://github.com/dirvine/ant-quic/issues
 - Documentation: https://docs.rs/ant-quic
 - Examples: https://github.com/dirvine/ant-quic/tree/main/examples
-

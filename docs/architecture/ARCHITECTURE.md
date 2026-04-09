@@ -2,7 +2,7 @@
 
 ## Overview
 
-ant-quic is a QUIC transport protocol implementation with advanced NAT traversal capabilities, optimized for P2P networks. It extends the QUIC protocol with NAT traversal capabilities based on draft-seemann-quic-nat-traversal-02 and draft-ietf-quic-address-discovery-00.
+ant-quic is a QUIC transport protocol implementation with advanced NAT traversal capabilities, optimized for P2P networks. It extends the QUIC protocol with native NAT traversal capabilities based on draft-seemann-quic-nat-traversal-02 and draft-ietf-quic-address-discovery-00, and its connectivity architecture also includes best-effort router-assisted port mapping via UPnP IGD as an additive local reachability optimization.
 
 **v0.13.0+: Pure Symmetric P2P Architecture**
 - Every node is identical - can connect, accept, and coordinate
@@ -26,7 +26,7 @@ This layer contains the core QUIC protocol implementation.
   - `OBSERVED_ADDRESS` (0x9f81a6 IPv4, 0x9f81a7 IPv6) - Report observed external address
 - **`src/crypto/`** - Cryptographic implementations:
   - TLS 1.3 support via rustls
-  - Pure PQC Raw Public Keys with ML-DSA-65 (Ed25519 only for PeerId identifiers)
+  - Pure PQC Raw Public Keys with ML-DSA-65 identities and `PeerId = SHA-256(public_key)`
   - Post-Quantum Cryptography (ML-KEM-768, ML-DSA-65)
 - **`src/transport_parameters.rs`** - QUIC transport parameters including:
   - `0x3d7e9f0bca12fea6` - NAT traversal capability negotiation
@@ -76,6 +76,7 @@ This layer provides developer-friendly APIs wrapping the low-level protocol.
 
 #### Helper Components
 - **`src/candidate_discovery.rs`** - Network interface and address discovery
+- **`src/port_mapping.rs`** - Best-effort router-assisted UDP port mapping lifecycle (UPnP IGD first cut)
 - **`src/auth.rs`** - Authentication manager with challenge-response protocol
 - **`src/chat.rs`** - Chat protocol implementation
 
@@ -88,7 +89,9 @@ User-facing applications demonstrating the library capabilities.
   - Uses symmetric P2P model (v0.13.0+)
   - Implements chat with peer discovery
   - Dashboard support for monitoring
-  - NAT traversal event handling
+  - Uses the unified outbound connect surface (`connect_known_peers`, `connect_addr`)
+  - NAT traversal event handling without exposing normal-user strategy toggles
+  - Exposes `--no-port-mapping` plus stats/status output for router-assist state
 
 #### Examples
 - **`examples/chat_demo.rs`** - Chat application demo
@@ -100,23 +103,33 @@ User-facing applications demonstrating the library capabilities.
 ### Connection Establishment Flow
 
 ```
-Application (ant-quic)
+Application / CLI
     ↓
-P2pEndpoint (v0.13.0+)
+P2pEndpoint unified outbound orchestrator
     ↓
-NatTraversalEndpoint
+NatTraversalEndpoint + relay/NAT helpers
     ↓
 high_level::Endpoint
     ↓
 Low-level Endpoint → Connection → Streams
 ```
 
+Normal consumers should not choose between direct, dual-stack, NAT traversal,
+or relay modes. `P2pEndpoint` selects the path internally based on available
+addresses, observed reachability, and fallback needs.
+
 ### NAT Traversal Flow (Symmetric P2P)
+
+0. **Router-Assist Phase (Best Effort)**
+   - On compatible home routers, the connectivity architecture may request a local UDP port mapping via UPnP IGD
+   - A successful mapping contributes an additional public candidate address
+   - The runtime is managed in `src/port_mapping.rs` and surfaced through endpoint/node status
+   - This improves reachability but does **not** replace peer-verified direct reachability checks
 
 1. **Discovery Phase**
    - Local interface enumeration
-   - Connect to any known peer
-   - Learn external address via OBSERVED_ADDRESS frames
+   - Connect to seeded known peers and refreshed runtime peers
+   - Learn external address candidates via OBSERVED_ADDRESS frames when peers report them
 
 2. **Coordination Phase**
    - Exchange candidates with target peer via any connected peer
@@ -130,6 +143,9 @@ Low-level Endpoint → Connection → Streams
    - QUIC path validation
    - Connection migration to direct path
 
+5. **Fallback Phase**
+   - If direct paths still fail, MASQUE relay keeps connectivity available
+
 ## Key Design Decisions
 
 ### Symmetric P2P Model (v0.13.0+)
@@ -137,22 +153,36 @@ Low-level Endpoint → Connection → Streams
 All nodes have identical capabilities:
 - Can initiate connections (like a "client")
 - Can accept connections (like a "server")
-- Can coordinate NAT traversal for other peers
+- Can participate in NAT traversal coordination for other peers
 - Can relay traffic when direct connection fails
 
 There are no special roles. The term "known_peers" replaces "bootstrap_nodes" - they're just addresses to connect to first.
 
+`PeerId` is the durable identity for a peer. `SocketAddr` is only the latest
+routable contact hint and can change across NAT rebinding, reconnects, or path
+migration. Any durable coordinator/bootstrap cache must therefore key by
+`PeerId` and treat stored addresses as mutable reachability metadata.
+
+See [PEER_IDENTITY_AND_ADDRESSING.md](PEER_IDENTITY_AND_ADDRESSING.md) for the
+short rule set we use when reviewing identity vs reachability changes.
+
+See [UNIFIED_CONNECTIVITY_PLAN.md](UNIFIED_CONNECTIVITY_PLAN.md) for the
+consumer-facing plan to unify discovery policy, connectivity orchestration, and
+pure-binary VPS proof of 100% reachability.
+
 ### Why Not Use STUN/TURN?
 - draft-seemann-quic-nat-traversal-02 provides QUIC-native approach
-- No external protocols needed
+- No external coordination services are needed
 - Address observation happens through normal QUIC connections
+- UPnP IGD is only a local-router optimization, not a central dependency
 - More efficient and simpler architecture
 
 ### Pure PQC Raw Public Keys
 - Implements certificate-free operation inspired by RFC 7250
-- Ed25519 keys for peer identity
-- X25519 + ML-KEM-768 hybrid key exchange (IANA 0x11EC)
-- Ed25519 + ML-DSA-65 hybrid signatures (0x0920)
+- ML-DSA-65 public keys for peer identity and authentication
+- PeerId = SHA-256(ML-DSA-65 public key)
+- ML-KEM-768 key exchange on every connection
+- ML-DSA-65 signatures on every authenticated connection
 - See `docs/rfcs/ant-quic-pqc-authentication.md` for full specification
 
 ### 100% Post-Quantum Cryptography (v0.13.0+)
@@ -166,7 +196,7 @@ There are no special roles. The term "known_peers" replaces "bootstrap_nodes" - 
 ### For Library Users (v0.13.0+)
 
 ```rust
-use ant_quic::{P2pEndpoint, P2pConfig};
+use ant_quic::{P2pConfig, P2pEndpoint};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -179,26 +209,16 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
     println!("Peer ID: {:?}", endpoint.peer_id());
 
-    // Connect to known peers for address discovery
-    endpoint.connect_bootstrap().await?;
+    // Known peers are discovery/bootstrap inputs, not special-role servers
+    endpoint.connect_known_peers().await?;
+
+    // Convenience: connect to a specific address through the unified
+    // outbound orchestration path
+    let _peer = endpoint.connect_addr("peer.example.com:9000".parse()?).await?;
 
     // External address is now discoverable
-    if let Some(addr) = endpoint.external_address() {
+    if let Some(addr) = endpoint.external_addr() {
         println!("External address: {}", addr);
-    }
-
-    // Subscribe to events
-    let mut events = endpoint.subscribe();
-    while let Ok(event) = events.recv().await {
-        match event {
-            P2pEvent::Connected { peer_id, addr } => {
-                println!("Connected to {} at {}", peer_id.to_hex(), addr);
-            }
-            P2pEvent::AddressDiscovered { addr } => {
-                println!("Discovered external address: {}", addr);
-            }
-            _ => {}
-        }
     }
 
     Ok(())
@@ -222,9 +242,10 @@ The architecture supports extensions through:
 - 100% Post-Quantum Cryptography (v0.13.0+)
 - Symmetric P2P architecture (v0.13.0+)
 - High-level APIs (`P2pEndpoint`, `NatTraversalEndpoint`)
+- Best-effort UPnP IGD port-mapping lifecycle and status surfaces
 - Production binary with full functionality
 - Comprehensive test suite
-- Peer authentication with Ed25519
+- Peer authentication with ML-DSA-65 raw public keys
 - Secure chat protocol
 - Real-time monitoring dashboard
 - GitHub Actions for automated releases

@@ -152,7 +152,7 @@ mod first_node_tests {
         println!("Connector created, attempting connection...");
 
         // Connect to listener
-        let connect_result = timeout(SHORT_TIMEOUT, connector.connect(listener_addr)).await;
+        let connect_result = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr)).await;
 
         // Verify connection succeeded
         match connect_result {
@@ -336,7 +336,7 @@ mod address_discovery_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             // Client connects
-            let _ = timeout(SHORT_TIMEOUT, client_clone.connect(observer_addr)).await;
+            let _ = timeout(SHORT_TIMEOUT, client_clone.connect_addr(observer_addr)).await;
 
             accept_handle.abort();
         });
@@ -388,7 +388,7 @@ mod data_transfer_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Client connects
-        let connect_result = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;
+        let connect_result = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr)).await;
 
         match connect_result {
             Ok(Ok(peer_conn)) => {
@@ -439,7 +439,7 @@ mod data_transfer_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Connect and test bidirectional transfer
-        match timeout(SHORT_TIMEOUT, node2.connect(node1_addr)).await {
+        match timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr)).await {
             Ok(Ok(peer)) => {
                 println!(
                     "Bidirectional connection established with {:?}",
@@ -738,7 +738,11 @@ mod nat_traversal_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Attempt connection (triggers NAT traversal state machine)
-        let _ = timeout(Duration::from_secs(2), client.connect(coordinator_addr)).await;
+        let _ = timeout(
+            Duration::from_secs(2),
+            client.connect_addr(coordinator_addr),
+        )
+        .await;
 
         // Check for NAT traversal events
         let events = collect_events(client_events, Duration::from_secs(1)).await;
@@ -1023,7 +1027,7 @@ mod channel_recv_and_shutdown_tests {
 
         // Client connects
         let client = create_test_node(vec![server_addr]).await;
-        let connect_result = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;
+        let connect_result = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr)).await;
 
         let peer_conn = match connect_result {
             Ok(Ok(pc)) => pc,
@@ -1140,7 +1144,7 @@ mod channel_recv_and_shutdown_tests {
         let client = create_test_node(vec![server_addr]).await;
 
         // Establish a connection (so shutdown has something to drain)
-        let _ = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;
+        let _ = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr)).await;
         let _ = accept_handle.await;
 
         // Send some data so buffers are non-empty

@@ -21,7 +21,7 @@ pub trait LinkTransport: Send + Sync + 'static {
     type Conn: LinkConn;
 
     fn local_peer(&self) -> PeerId;
-    fn external_address(&self) -> Option<SocketAddr>;
+    fn external_addr(&self) -> Option<SocketAddr>;
     fn peer_table(&self) -> Vec<(PeerId, Capabilities)>;
     fn dial(&self, peer: PeerId, proto: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>>;
     fn dial_addr(&self, addr: SocketAddr, proto: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>>;

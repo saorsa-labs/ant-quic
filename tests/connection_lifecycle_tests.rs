@@ -119,7 +119,7 @@ mod connection_lifecycle {
         println!("Connector created");
 
         // Try to connect
-        let connect_result = timeout(SHORT_TIMEOUT, connector.connect(listener_addr)).await;
+        let connect_result = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr)).await;
 
         match connect_result {
             Ok(Ok(connection)) => {
@@ -191,7 +191,7 @@ mod connection_lifecycle {
             .expect("Failed to create node2");
 
         // Attempt connection and observe state
-        let connect_result = timeout(SHORT_TIMEOUT, node2.connect(node1_addr)).await;
+        let connect_result = timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr)).await;
 
         match connect_result {
             Ok(Ok(connection)) => {
@@ -266,7 +266,7 @@ mod connection_lifecycle {
             .expect("Failed to create node2");
 
         // Try to connect
-        let _ = timeout(SHORT_TIMEOUT, node2.connect(node1_addr)).await;
+        let _ = timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr)).await;
 
         // After connection, node1 might learn its external address from node2
         // Note: In local testing, external address might not be discovered
@@ -316,7 +316,7 @@ mod error_conditions {
 
         let connect_result = timeout(
             Duration::from_secs(1), // Short timeout for failure
-            node.connect(invalid_addr),
+            node.connect_addr(invalid_addr),
         )
         .await;
 

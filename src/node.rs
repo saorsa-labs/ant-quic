@@ -13,7 +13,7 @@
 //! - Uses 100% post-quantum cryptography (ML-KEM-768)
 //! - Works behind any NAT via native QUIC hole punching
 //! - Can act as coordinator/relay if environment allows
-//! - Exposes complete observability via [`NodeStatus`]
+//! - Exposes a practical status snapshot via [`NodeStatus`]
 //!
 //! # Zero Configuration
 //!
@@ -435,34 +435,24 @@ impl Node {
 
     // === Connections ===
 
-    /// Connect to a peer by address
+    /// Connect to a peer by address.
     ///
-    /// This creates a direct connection to the specified address.
-    /// NAT traversal is handled automatically if needed.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let conn = node.connect_addr("quic.saorsalabs.com:9000".parse()?).await?;
-    /// println!("Connected to: {:?}", conn.peer_id);
-    /// ```
+    /// Thin facade over [`P2pEndpoint::connect_addr`], which uses the unified
+    /// outbound connectivity orchestrator.
     pub async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection, NodeError> {
-        self.inner.connect(addr).await.map_err(NodeError::Endpoint)
+        self.inner
+            .connect_addr(addr)
+            .await
+            .map_err(NodeError::Endpoint)
     }
 
-    /// Connect to a peer by ID
+    /// Connect to a peer by durable peer ID.
     ///
-    /// This uses NAT traversal to find and connect to the peer.
-    /// A coordinator (known peer) is used to help with hole punching.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let conn = node.connect(peer_id).await?;
-    /// ```
+    /// Thin facade over the unified peer-oriented [`P2pEndpoint`] connect path.
+    /// Strategy selection remains internal to the endpoint.
     pub async fn connect(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
         self.inner
-            .connect_to_peer(peer_id, None)
+            .connect_peer(peer_id)
             .await
             .map_err(NodeError::Endpoint)
     }
@@ -484,12 +474,12 @@ impl Node {
         self.inner.accept().await
     }
 
-    /// Add a known peer dynamically
+    /// Add a known peer dynamically.
     ///
-    /// Known peers help with NAT traversal and peer discovery.
-    /// You can add more peers at runtime.
+    /// Thin facade over [`P2pEndpoint::add_known_peer`]. Known peers help with
+    /// initial connectivity, discovery, and NAT traversal coordination.
     pub async fn add_peer(&self, addr: SocketAddr) {
-        self.inner.add_bootstrap(addr).await;
+        self.inner.add_known_peer(addr).await;
     }
 
     /// Connect to all known peers
@@ -539,8 +529,8 @@ impl Node {
 
     /// Get a snapshot of the node's current status
     ///
-    /// This provides complete visibility into the node's state,
-    /// including NAT type, connectivity, relay status, and performance.
+    /// This provides a practical snapshot of the node's state,
+    /// including NAT type, connectivity, relay/coordinator hints, and performance.
     ///
     /// # Example
     ///
@@ -588,6 +578,7 @@ impl Node {
                 socket_addr_scope(addr)
                     .is_some_and(|scope| scope == crate::ReachabilityScope::Global)
             });
+        let port_mapping = self.inner.port_mapping_snapshot();
 
         // A node is directly reachable only after fresh, peer-verified direct
         // inbound evidence. Scope is freshness-aware too, so an old global
@@ -615,13 +606,18 @@ impl Node {
             stats.active_direct_incoming_connections > 0 || fresh_scope.is_some();
         let direct_reachability_scope = fresh_scope;
 
-        // Relay/coordinator activity must be backed by real runtime metrics.
-        // The NAT stats path is still placeholder-ish, so stay conservative here.
-        let is_relaying = false;
-        let relay_sessions = 0;
+        // Relay/coordinator activity is still best-effort, but we can surface
+        // a conservative runtime snapshot from existing NAT/relay state instead
+        // of hard-coded false/zero placeholders.
+        let runtime_assist = self.inner.runtime_assist_snapshot().await;
+        let is_relaying =
+            runtime_assist.relay_public_addr.is_some() || runtime_assist.active_relay_sessions > 0;
+        let relay_sessions = runtime_assist.active_relay_sessions;
         let relay_bytes_forwarded = 0u64;
-        let is_coordinating = false;
-        let coordination_sessions = 0;
+        let is_coordinating = runtime_assist.preferred_coordinator.is_some()
+            || runtime_assist.coordinator_candidate_count > 0;
+        let coordination_sessions =
+            usize::try_from(runtime_assist.successful_coordinations).unwrap_or(usize::MAX);
 
         // Calculate average RTT from connected peers
         let mut total_rtt = Duration::ZERO;
@@ -652,6 +648,8 @@ impl Node {
             can_receive_direct,
             direct_reachability_scope,
             has_global_address,
+            port_mapping_active: port_mapping.active,
+            port_mapping_addr: port_mapping.external_addr,
             connected_peers: connected_peers.len(),
             active_connections: stats.active_connections,
             pending_connections: 0, // Not tracked yet
@@ -807,6 +805,8 @@ mod tests {
         // Check status fields are populated
         assert_ne!(status.peer_id.0, [0u8; 32]);
         assert_eq!(status.connected_peers, 0); // No connections yet
+        assert!(!status.port_mapping_active);
+        assert_eq!(status.port_mapping_addr, None);
 
         node.shutdown().await;
     }

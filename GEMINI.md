@@ -141,11 +141,11 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
     println!("Peer ID: {:?}", endpoint.peer_id());
 
-    // Connect to known peers for address discovery
-    endpoint.connect_bootstrap().await?;
+    // Seed connectivity and address discovery from configured known peers
+    endpoint.connect_known_peers().await?;
 
     // Your external address is now discoverable
-    if let Some(addr) = endpoint.external_address() {
+    if let Some(addr) = endpoint.external_addr() {
         println!("External address: {}", addr);
     }
 

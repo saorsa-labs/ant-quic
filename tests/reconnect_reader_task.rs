@@ -63,7 +63,7 @@ async fn recv_after_reconnect() {
     let b2 = Arc::clone(&b);
     let accept1 = tokio::spawn(async move { timeout(TIMEOUT, b2.accept()).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let conn = a.connect(b_addr).await.expect("connect");
+    let conn = a.connect_addr(b_addr).await.expect("connect");
     assert_eq!(conn.peer_id, b_id);
     let _ = accept1.await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -88,7 +88,7 @@ async fn recv_after_reconnect() {
     let b3 = Arc::clone(&b);
     let accept2 = tokio::spawn(async move { timeout(TIMEOUT, b3.accept()).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    a.connect(b_addr).await.expect("reconnect");
+    a.connect_addr(b_addr).await.expect("reconnect");
     let _ = accept2.await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 

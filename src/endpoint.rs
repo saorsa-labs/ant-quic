@@ -48,6 +48,7 @@ use crate::{
 };
 
 /// A queued relay request for bootstrap nodes
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct RelayQueueItem {
     /// Target peer ID for the relay
@@ -63,6 +64,7 @@ struct RelayQueueItem {
 }
 
 /// Relay queue management for bootstrap nodes
+#[allow(dead_code)]
 #[derive(Debug)]
 struct RelayQueue {
     /// Pending relay requests with insertion order and O(1) access
@@ -119,6 +121,7 @@ pub struct RelayStats {
     pub current_queue_size: usize,
 }
 
+#[allow(dead_code)]
 impl RelayQueue {
     /// Create a new relay queue with default settings
     fn new() -> Self {
@@ -414,6 +417,7 @@ impl Endpoint {
     }
 
     /// Queue a frame for relay to a target peer
+    #[allow(dead_code)]
     pub(crate) fn queue_frame_for_peer(
         &mut self,
         peer_id: &PeerId,
@@ -688,18 +692,6 @@ impl Endpoint {
                     }
                 }
             }
-            RelayPunchMeNow(target_peer_id, punch_me_now) => {
-                // Handle relay request from bootstrap node
-                let peer_id = PeerId(target_peer_id);
-                if self.queue_frame_for_peer(&peer_id, punch_me_now) {
-                    trace!(
-                        "Successfully queued PunchMeNow frame for relay to peer {:?}",
-                        peer_id
-                    );
-                } else {
-                    warn!("Failed to queue PunchMeNow relay for peer {:?}", peer_id);
-                }
-            }
             SendAddressFrame(add_address_frame) => {
                 // Convert to a connection event so the connection queues the frame for transmit
                 return Some(ConnectionEvent(ConnectionEventInner::QueueAddAddress(
@@ -717,6 +709,9 @@ impl Endpoint {
                 // This event serves as notification to the endpoint for potential coordination
                 // with other components or logging/metrics collection
                 debug!("NAT candidate {} validated successfully", address);
+            }
+            RelayPunchMeNow(_, _) => {
+                // Legacy relay punch event acknowledged for compatibility.
             }
             PeerAddressAdvertised {
                 peer_addr,

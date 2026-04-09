@@ -10,7 +10,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::{Node, PeerConnection};
+use ant_quic::unified_config::{AutoConnectPolicy, DiscoveryPolicy};
+use ant_quic::{Node, P2pConfig, P2pEndpoint, PeerConnection};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -29,6 +30,12 @@ async fn create_localhost_node() -> Node {
     Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .expect("Node::bind should succeed")
+}
+
+async fn create_localhost_endpoint_with_config(config: P2pConfig) -> P2pEndpoint {
+    P2pEndpoint::new(config)
+        .await
+        .expect("P2pEndpoint::new should succeed")
 }
 
 /// Test that calling connect_addr() twice to the same address returns the
@@ -185,6 +192,322 @@ async fn test_simultaneous_connect_no_phantom() {
     node_b.shutdown().await;
     let _ = accept_a.await;
     let _ = accept_b.await;
+}
+
+/// Test that connect_peer(peer_id) reuses an existing authenticated
+/// connection established via connect_addr(addr) instead of creating a
+/// duplicate peer entry.
+///
+/// Note: adding a raw address hint via add_peer(addr) does not by itself make
+/// a durable peer-ID dial resolvable; the peer identity is learned only after
+/// a successful authenticated connection.
+#[tokio::test]
+async fn test_connect_known_peers_auto_connect_disabled_skips_runtime_promoted_peers() {
+    let endpoint_a = create_localhost_endpoint_with_config(
+        P2pConfig::builder()
+            .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .discovery(DiscoveryPolicy {
+                static_known_peers: true,
+                mdns: None,
+                auto_connect: AutoConnectPolicy::Disabled,
+            })
+            .build()
+            .expect("config should build"),
+    )
+    .await;
+    let node_b = create_localhost_node().await;
+
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
+
+    let accept_handle = tokio::spawn({
+        let node = node_b.clone();
+        async move {
+            for _ in 0..2 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    let conn = timeout(Duration::from_secs(10), endpoint_a.connect_addr(addr_b))
+        .await
+        .expect("connect_addr should not time out")
+        .expect("connect_addr should succeed so the peer becomes runtime-known/promoted");
+    assert_eq!(
+        conn.peer_id,
+        node_b.peer_id(),
+        "direct connection should authenticate and learn node_b peer ID"
+    );
+
+    let _ = endpoint_a.disconnect(&node_b.peer_id()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let connected = timeout(Duration::from_secs(10), endpoint_a.connect_known_peers())
+        .await
+        .expect("connect_known_peers should not time out")
+        .expect("connect_known_peers should return successfully");
+
+    assert_eq!(
+        connected, 0,
+        "auto_connect=Disabled should suppress automatic dialing of runtime-promoted UDP peers"
+    );
+    assert!(
+        endpoint_a.connected_peers().await.is_empty(),
+        "endpoint_a should not auto-connect runtime-promoted peers when auto_connect is disabled"
+    );
+
+    endpoint_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = accept_handle.await;
+}
+
+#[tokio::test]
+async fn test_dynamic_add_peer_participates_in_connect_known_peers() {
+    let node_a = create_localhost_node().await;
+    let node_b = create_localhost_node().await;
+
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
+
+    node_a.add_peer(addr_b).await;
+
+    let accept_handle = tokio::spawn({
+        let node = node_b.clone();
+        async move {
+            for _ in 0..3 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let connected = timeout(Duration::from_secs(10), node_a.connect_known_peers())
+        .await
+        .expect("connect_known_peers should not time out")
+        .expect("connect_known_peers should succeed");
+
+    assert!(
+        connected >= 1,
+        "connect_known_peers should connect to dynamically added peer"
+    );
+
+    let peers_a = node_a.connected_peers().await;
+    assert_eq!(
+        peers_a.len(),
+        1,
+        "node_a should have exactly 1 connected peer after connect_known_peers via add_peer"
+    );
+    assert_eq!(
+        peers_a[0].peer_id,
+        node_b.peer_id(),
+        "dynamic add_peer target should be connected"
+    );
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = accept_handle.await;
+}
+
+#[tokio::test]
+async fn test_connect_peer_via_shared_coordinator_when_only_coordinator_is_known() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let node_c = create_localhost_node().await;
+    let node_a = create_localhost_node().await;
+    let node_b = create_localhost_node().await;
+
+    let addr_c = normalize_local_addr(node_c.local_addr().expect("node_c should have address"));
+    let peer_c = node_c.peer_id();
+    let peer_b = node_b.peer_id();
+    let peer_a = node_a.peer_id();
+
+    node_a.add_peer(addr_c).await;
+    node_b.add_peer(addr_c).await;
+
+    let mut raw_events_a = node_a.subscribe_raw();
+    let mut raw_events_b = node_b.subscribe_raw();
+
+    let accept_c = tokio::spawn({
+        let node = node_c.clone();
+        async move {
+            for _ in 0..8 {
+                match timeout(Duration::from_secs(10), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let connected_a = timeout(Duration::from_secs(10), node_a.connect_known_peers())
+        .await
+        .expect("node_a connect_known_peers should not time out")
+        .expect("node_a connect_known_peers should succeed");
+    let connected_b = timeout(Duration::from_secs(10), node_b.connect_known_peers())
+        .await
+        .expect("node_b connect_known_peers should not time out")
+        .expect("node_b connect_known_peers should succeed");
+
+    assert!(
+        connected_a >= 1,
+        "node_a should connect to coordinator node_c"
+    );
+    assert!(
+        connected_b >= 1,
+        "node_b should connect to coordinator node_c"
+    );
+
+    let coordinator_ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let peers_c = node_c.connected_peers().await;
+        let has_a = peers_c.iter().any(|p| p.peer_id == peer_a);
+        let has_b = peers_c.iter().any(|p| p.peer_id == peer_b);
+        if has_a && has_b {
+            break;
+        }
+        if tokio::time::Instant::now() >= coordinator_ready_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let peers_a_before = node_a.connected_peers().await;
+    assert_eq!(
+        peers_a_before.len(),
+        1,
+        "precondition: node_a should have exactly one connected peer before peer-id dial"
+    );
+    assert_eq!(
+        peers_a_before[0].peer_id, peer_c,
+        "precondition: node_a should only be connected to node_c before peer-id dial"
+    );
+
+    let peers_b_before = node_b.connected_peers().await;
+    assert_eq!(
+        peers_b_before.len(),
+        1,
+        "precondition: node_b should have exactly one connected peer before peer-id dial"
+    );
+    assert_eq!(
+        peers_b_before[0].peer_id, peer_c,
+        "precondition: node_b should only be connected to node_c before peer-id dial"
+    );
+
+    let connect_result = timeout(Duration::from_secs(30), node_a.connect(peer_b)).await;
+    let conn_ab = match connect_result {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            let peers_a = node_a.connected_peers().await;
+            let peers_b = node_b.connected_peers().await;
+            let events_a: Vec<_> = std::iter::from_fn(|| raw_events_a.try_recv().ok())
+                .take(8)
+                .collect();
+            let events_b: Vec<_> = std::iter::from_fn(|| raw_events_b.try_recv().ok())
+                .take(8)
+                .collect();
+            panic!(
+                "connect(peer_id) failed via shared coordinator: {} (node_a peers: {:?}, node_b peers: {:?}, node_a raw events: {:?}, node_b raw events: {:?})",
+                e, peers_a, peers_b, events_a, events_b
+            );
+        }
+        Err(_) => {
+            let peers_a = node_a.connected_peers().await;
+            let peers_b = node_b.connected_peers().await;
+            let events_a: Vec<_> = std::iter::from_fn(|| raw_events_a.try_recv().ok())
+                .take(8)
+                .collect();
+            let events_b: Vec<_> = std::iter::from_fn(|| raw_events_b.try_recv().ok())
+                .take(8)
+                .collect();
+            panic!(
+                "connect(peer_id) timed out via shared coordinator (node_a peers: {:?}, node_b peers: {:?}, node_a raw events: {:?}, node_b raw events: {:?})",
+                peers_a, peers_b, events_a, events_b
+            );
+        }
+    };
+    assert_eq!(
+        conn_ab.peer_id, peer_b,
+        "peer-id dial from node_a should connect to node_b"
+    );
+
+    let peers_a_after = node_a.connected_peers().await;
+    assert!(
+        peers_a_after.iter().any(|p| p.peer_id == peer_b),
+        "node_a should contain node_b after peer-id dial"
+    );
+
+    accept_c.abort();
+    let _ = accept_c.await;
+    let _ = timeout(Duration::from_secs(2), node_a.shutdown()).await;
+    let _ = timeout(Duration::from_secs(2), node_b.shutdown()).await;
+    let _ = timeout(Duration::from_secs(2), node_c.shutdown()).await;
+}
+
+#[tokio::test]
+async fn test_connect_peer_reuses_existing_connect_addr_connection() {
+    // Current validated scope: peer-oriented dialing reliably reuses an authenticated
+    // direct connection established via address dialing. Fuller peer-directory/
+    // discovery-driven identity dialing still needs stronger end-to-end coverage.
+    let node_a = create_localhost_node().await;
+    let node_b = create_localhost_node().await;
+
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
+    let peer_b = node_b.peer_id();
+
+    node_a.add_peer(addr_b).await;
+
+    let accept_handle = tokio::spawn({
+        let node = node_b.clone();
+        async move {
+            for _ in 0..3 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let conn_addr = timeout(Duration::from_secs(10), node_a.connect_addr(addr_b))
+        .await
+        .expect("connect_addr should not time out")
+        .expect("connect_addr should succeed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let conn_peer = timeout(Duration::from_secs(10), node_a.connect(peer_b))
+        .await
+        .expect("connect_peer should not time out")
+        .expect("connect_peer should succeed after connect_addr");
+
+    assert_eq!(
+        conn_addr.peer_id, peer_b,
+        "connect_addr should connect to node_b"
+    );
+    assert_eq!(
+        conn_peer.peer_id, peer_b,
+        "connect_peer should resolve to node_b"
+    );
+
+    let peers_a = node_a.connected_peers().await;
+    assert_eq!(
+        peers_a.len(),
+        1,
+        "node_a should still have exactly 1 connected peer after connect_addr + connect_peer"
+    );
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = accept_handle.await;
 }
 
 /// Run simultaneous connect multiple times to catch race conditions.

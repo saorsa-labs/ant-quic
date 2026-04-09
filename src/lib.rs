@@ -165,8 +165,10 @@ pub mod node_config;
 /// Consolidated node status for observability
 pub mod node_status;
 
+mod coordinator_control;
 /// Unified events for P2P nodes
 pub mod node_event;
+mod port_mapping;
 
 /// Reachability scope and traversal metadata shared across APIs
 pub mod reachability;
@@ -357,7 +359,9 @@ pub use p2p_endpoint::{
 };
 
 /// P2P configuration with builder pattern
-pub use unified_config::{ConfigError, MtuConfig, NatConfig, P2pConfig, P2pConfigBuilder};
+pub use unified_config::{
+    ConfigError, MtuConfig, NatConfig, P2pConfig, P2pConfigBuilder, PortMappingConfig,
+};
 
 /// Connection strategy for progressive NAT traversal fallback
 pub use connection_strategy::{

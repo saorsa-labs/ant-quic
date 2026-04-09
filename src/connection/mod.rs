@@ -4746,25 +4746,6 @@ impl Connection {
         self.nat_traversal = Some(NatTraversalState::new(8, Duration::from_secs(10)));
     }
 
-    /// Queue an ADD_ADDRESS frame to be sent to the peer
-    /// Derive peer ID from connection context
-    fn derive_peer_id_from_connection(&self) -> [u8; 32] {
-        // Generate a peer ID based on connection IDs
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::Hasher;
-        hasher.write(&self.rem_handshake_cid);
-        hasher.write(&self.handshake_cid);
-        hasher.write(&self.path.remote.to_string().into_bytes());
-        let hash = hasher.finish();
-        let mut peer_id = [0u8; 32];
-        peer_id[..8].copy_from_slice(&hash.to_be_bytes());
-        // Fill remaining bytes with connection ID data
-        let cid_bytes = self.rem_handshake_cid.as_ref();
-        let copy_len = (cid_bytes.len()).min(24);
-        peer_id[8..8 + copy_len].copy_from_slice(&cid_bytes[..copy_len]);
-        peer_id
-    }
-
     /// Handle AddAddress frame from peer
     fn handle_add_address(
         &mut self,
@@ -4835,88 +4816,29 @@ impl Connection {
             punch_me_now.round, punch_me_now.paired_with_sequence_number, punch_me_now.address
         );
 
-        // v0.13.0: All nodes can coordinate - try coordination first
-        if let Some(nat_state) = &self.nat_traversal {
-            // All nodes have bootstrap_coordinator now (v0.13.0)
-            if nat_state.bootstrap_coordinator.is_some() {
-                // Process coordination request
-                let from_peer_id = self.derive_peer_id_from_connection();
-
-                // Clone the frame to avoid borrow checker issues
-                let punch_me_now_clone = punch_me_now.clone();
-                drop(nat_state); // Release the borrow
-
-                let Some(nat_traversal) = self.nat_traversal.as_mut() else {
-                    return Ok(());
-                };
-
-                match nat_traversal.handle_punch_me_now_frame(
-                    from_peer_id,
-                    self.path.remote,
-                    &punch_me_now_clone,
-                    now,
-                ) {
-                    Ok(Some(coordination_frame)) => {
-                        trace!("Node coordinating PUNCH_ME_NOW between peers");
-
-                        // Send coordination frame to target peer via endpoint
-                        if let Some(target_peer_id) = punch_me_now.target_peer_id {
-                            self.endpoint_events.push_back(
-                                crate::shared::EndpointEventInner::RelayPunchMeNow(
-                                    target_peer_id,
-                                    coordination_frame,
-                                ),
-                            );
-                        }
-
-                        return Ok(());
-                    }
-                    Ok(None) => {
-                        trace!("Coordination completed or no action needed");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("Coordination failed: {}", e);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
         // We're a regular peer receiving coordination from bootstrap
         let nat_state = self.nat_traversal.as_mut().ok_or_else(|| {
             TransportError::PROTOCOL_VIOLATION("PunchMeNow frame without NAT traversal negotiation")
         })?;
 
-        // Handle peer's coordination request
-        if nat_state
-            .handle_peer_punch_request(punch_me_now.round, now)
-            .map_err(|_e| {
-                TransportError::PROTOCOL_VIOLATION("Failed to handle peer punch request")
-            })?
+        // Create punch target based on the received information and prime
+        // passive coordination directly from the incoming frame.
+        let target = nat_traversal::PunchTarget {
+            remote_addr: punch_me_now.address,
+            remote_sequence: punch_me_now.paired_with_sequence_number,
+            challenge: self.rng.r#gen(),
+        };
+
+        if let Err(_e) =
+            nat_state.prime_passive_coordination_target(punch_me_now.round, target, now)
         {
-            trace!("Coordination synchronized for round {}", punch_me_now.round);
-
-            // Create punch targets based on the received information
-            // The peer's address tells us where they'll be listening
-            let _local_addr = self
-                .local_ip
-                .map(|ip| SocketAddr::new(ip, 0))
-                .unwrap_or_else(|| {
-                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-                });
-
-            let target = nat_traversal::PunchTarget {
-                remote_addr: punch_me_now.address,
-                remote_sequence: punch_me_now.paired_with_sequence_number,
-                challenge: self.rng.r#gen(),
-            };
-
-            // Start coordination with this target
-            let _ = nat_state.start_coordination_round(vec![target], now);
-        } else {
             debug!(
-                "Failed to synchronize coordination for round {}",
+                "Failed to prime passive coordination for round {}",
+                punch_me_now.round
+            );
+        } else {
+            trace!(
+                "Passive coordination primed for round {}",
                 punch_me_now.round
             );
         }

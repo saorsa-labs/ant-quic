@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Unified outbound connect surface**: `P2pEndpoint` now presents a primary peer-oriented connect API plus `connect_addr(...)` convenience, with path selection handled internally.
+- **CLI connect cleanup**: `src/bin/ant-quic.rs` now uses the unified connect surface (`connect_known_peers`, `connect_addr`) instead of exposing normal-user manual fallback/strategy selection.
+- **Terminology cleanup**: docs and APIs continue shifting from privileged “bootstrap node” language toward symmetric-peer `known_peers` / discovery-input terminology.
+
 ### Breaking Changes
 
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.

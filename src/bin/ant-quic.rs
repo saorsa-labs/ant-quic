@@ -23,16 +23,19 @@
 //! ant-quic --known-peers 1.2.3.4:9000,5.6.7.8:9000
 //! ```
 //!
-//! Run throughput test:
+//! Run throughput test against an address:
 //! ```bash
 //! ant-quic --known-peers 1.2.3.4:9000 --connect 5.6.7.8:9001 --throughput-test
+//! ```
+//!
+//! Connect to a peer by durable peer ID:
+//! ```bash
+//! ant-quic --known-peers 1.2.3.4:9000 --connect-peer-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 //! ```
 
 use ant_quic::host_identity::{HostIdentity, auto_storage};
 use ant_quic::transport::TransportAddr;
-use ant_quic::{
-    ConnectionMethod, MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPhase,
-};
+use ant_quic::{MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPhase};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -82,17 +85,13 @@ struct Args {
     #[arg(short, long, value_delimiter = ',')]
     bootstrap: Vec<SocketAddr>,
 
-    /// Peer address to connect to directly
-    #[arg(short, long)]
+    /// Peer address to connect to using the canonical address-based connect entrypoint
+    #[arg(short, long, conflicts_with = "connect_peer_id")]
     connect: Option<SocketAddr>,
 
-    /// Use fallback strategy: IPv4 → IPv6 → HolePunch → Relay
-    #[arg(long)]
-    connect_fallback: bool,
-
-    /// IPv6 address for fallback connection
-    #[arg(long)]
-    connect_ipv6: Option<SocketAddr>,
+    /// Durable 32-byte peer ID to connect to using the canonical peer-oriented connect entrypoint
+    #[arg(long, value_name = "HEX", conflicts_with = "connect")]
+    connect_peer_id: Option<String>,
 
     /// Run throughput test after connecting
     #[arg(long)]
@@ -137,6 +136,14 @@ struct Args {
     /// JSON output for machine parsing
     #[arg(long)]
     json: bool,
+
+    /// Skip injecting default bootstrap peers when no peers were explicitly provided
+    #[arg(long, hide = true)]
+    no_default_bootstrap: bool,
+
+    /// Disable best-effort router port mapping (UPnP IGD)
+    #[arg(long)]
+    no_port_mapping: bool,
 
     /// Show full public key (not just first 8 bytes)
     #[arg(long)]
@@ -339,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     // Use default bootstrap nodes if no peers were specified
-    if all_peers.is_empty() {
+    if all_peers.is_empty() && !args.no_default_bootstrap {
         info!("No peers specified, using default Saorsa Labs bootstrap nodes");
         for addr_str in DEFAULT_BOOTSTRAP_NODES {
             match tokio::net::lookup_host(addr_str).await {
@@ -369,6 +376,13 @@ async fn main() -> anyhow::Result<()> {
         builder = builder.mtu(MtuConfig::pqc_optimized());
         info!("Using PQC-optimized MTU settings");
     }
+
+    if args.no_port_mapping {
+        builder = builder.port_mapping_enabled(false);
+        info!("Best-effort router port mapping disabled");
+    } else {
+        info!("Best-effort router port mapping enabled");
+    }
     // v0.13.0: No mode-based NAT config - all nodes are symmetric
 
     let config = builder.build()?;
@@ -395,6 +409,21 @@ async fn main() -> anyhow::Result<()> {
         info!("Local Address: {}", addr);
     }
     info!("═══════════════════════════════════════════════════════════════");
+
+    if args.json {
+        if let Some(addr) = endpoint.local_addr() {
+            println!(
+                r#"{{"event":"local_identity","peer_id":"{}","addr":"{}"}}"#,
+                hex::encode(peer_id.0),
+                addr
+            );
+        } else {
+            println!(
+                r#"{{"event":"local_identity","peer_id":"{}"}}"#,
+                hex::encode(peer_id.0)
+            );
+        }
+    }
 
     // Setup shutdown signal
     let shutdown = CancellationToken::new();
@@ -658,73 +687,69 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Connect to known peers (bootstrap nodes)
+    // Connect to known peers (bootstrap/discovery inputs)
     if !all_peers.is_empty() {
         info!("Connecting to {} known peer(s)...", all_peers.len());
-        for peer_addr in &all_peers {
-            info!("Connecting to known peer at {}...", peer_addr);
-            match endpoint.connect(*peer_addr).await {
-                Ok(peer) => {
-                    info!(
-                        "Connected to known peer: {} at {}",
-                        format_peer_id(&peer.peer_id),
-                        peer_addr
-                    );
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
-                }
-                Err(e) => {
-                    error!("Failed to connect to known peer {}: {}", peer_addr, e);
-                }
+        match endpoint.connect_known_peers().await {
+            Ok(count) => {
+                info!("Connected to {} known peer(s)", count);
+                stats
+                    .connections_initiated
+                    .fetch_add(count as u64, Ordering::SeqCst);
+            }
+            Err(e) => {
+                error!("Failed to connect to known peers: {}", e);
             }
         }
     }
 
-    // Connect to specific peer if specified
+    // Connect to specific peer by address if specified
     if let Some(peer_addr) = args.connect {
-        if args.connect_fallback {
-            // Use progressive fallback: IPv4 → IPv6 → HolePunch → Relay
-            info!(
-                "Connecting to peer with fallback strategy: IPv4={}, IPv6={:?}",
-                peer_addr, args.connect_ipv6
-            );
-            match endpoint
-                .connect_with_fallback(Some(peer_addr), args.connect_ipv6, None, None)
-                .await
-            {
-                Ok((peer, method)) => {
-                    let method: ConnectionMethod = method;
-                    info!(
-                        "✓ Connected to peer {} via {}",
-                        format_peer_id(&peer.peer_id),
-                        method
-                    );
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "Connecting to peer at {} via unified connectivity path...",
+            peer_addr
+        );
+        match endpoint.connect_addr(peer_addr).await {
+            Ok(peer) => {
+                info!("Connected to peer: {}", format_peer_id(&peer.peer_id));
+                stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
 
-                    // Run throughput test if requested
-                    if args.throughput_test {
-                        run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to connect with fallback: {}", e);
+                // Run throughput test if requested
+                if args.throughput_test {
+                    run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
                 }
             }
-        } else {
-            // Direct connection (original behavior)
-            info!("Connecting to peer at {}...", peer_addr);
-            match endpoint.connect(peer_addr).await {
-                Ok(peer) => {
-                    info!("Connected to peer: {}", format_peer_id(&peer.peer_id));
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
+            Err(e) => {
+                error!("Failed to connect to peer {}: {}", peer_addr, e);
+            }
+        }
+    }
 
-                    // Run throughput test if requested
-                    if args.throughput_test {
-                        run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
+    // Connect to specific peer by durable peer ID if specified
+    if let Some(peer_id_hex) = &args.connect_peer_id {
+        match parse_peer_id_hex(peer_id_hex) {
+            Ok(peer_id) => {
+                info!(
+                    "Connecting to peer ID {} via unified peer-oriented path...",
+                    hex::encode(peer_id.0)
+                );
+                match endpoint.connect_peer(peer_id).await {
+                    Ok(peer) => {
+                        info!("Connected to peer: {}", format_peer_id(&peer.peer_id));
+                        stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
+
+                        // Run throughput test if requested
+                        if args.throughput_test {
+                            run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to peer {}: {}", peer_id_hex, e);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to connect to peer: {}", e);
-                }
+            }
+            Err(e) => {
+                error!("Invalid --connect-peer-id value {}: {}", peer_id_hex, e);
             }
         }
     }
@@ -936,10 +961,12 @@ async fn handle_event_with_state(
 
 async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json: bool) {
     let stats = endpoint.stats().await;
+    let port_mapping_active = endpoint.port_mapping_active();
+    let port_mapping_addr = endpoint.port_mapping_addr();
 
     if json {
         println!(
-            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{}}}"#,
+            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{},"port_mapping_active":{},"port_mapping_addr":{}}}"#,
             stats.active_connections,
             stats.successful_connections,
             stats.failed_connections,
@@ -951,6 +978,10 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
             runtime_stats
                 .external_addresses_discovered
                 .load(Ordering::SeqCst),
+            port_mapping_active,
+            port_mapping_addr
+                .map(|addr| format!("\"{}\"", addr))
+                .unwrap_or_else(|| "null".to_string()),
         );
     } else {
         info!("=== Statistics ===");
@@ -977,6 +1008,10 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
             "  Bytes received: {}",
             format_bytes(runtime_stats.bytes_received.load(Ordering::SeqCst))
         );
+        info!("  Port mapping active: {}", port_mapping_active);
+        if let Some(mapped_addr) = port_mapping_addr {
+            info!("  Port mapping address: {}", mapped_addr);
+        }
     }
 }
 
@@ -1074,6 +1109,27 @@ async fn run_throughput_test(
 fn format_peer_id(peer_id: &PeerId) -> String {
     let bytes = &peer_id.0;
     hex::encode(&bytes[..8])
+}
+
+fn parse_peer_id_hex(value: &str) -> anyhow::Result<PeerId> {
+    if value.len() != 64 {
+        anyhow::bail!(
+            "expected 64 hex characters for a 32-byte peer ID, got {}",
+            value.len()
+        );
+    }
+
+    let decoded = hex::decode(value).map_err(|e| anyhow::anyhow!("invalid hex peer ID: {}", e))?;
+    if decoded.len() != 32 {
+        anyhow::bail!(
+            "expected 32 decoded bytes for peer ID, got {}",
+            decoded.len()
+        );
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(PeerId(bytes))
 }
 
 fn format_bytes(bytes: u64) -> String {

@@ -81,15 +81,21 @@ Compressed (known targets):
 [Context ID (VarInt)] [Payload]
 ```
 
-### Three-Layer Connectivity Strategy
+### Layered Connectivity Strategy
 
 | Layer | Method | Success Rate | Latency |
 |-------|--------|--------------|---------|
+| 0 | Router-assisted port mapping (UPnP IGD) | Environment-dependent | Lowest when available |
 | 1 | Direct QUIC (no NAT) | ~20% | Lowest |
 | 2 | Native NAT traversal | High* | Low |
 | 3 | MASQUE relay | ~100% | Higher |
 
 *Testing including CGNAT environments has shown excellent results (100% in controlled tests). However, without widespread deployment data across diverse network configurations, we state "High" rather than a specific percentage. Actual success rates may vary based on NAT implementation specifics.
+
+Layer 0 is now implemented as a first-cut best-effort UPnP IGD port-mapping
+runtime under NAT policy. It can improve inbound reachability on compatible
+home routers, but MASQUE remains the layer-3 fallback when direct paths still
+fail.
 
 ### Relay-to-Direct Migration
 

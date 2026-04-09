@@ -518,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
         info!("Connecting to {} known peer(s)...", args.known_peers.len());
         for peer_addr in &args.known_peers {
             info!("Connecting to peer at {}...", peer_addr);
-            match endpoint.connect(*peer_addr).await {
+            match endpoint.connect_addr(*peer_addr).await {
                 Ok(peer) => {
                     info!(
                         "Connected to peer: {} at {}",

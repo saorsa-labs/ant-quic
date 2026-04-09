@@ -56,6 +56,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::RwLock as ParkingRwLock;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +71,7 @@ use crate::connection_strategy::{
 };
 use crate::constrained::ConnectionId as ConstrainedConnectionId;
 use crate::constrained::EngineEvent;
+use crate::coordinator_control::{clear_live_request, take_live_rejection};
 use crate::crypto::raw_public_keys::key_utils::{
     derive_peer_id_from_public_key, generate_ml_dsa_keypair,
 };
@@ -78,6 +80,7 @@ pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
 };
+use crate::port_mapping::{PortMappingSnapshot, spawn_best_effort_port_mapping};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
@@ -184,10 +187,11 @@ pub struct P2pEndpoint {
     /// Registered when ConnectionAccepted/Established fires for constrained transports.
     constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, (PeerId, TransportAddr)>>>,
 
-    /// Target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW uses this instead of wire_id_from_addr, allowing the
-    /// coordinator to match by peer identity (works for symmetric NAT).
-    hole_punch_target_peer_id: Arc<tokio::sync::Mutex<Option<[u8; 32]>>>,
+    /// Explicitly added manual UDP known peers (via add_known_peer/add_bootstrap).
+    manual_known_peer_udp_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+
+    /// Best-effort router port-mapping state.
+    port_mapping_state: Arc<ParkingRwLock<PortMappingSnapshot>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
@@ -253,6 +257,16 @@ pub struct ConnectionMetrics {
 
     /// Last activity timestamp
     pub last_activity: Option<Instant>,
+}
+
+/// Best-effort runtime assist snapshot for higher-level status surfaces.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeAssistSnapshot {
+    pub preferred_coordinator: Option<SocketAddr>,
+    pub coordinator_candidate_count: usize,
+    pub successful_coordinations: u32,
+    pub active_relay_sessions: usize,
+    pub relay_public_addr: Option<SocketAddr>,
 }
 
 /// P2P endpoint statistics
@@ -648,12 +662,8 @@ async fn bridge_nat_traversal_event(
         NatTraversalEvent::CoordinationRequested { .. } => {
             stats.write().await.nat_traversal_attempts += 1;
         }
-        NatTraversalEvent::ConnectionEstablished {
-            traversal_method, ..
-        } => {
-            if !traversal_method.is_direct() {
-                stats.write().await.nat_traversal_successes += 1;
-            }
+        NatTraversalEvent::ConnectionEstablished { .. } => {
+            stats.write().await.nat_traversal_successes += 1;
         }
         NatTraversalEvent::TraversalFailed { peer_id, .. } => {
             stats.write().await.failed_connections += 1;
@@ -752,7 +762,7 @@ impl P2pEndpoint {
         > = None;
 
         // Try dual-socket first (separate IPv4 + IPv6 sockets)
-        let inner = match crate::transport::UdpTransport::bind_dual_stack_for_endpoint(
+        let mut inner = match crate::transport::UdpTransport::bind_dual_stack_for_endpoint(
             requested_port,
         )
         .await
@@ -867,6 +877,8 @@ impl P2pEndpoint {
             }
         };
 
+        inner.set_local_peer_id(peer_id);
+
         // Get the transport registry that was set on the endpoint
         let transport_registry = inner
             .transport_registry()
@@ -911,7 +923,8 @@ impl P2pEndpoint {
             router: Arc::new(RwLock::new(router)),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
-            hole_punch_target_peer_id: Arc::new(tokio::sync::Mutex::new(None)),
+            manual_known_peer_udp_addrs: Arc::new(RwLock::new(Vec::new())),
+            port_mapping_state: Arc::new(ParkingRwLock::new(PortMappingSnapshot::default())),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -929,6 +942,7 @@ impl P2pEndpoint {
         // tasks and immediately emits PeerDisconnected events.  This gives
         // millisecond disconnect detection vs the 30-second reaper interval.
         endpoint.spawn_reader_exit_handler();
+        endpoint.spawn_port_mapping_task();
 
         Ok(endpoint)
     }
@@ -967,9 +981,33 @@ impl P2pEndpoint {
     /// Collects both IPv4 and IPv6 addresses discovered via OBSERVED_ADDRESS
     /// frames from peers. Critical for dual-stack nodes.
     pub fn all_external_addrs(&self) -> Vec<SocketAddr> {
-        self.inner
+        let mut addrs = self
+            .inner
             .get_all_observed_external_addresses()
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if let Some(mapped_addr) = self.port_mapping_addr() {
+            if !addrs.contains(&mapped_addr) {
+                addrs.push(mapped_addr);
+            }
+        }
+
+        addrs
+    }
+
+    /// Returns the current best-effort router port-mapping snapshot.
+    pub(crate) fn port_mapping_snapshot(&self) -> PortMappingSnapshot {
+        *self.port_mapping_state.read()
+    }
+
+    /// Returns whether best-effort router port mapping is currently active.
+    pub fn port_mapping_active(&self) -> bool {
+        self.port_mapping_snapshot().active
+    }
+
+    /// Returns the currently mapped public address, if router port mapping is active.
+    pub fn port_mapping_addr(&self) -> Option<SocketAddr> {
+        self.port_mapping_snapshot().external_addr
     }
 
     /// Get the transport registry for this endpoint
@@ -987,16 +1025,17 @@ impl P2pEndpoint {
 
     // === Connection Management ===
 
-    /// Connect to a peer by address (direct connection).
+    /// Connect to a peer by address using the canonical address-oriented public surface.
     ///
-    /// Uses Raw Public Key authentication - the peer's identity is verified via their
-    /// ML-DSA-65 public key, not via SNI/certificates.
-    ///
-    /// If we already have a live connection to the target address, returns the
-    /// existing connection instead of creating a duplicate. After handshake, if
-    /// we discover a simultaneous open (both sides connected at the same time),
-    /// a deterministic tiebreaker ensures both sides keep the same connection.
-    pub async fn connect(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
+    /// This routes through the unified outbound orchestrator.
+    pub async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
+        self.connect_orchestrated(None, vec![addr]).await
+    }
+
+    async fn prepare_direct_addr_attempt(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<Option<PeerConnection>, EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -1019,13 +1058,14 @@ impl P2pEndpoint {
                                 "connect: reusing existing live connection to {} (peer {:?})",
                                 addr, peer_id
                             );
-                            return Ok(existing.clone());
+                            return Ok(Some(existing.clone()));
                         }
                     }
                     break;
                 }
             }
         }
+
         // If a dead connection was found, is_peer_connected() already cleaned it up.
         // Remove stale entry from connected_peers too.
         {
@@ -1045,6 +1085,13 @@ impl P2pEndpoint {
             }
         }
 
+        Ok(None)
+    }
+
+    async fn attempt_direct_handshake(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<crate::high_level::Connection, EndpointError> {
         info!("Connecting directly to {}", addr);
 
         let endpoint = self
@@ -1064,95 +1111,290 @@ impl P2pEndpoint {
             .timeouts
             .nat_traversal
             .connection_establishment_timeout;
-        let connection = match timeout(handshake_timeout, connecting).await {
-            Ok(Ok(conn)) => conn,
+        match timeout(handshake_timeout, connecting).await {
+            Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => {
                 info!("connect: handshake to {} failed: {}", addr, e);
-                return Err(EndpointError::Connection(e.to_string()));
+                Err(EndpointError::Connection(e.to_string()))
             }
             Err(_) => {
                 info!(
                     "connect: handshake to {} timed out after {:?}",
                     addr, handshake_timeout
                 );
-                return Err(EndpointError::Timeout);
+                Err(EndpointError::Timeout)
             }
-        };
+        }
+    }
 
-        // Prefer peer ID derived from the authenticated public key.
-        let peer_id = self
-            .inner
-            .extract_peer_id_from_connection(&connection)
-            .await
-            .unwrap_or_else(|| peer_id_from_socket_addr(addr));
-
-        // Post-handshake dedup: if we already have a live connection to this
-        // peer (e.g. from a simultaneous open), just overwrite it with the new
-        // outgoing connection.  The accept() path does the same — both sides
-        // converge on the most recent healthy connection.  Previous attempts
-        // at deterministic tiebreaking (close one side, keep the other) caused
-        // cascading race conditions: retry storms, infinite accept loops, and
-        // "closed by peer: duplicate" errors.
-        if self.inner.is_peer_connected(&peer_id) {
-            debug!(
-                "connect: simultaneous open for peer {:?} — overwriting existing connection",
-                peer_id
-            );
+    async fn connect_direct_addr(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
+        if let Some(existing) = self.prepare_direct_addr_attempt(addr).await? {
+            return Ok(existing);
         }
 
-        // Store connection
-        self.inner
-            .add_connection(peer_id, connection.clone())
-            .map_err(EndpointError::NatTraversal)?;
-
-        // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing.
-        // This enables coordinators to look up the connection by peer identity
-        // instead of socket address (essential for symmetric NAT).
-        self.inner.register_connection_peer_id(addr, peer_id);
-        self.inner
-            .record_bootstrap_direct_connection(&addr, Some(connection.rtt()));
-
-        // Clone the connection for the reader task BEFORE passing to handler.
-        // We must NOT re-fetch via get_connection() because a concurrent accept()
-        // can replace the DashMap entry between add_connection() and here, causing
-        // spawn_reader_task to get the wrong connection object.  This was the root
-        // cause of the simultaneous-connect recv() hang: the reader task ended up
-        // on a connection the remote peer wasn't sending on.
-        let reader_conn = connection.clone();
-
-        // Spawn handler (we initiated the connection = Client side)
-        self.inner
-            .spawn_connection_handler(peer_id, connection, Side::Client, TraversalMethod::Direct)
-            .map_err(EndpointError::NatTraversal)?;
-
-        // Create peer connection record
-        // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
-        let peer_conn = PeerConnection {
-            peer_id,
-            remote_addr: TransportAddr::Udp(addr),
-            traversal_method: TraversalMethod::Direct,
-            side: Side::Client,
-            authenticated: true, // TLS handles authentication
-            connected_at: Instant::now(),
-            last_activity: Instant::now(),
-        };
-
-        // Spawn background reader task BEFORE storing peer in connected_peers
-        // This prevents a race where recv() called immediately after connect()
-        // returns might miss early data if the peer sends before the task starts.
-        // Use the cloned connection directly — do NOT re-fetch from the DashMap.
-        self.spawn_reader_task(peer_id, reader_conn).await;
-
-        // Store peer (reader task is already running, so no data loss window)
-        self.connected_peers
-            .write()
+        let connection = self.attempt_direct_handshake(addr).await?;
+        self.finalize_direct_connection(connection, addr, None)
             .await
-            .insert(peer_id, peer_conn.clone());
+    }
 
-        self.observe_direct_peer_reachability(peer_id, &peer_conn.remote_addr);
-        self.publish_connection_established(&peer_conn).await;
+    fn runtime_known_peer_udp_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self
+            .config
+            .known_peers
+            .iter()
+            .filter_map(|addr| addr.as_socket_addr())
+            .collect();
 
-        Ok(peer_conn)
+        for addr in self.inner.bootstrap_addresses() {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+
+        addrs
+    }
+
+    async fn connect_direct_candidates(
+        &self,
+        addrs: &[SocketAddr],
+    ) -> Result<PeerConnection, EndpointError> {
+        const MAX_DIRECT_CANDIDATES: usize = 4;
+
+        let mut last_err: Option<EndpointError> = None;
+        for addr in addrs.iter().take(MAX_DIRECT_CANDIDATES) {
+            match self.connect_direct_addr(*addr).await {
+                Ok(conn) => return Ok(conn),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap_or(EndpointError::NoAddress))
+    }
+
+    async fn refresh_runtime_known_peer_connections(&self) {
+        for addr in self.runtime_known_peer_udp_addrs() {
+            let _ = self.connect_direct_addr(addr).await;
+        }
+    }
+
+    async fn coordinator_candidates(&self) -> Vec<SocketAddr> {
+        let mut candidates = Vec::new();
+
+        if let Some(addr) = self.inner.preferred_coordinator()
+            && !candidates.contains(&addr)
+        {
+            candidates.push(addr);
+        }
+
+        {
+            let peers = self.connected_peers.read().await;
+            for (peer_id, existing) in peers.iter() {
+                let Some(addr) = existing.remote_addr.as_socket_addr() else {
+                    continue;
+                };
+                if !self.inner.is_peer_connected(peer_id) {
+                    continue;
+                }
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+
+        for addr in self.runtime_known_peer_udp_addrs() {
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
+        }
+
+        candidates
+    }
+
+    pub(crate) async fn runtime_assist_snapshot(&self) -> RuntimeAssistSnapshot {
+        let coordinator_candidates = self.coordinator_candidates().await;
+        let successful_coordinations = self
+            .inner
+            .get_statistics()
+            .map(|stats| stats.successful_coordinations)
+            .unwrap_or(0);
+        let active_relay_sessions = self.inner.relay_sessions().len();
+        let relay_public_addr = self.inner.relay_public_addr();
+        let preferred_coordinator = coordinator_candidates.first().copied();
+
+        RuntimeAssistSnapshot {
+            preferred_coordinator,
+            coordinator_candidate_count: coordinator_candidates.len(),
+            successful_coordinations,
+            active_relay_sessions,
+            relay_public_addr,
+        }
+    }
+
+    async fn find_live_connection_for_addrs(&self, addrs: &[SocketAddr]) -> Option<PeerConnection> {
+        let peers = self.connected_peers.read().await;
+        for addr in addrs {
+            if let Some((existing_peer_id, existing)) = peers
+                .iter()
+                .find(|(_, p)| p.remote_addr == TransportAddr::Udp(*addr))
+                .map(|(id, conn)| (*id, conn.clone()))
+            {
+                if self.inner.is_peer_connected(&existing_peer_id) {
+                    return Some(existing);
+                }
+            }
+        }
+        None
+    }
+
+    async fn connect_orchestrated(
+        &self,
+        peer_id: Option<PeerId>,
+        mut explicit_addrs: Vec<SocketAddr>,
+    ) -> Result<PeerConnection, EndpointError> {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let is_simple_address_only = peer_id.is_none() && explicit_addrs.len() == 1;
+
+        if let Some(peer_id) = peer_id {
+            if let Some(conn) = self.connected_peers.read().await.get(&peer_id) {
+                if self.inner.is_peer_connected(&peer_id) {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+
+        if !is_simple_address_only {
+            let peers = self.connected_peers.read().await;
+            for addr in &explicit_addrs {
+                if let Some((existing_peer_id, existing)) = peers
+                    .iter()
+                    .find(|(_, p)| p.remote_addr == TransportAddr::Udp(*addr))
+                    .map(|(id, conn)| (*id, conn.clone()))
+                {
+                    if self.inner.is_peer_connected(&existing_peer_id) {
+                        info!(
+                            "connect_orchestrated: reusing existing live connection to {} (peer {:?})",
+                            addr, existing_peer_id
+                        );
+                        return Ok(existing);
+                    }
+                }
+            }
+        }
+
+        if !is_simple_address_only {
+            let target_addrs = explicit_addrs.clone();
+            let mut peers = self.connected_peers.write().await;
+            let stale_peer_ids: Vec<PeerId> = peers
+                .iter()
+                .filter(|(_, p)| match p.remote_addr {
+                    TransportAddr::Udp(addr) => target_addrs.contains(&addr),
+                    _ => false,
+                })
+                .filter(|(id, _)| !self.inner.is_peer_connected(id))
+                .map(|(id, _)| *id)
+                .collect();
+            for stale_id in &stale_peer_ids {
+                peers.remove(stale_id);
+            }
+        }
+
+        if let Some(peer_id) = peer_id
+            && let Some(cached_peer) = self.bootstrap_cache.get_peer(&peer_id).await
+        {
+            for addr in cached_peer.preferred_addresses() {
+                if !explicit_addrs.contains(&addr) {
+                    explicit_addrs.push(addr);
+                }
+            }
+        }
+
+        if let Some(peer_id) = peer_id
+            && let Some(runtime_addr) = self.inner.bootstrap_address_for_peer(peer_id)
+            && !explicit_addrs.contains(&runtime_addr)
+        {
+            explicit_addrs.push(runtime_addr);
+        }
+
+        if peer_id.is_some() && !explicit_addrs.is_empty() {
+            match self.connect_direct_candidates(&explicit_addrs).await {
+                Ok(conn) => return Ok(conn),
+                Err(err) => {
+                    debug!(
+                        "connect_orchestrated: direct multi-candidate pre-pass exhausted before fallback: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        let target_ipv4 = explicit_addrs.iter().copied().find(SocketAddr::is_ipv4);
+        let target_ipv6 = explicit_addrs.iter().copied().find(SocketAddr::is_ipv6);
+
+        if target_ipv4.is_some() || target_ipv6.is_some() {
+            match self
+                .connect_with_fallback(target_ipv4, target_ipv6, None, peer_id)
+                .await
+            {
+                Ok((conn, _)) => return Ok(conn),
+                Err(err) => {
+                    let peers = self.connected_peers.read().await;
+                    for addr in &explicit_addrs {
+                        if let Some((existing_peer_id, existing)) = peers
+                            .iter()
+                            .find(|(_, p)| p.remote_addr == TransportAddr::Udp(*addr))
+                            .map(|(id, conn)| (*id, conn.clone()))
+                        {
+                            if self.inner.is_peer_connected(&existing_peer_id) {
+                                info!(
+                                    "connect_orchestrated: converged to existing live connection after fallback failure for {} (peer {:?})",
+                                    addr, existing_peer_id
+                                );
+                                return Ok(existing);
+                            }
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(peer_id) = peer_id {
+            if explicit_addrs.is_empty() && self.inner.preferred_coordinator().is_none() {
+                self.refresh_runtime_known_peer_connections().await;
+
+                if let Some(conn) = self.connected_peers.read().await.get(&peer_id)
+                    && self.inner.is_peer_connected(&peer_id)
+                {
+                    return Ok(conn.clone());
+                }
+            }
+
+            return self.connect_to_peer(peer_id, None).await;
+        }
+
+        Err(EndpointError::NoAddress)
+    }
+
+    /// Connect to a peer by address (direct connection).
+    ///
+    /// Compatibility-oriented alias retained for older callers. Prefer
+    /// [`Self::connect_addr`] as the preferred address-oriented public surface.
+    ///
+    /// Uses Raw Public Key authentication - the peer's identity is verified via their
+    /// ML-DSA-65 public key, not via SNI/certificates.
+    ///
+    /// If we already have a live connection to the target address, returns the
+    /// existing connection instead of creating a duplicate. After handshake, if
+    /// we discover a simultaneous open (both sides connected at the same time),
+    /// a deterministic tiebreaker ensures both sides keep the same connection.
+    #[deprecated(
+        note = "use connect_addr(addr) to route address-based dials through the unified orchestrator"
+    )]
+    pub async fn connect(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
+        self.connect_addr(addr).await
     }
 
     /// Connect to a peer using any transport address
@@ -1204,7 +1446,7 @@ impl P2pEndpoint {
                     ))
                 })?;
                 drop(router); // Release lock before async operation
-                self.connect(socket_addr).await
+                self.connect_addr(socket_addr).await
             }
             ProtocolEngine::Constrained => {
                 // For constrained transports, use the router's constrained connection
@@ -1475,7 +1717,7 @@ impl P2pEndpoint {
                 addr
             );
 
-            match timeout(Duration::from_secs(5), self.connect(*addr)).await {
+            match timeout(Duration::from_secs(5), self.connect_direct_addr(*addr)).await {
                 Ok(Ok(peer_conn)) => {
                     info!("✓ {} connection successful to {}", family_name, addr);
                     return Some(peer_conn);
@@ -1495,11 +1737,11 @@ impl P2pEndpoint {
         None
     }
 
-    /// Connect to a peer using cached information (addresses, tokens)
+    /// Connect to a peer using cached information (addresses, tokens).
     ///
-    /// This method retrieves the peer from `BootstrapCache` and attempts to connect
-    /// using its known addresses. It leverages `connect_dual_stack` with the `PeerId`
-    /// to enable token-based 0-RTT/Fast Reconnect.
+    /// Compatibility helper retained for callers that explicitly expect cached
+    /// address resolution first. Prefer [`Self::connect_peer`] as the canonical
+    /// peer-oriented public surface.
     pub async fn connect_cached(&self, peer_id: PeerId) -> Result<PeerConnection, EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -1529,7 +1771,19 @@ impl P2pEndpoint {
             .await
     }
 
-    /// Connect to a peer by ID using NAT traversal
+    /// Connect to a peer by durable peer ID.
+    ///
+    /// This is the canonical peer-oriented public surface. It first tries any
+    /// cached/known addresses via existing code and then falls back to the
+    /// existing peer-ID NAT traversal path when necessary.
+    pub async fn connect_peer(&self, peer_id: PeerId) -> Result<PeerConnection, EndpointError> {
+        self.connect_orchestrated(Some(peer_id), Vec::new()).await
+    }
+
+    /// Connect to a peer by ID using NAT traversal.
+    ///
+    /// Compatibility-oriented wrapper retained for older callers. Prefer
+    /// [`Self::connect_peer`] for the canonical peer-oriented public surface.
     pub async fn connect_to_peer(
         &self,
         peer_id: PeerId,
@@ -1539,14 +1793,15 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        let coord_addr = coordinator
-            .or_else(|| {
-                self.config
-                    .known_peers
-                    .first()
-                    .and_then(|addr| addr.as_socket_addr())
-            })
-            .ok_or_else(|| EndpointError::Config("No coordinator available".to_string()))?;
+        let coord_addr = if let Some(addr) = coordinator {
+            addr
+        } else {
+            self.coordinator_candidates()
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| EndpointError::Config("No coordinator available".to_string()))?
+        };
 
         info!(
             "Initiating NAT traversal to peer {:?} via coordinator {}",
@@ -1577,18 +1832,68 @@ impl P2pEndpoint {
                 return Err(EndpointError::ShuttingDown);
             }
 
+            if let Some(conn) = self
+                .inner
+                .get_connection_by_authenticated_peer(peer_id)
+                .await
+                .or_else(|| self.inner.session_connection(peer_id))
+            {
+                info!(
+                    "connect_to_peer observed existing inner connection for peer {:?}; finalizing",
+                    peer_id
+                );
+                let remote_address = conn.remote_address();
+                let side = conn.side();
+
+                self.inner
+                    .register_connection_peer_id(remote_address, peer_id);
+
+                let peer_conn = PeerConnection {
+                    peer_id,
+                    remote_addr: TransportAddr::Udp(remote_address),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side,
+                    authenticated: true,
+                    connected_at: Instant::now(),
+                    last_activity: Instant::now(),
+                };
+
+                self.connected_peers
+                    .write()
+                    .await
+                    .insert(peer_id, peer_conn.clone());
+
+                let endpoint = self.clone();
+                let published = peer_conn.clone();
+                let bg_conn = conn.clone();
+                let bg_remote = remote_address;
+                tokio::spawn(async move {
+                    endpoint.spawn_reader_task(peer_id, bg_conn).await;
+                    endpoint
+                        .observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(bg_remote));
+                    endpoint.publish_connection_established(&published).await;
+                });
+
+                return Ok(peer_conn);
+            }
+
             let events = self
                 .inner
                 .poll(Instant::now())
                 .map_err(EndpointError::NatTraversal)?;
 
+            let had_events = !events.is_empty();
             for event in events {
+                info!(
+                    "connect_to_peer polled event for target {:?}: {:?}",
+                    peer_id, event
+                );
                 match event {
                     NatTraversalEvent::ConnectionEstablished {
                         peer_id: evt_peer,
                         remote_address,
                         side,
-                        traversal_method,
+                        ..
                     } if evt_peer == peer_id => {
                         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
                         self.inner
@@ -1598,7 +1903,7 @@ impl P2pEndpoint {
                         let peer_conn = PeerConnection {
                             peer_id,
                             remote_addr: TransportAddr::Udp(remote_address),
-                            traversal_method,
+                            traversal_method: TraversalMethod::HolePunch,
                             side,
                             authenticated: true, // TLS handles authentication
                             connected_at: Instant::now(),
@@ -1607,8 +1912,16 @@ impl P2pEndpoint {
 
                         // Spawn background reader task BEFORE storing in connected_peers
                         // to prevent race where recv() misses early data
-                        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-                            self.spawn_reader_task(peer_id, conn).await;
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(peer_id)
+                            .await
+                            .or_else(|| self.inner.session_connection(peer_id))
+                        {
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(peer_id, conn).await;
+                            });
                         }
 
                         self.connected_peers
@@ -1616,7 +1929,15 @@ impl P2pEndpoint {
                             .await
                             .insert(peer_id, peer_conn.clone());
 
-                        self.publish_connection_established(&peer_conn).await;
+                        self.observe_direct_peer_reachability(
+                            peer_id,
+                            &TransportAddr::Udp(remote_address),
+                        );
+                        let endpoint = self.clone();
+                        let published = peer_conn.clone();
+                        tokio::spawn(async move {
+                            endpoint.publish_connection_established(&published).await;
+                        });
 
                         return Ok(peer_conn);
                     }
@@ -1631,9 +1952,60 @@ impl P2pEndpoint {
                 }
             }
 
+            if let Some(conn) = self
+                .inner
+                .get_connection_by_authenticated_peer(peer_id)
+                .await
+                .or_else(|| self.inner.session_connection(peer_id))
+            {
+                info!(
+                    "connect_to_peer observed existing inner connection for peer {:?}; finalizing",
+                    peer_id
+                );
+                let remote_address = conn.remote_address();
+                let side = conn.side();
+
+                self.inner
+                    .register_connection_peer_id(remote_address, peer_id);
+
+                let peer_conn = PeerConnection {
+                    peer_id,
+                    remote_addr: TransportAddr::Udp(remote_address),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side,
+                    authenticated: true,
+                    connected_at: Instant::now(),
+                    last_activity: Instant::now(),
+                };
+
+                let endpoint = self.clone();
+                tokio::spawn(async move {
+                    endpoint.spawn_reader_task(peer_id, conn).await;
+                });
+
+                self.connected_peers
+                    .write()
+                    .await
+                    .insert(peer_id, peer_conn.clone());
+
+                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                let endpoint = self.clone();
+                let published = peer_conn.clone();
+                tokio::spawn(async move {
+                    endpoint.publish_connection_established(&published).await;
+                });
+
+                return Ok(peer_conn);
+            }
+
+            if had_events {
+                continue;
+            }
+
             // Wait for connection notification, shutdown, or timeout
             tokio::select! {
                 _ = self.inner.connection_notify().notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 _ = self.shutdown.cancelled() => {
                     return Err(EndpointError::ShuttingDown);
                 }
@@ -1681,17 +2053,6 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
-    /// Set the target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW frame carries the peer ID instead of a socket-address-derived
-    /// wire ID, allowing the coordinator to find the target connection by
-    /// authenticated identity — essential for symmetric NAT where the address
-    /// differs per peer.
-    ///
-    /// Cleared after each `connect_with_fallback` call.
-    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
-        *self.hole_punch_target_peer_id.lock().await = peer_id;
-    }
-
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
     pub async fn connect_with_fallback(
         &self,
@@ -1707,11 +2068,7 @@ impl P2pEndpoint {
         // Build strategy config with coordinator and relay from our config
         let mut config = strategy_config.unwrap_or_default();
         if config.coordinator.is_none() {
-            config.coordinator = self
-                .config
-                .known_peers
-                .first()
-                .and_then(|addr| addr.as_socket_addr());
+            config.coordinator = self.coordinator_candidates().await.into_iter().next();
         }
         if config.relay_addrs.is_empty() {
             // Optimization: Try to find a high-quality relay from our cache first
@@ -1737,7 +2094,40 @@ impl P2pEndpoint {
                 }
             }
 
-            // Fallback to static config if cache gave nothing
+            // Next prefer live connected UDP peers as relay candidates.
+            if config.relay_addrs.is_empty() {
+                let target_addr = target_ipv4.or(target_ipv6);
+                let peers = self.connected_peers.read().await;
+                for (existing_peer_id, existing) in peers.iter() {
+                    let Some(relay_addr) = existing.remote_addr.as_socket_addr() else {
+                        continue;
+                    };
+                    if Some(relay_addr) == target_addr {
+                        continue;
+                    }
+                    if !self.inner.is_peer_connected(existing_peer_id) {
+                        continue;
+                    }
+                    if !config.relay_addrs.contains(&relay_addr) {
+                        config.relay_addrs.push(relay_addr);
+                    }
+                }
+            }
+
+            // Then prefer remaining runtime known peer UDP addresses.
+            if config.relay_addrs.is_empty() {
+                let target_addr = target_ipv4.or(target_ipv6);
+                for relay_addr in self.runtime_known_peer_udp_addrs() {
+                    if Some(relay_addr) == target_addr {
+                        continue;
+                    }
+                    if !config.relay_addrs.contains(&relay_addr) {
+                        config.relay_addrs.push(relay_addr);
+                    }
+                }
+            }
+
+            // Fallback to static config if cache, live peers, and runtime known peers gave nothing
             if config.relay_addrs.is_empty() {
                 if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
                     config.relay_addrs.push(relay_addr);
@@ -1773,8 +2163,28 @@ impl P2pEndpoint {
                         continue;
                     }
 
+                    for addr in &direct_addresses {
+                        if let Some(existing) = self.prepare_direct_addr_attempt(*addr).await? {
+                            let method = if addr.is_ipv6() {
+                                ConnectionMethod::DirectIPv6
+                            } else {
+                                ConnectionMethod::DirectIPv4
+                            };
+                            info!(
+                                "Direct stage: reusing existing exact-address connection to {}",
+                                addr
+                            );
+                            return Ok((existing, method));
+                        }
+                    }
+
                     let he_config = HappyEyeballsConfig::default();
                     let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+                    let handshake_timeout = self
+                        .config
+                        .timeouts
+                        .nat_traversal
+                        .connection_establishment_timeout;
 
                     info!(
                         "Happy Eyeballs: racing {} direct addresses (timeout: {:?})",
@@ -1802,9 +2212,14 @@ impl P2pEndpoint {
                                 let connecting = ep
                                     .connect(addr, "peer")
                                     .map_err(|e| format!("connect error: {e}"))?;
-                                connecting
-                                    .await
-                                    .map_err(|e| format!("handshake error: {e}"))
+                                match timeout(handshake_timeout, connecting).await {
+                                    Ok(Ok(conn)) => Ok(conn),
+                                    Ok(Err(e)) => Err(format!("handshake error: {e}")),
+                                    Err(_) => Err(format!(
+                                        "handshake timeout after {:?}",
+                                        handshake_timeout
+                                    )),
+                                }
                             }
                         })
                         .await
@@ -1830,11 +2245,49 @@ impl P2pEndpoint {
                             return Ok((peer_conn, method));
                         }
                         Ok(Err(e)) => {
+                            if let Some(existing) =
+                                self.find_live_connection_for_addrs(&direct_addresses).await
+                            {
+                                let method = existing
+                                    .remote_addr
+                                    .as_socket_addr()
+                                    .map(|addr| {
+                                        if addr.is_ipv6() {
+                                            ConnectionMethod::DirectIPv6
+                                        } else {
+                                            ConnectionMethod::DirectIPv4
+                                        }
+                                    })
+                                    .unwrap_or(ConnectionMethod::DirectIPv4);
+                                debug!(
+                                    "Happy Eyeballs: direct race exhausted but converged to existing live connection"
+                                );
+                                return Ok((existing, method));
+                            }
                             debug!("Happy Eyeballs: all direct attempts failed: {}", e);
                             strategy.transition_to_ipv6(e.to_string());
                             strategy.transition_to_holepunch("Happy Eyeballs exhausted");
                         }
                         Err(_) => {
+                            if let Some(existing) =
+                                self.find_live_connection_for_addrs(&direct_addresses).await
+                            {
+                                let method = existing
+                                    .remote_addr
+                                    .as_socket_addr()
+                                    .map(|addr| {
+                                        if addr.is_ipv6() {
+                                            ConnectionMethod::DirectIPv6
+                                        } else {
+                                            ConnectionMethod::DirectIPv4
+                                        }
+                                    })
+                                    .unwrap_or(ConnectionMethod::DirectIPv4);
+                                debug!(
+                                    "Happy Eyeballs: direct race timed out but converged to existing live connection"
+                                );
+                                return Ok((existing, method));
+                            }
                             debug!("Happy Eyeballs: direct connection timed out");
                             strategy.transition_to_ipv6("Timeout");
                             strategy.transition_to_holepunch("Happy Eyeballs timed out");
@@ -1910,7 +2363,7 @@ impl P2pEndpoint {
 
                     match timeout(
                         strategy.relay_timeout(),
-                        self.try_relay_connection(target, relay_addr),
+                        self.try_relay_connection(target, relay_addr, peer_id),
                     )
                     .await
                     {
@@ -1970,40 +2423,25 @@ impl P2pEndpoint {
             .or(hint_peer_id)
             .unwrap_or_else(|| peer_id_from_socket_addr(addr));
 
-        // Dedup check: if already connected to this peer, use tiebreaker
+        // Post-handshake dedup: if we already have a live connection to this
+        // peer (e.g. from a simultaneous open), just overwrite it with the new
+        // outgoing connection. This matches the already-working direct-only
+        // connect path and avoids returning a connection that was closed as a
+        // duplicate during tie-breaking.
         if self.inner.is_peer_connected(&peer_id) {
-            let local_id = self.inner.local_peer_id();
-            let we_keep_client = local_id < peer_id;
-            if !we_keep_client {
-                // We have the higher PeerId: close this outgoing connection,
-                // keep the existing one (from accept path).
-                info!(
-                    "finalize_direct_connection: simultaneous open for peer {:?} — \
-                     our PeerId is higher, closing outgoing (keeping incoming)",
+            let has_peer_entry = self.connected_peers.read().await.contains_key(&peer_id);
+            if has_peer_entry {
+                debug!(
+                    "finalize_direct_connection: simultaneous open for peer {:?} — overwriting existing connection",
                     peer_id
                 );
-                connection.close(0u32.into(), b"duplicate");
-                // Wait briefly for the accept path to populate connected_peers
-                for _ in 0..10 {
-                    let peers = self.connected_peers.read().await;
-                    if let Some(existing) = peers.get(&peer_id) {
-                        return Ok(existing.clone());
-                    }
-                    drop(peers);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                return Err(EndpointError::Connection(
-                    "simultaneous open: peer connection not yet available, retry".into(),
-                ));
+            } else {
+                debug!(
+                    "finalize_direct_connection: removing stale low-level connection state for peer {:?} before registering new connection",
+                    peer_id
+                );
+                let _ = self.inner.remove_connection(&peer_id);
             }
-            // We have the lower PeerId: keep our outgoing connection,
-            // remove the old one from accept path.
-            info!(
-                "finalize_direct_connection: simultaneous open for peer {:?} — \
-                 our PeerId is lower, keeping outgoing (replacing incoming)",
-                peer_id
-            );
-            let _ = self.inner.remove_connection(&peer_id);
         }
 
         // Store in NAT traversal layer
@@ -2014,15 +2452,19 @@ impl P2pEndpoint {
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner.register_connection_peer_id(addr, peer_id);
         self.inner
-            .record_bootstrap_direct_connection(&addr, Some(connection.rtt()));
+            .record_bootstrap_direct_connection(peer_id, &addr, Some(connection.rtt()));
 
         // Clone the connection for the reader task BEFORE handler consumes it.
         // Do NOT re-fetch via get_connection() — see simultaneous-connect fix.
         let reader_conn = connection.clone();
 
+        // In simultaneous-open races, abort any previous reader for this peer
+        // before installing the replacement connection lifecycle.
+        self.abort_existing_reader_task(peer_id).await;
+
         // Spawn connection handler (Client side - we initiated)
         self.inner
-            .spawn_connection_handler(peer_id, connection, Side::Client, TraversalMethod::Direct)
+            .spawn_connection_handler(peer_id, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
@@ -2060,7 +2502,7 @@ impl P2pEndpoint {
         // First ensure we're connected to the coordinator
         if !self.is_connected_to_addr(coordinator).await {
             debug!("Connecting to coordinator {} first", coordinator);
-            self.connect(coordinator).await?;
+            self.connect_direct_addr(coordinator).await?;
         }
 
         // Initiate NAT traversal
@@ -2073,6 +2515,7 @@ impl P2pEndpoint {
 
         loop {
             if self.shutdown.is_cancelled() {
+                let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                 return Err(EndpointError::ShuttingDown);
             }
 
@@ -2081,23 +2524,41 @@ impl P2pEndpoint {
                 .poll(Instant::now())
                 .map_err(EndpointError::NatTraversal)?;
 
+            if let Some(rejection) = take_live_rejection(self.inner.local_peer_id(), peer_id) {
+                let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                return Err(EndpointError::NatTraversal(
+                    NatTraversalError::CoordinationFailed(format!(
+                        "coordination rejected: {:?}",
+                        rejection.reason
+                    )),
+                ));
+            }
+
+            let had_events = !events.is_empty();
             for event in events {
+                info!(
+                    "try_hole_punch polled event for target {:?}: {:?}",
+                    peer_id, event
+                );
                 match event {
                     NatTraversalEvent::ConnectionEstablished {
                         peer_id: evt_peer,
                         remote_address,
                         side,
-                        traversal_method,
+                        ..
                     } if evt_peer == peer_id || remote_address == target => {
-                        // Register peer ID at low-level endpoint so coordinators
-                        // can route PUNCH_ME_NOW by peer identity (symmetric NAT).
+                        // Register peer ID at the low-level endpoint so local
+                        // hole-punch session handling can map authenticated
+                        // connections back to peer identity. This is local routing
+                        // context, not a guarantee that RFC PUNCH_ME_NOW preserves
+                        // peer ID end-to-end on the wire.
                         self.inner
                             .register_connection_peer_id(remote_address, evt_peer);
 
                         let peer_conn = PeerConnection {
                             peer_id: evt_peer,
                             remote_addr: TransportAddr::Udp(remote_address),
-                            traversal_method,
+                            traversal_method: TraversalMethod::HolePunch,
                             side,
                             authenticated: true,
                             connected_at: Instant::now(),
@@ -2106,8 +2567,16 @@ impl P2pEndpoint {
 
                         // Spawn background reader task BEFORE storing in connected_peers
                         // to prevent race where recv() misses early data
-                        if let Ok(Some(conn)) = self.inner.get_connection(&evt_peer) {
-                            self.spawn_reader_task(evt_peer, conn).await;
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(evt_peer)
+                            .await
+                            .or_else(|| self.inner.session_connection(evt_peer))
+                        {
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(evt_peer, conn).await;
+                            });
                         }
 
                         self.connected_peers
@@ -2115,8 +2584,17 @@ impl P2pEndpoint {
                             .await
                             .insert(evt_peer, peer_conn.clone());
 
-                        self.publish_connection_established(&peer_conn).await;
+                        self.observe_direct_peer_reachability(
+                            evt_peer,
+                            &TransportAddr::Udp(remote_address),
+                        );
+                        let endpoint = self.clone();
+                        let published = peer_conn.clone();
+                        tokio::spawn(async move {
+                            endpoint.publish_connection_established(&published).await;
+                        });
 
+                        let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                         return Ok(peer_conn);
                     }
                     NatTraversalEvent::TraversalFailed {
@@ -2124,19 +2602,74 @@ impl P2pEndpoint {
                         error,
                         ..
                     } if evt_peer == peer_id => {
+                        let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                         return Err(EndpointError::NatTraversal(error));
                     }
                     _ => {}
                 }
             }
 
+            if let Some(conn) = self
+                .inner
+                .get_connection_by_authenticated_peer(peer_id)
+                .await
+                .or_else(|| self.inner.session_connection(peer_id))
+            {
+                info!(
+                    "try_hole_punch observed existing inner connection for peer {:?}; finalizing",
+                    peer_id
+                );
+                let remote_address = conn.remote_address();
+                let side = conn.side();
+
+                self.inner
+                    .register_connection_peer_id(remote_address, peer_id);
+
+                let peer_conn = PeerConnection {
+                    peer_id,
+                    remote_addr: TransportAddr::Udp(remote_address),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side,
+                    authenticated: true,
+                    connected_at: Instant::now(),
+                    last_activity: Instant::now(),
+                };
+
+                let endpoint = self.clone();
+                tokio::spawn(async move {
+                    endpoint.spawn_reader_task(peer_id, conn).await;
+                });
+
+                self.connected_peers
+                    .write()
+                    .await
+                    .insert(peer_id, peer_conn.clone());
+
+                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                let endpoint = self.clone();
+                let published = peer_conn.clone();
+                tokio::spawn(async move {
+                    endpoint.publish_connection_established(&published).await;
+                });
+
+                let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                return Ok(peer_conn);
+            }
+
+            if had_events {
+                continue;
+            }
+
             // Wait for connection notification, shutdown, or timeout
             tokio::select! {
                 _ = self.inner.connection_notify().notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 _ = self.shutdown.cancelled() => {
+                    let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                     return Err(EndpointError::ShuttingDown);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                     return Err(EndpointError::Timeout);
                 }
             }
@@ -2147,6 +2680,7 @@ impl P2pEndpoint {
         &self,
         target: SocketAddr,
         relay_addr: SocketAddr,
+        hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
         info!(
             "Attempting MASQUE relay connection to {} via {}",
@@ -2224,7 +2758,16 @@ impl P2pEndpoint {
         };
 
         // Step 6: Finalize — store connection, spawn handler
-        let relay_peer_id = peer_id_from_transport_addr(&TransportAddr::Udp(target));
+        let relay_peer_id = self
+            .inner
+            .extract_peer_id_from_connection(&connection)
+            .await
+            .or(hint_peer_id)
+            .ok_or_else(|| {
+                EndpointError::Connection(
+                    "Relay connection established without a durable peer identity".to_string(),
+                )
+            })?;
 
         self.inner
             .add_connection(relay_peer_id, connection.clone())
@@ -2238,12 +2781,7 @@ impl P2pEndpoint {
         let reader_conn = connection.clone();
 
         self.inner
-            .spawn_connection_handler(
-                relay_peer_id,
-                connection,
-                Side::Client,
-                TraversalMethod::Relay,
-            )
+            .spawn_connection_handler(relay_peer_id, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
@@ -2341,13 +2879,15 @@ impl P2pEndpoint {
                 // QUIC connection (simultaneous-connect recv() hang).
                 let reader_conn = connection.clone();
 
+                // In simultaneous-open races, abort any previous reader for this peer
+                // before installing the replacement connection lifecycle.
+                self.abort_existing_reader_task(resolved_peer_id).await;
+
                 // They initiated the connection to us = Server side
-                if let Err(e) = self.inner.spawn_connection_handler(
-                    resolved_peer_id,
-                    connection,
-                    Side::Server,
-                    TraversalMethod::Direct,
-                ) {
+                if let Err(e) =
+                    self.inner
+                        .spawn_connection_handler(resolved_peer_id, connection, Side::Server)
+                {
                     error!("Failed to spawn connection handler: {}", e);
                     return None;
                 }
@@ -2671,23 +3211,78 @@ impl P2pEndpoint {
 
     // === Known Peers ===
 
-    /// Connect to configured known peers
+    /// Connect to configured known peers.
     ///
-    /// This method now uses the connection router to automatically select
-    /// the appropriate protocol engine for each peer address.
+    /// This is part of the preferred public surface for bootstrapping and
+    /// discovery-oriented outbound connectivity.
     pub async fn connect_known_peers(&self) -> Result<usize, EndpointError> {
         let mut connected = 0;
-        let known_peers = self.config.known_peers.clone();
+        let static_known_peers = if self.config.discovery.static_known_peers {
+            self.config.known_peers.clone()
+        } else {
+            Vec::new()
+        };
+        let manual_udp_known_peers = self.manual_known_peer_udp_addrs.read().await.clone();
+        let runtime_udp_known_peers = self.runtime_known_peer_udp_addrs();
+        let auto_runtime_udp_known_peers = if self.config.discovery.auto_connect
+            == crate::unified_config::AutoConnectPolicy::Enabled
+        {
+            runtime_udp_known_peers
+                .iter()
+                .copied()
+                .filter(|addr| !manual_udp_known_peers.contains(addr))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut connected_udp_addrs = std::collections::HashSet::new();
 
-        for addr in &known_peers {
-            // Use connect_transport for all address types
+        for addr in &static_known_peers {
+            // Use connect_transport for all statically configured transport-capable addresses
             match self.connect_transport(addr, None).await {
                 Ok(_) => {
                     connected += 1;
+                    if let Some(socket_addr) = addr.as_socket_addr() {
+                        connected_udp_addrs.insert(socket_addr);
+                    }
                     info!("Connected to known peer {}", addr);
                 }
                 Err(e) => {
                     warn!("Failed to connect to known peer {}: {}", addr, e);
+                }
+            }
+        }
+
+        for addr in &manual_udp_known_peers {
+            if connected_udp_addrs.contains(addr) {
+                continue;
+            }
+
+            match self.connect_addr(*addr).await {
+                Ok(_) => {
+                    connected += 1;
+                    connected_udp_addrs.insert(*addr);
+                    info!("Connected to manual known peer {}", addr);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to manual known peer {}: {}", addr, e);
+                }
+            }
+        }
+
+        for addr in &auto_runtime_udp_known_peers {
+            if connected_udp_addrs.contains(addr) {
+                continue;
+            }
+
+            match self.connect_addr(*addr).await {
+                Ok(_) => {
+                    connected += 1;
+                    connected_udp_addrs.insert(*addr);
+                    info!("Connected to runtime known peer {}", addr);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to runtime known peer {}: {}", addr, e);
                 }
             }
         }
@@ -2697,21 +3292,35 @@ impl P2pEndpoint {
             stats.connected_bootstrap_nodes = connected;
         }
 
-        let _ = self.event_tx.send(P2pEvent::BootstrapStatus {
-            connected,
-            total: known_peers.len(),
-        });
+        let total = static_known_peers.len()
+            + manual_udp_known_peers
+                .iter()
+                .filter(|addr| {
+                    !static_known_peers
+                        .iter()
+                        .filter_map(|known| known.as_socket_addr())
+                        .any(|known| known == **addr)
+                })
+                .count()
+            + auto_runtime_udp_known_peers
+                .iter()
+                .filter(|addr| {
+                    !static_known_peers
+                        .iter()
+                        .filter_map(|known| known.as_socket_addr())
+                        .any(|known| known == **addr)
+                        && !manual_udp_known_peers.contains(addr)
+                })
+                .count();
+
+        let _ = self
+            .event_tx
+            .send(P2pEvent::BootstrapStatus { connected, total });
 
         // After bootstrap, check for symmetric NAT and set up relay if needed
         if connected > 0 {
             let inner = Arc::clone(&self.inner);
-            let bootstrap_addrs: Vec<SocketAddr> = known_peers
-                .iter()
-                .filter_map(|addr| match addr {
-                    TransportAddr::Udp(a) => Some(*a),
-                    _ => None,
-                })
-                .collect();
+            let bootstrap_addrs = runtime_udp_known_peers;
 
             tokio::spawn(async move {
                 // Wait for OBSERVED_ADDRESS frames to arrive from peers
@@ -2745,9 +3354,25 @@ impl P2pEndpoint {
         Ok(connected)
     }
 
-    /// Add a bootstrap node dynamically
+    /// Add a known peer dynamically.
+    ///
+    /// This is the canonical public name for adding discovery/bootstrap inputs.
+    pub async fn add_known_peer(&self, addr: SocketAddr) {
+        self.add_bootstrap(addr).await;
+    }
+
+    /// Add a bootstrap node dynamically.
+    ///
+    /// Compatibility-oriented alias retained for older callers. Prefer
+    /// [`Self::add_known_peer`].
     pub async fn add_bootstrap(&self, addr: SocketAddr) {
         let _ = self.inner.add_bootstrap_node(addr);
+        {
+            let mut manual = self.manual_known_peer_udp_addrs.write().await;
+            if !manual.contains(&addr) {
+                manual.push(addr);
+            }
+        }
         let mut stats = self.stats.write().await;
         stats.total_bootstrap_nodes += 1;
     }
@@ -2814,14 +3439,75 @@ impl P2pEndpoint {
 
     // === Internal helpers ===
 
+    fn spawn_port_mapping_task(&self) {
+        if !self.config.nat.port_mapping.enabled {
+            info!("Best-effort router port mapping disabled by configuration");
+            return;
+        }
+
+        let Some(local_addr) = self.local_addr() else {
+            warn!(
+                "Skipping best-effort router port mapping because local bind address is unavailable"
+            );
+            return;
+        };
+
+        let endpoint = self.clone();
+        spawn_best_effort_port_mapping(
+            self.config.nat.port_mapping,
+            local_addr.port(),
+            self.shutdown.clone(),
+            move |snapshot| endpoint.apply_port_mapping_snapshot(snapshot),
+        );
+    }
+
+    fn apply_port_mapping_snapshot(&self, snapshot: PortMappingSnapshot) {
+        let previous_addr = {
+            let mut current = self.port_mapping_state.write();
+            let previous = current.external_addr;
+            *current = snapshot;
+            previous
+        };
+
+        if let Some(previous_addr) = previous_addr {
+            if snapshot.external_addr != Some(previous_addr) {
+                let _ = self.inner.remove_local_external_candidate(previous_addr);
+            }
+        }
+
+        if snapshot.active {
+            if let Some(mapped_addr) = snapshot.external_addr {
+                if let Err(error) = self.inner.add_local_external_candidate(mapped_addr) {
+                    warn!(
+                        error = %error,
+                        mapped_addr = %mapped_addr,
+                        "Failed to add router-mapped address to the NAT candidate set"
+                    );
+                }
+            }
+        }
+    }
+
     /// Spawn a background tokio task that reads uni streams from a QUIC connection
     /// and forwards received data into the shared `data_tx` channel.
     ///
     /// The task exits naturally when the connection is closed or the channel is dropped.
+    async fn abort_existing_reader_task(&self, peer_id: PeerId) {
+        let mut handles = self.reader_handles.write().await;
+        if let Some(old_handle) = handles.remove(&peer_id) {
+            tracing::debug!(
+                "Aborting previous reader task for peer {:?} before connection replacement",
+                peer_id
+            );
+            old_handle.abort();
+        }
+    }
+
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
+        let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
@@ -2852,6 +3538,28 @@ impl P2pEndpoint {
 
                 let data_len = data.len();
                 tracing::trace!("Reader task: {} bytes from peer {:?}", data_len, peer_id);
+
+                match inner
+                    .handle_coordinator_control_message(peer_id, connection.clone(), &data)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::trace!(
+                            "Reader task: handled coordinator control payload from peer {:?}",
+                            peer_id
+                        );
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Reader task for peer {:?}: failed to handle coordinator control payload: {}",
+                            peer_id,
+                            e
+                        );
+                        continue;
+                    }
+                }
 
                 // Update last_activity
                 if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
@@ -3215,7 +3923,8 @@ impl Clone for P2pEndpoint {
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
-            hole_punch_target_peer_id: Arc::clone(&self.hole_punch_target_peer_id),
+            manual_known_peer_udp_addrs: Arc::clone(&self.manual_known_peer_udp_addrs),
+            port_mapping_state: Arc::clone(&self.port_mapping_state),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
@@ -3333,7 +4042,6 @@ mod tests {
                 peer_id,
                 remote_address: remote_addr,
                 side: Side::Client,
-                traversal_method: TraversalMethod::HolePunch,
             },
         )
         .await;
@@ -3464,6 +4172,42 @@ mod tests {
             );
         }
         // Note: endpoint creation may fail in test environment without network
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_disabled_mode_starts_cleanly() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        if let Ok(endpoint) = P2pEndpoint::new(config).await {
+            assert!(!endpoint.port_mapping_active());
+            assert_eq!(endpoint.port_mapping_addr(), None);
+            endpoint.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_candidate_propagates_to_external_addresses() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        if let Ok(endpoint) = P2pEndpoint::new(config).await {
+            let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
+            endpoint.apply_port_mapping_snapshot(PortMappingSnapshot {
+                active: true,
+                external_addr: Some(mapped_addr),
+            });
+
+            assert!(endpoint.port_mapping_active());
+            assert_eq!(endpoint.port_mapping_addr(), Some(mapped_addr));
+            assert!(endpoint.all_external_addrs().contains(&mapped_addr));
+
+            endpoint.shutdown().await;
+        }
     }
 
     // ==========================================================================

@@ -680,7 +680,7 @@ impl LinkTransport for P2pLinkTransport {
                     // Connect through P2pEndpoint
                     let peer_conn = self
                         .endpoint
-                        .connect(addr)
+                        .connect_addr(addr)
                         .await
                         .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?;
 
@@ -709,7 +709,7 @@ impl LinkTransport for P2pLinkTransport {
             // Connect through P2pEndpoint
             let peer_conn = self
                 .endpoint
-                .connect(addr)
+                .connect_addr(addr)
                 .await
                 .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?;
 

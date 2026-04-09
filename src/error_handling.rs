@@ -182,7 +182,7 @@ macro_rules! context {
 /// ```rust
 /// use crate::error_handling::{AntQuicError, Result, utils::*};
 ///
-/// fn connect_to_peer(peer_id: &str) -> Result<()> {
+/// fn connect_peer(peer_id: &str) -> Result<()> {
 ///     // Validate input
 ///     ensure!(!peer_id.is_empty(), AntQuicError::InvalidParameter("peer_id cannot be empty".to_string()));
 ///
@@ -190,7 +190,7 @@ macro_rules! context {
 ///     match do_connection_attempt(peer_id) {
 ///         Ok(()) => Ok(()),
 ///         Err(e) => {
-///             log_error(&e, "Failed to connect to peer");
+///             log_error(&e, "Failed to connect peer through unified connectivity path");
 ///             if is_recoverable(&e) {
 ///                 if let Some(delay) = get_retry_delay(&e) {
 ///                     std::thread::sleep(delay);

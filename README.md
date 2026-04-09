@@ -16,6 +16,7 @@
 - **Symmetric P2P Nodes** - Every node is identical: connect, accept, coordinate
 - **Automatic NAT Traversal** - Per [draft-seemann-quic-nat-traversal-02](docs/rfcs/draft-seemann-quic-nat-traversal-02.txt)
 - **External Address Discovery** - Per [draft-ietf-quic-address-discovery-00](docs/rfcs/draft-ietf-quic-address-discovery-00.txt)
+- **Router-Assisted Reachability** - UPnP IGD is part of the implemented connectivity stack as a best-effort local-router port-mapping assist layer (enabled by default, disable with `--no-port-mapping`)
 - **Pure PQC Raw Public Keys** - ML-DSA-65 authentication per [our specification](docs/rfcs/ant-quic-pqc-authentication.md)
 - **Zero Configuration Required** - Sensible defaults, just create and connect
 - **Powered by [saorsa-pqc](https://crates.io/crates/saorsa-pqc)** - NIST FIPS 203/204 compliant implementations
@@ -35,12 +36,17 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
     println!("Peer ID: {:?}", endpoint.peer_id());
 
-    // Connect to known peers for address discovery
-    endpoint.connect_bootstrap().await?;
+    // Seed connectivity and address discovery through the unified path
+    endpoint.connect_known_peers().await?;
 
-    // Your external address is now known
-    if let Some(addr) = endpoint.external_address() {
+    // Your external address may become known after seeded peer observation
+    if let Some(addr) = endpoint.external_addr() {
         println!("External address: {}", addr);
+    }
+
+    // Best-effort router port mapping contributes an additional candidate when available
+    if let Some(mapped) = endpoint.port_mapping_addr() {
+        println!("Router-mapped address: {}", mapped);
     }
 
     Ok(())
@@ -74,7 +80,12 @@ In v0.13.0, we removed all role distinctions:
 - **Any peer can coordinate** NAT traversal for other peers
 - **Any peer can report** your external address via OBSERVED_ADDRESS frames
 
-The term "known_peers" replaces "bootstrap_nodes" - they're just addresses to connect to first. Any connected peer can help with address discovery.
+The term "known_peers" replaces "bootstrap_nodes" - they're just addresses to connect to first. In practice, seeded known peers and refreshed runtime peers provide the initial address-observation context.
+
+**PeerId vs SocketAddr**: `PeerId` is the durable peer identity. `SocketAddr`
+is only a routing/contact hint and may change across NAT rebinding,
+reconnects, or path migration. Persist coordinator/bootstrap knowledge by
+`PeerId`, then update the latest known `SocketAddr` as reachability changes.
 
 **Measure, don't trust**: capability hints are treated as unverified signals.
 Peers are selected based on observed reachability and success rates, not
@@ -129,7 +140,8 @@ let pqc = PqcConfig::builder()
 
 ### Identity Model
 
-- **32-byte PeerId** - SHA-256 hash of ML-DSA-65 public key (compact identifier for addressing)
+- **32-byte PeerId** - SHA-256 hash of ML-DSA-65 public key (compact identifier for durable peer identity)
+- **SocketAddr is not identity** - addresses are ephemeral reachability hints and must be treated as mutable contact metadata
 - **ML-DSA-65 Authentication** - All TLS handshake signatures use pure PQC
 - **ML-KEM-768 Key Exchange** - All key agreement uses pure PQC
 
@@ -138,14 +150,25 @@ See [docs/guides/pqc-security.md](docs/guides/pqc-security.md) for security anal
 ## NAT Traversal
 
 NAT traversal is built into the QUIC protocol via extension frames, not STUN/TURN.
+In addition, the connectivity architecture now treats **UPnP IGD** as a
+best-effort local-router assist layer on compatible home networks. This is
+additive: it can improve inbound reachability and yield a better external
+candidate address, but native QUIC address discovery, hole punching, and MASQUE
+relay fallback remain the core connectivity path.
+
+### Connectivity Stack
+
+1. **Router assist (UPnP IGD)** — best-effort local gateway port mapping on compatible home routers
+2. **Native QUIC NAT traversal** — OBSERVED_ADDRESS + ADD_ADDRESS + PUNCH_ME_NOW
+3. **MASQUE relay fallback** — last-resort reachability when direct paths still fail
 
 ### How It Works
 
-1. **Connect to any known peer**
-2. **Peer observes your external address** from incoming packets
-3. **Peer sends OBSERVED_ADDRESS frame** back to you
-4. **You learn your public address** and can coordinate hole punching
-5. **Direct P2P connection** established through NAT
+1. **Connect to one or more known/runtime peers**
+2. **A connected peer may observe your external address** from incoming packets
+3. **That peer can send an OBSERVED_ADDRESS frame** back to you
+4. **You may learn a public address candidate** and use it for later coordination
+5. **Direct P2P connection may then be established** through NAT
 
 ### Extension Frames
 
@@ -231,36 +254,36 @@ cargo build --release
 ## Binary Usage
 
 ```bash
-# Run as P2P node (auto-connects to default bootstrap nodes)
+# Run as a symmetric peer (auto-seeds from default known peers if none are provided)
 ant-quic --listen 0.0.0.0:9000
 
-# Connect to specific known peers
+# Provide explicit known peers for initial connectivity and address discovery
 ant-quic --listen 0.0.0.0:9000 --known-peers 1.2.3.4:9000 --known-peers 5.6.7.8:9000
 
-# Show your external address (discovered via peers)
+# Connect to a specific address through the unified outbound connectivity path
+ant-quic --listen 0.0.0.0:9000 --connect 5.6.7.8:9001
+
+# Disable best-effort router port mapping on demand
+ant-quic --listen 0.0.0.0:9000 --no-port-mapping
+
+# Show your external address (discovered via connected peers)
 ant-quic --listen 0.0.0.0:9000
 # Output: External address: YOUR.PUBLIC.IP:PORT
-
-# Run with monitoring dashboard
-ant-quic --dashboard --listen 0.0.0.0:9000
-
-# Interactive commands while running:
-# /status - Show connections and discovered addresses
-# /peers  - List connected peers
-# /help   - Show all commands
 ```
 
-### Default Bootstrap Nodes
+`--connect` does **not** force a "direct-only" attempt. It uses the canonical address-based connect entrypoint, so the endpoint still applies its normal routing/orchestration behavior such as connection reuse, direct dialing, and fallback handling when applicable. Richer peer-oriented discovery behavior comes from `connect_known_peers()` and `connect_peer()`.
 
-If no `--known-peers` are specified, ant-quic automatically connects to the Saorsa Labs bootstrap nodes:
+### Default Known Peers
+
+If no `--known-peers` are specified, ant-quic automatically seeds connectivity from the default Saorsa Labs known peers:
 - `saorsa-1.saorsalabs.com:9000`
 - `saorsa-2.saorsalabs.com:9000`
 
-These nodes run the same ant-quic software as any peer - they help with initial peer discovery and external address observation.
+These are ordinary symmetric peers running the same ant-quic software as everyone else. They are useful starting points for initial discovery, but they are not special protocol roles.
 
-### Bootstrap Cache
+### Peer Cache
 
-ant-quic maintains a local cache of discovered peers to improve startup time and resilience. The cache is stored as a JSON file:
+ant-quic maintains a local cache of discovered peers to improve startup time and resilience. The cache is stored as an encrypted local file:
 
 | Platform | Cache Location |
 |----------|----------------|
@@ -299,21 +322,27 @@ impl P2pEndpoint {
     // Identity
     fn peer_id(&self) -> PeerId;
     fn local_addr(&self) -> Option<SocketAddr>;
-    fn external_address(&self) -> Option<SocketAddr>;
+    fn external_addr(&self) -> Option<SocketAddr>;
+    fn all_external_addrs(&self) -> Vec<SocketAddr>;
+    fn port_mapping_active(&self) -> bool;
+    fn port_mapping_addr(&self) -> Option<SocketAddr>;
 
     // Connections
-    async fn connect_bootstrap(&self) -> Result<()>;
-    async fn connect_to_peer(&self, peer: PeerId) -> Result<Connection>;
-    fn connected_peers(&self) -> Vec<PeerId>;
+    async fn connect_known_peers(&self) -> Result<usize>;
+    async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection>;
+    async fn connect_peer(&self, peer: PeerId) -> Result<PeerConnection>;
+    async fn connected_peers(&self) -> Vec<PeerConnection>;
+    async fn accept(&self) -> Option<PeerConnection>;
 
     // Events
     fn subscribe(&self) -> broadcast::Receiver<P2pEvent>;
 
     // Statistics
-    fn stats(&self) -> EndpointStats;
-    fn nat_stats(&self) -> NatTraversalStatistics;
+    async fn stats(&self) -> EndpointStats;
 }
 ```
+
+`connect_addr()` is the canonical address-based connect entrypoint. It goes through the endpoint's normal routing/orchestration path, including connection reuse, direct dialing, and fallback handling when applicable. Richer peer-oriented discovery and identity-driven behavior comes from `connect_known_peers()` and `connect_peer()`.
 
 ### P2pConfig Builder
 

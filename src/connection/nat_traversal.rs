@@ -2625,6 +2625,75 @@ impl NatTraversalState {
         Ok(round)
     }
 
+    pub(super) fn prime_passive_coordination_target(
+        &mut self,
+        incoming_round: VarInt,
+        target: PunchTarget,
+        now: Instant,
+    ) -> Result<(), NatTraversalError> {
+        if self.is_peer_coordination_suspicious(incoming_round, now) {
+            self.stats.suspicious_coordination_attempts += 1;
+            self.stats.security_rejections += 1;
+            debug!(
+                "Suspicious passive coordination request rejected for round {}",
+                incoming_round
+            );
+            return Err(NatTraversalError::SuspiciousCoordination);
+        }
+
+        if let Some(coord) = &mut self.coordination
+            && coord.round == incoming_round
+            && matches!(
+                coord.state,
+                CoordinationPhase::Requesting
+                    | CoordinationPhase::Coordinating
+                    | CoordinationPhase::Preparing
+            )
+        {
+            if !coord.punch_targets.iter().any(|existing| {
+                existing.remote_addr == target.remote_addr
+                    && existing.remote_sequence == target.remote_sequence
+            }) {
+                coord.punch_targets.push(target);
+            }
+            coord.peer_punch_received = true;
+            coord.state = CoordinationPhase::Preparing;
+
+            let network_rtt = self
+                .network_monitor
+                .get_estimated_rtt()
+                .unwrap_or(Duration::from_millis(100));
+            let quality_score = self.network_monitor.get_quality_score();
+            let base_grace = Duration::from_millis(150);
+            let rtt_factor = (network_rtt.as_millis() as f64 / 100.0).clamp(0.5, 3.0);
+            let quality_factor = (2.0 - quality_score).clamp(1.0, 2.0);
+            let adaptive_grace = Duration::from_millis(
+                (base_grace.as_millis() as f64 * rtt_factor * quality_factor) as u64,
+            );
+            coord.punch_start = now + adaptive_grace;
+            return Ok(());
+        }
+
+        let coordination_grace = Duration::from_millis(500);
+        let punch_start = now + coordination_grace;
+        self.coordination = Some(CoordinationState {
+            round: incoming_round,
+            punch_targets: vec![target],
+            round_start: now,
+            punch_start,
+            round_duration: self.coordination_timeout,
+            state: CoordinationPhase::Preparing,
+            punch_request_sent: false,
+            peer_punch_received: true,
+            retry_count: 0,
+            max_retries: 3,
+            timeout_state: AdaptiveTimeoutState::new(),
+            last_retry_at: None,
+        });
+
+        Ok(())
+    }
+
     /// Check if a coordination request shows suspicious patterns
     fn is_coordination_suspicious(&self, targets: &[PunchTarget], _now: Instant) -> bool {
         // Check for excessive number of targets
