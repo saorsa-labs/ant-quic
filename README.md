@@ -285,13 +285,15 @@ These are ordinary symmetric peers running the same ant-quic software as everyon
 
 ### Peer Cache
 
-ant-quic maintains a local cache of discovered peers to improve startup time and resilience. The cache is stored as an encrypted local file:
+ant-quic maintains a local cache of discovered peers to improve startup time and resilience. The cache is stored under the platform cache directory:
 
-| Platform | Cache Location |
-|----------|----------------|
-| **macOS** | `~/Library/Caches/ant-quic/bootstrap_cache.json` |
-| **Linux** | `~/.cache/ant-quic/bootstrap_cache.json` |
-| **Windows** | `%LOCALAPPDATA%\ant-quic\bootstrap_cache.json` |
+| Platform | Cache Directory |
+|----------|-----------------|
+| **macOS** | `~/Library/Caches/ant-quic/` |
+| **Linux** | `~/.cache/ant-quic/` |
+| **Windows** | `%LOCALAPPDATA%\\ant-quic\\` |
+
+The runtime manages the exact cache filename and format within that directory.
 
 The cache includes:
 - Peer IDs and socket addresses

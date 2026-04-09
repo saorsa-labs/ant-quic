@@ -41,6 +41,13 @@ ant-quic should be the **smallest useful substrate** that can reliably connect m
 
 Implement **native QUIC NAT traversal** as the primary reachability mechanism using QUIC extension frames, eliminating external infrastructure. In addition, accept **router-assisted port mapping** (UPnP IGD first, with PCP/NAT-PMP as possible future follow-ons) as an additive local optimization for compatible home/edge routers.
 
+For the current UPnP IGD implementation, standardize on `igd-next` as the
+router-assist library. It best matches ant-quic's immediate needs: Tokio async
+integration, simple gateway discovery, external IPv4 address lookup, UDP
+add/remove port mapping, and a permissive MIT license. If we later expand
+router assist beyond UPnP IGD, add a separate backend rather than replacing the
+UPnP implementation outright.
+
 ### Extension Frames
 
 | Frame | Type ID | Purpose |
@@ -75,8 +82,33 @@ Router-assisted mapping is **additive only**:
 
 Current first-cut runtime status:
 - implemented via `PortMappingConfig` under `NatConfig`
+- implemented with `igd-next` as the UPnP IGD backend
 - enabled by default, with CLI opt-out via `--no-port-mapping`
 - mapped public addresses feed candidate/status surfaces, but do not flip direct-reachability truth on their own
+- current implementation is intentionally narrow: UDP-only and IPv4-only
+
+### Router-Assist Library Selection
+
+The router-assist layer is intentionally narrower than a full generic UPnP
+control-point stack. ant-quic currently needs:
+
+- Tokio-native async gateway discovery
+- external address lookup
+- best-effort UDP port mapping with renew/remove
+- a small dependency and maintenance surface
+- a permissive license compatible with `MIT OR Apache-2.0`
+
+`igd-next` fits that profile well and is therefore the selected library for the
+UPnP IGD slice.
+
+Future follow-on protocol support should be evaluated separately:
+
+- **PCP/NAT-PMP**: prefer adding a dedicated backend, with `crab_nat` the
+  current best candidate, rather than forcing those protocols through a UPnP
+  abstraction
+- **IPv6 pinholes / richer gateway capabilities / multi-gateway policy**:
+  revisit the abstraction only when those capabilities become first-order
+  requirements
 
 ### Layered Connectivity Strategy
 
@@ -132,7 +164,26 @@ Based on IETF drafts (not yet RFCs):
    - Rejected: Not universally supported, router compatibility varies, and it should not become the core connectivity dependency
    - Accepted in narrower form: UPnP IGD is useful as an additive local-router optimization layered under the native QUIC traversal strategy
 
-4. **Always relay**: Route all traffic through known peers
+4. **Switch from `igd-next` to a broader UPnP library now**
+   - Rejected: ant-quic only needs a narrow IGD feature set today, and broader
+     libraries add integration work without improving the core reachability
+     design
+   - `rupnp`: useful generic UPnP control-point library, but broader than
+     needed for simple IGD mapping and would require more manual IGD service
+     selection/action plumbing
+   - `easy-upnp`: mostly a convenience wrapper over `igd-next`, so it does not
+     materially improve capability for ant-quic
+   - `oxy-upnp-igd`: focused IGD crate, but `AGPL-3.0-only`, which is a poor
+     fit for this project's licensing posture
+
+5. **Replace UPnP IGD with PCP/NAT-PMP now**
+   - Rejected: PCP/NAT-PMP would expand reachability on some networks, but they
+     are follow-on optimizations, not replacements for native QUIC NAT
+     traversal or the current best-effort UPnP layer
+   - Accepted in narrower form: when we add those protocols, prefer a separate
+     backend using a focused crate such as `crab_nat`
+
+6. **Always relay**: Route all traffic through known peers
    - Rejected: Inefficient, creates bottlenecks
 
 ## References
@@ -142,3 +193,5 @@ Based on IETF drafts (not yet RFCs):
 - Documentation: `docs/NAT_TRAVERSAL_GUIDE.md`
 - Implementation: `src/nat_traversal_api.rs`, `src/connection/nat_traversal.rs`
 - Frame definitions: `src/frame.rs`
+- UPnP IGD crate: `igd-next`
+- PCP/NAT-PMP candidate crate: `crab_nat`
