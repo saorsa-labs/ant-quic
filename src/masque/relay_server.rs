@@ -182,6 +182,10 @@ pub enum DatagramResult {
 pub struct MasqueRelayServer {
     /// Server configuration
     config: MasqueRelayConfig,
+    /// Default primary address to fall back to when no better public address is known.
+    default_public_address: SocketAddr,
+    /// Default secondary address for the other IP family, when configured.
+    default_secondary_address: Option<SocketAddr>,
     /// Primary public address advertised to clients
     public_address: ParkingRwLock<SocketAddr>,
     /// Secondary public address (other IP version for dual-stack)
@@ -205,6 +209,8 @@ impl MasqueRelayServer {
     pub fn new(config: MasqueRelayConfig, public_address: SocketAddr) -> Self {
         Self {
             config,
+            default_public_address: public_address,
+            default_secondary_address: None,
             public_address: ParkingRwLock::new(public_address),
             secondary_address: ParkingRwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
@@ -251,6 +257,8 @@ impl MasqueRelayServer {
 
         Self {
             config,
+            default_public_address: primary,
+            default_secondary_address: Some(secondary),
             public_address: ParkingRwLock::new(primary),
             secondary_address: ParkingRwLock::new(Some(secondary)),
             sessions: RwLock::new(HashMap::new()),
@@ -313,6 +321,15 @@ impl MasqueRelayServer {
         *self.secondary_address.read()
     }
 
+    fn default_address_for_family(&self, want_ipv4: bool) -> Option<SocketAddr> {
+        if self.default_public_address.is_ipv4() == want_ipv4 {
+            Some(self.default_public_address)
+        } else {
+            self.default_secondary_address
+                .filter(|addr| addr.is_ipv4() == want_ipv4)
+        }
+    }
+
     /// Get count of bridged (cross-IP-version) connections
     pub fn bridged_connection_count(&self) -> u64 {
         self.bridged_connections.load(Ordering::Relaxed)
@@ -371,6 +388,42 @@ impl MasqueRelayServer {
             old = %old,
             new = %addr,
             "Relay server public address updated"
+        );
+    }
+
+    /// Reconcile the advertised public addresses for both IP families.
+    ///
+    /// When a family-specific public address is unavailable, the server falls
+    /// back to its original bind/default address for that family so stale
+    /// router-mapped advertisements do not linger indefinitely.
+    pub fn reconcile_public_addresses(&self, ipv4: Option<SocketAddr>, ipv6: Option<SocketAddr>) {
+        let resolved_ipv4 = ipv4.or_else(|| self.default_address_for_family(true));
+        let resolved_ipv6 = ipv6.or_else(|| self.default_address_for_family(false));
+
+        let (new_primary, new_secondary) = match (resolved_ipv4, resolved_ipv6) {
+            (Some(v4), Some(v6)) => (v4, Some(v6)),
+            (Some(v4), None) => (v4, None),
+            (None, Some(v6)) => (v6, None),
+            (None, None) => (self.default_public_address, self.default_secondary_address),
+        };
+
+        let mut public_address = self.public_address.write();
+        let mut secondary_address = self.secondary_address.write();
+        if *public_address == new_primary && *secondary_address == new_secondary {
+            return;
+        }
+
+        let old_primary = *public_address;
+        let old_secondary = *secondary_address;
+        *public_address = new_primary;
+        *secondary_address = new_secondary;
+
+        tracing::info!(
+            old_primary = %old_primary,
+            old_secondary = ?old_secondary,
+            new_primary = %new_primary,
+            new_secondary = ?new_secondary,
+            "Relay server public addresses reconciled"
         );
     }
 
@@ -1177,6 +1230,28 @@ mod tests {
                 .ip(),
             refreshed_addr.ip()
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_public_addresses_falls_back_to_defaults_per_family() {
+        let config = MasqueRelayConfig::default();
+        let default_ipv4: SocketAddr = "0.0.0.0:9000".parse().expect("valid addr");
+        let default_ipv6: SocketAddr = "[::]:9000".parse().expect("valid addr");
+        let server = MasqueRelayServer::new_dual_stack(config, default_ipv4, default_ipv6);
+
+        let observed_ipv4: SocketAddr = "198.51.100.77:9000".parse().expect("valid addr");
+        server.reconcile_public_addresses(Some(observed_ipv4), None);
+        assert_eq!(server.public_address(), observed_ipv4);
+        assert_eq!(server.secondary_address(), Some(default_ipv6));
+
+        let observed_ipv6: SocketAddr = "[2001:db8::77]:9000".parse().expect("valid addr");
+        server.reconcile_public_addresses(None, Some(observed_ipv6));
+        assert_eq!(server.public_address(), default_ipv4);
+        assert_eq!(server.secondary_address(), Some(observed_ipv6));
+
+        server.reconcile_public_addresses(None, None);
+        assert_eq!(server.public_address(), default_ipv4);
+        assert_eq!(server.secondary_address(), Some(default_ipv6));
     }
 
     #[tokio::test]

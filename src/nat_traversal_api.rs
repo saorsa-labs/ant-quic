@@ -2259,25 +2259,16 @@ impl NatTraversalEndpoint {
         if let Ok(mut addr) = self.relay_public_addr.lock() {
             *addr = Some(relay_public_addr);
         }
+        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.clear();
+        }
 
         // Step 5: Now that the endpoint is accepting, advertise to all peers
         let mut advertised = 0;
-        for entry in self.connections.iter() {
-            let conn = entry.value().clone();
-            match conn.send_nat_address_advertisement(relay_public_addr, 100) {
-                Ok(_) => {
-                    advertised += 1;
-                    if let Ok(mut peers) = self.relay_advertised_peers.lock() {
-                        peers.insert(conn.remote_address());
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to advertise relay address to {}: {}",
-                        entry.key(),
-                        e
-                    );
-                }
+        let peer_ids: Vec<_> = self.connections.iter().map(|entry| *entry.key()).collect();
+        for peer_id in peer_ids {
+            if self.publish_active_relay_to_peer(peer_id) {
+                advertised += 1;
             }
         }
 
@@ -2308,8 +2299,98 @@ impl NatTraversalEndpoint {
         }
     }
 
-    pub(crate) fn update_relay_server_public_address(&self, public_addr: SocketAddr) {
-        Self::apply_relay_server_public_address(self.relay_server.as_ref(), public_addr);
+    fn best_observed_external_address_for_family(&self, want_ipv4: bool) -> Option<SocketAddr> {
+        let known_peer_addrs: std::collections::HashSet<_> =
+            self.config.known_peers.iter().copied().collect();
+
+        for entry in self.connections.iter() {
+            let connection = entry.value();
+            if known_peer_addrs.contains(&connection.remote_address())
+                && let Some(addr) = connection.observed_address()
+            {
+                let addr = normalize_socket_addr(addr);
+                if !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4 {
+                    return Some(addr);
+                }
+            }
+        }
+
+        for entry in self.connections.iter() {
+            if let Some(addr) = entry.value().observed_address() {
+                let addr = normalize_socket_addr(addr);
+                if !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4 {
+                    return Some(addr);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn reconcile_relay_server_public_addresses(&self, mapped_addr: Option<SocketAddr>) {
+        let mapped_addr = mapped_addr
+            .map(normalize_socket_addr)
+            .filter(|addr| !addr.ip().is_unspecified());
+        let ipv4 = match mapped_addr {
+            Some(addr) if addr.is_ipv4() => Some(addr),
+            _ => self.best_observed_external_address_for_family(true),
+        };
+        let ipv6 = match mapped_addr {
+            Some(addr) if addr.is_ipv6() => Some(addr),
+            _ => self.best_observed_external_address_for_family(false),
+        };
+
+        if let Some(server) = self.relay_server.as_ref() {
+            server.reconcile_public_addresses(ipv4, ipv6);
+        }
+    }
+
+    pub(crate) fn publish_active_relay_to_peer(&self, peer_id: PeerId) -> bool {
+        let relay_public_addr = match self.relay_public_addr.lock().ok().and_then(|guard| *guard) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let connection = match self.connections.get_mut(&peer_id) {
+            Some(connection) => connection,
+            None => return false,
+        };
+        let remote_addr = connection.remote_address();
+
+        if self
+            .relay_advertised_peers
+            .lock()
+            .ok()
+            .is_some_and(|peers| peers.contains(&remote_addr))
+        {
+            return false;
+        }
+
+        match connection.send_nat_address_advertisement(relay_public_addr, 100) {
+            Ok(sequence) => {
+                if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                    peers.insert(remote_addr);
+                }
+                info!(
+                    peer_id = ?peer_id,
+                    remote_addr = %remote_addr,
+                    relay_public_addr = %relay_public_addr,
+                    seq = sequence,
+                    "Advertised proactive relay address to connected peer"
+                );
+                true
+            }
+            Err(error) => {
+                debug!(
+                    peer_id = ?peer_id,
+                    remote_addr = %remote_addr,
+                    relay_public_addr = %relay_public_addr,
+                    error = %error,
+                    "Failed to advertise proactive relay address to connected peer"
+                );
+                false
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2317,6 +2398,25 @@ impl NatTraversalEndpoint {
         self.relay_server
             .as_ref()
             .map(|server| server.public_address())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_relay_public_addr(&self, relay_public_addr: SocketAddr) {
+        if let Ok(mut addr) = self.relay_public_addr.lock() {
+            *addr = Some(relay_public_addr);
+        }
+        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relay_advertised_peer_addrs(&self) -> Vec<SocketAddr> {
+        self.relay_advertised_peers
+            .lock()
+            .ok()
+            .map(|peers| peers.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Get the transport registry if configured
@@ -5195,7 +5295,12 @@ impl NatTraversalEndpoint {
         self.emitted_established_events.remove(peer_id);
 
         // DashMap provides lock-free .remove() that returns Option<(K, V)>
-        Ok(self.connections.remove(peer_id).map(|(_, v)| v))
+        Ok(self.connections.remove(peer_id).map(|(_, connection)| {
+            if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                peers.remove(&connection.remote_address());
+            }
+            connection
+        }))
     }
 
     /// List all active connections
@@ -7900,7 +8005,7 @@ mod tests {
             .expect("Endpoint creation should succeed");
 
         let refreshed_addr: SocketAddr = "198.51.100.44:49000".parse().expect("valid addr");
-        endpoint.update_relay_server_public_address(refreshed_addr);
+        endpoint.reconcile_relay_server_public_addresses(Some(refreshed_addr));
 
         assert_eq!(endpoint.relay_server_public_address(), Some(refreshed_addr));
     }

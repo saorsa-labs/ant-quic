@@ -1168,8 +1168,11 @@ impl P2pEndpoint {
     }
 
     /// Returns whether this endpoint is willing to provide relay service for peers.
+    ///
+    /// ant-quic uses an always-on symmetric assist plane, so this reports the
+    /// effective runtime behaviour rather than any legacy config flag.
     pub fn relay_service_enabled(&self) -> bool {
-        self.config.nat.enable_relay_service
+        true
     }
 
     /// Returns whether this endpoint advertises coordinator capability.
@@ -2942,9 +2945,13 @@ impl P2pEndpoint {
             self.connected_peers.as_ref(),
             self.stats.as_ref(),
             &self.event_tx,
-            peer_conn,
+            peer_conn.clone(),
         )
         .await;
+
+        if peer_conn.remote_addr.as_socket_addr().is_some() {
+            let _ = self.inner.publish_active_relay_to_peer(peer_conn.peer_id);
+        }
     }
 
     /// Check if we're connected to a specific address
@@ -3476,6 +3483,7 @@ impl P2pEndpoint {
         if connected > 0 {
             let inner = Arc::clone(&self.inner);
             let bootstrap_addrs = runtime_udp_known_peers;
+            let event_tx = self.event_tx.clone();
 
             tokio::spawn(async move {
                 // Wait for OBSERVED_ADDRESS frames to arrive from peers
@@ -3491,6 +3499,7 @@ impl P2pEndpoint {
                                     "Proactive relay active at {} via bootstrap {}",
                                     relay_addr, bootstrap
                                 );
+                                let _ = event_tx.send(P2pEvent::RelayEstablished { relay_addr });
                                 return;
                             }
                             Err(e) => {
@@ -3837,9 +3846,8 @@ impl P2pEndpoint {
             previous
         };
 
-        if let Some(mapped_addr) = snapshot.external_addr {
-            self.inner.update_relay_server_public_address(mapped_addr);
-        }
+        self.inner
+            .reconcile_relay_server_public_addresses(snapshot.external_addr);
 
         if let Some(previous_addr) = previous_addr
             && snapshot.external_addr != Some(previous_addr)
@@ -4732,6 +4740,125 @@ mod tests {
 
             endpoint.shutdown().await;
         }
+    }
+
+    async fn wait_for_observed_external_addr(endpoint: &P2pEndpoint) -> SocketAddr {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(addr) = endpoint.external_addr() {
+                    return addr;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("observed external address should be discovered")
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_removal_recomputes_relay_public_address_from_observed_address() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        let listener = P2pEndpoint::new(config.clone())
+            .await
+            .expect("listener should create");
+        let dialer = P2pEndpoint::new(config)
+            .await
+            .expect("dialer should create");
+
+        let listener_addr = localhost_addr(listener.local_addr().expect("listener addr"));
+        let _ = dialer
+            .connect_addr(listener_addr)
+            .await
+            .expect("dialer should connect");
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept should complete")
+            .expect("listener should accept");
+
+        let observed_addr = wait_for_observed_external_addr(&listener).await;
+        let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
+        listener.apply_port_mapping_snapshot(PortMappingSnapshot {
+            active: true,
+            external_addr: Some(mapped_addr),
+        });
+        assert_eq!(
+            listener.inner.relay_server_public_address(),
+            Some(mapped_addr)
+        );
+
+        listener.apply_port_mapping_snapshot(PortMappingSnapshot::default());
+        assert_eq!(
+            listener.inner.relay_server_public_address(),
+            Some(observed_addr)
+        );
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_active_relay_is_advertised_to_future_connected_peers() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        let relay_endpoint = P2pEndpoint::new(config.clone())
+            .await
+            .expect("relay endpoint should create");
+        relay_endpoint
+            .inner
+            .set_test_relay_public_addr("198.51.100.200:45000".parse().expect("valid addr"));
+
+        let peer_endpoint = P2pEndpoint::new(config)
+            .await
+            .expect("peer endpoint should create");
+        let relay_listen_addr =
+            localhost_addr(relay_endpoint.local_addr().expect("relay listen addr"));
+        let _ = peer_endpoint
+            .connect_addr(relay_listen_addr)
+            .await
+            .expect("peer should connect");
+        let accepted = tokio::time::timeout(Duration::from_secs(5), relay_endpoint.accept())
+            .await
+            .expect("accept should complete")
+            .expect("relay endpoint should accept");
+        let peer_remote_addr = accepted
+            .remote_addr
+            .as_socket_addr()
+            .expect("accepted peer should have socket addr");
+
+        let advertised = relay_endpoint.inner.relay_advertised_peer_addrs();
+        assert!(
+            advertised.contains(&peer_remote_addr),
+            "future connected peers should receive the active relay advertisement"
+        );
+
+        peer_endpoint.shutdown().await;
+        relay_endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_relay_service_enabled_reports_effective_runtime_when_legacy_flag_is_disabled() {
+        let mut config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+        config.nat.enable_relay_service = false;
+
+        let endpoint = P2pEndpoint::new(config)
+            .await
+            .expect("endpoint should create");
+        assert!(
+            endpoint.relay_service_enabled(),
+            "status should reflect the always-on relay runtime"
+        );
+
+        endpoint.shutdown().await;
     }
 
     fn localhost_addr(addr: SocketAddr) -> SocketAddr {
