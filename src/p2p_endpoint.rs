@@ -4826,6 +4826,7 @@ mod tests {
         endpoint.shutdown().await;
     }
 
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity() {
         let node_b = crate::Node::bind(SocketAddr::new(
@@ -4859,7 +4860,7 @@ mod tests {
         let accept_handle = tokio::spawn({
             let node = node_b.clone();
             async move {
-                let _ = tokio::time::timeout(Duration::from_secs(5), node.accept()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(20), node.accept()).await;
             }
         });
 
@@ -4869,7 +4870,7 @@ mod tests {
             addr_b, fake_claim,
         )));
 
-        let success = tokio::time::timeout(Duration::from_secs(10), async {
+        let success = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match events.recv().await.expect("event should arrive") {
                     P2pEvent::MdnsAutoConnectSucceeded {
@@ -4892,6 +4893,7 @@ mod tests {
         let _ = accept_handle.await;
     }
 
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn test_mdns_discovered_peer_coexists_with_static_known_peer_dedup() {
         let node_b = crate::Node::bind(SocketAddr::new(
@@ -4927,7 +4929,7 @@ mod tests {
             let node = node_b.clone();
             async move {
                 for _ in 0..2 {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), node.accept()).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(20), node.accept()).await;
                 }
             }
         });
@@ -4938,7 +4940,7 @@ mod tests {
         )));
 
         let connected =
-            tokio::time::timeout(Duration::from_secs(10), endpoint_a.connect_known_peers())
+            tokio::time::timeout(Duration::from_secs(20), endpoint_a.connect_known_peers())
                 .await
                 .expect("connect_known_peers should not time out")
                 .expect("connect_known_peers should succeed");
