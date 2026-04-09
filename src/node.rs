@@ -12,7 +12,7 @@
 //!
 //! - Uses 100% post-quantum cryptography (ML-KEM-768)
 //! - Works behind any NAT via native QUIC hole punching
-//! - Can act as coordinator/relay if environment allows
+//! - Offers relay/bootstrap/coordinator capability hints by default
 //! - Exposes a practical status snapshot via [`NodeStatus`]
 //!
 //! # Zero Configuration
@@ -658,12 +658,13 @@ impl Node {
         // a conservative runtime snapshot from existing NAT/relay state instead
         // of hard-coded false/zero placeholders.
         let runtime_assist = self.inner.runtime_assist_snapshot().await;
-        let is_relaying =
-            runtime_assist.relay_public_addr.is_some() || runtime_assist.active_relay_sessions > 0;
+        let relay_service_enabled = self.inner.relay_service_enabled();
+        let coordinator_service_enabled = self.inner.coordinator_service_enabled();
+        let bootstrap_service_enabled = self.inner.bootstrap_service_enabled();
+        let is_relaying = runtime_assist.active_relay_sessions > 0;
         let relay_sessions = runtime_assist.active_relay_sessions;
         let relay_bytes_forwarded = 0u64;
-        let is_coordinating = runtime_assist.preferred_coordinator.is_some()
-            || runtime_assist.coordinator_candidate_count > 0;
+        let is_coordinating = runtime_assist.successful_coordinations > 0;
         let coordination_sessions =
             usize::try_from(runtime_assist.successful_coordinations).unwrap_or(usize::MAX);
 
@@ -701,6 +702,9 @@ impl Node {
             mdns_browsing: mdns.browsing,
             mdns_advertising: mdns.advertising,
             mdns_discovered_peers: mdns.discovered_peers.len(),
+            relay_service_enabled,
+            coordinator_service_enabled,
+            bootstrap_service_enabled,
             connected_peers: connected_peers.len(),
             active_connections: stats.active_connections,
             pending_connections: 0, // Not tracked yet
@@ -858,6 +862,11 @@ mod tests {
         assert_eq!(status.connected_peers, 0); // No connections yet
         assert!(!status.port_mapping_active);
         assert_eq!(status.port_mapping_addr, None);
+        assert!(status.relay_service_enabled);
+        assert!(status.coordinator_service_enabled);
+        assert!(status.bootstrap_service_enabled);
+        assert!(!status.is_relaying);
+        assert!(!status.is_coordinating);
 
         node.shutdown().await;
     }

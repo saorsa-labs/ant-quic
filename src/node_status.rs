@@ -21,6 +21,7 @@
 //!
 //! println!("NAT type: {:?}", status.nat_type);
 //! println!("Can receive direct: {}", status.can_receive_direct);
+//! println!("Relay service enabled: {}", status.relay_service_enabled);
 //! println!("Acting as relay: {}", status.is_relaying);
 //! println!("Relay sessions: {}", status.relay_sessions);
 //! ```
@@ -98,8 +99,9 @@ impl std::fmt::Display for NatType {
 /// - **NAT Status**: nat_type, can_receive_direct, direct_reachability_scope, has_global_address
 /// - **Connections**: connected_peers, active_connections, pending_connections
 /// - **NAT Traversal**: direct_connections, relayed_connections, hole_punch_success_rate
-/// - **Relay**: is_relaying, relay_sessions, relay_bytes_forwarded
-/// - **Coordinator**: is_coordinating, coordination_sessions
+/// - **Assist Services**: relay_service_enabled, coordinator_service_enabled, bootstrap_service_enabled
+/// - **Relay Activity**: is_relaying, relay_sessions, relay_bytes_forwarded
+/// - **Coordinator Activity**: is_coordinating, coordination_sessions
 /// - **Performance**: avg_rtt, uptime
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
@@ -149,6 +151,24 @@ pub struct NodeStatus {
     /// Number of currently eligible peers surfaced by first-party mDNS.
     pub mdns_discovered_peers: usize,
 
+    // --- Assist Services ---
+    /// Whether this node offers relay service as a capability hint to peers.
+    ///
+    /// This is a local policy/configuration signal. Remote peers still decide
+    /// whether this node is actually useful for relay service.
+    pub relay_service_enabled: bool,
+
+    /// Whether this node offers coordinator capability as a hint to peers.
+    ///
+    /// This is a capability advertisement, not proof of current reachability
+    /// or performance.
+    pub coordinator_service_enabled: bool,
+
+    /// Whether this node offers bootstrap/known-peer assist capability.
+    ///
+    /// Peers may treat this node as one discovery/bootstrap input among many.
+    pub bootstrap_service_enabled: bool,
+
     // --- Connections ---
     /// Number of connected peers
     pub connected_peers: usize,
@@ -174,8 +194,8 @@ pub struct NodeStatus {
     // --- Relay Status (NEW - key visibility) ---
     /// Whether this node is currently acting as a relay for others.
     ///
-    /// This is currently conservative/best-effort rather than an authoritative
-    /// runtime relay accounting signal.
+    /// This tracks observed runtime activity, not merely whether the node is
+    /// willing to offer relay service.
     pub is_relaying: bool,
 
     /// Number of active relay sessions.
@@ -189,14 +209,15 @@ pub struct NodeStatus {
     // --- Coordinator Status (NEW - key visibility) ---
     /// Whether this node is coordinating NAT traversal.
     ///
-    /// This is currently conservative/best-effort rather than an authoritative
-    /// runtime coordination signal. Fresh peer-verified direct reachability is
-    /// still the stronger indicator for coordinator viability.
+    /// This is a best-effort signal derived from observed coordination
+    /// activity in the current process lifetime, not merely whether the node
+    /// advertises coordinator capability.
     pub is_coordinating: bool,
 
     /// Number of active coordination sessions.
     ///
-    /// Currently reported conservatively; this is not yet a complete runtime metric.
+    /// This is currently a best-effort cumulative proxy derived from runtime
+    /// coordination statistics rather than an authoritative live in-flight count.
     pub coordination_sessions: usize,
 
     // --- Performance ---
@@ -224,6 +245,9 @@ impl Default for NodeStatus {
             mdns_browsing: false,
             mdns_advertising: false,
             mdns_discovered_peers: 0,
+            relay_service_enabled: false,
+            coordinator_service_enabled: false,
+            bootstrap_service_enabled: false,
             connected_peers: 0,
             active_connections: 0,
             pending_connections: 0,
@@ -249,10 +273,10 @@ impl NodeStatus {
 
     /// Check if node can help with NAT traversal
     ///
-    /// Returns true if the node has peer-verified direct reachability and can
-    /// act as coordinator/relay for other peers.
+    /// Returns true if the node currently participates in the assist plane or
+    /// has peer-verified direct reachability.
     pub fn can_help_traversal(&self) -> bool {
-        self.can_receive_direct
+        self.relay_service_enabled || self.coordinator_service_enabled || self.can_receive_direct
     }
 
     /// Get the total number of connections (direct + relayed)
@@ -307,6 +331,9 @@ mod tests {
         assert!(!status.mdns_browsing);
         assert!(!status.mdns_advertising);
         assert_eq!(status.mdns_discovered_peers, 0);
+        assert!(!status.relay_service_enabled);
+        assert!(!status.coordinator_service_enabled);
+        assert!(!status.bootstrap_service_enabled);
         assert_eq!(status.connected_peers, 0);
         assert!(!status.is_relaying);
         assert!(!status.is_coordinating);
@@ -332,6 +359,14 @@ mod tests {
             "Global address alone must not imply direct reachability"
         );
 
+        status.relay_service_enabled = true;
+        assert!(status.can_help_traversal());
+
+        status.relay_service_enabled = false;
+        status.coordinator_service_enabled = true;
+        assert!(status.can_help_traversal());
+
+        status.coordinator_service_enabled = false;
         status.can_receive_direct = true;
         status.direct_reachability_scope = Some(ReachabilityScope::Global);
         assert!(status.can_help_traversal());
@@ -451,5 +486,17 @@ mod tests {
         assert!(status.mdns_browsing);
         assert!(status.mdns_advertising);
         assert_eq!(status.mdns_discovered_peers, 2);
+    }
+
+    #[test]
+    fn test_assist_service_status_fields() {
+        let mut status = NodeStatus::default();
+        status.relay_service_enabled = true;
+        status.coordinator_service_enabled = true;
+        status.bootstrap_service_enabled = true;
+
+        assert!(status.relay_service_enabled);
+        assert!(status.coordinator_service_enabled);
+        assert!(status.bootstrap_service_enabled);
     }
 }

@@ -269,11 +269,8 @@ pub struct ConnectionMetrics {
 /// Best-effort runtime assist snapshot for higher-level status surfaces.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeAssistSnapshot {
-    pub preferred_coordinator: Option<SocketAddr>,
-    pub coordinator_candidate_count: usize,
     pub successful_coordinations: u32,
     pub active_relay_sessions: usize,
-    pub relay_public_addr: Option<SocketAddr>,
 }
 
 /// P2P endpoint statistics
@@ -1170,6 +1167,27 @@ impl P2pEndpoint {
         self.mdns_state.read().clone()
     }
 
+    /// Returns whether this endpoint is willing to provide relay service for peers.
+    pub fn relay_service_enabled(&self) -> bool {
+        self.config.nat.enable_relay_service
+    }
+
+    /// Returns whether this endpoint advertises coordinator capability.
+    ///
+    /// ant-quic uses a symmetric model where every node can participate in
+    /// coordination decisions; remote peers still decide whether to use it.
+    pub const fn coordinator_service_enabled(&self) -> bool {
+        true
+    }
+
+    /// Returns whether this endpoint advertises bootstrap/known-peer assist capability.
+    ///
+    /// This is an opt-in signal that the node can be treated as one candidate
+    /// discovery/bootstrap input. It is not proof that peers must or should use it.
+    pub const fn bootstrap_service_enabled(&self) -> bool {
+        true
+    }
+
     /// Get the transport registry for this endpoint
     ///
     /// The transport registry contains all registered transport providers (UDP, BLE, etc.)
@@ -1371,22 +1389,16 @@ impl P2pEndpoint {
     }
 
     pub(crate) async fn runtime_assist_snapshot(&self) -> RuntimeAssistSnapshot {
-        let coordinator_candidates = self.coordinator_candidates().await;
         let successful_coordinations = self
             .inner
             .get_statistics()
             .map(|stats| stats.successful_coordinations)
             .unwrap_or(0);
         let active_relay_sessions = self.inner.relay_sessions().len();
-        let relay_public_addr = self.inner.relay_public_addr();
-        let preferred_coordinator = coordinator_candidates.first().copied();
 
         RuntimeAssistSnapshot {
-            preferred_coordinator,
-            coordinator_candidate_count: coordinator_candidates.len(),
             successful_coordinations,
             active_relay_sessions,
-            relay_public_addr,
         }
     }
 
@@ -3623,33 +3635,37 @@ impl P2pEndpoint {
             return;
         };
 
-        #[cfg(not(feature = "mdns-discovery"))]
-        {
-            warn!(
-                service = mdns.service.as_deref().unwrap_or_default(),
-                "mDNS was configured but the mdns-discovery feature is not enabled"
+        let configured_loopback_only = self
+            .config
+            .bind_addr
+            .as_ref()
+            .and_then(TransportAddr::as_socket_addr)
+            .is_some_and(|configured| configured.ip().is_loopback());
+
+        if configured_loopback_only || local_addr.ip().is_loopback() {
+            info!(
+                configured_loopback_only,
+                local_addr = %local_addr,
+                "Skipping first-party mDNS for a loopback-only endpoint"
             );
             return;
         }
 
-        #[cfg(feature = "mdns-discovery")]
         {
-            {
-                let mut snapshot = self.mdns_state.write();
-                snapshot.browsing = mdns.mode.browse_enabled();
-                snapshot.service = mdns.service.clone();
-                snapshot.namespace = mdns.namespace.clone();
-            }
-
-            let endpoint = self.clone();
-            spawn_mdns_runtime(
-                mdns,
-                self.peer_id,
-                local_addr.port(),
-                self.shutdown.clone(),
-                move |event| endpoint.apply_mdns_runtime_event(event),
-            );
+            let mut snapshot = self.mdns_state.write();
+            snapshot.browsing = mdns.mode.browse_enabled();
+            snapshot.service = mdns.service.clone();
+            snapshot.namespace = mdns.namespace.clone();
         }
+
+        let endpoint = self.clone();
+        spawn_mdns_runtime(
+            mdns,
+            self.peer_id,
+            local_addr.port(),
+            self.shutdown.clone(),
+            move |event| endpoint.apply_mdns_runtime_event(event),
+        );
     }
 
     fn apply_mdns_runtime_event(&self, event: MdnsRuntimeEvent) {
@@ -4780,6 +4796,34 @@ mod tests {
 
         endpoint_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_skips_loopback_bind_hints() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let mdns = endpoint.mdns_snapshot();
+        assert!(
+            !mdns.browsing,
+            "loopback-only bind hints must suppress background mDNS browsing"
+        );
+        assert!(
+            !mdns.advertising,
+            "loopback-only bind hints must suppress background mDNS advertising"
+        );
+
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]

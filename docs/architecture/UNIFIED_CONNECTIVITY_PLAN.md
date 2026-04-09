@@ -7,9 +7,10 @@ Implementation plan with the main UPnP + mDNS pieces now landed in code.
 - Phase 3.5 router-assisted port mapping is landed with first-party UPnP IGD,
   renewal, shutdown cleanup, additive candidate propagation, and structured
   lifecycle events.
-- Phase 4 scoped first-party mDNS is landed behind the `mdns-discovery`
-  feature flag, including browse/advertise runtime, service/namespace scoping,
-  discover-only vs auto-connect policy, and structured discovery events/state.
+- Phase 4 scoped first-party mDNS is landed as a built-in runtime, including
+  browse/advertise support, service/namespace scoping, discover-only vs
+  auto-connect policy, structured discovery events/state, and default-on
+  zero-config participation for non-loopback endpoints.
 - Future provider-generalization work such as PCP/NAT-PMP or a broader peer
   directory abstraction is still follow-up work, not a blocker for the current
   LAN-scoped mDNS + UPnP expectations.
@@ -62,9 +63,9 @@ not complete yet.
 ### Immediate implication for consumers
 
 Consumers such as `x0x` can now cut over to `ant-quic` for service-scoped,
-namespace-scoped LAN discovery if the `mdns-discovery` feature is enabled. The
-remaining future work is about broader provider abstraction, not the core
-first-party mDNS runtime itself.
+namespace-scoped LAN discovery without carrying an app-local compile-time mDNS
+feature gate. The remaining future work is about broader provider abstraction,
+not the core first-party mDNS runtime itself.
 
 ## Core principles
 
@@ -489,7 +490,7 @@ The first cut of this phase is now implemented:
 
 ### Phase 4 — optional mDNS integration (landed)
 
-This phase is now landed behind the `mdns-discovery` feature flag:
+This phase is now landed as a built-in runtime:
 
 1. first-party optional mDNS provider/runtime is present
 2. service/namespace scoping is enforced in the runtime
@@ -500,7 +501,8 @@ This phase is now landed behind the `mdns-discovery` feature flag:
 
 #### Phase 4 detailed implementation checklist
 
-1. add an optional mDNS runtime/provider module behind a dedicated feature flag
+1. land the built-in first-party mDNS runtime/provider with no compile-time
+   feature gate
 2. finalize the public config shape for:
    - enabled/disabled
    - service name
@@ -777,8 +779,9 @@ resource policy:
 1. enable LAN discovery participation by default (including mDNS when available)
 2. publish global findability/discovery hints by default (for example rendezvous
    advertisements)
-3. publish coordinator/relay capability hints when the local node is actually
-   eligible to help
+3. publish coordinator/relay/bootstrap capability hints by default, while still
+   letting authenticated/runtime policy decide whether the local node is
+   actually useful to another peer
 4. allow this node to be selected as one of many assist paths by peers
 
 Crucially, this flag must **not** force peers to route through `x0xd`.

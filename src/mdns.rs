@@ -8,7 +8,15 @@ use tracing::{debug, warn};
 use crate::nat_traversal_api::PeerId;
 use crate::unified_config::MdnsConfig;
 
-const RESERVED_METADATA_KEYS: [&str; 3] = ["peer_id", "namespace", "service"];
+const RESERVED_METADATA_KEYS: [&str; 7] = [
+    "peer_id",
+    "namespace",
+    "service",
+    "assist_connectivity",
+    "relay_service",
+    "coordinator_service",
+    "bootstrap_service",
+];
 
 /// Public snapshot of the endpoint's mDNS runtime state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -249,6 +257,10 @@ pub(crate) fn advertised_metadata(
         "service".to_string(),
         config.service.clone().unwrap_or_default(),
     );
+    metadata.insert("assist_connectivity".to_string(), "true".to_string());
+    metadata.insert("relay_service".to_string(), "true".to_string());
+    metadata.insert("coordinator_service".to_string(), "true".to_string());
+    metadata.insert("bootstrap_service".to_string(), "true".to_string());
     if let Some(namespace) = config.namespace.clone() {
         metadata.insert("namespace".to_string(), namespace);
     }
@@ -295,7 +307,6 @@ pub(crate) fn parse_peer_id_hex(value: &str) -> Option<PeerId> {
     Some(PeerId(bytes))
 }
 
-#[cfg(feature = "mdns-discovery")]
 pub(crate) fn spawn_mdns_runtime<F>(
     config: MdnsConfig,
     local_peer_id: PeerId,
@@ -314,19 +325,6 @@ pub(crate) fn spawn_mdns_runtime<F>(
     });
 }
 
-#[cfg(not(feature = "mdns-discovery"))]
-pub(crate) fn spawn_mdns_runtime<F>(
-    _config: MdnsConfig,
-    _local_peer_id: PeerId,
-    _local_port: u16,
-    _shutdown: CancellationToken,
-    _on_event: F,
-) where
-    F: FnMut(MdnsRuntimeEvent) + Send + 'static,
-{
-}
-
-#[cfg(feature = "mdns-discovery")]
 async fn run_mdns_runtime<F>(
     config: MdnsConfig,
     local_peer_id: PeerId,
@@ -406,7 +404,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "mdns-discovery")]
 async fn drive_browse_loop<F>(
     receiver: mdns_sd::Receiver<mdns_sd::ServiceEvent>,
     shutdown: CancellationToken,
@@ -458,7 +455,6 @@ async fn drive_browse_loop<F>(
     }
 }
 
-#[cfg(feature = "mdns-discovery")]
 async fn graceful_unregister(daemon: &mdns_sd::ServiceDaemon, fullname: &str) {
     match daemon.unregister(fullname) {
         Ok(receiver) => {
@@ -470,7 +466,6 @@ async fn graceful_unregister(daemon: &mdns_sd::ServiceDaemon, fullname: &str) {
     }
 }
 
-#[cfg(feature = "mdns-discovery")]
 async fn graceful_shutdown(daemon: &mdns_sd::ServiceDaemon) {
     match daemon.shutdown() {
         Ok(receiver) => {
@@ -747,6 +742,22 @@ mod tests {
         assert_eq!(
             metadata.get("namespace").map(String::as_str),
             Some("workspace-a")
+        );
+        assert_eq!(
+            metadata.get("assist_connectivity").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata.get("relay_service").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata.get("coordinator_service").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata.get("bootstrap_service").map(String::as_str),
+            Some("true")
         );
     }
 }

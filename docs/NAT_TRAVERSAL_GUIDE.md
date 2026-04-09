@@ -286,18 +286,23 @@ NAT traversal protocol.
 
 ### Scoped mDNS Discovery
 
-ant-quic also supports first-party scoped mDNS when built with the
-`mdns-discovery` feature:
+ant-quic supports first-party scoped mDNS out of the box, with zero-config
+browse+advertise enabled by default for non-loopback endpoints:
 
 - `service` controls the DNS-SD service/application scope
 - `namespace` constrains discoveries to the current workspace/network scope
 - `mode` chooses `browse`, `advertise`, or `both`
 - `auto_connect` chooses discover-only vs automatic dialing
 - `metadata` publishes optional TXT key/value pairs alongside the built-in
-  `peer_id`, `service`, and `namespace` fields
+  `peer_id`, `service`, `namespace`, and assist-role hints
 
 mDNS results are pre-auth locator claims only. The authenticated QUIC handshake
 still decides the durable `PeerId`.
+
+ant-quic now also publishes relay/bootstrap/coordinator capability hints by
+default in its discovery metadata and status surfaces. Those hints mean "this
+node is willing to participate", not "this node must be used" or "this node is
+currently the best assist path".
 
 ### Runtime Configuration
 
@@ -318,13 +323,11 @@ ant-quic --listen [::]:0 \
          --known-peers quic.saorsalabs.com:9000 \
          --no-port-mapping
 
-# Enable scoped mDNS browse+advertise without auto-connect
+# Use the built-in default mDNS behavior (browse+advertise with auto-connect)
 ant-quic --listen [::]:0 \
-         --mdns \
-         --mdns-service ant-quic \
-         --mdns-namespace workspace-a
+         --stats
 
-# Enable scoped mDNS browse-only with auto-connect
+# Override the default mDNS scope and mode explicitly
 ant-quic --listen [::]:0 \
          --mdns-service ant-quic \
          --mdns-namespace workspace-a \
@@ -347,7 +350,7 @@ let config = P2pConfig::builder()
         service: Some("ant-quic".into()),
         namespace: Some("workspace-a".into()),
         mode: MdnsMode::Both,
-        auto_connect: AutoConnectPolicy::Disabled,
+        auto_connect: AutoConnectPolicy::Enabled,
         metadata: std::collections::BTreeMap::new(),
     })
     .nat(NatConfig {

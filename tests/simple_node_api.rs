@@ -193,9 +193,22 @@ mod status_tests {
         println!("  nat_type: {:?}", status.nat_type);
         println!("  can_receive_direct: {}", status.can_receive_direct);
         println!("  connected_peers: {}", status.connected_peers);
+        println!("  relay_service_enabled: {}", status.relay_service_enabled);
+        println!(
+            "  coordinator_service_enabled: {}",
+            status.coordinator_service_enabled
+        );
+        println!(
+            "  bootstrap_service_enabled: {}",
+            status.bootstrap_service_enabled
+        );
         println!("  is_relaying: {}", status.is_relaying);
         println!("  is_coordinating: {}", status.is_coordinating);
         println!("  uptime: {:?}", status.uptime);
+
+        assert!(status.relay_service_enabled);
+        assert!(status.coordinator_service_enabled);
+        assert!(status.bootstrap_service_enabled);
 
         node.shutdown().await;
     }
@@ -207,11 +220,17 @@ mod status_tests {
 
         // Relay fields should be accessible
         println!("Relay status:");
+        println!("  relay_service_enabled: {}", status.relay_service_enabled);
         println!("  is_relaying: {}", status.is_relaying);
         println!("  relay_sessions: {}", status.relay_sessions);
         println!("  relay_bytes_forwarded: {}", status.relay_bytes_forwarded);
 
-        // Initially, node shouldn't be relaying
+        assert!(
+            status.relay_service_enabled,
+            "Relay service should be offered by default"
+        );
+        // Initially, node shouldn't be actively relaying
+        assert!(!status.is_relaying, "No active relay traffic initially");
         assert_eq!(status.relay_sessions, 0, "No relay sessions initially");
 
         node.shutdown().await;
@@ -224,8 +243,17 @@ mod status_tests {
 
         // Coordinator fields should be accessible
         println!("Coordinator status:");
+        println!(
+            "  coordinator_service_enabled: {}",
+            status.coordinator_service_enabled
+        );
         println!("  is_coordinating: {}", status.is_coordinating);
         println!("  coordination_sessions: {}", status.coordination_sessions);
+
+        assert!(
+            status.coordinator_service_enabled,
+            "Coordinator service should be offered by default"
+        );
 
         node.shutdown().await;
     }
@@ -271,6 +299,7 @@ mod status_tests {
 
         // Initially not connected
         assert!(!is_connected, "No connections initially");
+        assert!(can_help, "Default node should offer traversal assistance");
         assert_eq!(total_conns, 0, "No connections initially");
 
         node.shutdown().await;

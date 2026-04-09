@@ -458,36 +458,29 @@ async fn main() -> anyhow::Result<()> {
     if args.no_mdns {
         builder = builder.mdns_enabled(false);
         info!("First-party mDNS disabled");
-    } else if mdns_requested {
-        #[cfg(not(feature = "mdns-discovery"))]
-        anyhow::bail!("mDNS flags require ant-quic to be built with the mdns-discovery feature");
-
-        #[cfg(feature = "mdns-discovery")]
-        {
-            let mdns_config = MdnsConfig {
-                enabled: true,
-                service: Some(
-                    args.mdns_service
-                        .clone()
-                        .unwrap_or_else(|| "ant-quic".to_string()),
-                ),
-                namespace: args.mdns_namespace.clone(),
-                mode: args.mdns_mode.unwrap_or(CliMdnsMode::Both).into(),
-                auto_connect: args
-                    .mdns_auto_connect
-                    .unwrap_or(CliMdnsAutoConnect::Disabled)
-                    .into(),
-                metadata: std::collections::BTreeMap::new(),
-            };
-            builder = builder.mdns(mdns_config.clone());
-            info!(
-                service = mdns_config.service.as_deref().unwrap_or_default(),
-                namespace = mdns_config.namespace.as_deref().unwrap_or_default(),
-                mode = ?mdns_config.mode,
-                auto_connect = ?mdns_config.auto_connect,
-                "First-party mDNS enabled"
-            );
+    } else {
+        let mut mdns_config = MdnsConfig::default();
+        if let Some(service) = args.mdns_service.clone() {
+            mdns_config.service = Some(service);
         }
+        if let Some(namespace) = args.mdns_namespace.clone() {
+            mdns_config.namespace = Some(namespace);
+        }
+        if let Some(mode) = args.mdns_mode {
+            mdns_config.mode = mode.into();
+        }
+        if let Some(auto_connect) = args.mdns_auto_connect {
+            mdns_config.auto_connect = auto_connect.into();
+        }
+
+        builder = builder.mdns(mdns_config.clone());
+        info!(
+            service = mdns_config.service.as_deref().unwrap_or_default(),
+            namespace = mdns_config.namespace.as_deref().unwrap_or_default(),
+            mode = ?mdns_config.mode,
+            auto_connect = ?mdns_config.auto_connect,
+            "First-party mDNS enabled"
+        );
     }
     // v0.13.0: No mode-based NAT config - all nodes are symmetric
 
@@ -1272,10 +1265,13 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
     let port_mapping_active = endpoint.port_mapping_active();
     let port_mapping_addr = endpoint.port_mapping_addr();
     let mdns = endpoint.mdns_snapshot();
+    let relay_service_enabled = endpoint.relay_service_enabled();
+    let coordinator_service_enabled = endpoint.coordinator_service_enabled();
+    let bootstrap_service_enabled = endpoint.bootstrap_service_enabled();
 
     if json {
         println!(
-            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{},"port_mapping_active":{},"port_mapping_addr":{},"mdns_browsing":{},"mdns_advertising":{},"mdns_discovered_peers":{}}}"#,
+            r#"{{"type":"stats","active_connections":{},"successful_connections":{},"failed_connections":{},"nat_traversals":{},"bytes_sent":{},"bytes_received":{},"external_addresses":{},"port_mapping_active":{},"port_mapping_addr":{},"mdns_browsing":{},"mdns_advertising":{},"mdns_discovered_peers":{},"relay_service_enabled":{},"coordinator_service_enabled":{},"bootstrap_service_enabled":{}}}"#,
             stats.active_connections,
             stats.successful_connections,
             stats.failed_connections,
@@ -1294,6 +1290,9 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
             mdns.browsing,
             mdns.advertising,
             mdns.discovered_peers.len(),
+            relay_service_enabled,
+            coordinator_service_enabled,
+            bootstrap_service_enabled,
         );
     } else {
         info!("=== Statistics ===");
@@ -1327,6 +1326,12 @@ async fn print_stats(endpoint: &P2pEndpoint, runtime_stats: &RuntimeStats, json:
         info!("  mDNS browsing: {}", mdns.browsing);
         info!("  mDNS advertising: {}", mdns.advertising);
         info!("  mDNS discovered peers: {}", mdns.discovered_peers.len());
+        info!("  Relay service enabled: {}", relay_service_enabled);
+        info!(
+            "  Coordinator service enabled: {}",
+            coordinator_service_enabled
+        );
+        info!("  Bootstrap service enabled: {}", bootstrap_service_enabled);
     }
 }
 

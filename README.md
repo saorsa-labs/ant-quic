@@ -16,7 +16,9 @@
 - **Symmetric P2P Nodes** - Every node is identical: connect, accept, coordinate
 - **Automatic NAT Traversal** - Per [draft-seemann-quic-nat-traversal-02](docs/rfcs/draft-seemann-quic-nat-traversal-02.txt)
 - **External Address Discovery** - Per [draft-ietf-quic-address-discovery-00](docs/rfcs/draft-ietf-quic-address-discovery-00.txt)
+- **Default-On Local Discovery** - First-party scoped mDNS is built in and enabled by default on non-loopback endpoints
 - **Router-Assisted Reachability** - UPnP IGD is part of the implemented connectivity stack as a best-effort local-router port-mapping assist layer (enabled by default, disable with `--no-port-mapping`)
+- **Assist Capability Hints** - Nodes advertise relay/bootstrap/coordinator willingness by default; peers still decide whether to use them
 - **Pure PQC Raw Public Keys** - ML-DSA-65 authentication per [our specification](docs/rfcs/ant-quic-pqc-authentication.md)
 - **Zero Configuration Required** - Sensible defaults, just create and connect
 - **Powered by [saorsa-pqc](https://crates.io/crates/saorsa-pqc)** - NIST FIPS 203/204 compliant implementations

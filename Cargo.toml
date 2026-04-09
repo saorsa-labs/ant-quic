@@ -50,9 +50,6 @@ log = ["tracing/log"]
 # Enhanced network interface discovery
 network-discovery = ["dep:socket2", "dep:nix"]
 
-# First-party mDNS browse/advertise runtime
-mdns-discovery = ["dep:mdns-sd"]
-
 # Fuzzing/testing features
 arbitrary = ["dep:arbitrary"]
 
@@ -156,7 +153,7 @@ tracing-subscriber = { version = "0.3.0", default-features = false, features = [
 quinn-udp = { version = "0.5", features = ["log", "tracing"] }
 pin-project-lite = "0.2"
 igd-next = { version = "0.17", features = ["aio_tokio"] }
-mdns-sd = { version = "0.19", optional = true }
+mdns-sd = { version = "0.19" }
 
 # Compliance validator dependencies
 regex = "1.11"

@@ -70,7 +70,7 @@ impl MdnsMode {
 }
 
 /// Configuration for optional first-party mDNS discovery/runtime integration.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdnsConfig {
     /// Whether mDNS discovery is enabled.
     pub enabled: bool,
@@ -100,12 +100,20 @@ pub struct MdnsConfig {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// Public discovery policy scaffold for the unified connectivity plan.
-///
-/// This is intentionally lightweight for now: runtime behavior remains backward
-/// compatible and still primarily uses `known_peers` as the active discovery
-/// input. These fields provide the public configuration shape needed for future
-/// provider-based discovery wiring.
+impl Default for MdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            service: Some("ant-quic".to_string()),
+            namespace: None,
+            mode: MdnsMode::Both,
+            auto_connect: AutoConnectPolicy::Enabled,
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
+/// Public discovery policy for zero-config and policy-driven discovery inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryPolicy {
     /// Whether statically configured known peers are enabled as a discovery source.
@@ -117,12 +125,12 @@ pub struct DiscoveryPolicy {
 }
 
 impl DiscoveryPolicy {
-    /// Create a discovery policy with current backward-compatible behavior.
+    /// Create the default zero-config discovery policy.
     pub fn current_default() -> Self {
         Self {
             static_known_peers: true,
-            mdns: None,
-            auto_connect: AutoConnectPolicy::Disabled,
+            mdns: Some(MdnsConfig::default()),
+            auto_connect: AutoConnectPolicy::Enabled,
         }
     }
 }
@@ -159,10 +167,7 @@ pub struct P2pConfig {
     /// privileged peer role.
     pub known_peers: Vec<TransportAddr>,
 
-    /// Discovery policy scaffold for future provider-based discovery wiring.
-    ///
-    /// Defaults to the current behavior where static `known_peers` are enabled
-    /// as the primary discovery/bootstrap input.
+    /// Discovery policy for static peers and zero-config local discovery.
     pub discovery: DiscoveryPolicy,
 
     /// Trust policy for discovered/authenticated peers.
@@ -1227,6 +1232,16 @@ mod tests {
         assert!(config.bind_addr.is_none());
         assert!(config.known_peers.is_empty());
         assert_eq!(config.max_connections, 256);
+        assert_eq!(config.discovery.auto_connect, AutoConnectPolicy::Enabled);
+        let mdns = config
+            .discovery
+            .mdns
+            .as_ref()
+            .expect("default config should enable first-party mDNS");
+        assert!(mdns.enabled);
+        assert_eq!(mdns.service.as_deref(), Some("ant-quic"));
+        assert_eq!(mdns.mode, MdnsMode::Both);
+        assert_eq!(mdns.auto_connect, AutoConnectPolicy::Enabled);
     }
 
     #[test]
@@ -1389,7 +1404,11 @@ mod tests {
     #[test]
     fn test_mdns_enabled_requires_service_name() {
         let error = P2pConfig::builder()
-            .mdns_enabled(true)
+            .mdns(MdnsConfig {
+                enabled: true,
+                service: None,
+                ..MdnsConfig::default()
+            })
             .build()
             .expect_err("enabled mDNS without a service name should fail");
 
@@ -1717,6 +1736,14 @@ mod tests {
 
         // Verify None bind_addr
         assert!(config.bind_addr.is_none());
+
+        let mdns = config
+            .discovery
+            .mdns
+            .as_ref()
+            .expect("default config should keep mDNS enabled");
+        assert!(mdns.enabled);
+        assert_eq!(mdns.service.as_deref(), Some("ant-quic"));
     }
 
     #[test]

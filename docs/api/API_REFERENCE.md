@@ -103,8 +103,8 @@ is always `PeerId`, derived from the authenticated ML-DSA-65 public key.
 
 ### DiscoveryPolicy and MdnsConfig
 
-Scoped first-party mDNS is available when ant-quic is built with the
-`mdns-discovery` feature:
+Scoped first-party mDNS is always available and defaults to enabled
+zero-config discovery for non-loopback endpoints:
 
 ```rust
 use ant_quic::unified_config::{
@@ -119,16 +119,20 @@ let config = P2pConfig::builder()
             service: Some("ant-quic".into()),
             namespace: Some("workspace-a".into()),
             mode: MdnsMode::Both,
-            auto_connect: AutoConnectPolicy::Disabled,
+            auto_connect: AutoConnectPolicy::Enabled,
             metadata: std::collections::BTreeMap::new(),
         }),
-        auto_connect: AutoConnectPolicy::Disabled,
+        auto_connect: AutoConnectPolicy::Enabled,
     })
     .build()?;
 ```
 
 mDNS records are locator claims only. The authenticated QUIC handshake remains
 the durable source of truth for `PeerId`.
+
+Nodes advertise relay/bootstrap/coordinator capability hints by default.
+Those hints are policy claims only; authenticated identity and runtime
+performance still decide whether a peer should actually use them.
 
 ### NatConfig
 
@@ -213,6 +217,11 @@ let all_candidates: Vec<SocketAddr> = endpoint.all_external_addrs();
 // Query first-party mDNS browse/advertise state
 let mdns = endpoint.mdns_snapshot();
 let mdns_peer_count = mdns.discovered_peers.len();
+
+// Query assist-role capability hints
+let relay_service_enabled = endpoint.relay_service_enabled();
+let coordinator_service_enabled = endpoint.coordinator_service_enabled();
+let bootstrap_service_enabled = endpoint.bootstrap_service_enabled();
 ```
 
 Address discovery primarily comes from seeded peer connectivity. Applications generally call `connect_known_peers()` to establish that context, then use `connect_addr()` for address-based dialing or `connect_peer()` for peer-oriented dialing while the endpoint applies its normal routing/orchestration behavior.
