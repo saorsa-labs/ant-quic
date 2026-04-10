@@ -75,17 +75,33 @@ pub struct ReachableAddressRecord {
 pub struct PeerCapabilities {
     /// Peer is suitable as a generally reusable relay helper.
     ///
-    /// This is intentionally conservative: only fresh **global-scope** direct
-    /// evidence promotes the peer into this broad capability bucket. LAN and
-    /// loopback reachability are still preserved separately in
-    /// `reachable_addresses` / `direct_reachability_scope` for scoped callers.
+    /// This is the **effective** relay signal used by cache selection. It is
+    /// true when we have either fresh global-scope direct evidence or an
+    /// explicit higher-layer assist hint persisted into the bootstrap cache.
+    /// Scoped local/loopback direct evidence is preserved separately in
+    /// `reachable_addresses` / `direct_reachability_scope` for callers that
+    /// need to reason about reachability quality.
     pub supports_relay: bool,
 
     /// Peer is suitable as a generally reusable NAT traversal coordinator.
     ///
-    /// Like `supports_relay`, this is intentionally conservative and only flips
-    /// true when we have fresh global-scope direct evidence.
+    /// Like `supports_relay`, this is an effective capability signal that may
+    /// come from fresh global direct evidence or an explicit higher-layer hint.
     pub supports_coordination: bool,
+
+    /// Whether a higher layer explicitly hinted that this peer can relay.
+    ///
+    /// This survives bootstrap-cache persistence and is combined with direct
+    /// evidence to derive `supports_relay`.
+    #[serde(default)]
+    pub hinted_supports_relay: bool,
+
+    /// Whether a higher layer explicitly hinted that this peer can coordinate.
+    ///
+    /// This survives bootstrap-cache persistence and is combined with direct
+    /// evidence to derive `supports_coordination`.
+    #[serde(default)]
+    pub hinted_supports_coordination: bool,
 
     /// Protocol identifiers advertised by this peer (as hex strings for serialization)
     #[serde(default)]
@@ -111,6 +127,23 @@ pub struct PeerCapabilities {
 }
 
 impl PeerCapabilities {
+    fn refresh_effective_helper_flags(&mut self) {
+        let globally_reachable = self.has_global_direct_reachability();
+        self.supports_relay = globally_reachable || self.hinted_supports_relay;
+        self.supports_coordination = globally_reachable || self.hinted_supports_coordination;
+    }
+
+    /// Record explicit higher-layer assist-role hints.
+    pub fn record_assist_hints(&mut self, supports_relay: bool, supports_coordination: bool) {
+        if supports_relay {
+            self.hinted_supports_relay = true;
+        }
+        if supports_coordination {
+            self.hinted_supports_coordination = true;
+        }
+        self.refresh_effective_helper_flags();
+    }
+
     /// Record an externally observed address if we have not seen it before.
     pub fn record_external_address(&mut self, addr: SocketAddr) {
         if !self.external_addresses.contains(&addr) {
@@ -141,9 +174,7 @@ impl PeerCapabilities {
             .map(|entry| entry.scope)
             .max();
 
-        let globally_reachable = self.has_global_direct_reachability();
-        self.supports_relay = globally_reachable;
-        self.supports_coordination = globally_reachable;
+        self.refresh_effective_helper_flags();
     }
 
     /// Whether peer-verified direct reachability evidence is still fresh.
@@ -176,9 +207,7 @@ impl PeerCapabilities {
             .map(|entry| entry.scope)
             .max();
 
-        let globally_reachable = self.has_global_direct_reachability();
-        self.supports_relay = globally_reachable;
-        self.supports_coordination = globally_reachable;
+        self.refresh_effective_helper_flags();
     }
 
     /// Return all known addresses, preferring peer-verified reachable addresses.
@@ -754,6 +783,23 @@ mod tests {
         assert_eq!(preferred[0], "192.168.1.20:9000".parse().unwrap());
         assert!(preferred.contains(&"203.0.113.20:9000".parse().unwrap()));
         assert!(preferred.contains(&"198.51.100.7:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_explicit_assist_hints_survive_direct_refresh() {
+        let mut caps = PeerCapabilities::default();
+        let now = SystemTime::now();
+
+        caps.record_assist_hints(true, true);
+        caps.record_direct_observation("203.0.113.20:9000".parse().unwrap(), now);
+        caps.refresh_direct_capabilities(Duration::from_secs(60), now + Duration::from_secs(120));
+
+        assert!(caps.reachable_addresses.is_empty());
+        assert!(caps.hinted_supports_relay);
+        assert!(caps.hinted_supports_coordination);
+        assert!(caps.supports_relay);
+        assert!(caps.supports_coordination);
+        assert_eq!(caps.direct_reachability_scope, None);
     }
 
     #[test]

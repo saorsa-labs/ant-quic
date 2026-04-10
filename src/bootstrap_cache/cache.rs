@@ -654,6 +654,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_persisted_explicit_assist_hints_survive_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let peer_id = PeerId([9; 32]);
+        let peer_addr: SocketAddr = "198.51.100.9:9000".parse().unwrap();
+
+        {
+            let cache = create_test_cache(&temp_dir).await;
+            let mut peer = CachedPeer::new(peer_id, vec![peer_addr], PeerSource::Merge);
+            peer.capabilities.record_assist_hints(true, true);
+            cache.upsert(peer).await;
+            cache.save().await.unwrap();
+        }
+
+        {
+            let cache = create_test_cache(&temp_dir).await;
+            let peer = cache.get(&peer_id).await.expect("peer should reload");
+            assert!(peer.capabilities.hinted_supports_relay);
+            assert!(peer.capabilities.hinted_supports_coordination);
+            assert!(peer.capabilities.supports_relay);
+            assert!(peer.capabilities.supports_coordination);
+            assert!(peer.addresses.contains(&peer_addr));
+        }
+    }
+
+    #[tokio::test]
     async fn test_quality_scoring() {
         let temp_dir = TempDir::new().unwrap();
         let cache = create_test_cache(&temp_dir).await;

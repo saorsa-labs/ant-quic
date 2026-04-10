@@ -69,7 +69,7 @@ endpoint
 
 `connect_peer_with_addrs()` is the advanced variant for higher layers that already have a durable `PeerId` plus candidate socket addresses from imported peer cards, peer caches, or external discovery. It still uses the same authenticated orchestration path as `connect_peer()`; the address list is only a dialing hint.
 
-`upsert_peer_hints()` is the advanced discovery bridge for callers that learn peer addresses or assist-role hints (for example from imported cards, caches, gossip, or rendezvous). It lets higher layers feed that metadata into ant-quic while keeping actual path selection inside the transport.
+`upsert_peer_hints()` is the advanced discovery bridge for callers that learn peer addresses or assist-role hints (for example from imported cards, caches, gossip, or rendezvous). It merges that metadata into both ant-quic's live runtime view and the persisted bootstrap cache while keeping actual path selection inside the transport. Explicit assist-role hints remain advisory claims; separately tracked direct reachability evidence still determines the stronger peer-verified path quality signals.
 
 ### Accepting Connections
 

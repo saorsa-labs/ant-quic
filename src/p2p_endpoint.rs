@@ -2106,6 +2106,9 @@ impl P2pEndpoint {
         }
 
         if let Some(caps) = capabilities {
+            cached_peer
+                .capabilities
+                .record_assist_hints(caps.supports_relay, caps.supports_coordination);
             cached_peer.capabilities.protocols.extend(caps.protocols);
             if caps.nat_type.is_some() {
                 cached_peer.capabilities.nat_type = caps.nat_type;
@@ -5061,6 +5064,120 @@ mod tests {
             candidates.contains(&hinted_addr),
             "hinted coordinator address should be considered for orchestration"
         );
+
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_upsert_peer_hints_feeds_relay_cache_selection_after_runtime_hints_clear() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x6b; 32]);
+        let hinted_addr: SocketAddr = "198.51.100.61:9000".parse().expect("valid addr");
+        let target_addr: SocketAddr = "203.0.113.61:443".parse().expect("valid addr");
+        let caps = PeerCapabilities {
+            supports_relay: true,
+            ..PeerCapabilities::default()
+        };
+
+        endpoint
+            .upsert_peer_hints(peer_id, vec![hinted_addr], Some(caps))
+            .await;
+
+        endpoint.peer_hint_records.write().await.clear();
+
+        let cached = endpoint
+            .bootstrap_cache
+            .get(&peer_id)
+            .await
+            .expect("cached hinted peer should exist");
+        assert!(cached.capabilities.hinted_supports_relay);
+        assert!(cached.capabilities.supports_relay);
+
+        let relays = endpoint
+            .bootstrap_cache
+            .select_relays_for_target(4, &target_addr, false)
+            .await;
+        assert!(
+            relays.iter().any(|peer| peer.peer_id == peer_id),
+            "persisted relay hint should feed bootstrap-cache relay selection"
+        );
+
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_upsert_peer_hints_merge_addrs_and_roles() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x7c; 32]);
+        let addr_a: SocketAddr = "198.51.100.71:9000".parse().expect("valid addr");
+        let addr_b: SocketAddr = "198.51.100.72:9000".parse().expect("valid addr");
+
+        endpoint
+            .upsert_peer_hints(
+                peer_id,
+                vec![addr_a],
+                Some(PeerCapabilities {
+                    supports_coordination: true,
+                    ..PeerCapabilities::default()
+                }),
+            )
+            .await;
+        endpoint
+            .upsert_peer_hints(
+                peer_id,
+                vec![addr_a, addr_b],
+                Some(PeerCapabilities {
+                    supports_relay: true,
+                    ..PeerCapabilities::default()
+                }),
+            )
+            .await;
+
+        let hints = endpoint.peer_hint_records.read().await;
+        let runtime = hints.get(&peer_id).expect("runtime hints should exist");
+        assert_eq!(runtime.addrs.len(), 2);
+        assert!(runtime.addrs.contains(&addr_a));
+        assert!(runtime.addrs.contains(&addr_b));
+        assert!(runtime.capabilities.supports_relay);
+        assert!(runtime.capabilities.supports_coordination);
+        drop(hints);
+
+        let cached = endpoint
+            .bootstrap_cache
+            .get(&peer_id)
+            .await
+            .expect("cached hinted peer should exist");
+        assert_eq!(cached.addresses.len(), 2);
+        assert!(cached.addresses.contains(&addr_a));
+        assert!(cached.addresses.contains(&addr_b));
+        assert!(cached.capabilities.supports_relay);
+        assert!(cached.capabilities.supports_coordination);
+        assert!(cached.capabilities.hinted_supports_relay);
+        assert!(cached.capabilities.hinted_supports_coordination);
 
         endpoint.shutdown().await;
     }

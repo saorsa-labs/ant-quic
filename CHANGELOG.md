@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.6] - 2026-04-10
+
+### Fixed
+
+- **Persisted assist-role hints**: `upsert_peer_hints(...)` now records relay/coordinator capability hints into the bootstrap cache instead of keeping them runtime-only.
+- **Stable helper selection after restart**: persisted explicit relay/coordinator hints now survive cache refreshes and process restarts, so helper selection does not silently regress after reboot.
+- **Relay-hint coverage**: added tests for relay candidate selection, repeated hint merges, and persistence/reopen behavior for explicit assist hints.
+
 ## [0.26.5] - 2026-04-10
 
 ### Fixed
