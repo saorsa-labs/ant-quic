@@ -1350,12 +1350,20 @@ impl P2pEndpoint {
     }
 
     async fn connect_direct_addr(&self, addr: SocketAddr) -> Result<PeerConnection, EndpointError> {
+        self.connect_direct_addr_with_hint(addr, None).await
+    }
+
+    async fn connect_direct_addr_with_hint(
+        &self,
+        addr: SocketAddr,
+        hint_peer_id: Option<PeerId>,
+    ) -> Result<PeerConnection, EndpointError> {
         if let Some(existing) = self.prepare_direct_addr_attempt(addr).await? {
             return Ok(existing);
         }
 
         let connection = self.attempt_direct_handshake(addr).await?;
-        self.finalize_direct_connection(connection, addr, None)
+        self.finalize_direct_connection(connection, addr, hint_peer_id)
             .await
     }
 
@@ -1379,12 +1387,16 @@ impl P2pEndpoint {
     async fn connect_direct_candidates(
         &self,
         addrs: &[SocketAddr],
+        hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
         const MAX_DIRECT_CANDIDATES: usize = 4;
 
         let mut last_err: Option<EndpointError> = None;
         for addr in addrs.iter().take(MAX_DIRECT_CANDIDATES) {
-            match self.connect_direct_addr(*addr).await {
+            match self
+                .connect_direct_addr_with_hint(*addr, hint_peer_id)
+                .await
+            {
                 Ok(conn) => return Ok(conn),
                 Err(err) => last_err = Some(err),
             }
@@ -1586,7 +1598,10 @@ impl P2pEndpoint {
         }
 
         if peer_id.is_some() && !explicit_addrs.is_empty() {
-            match self.connect_direct_candidates(&explicit_addrs).await {
+            match self
+                .connect_direct_candidates(&explicit_addrs, peer_id)
+                .await
+            {
                 Ok(conn) => return Ok(conn),
                 Err(err) => {
                     debug!(

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.3] - 2026-04-09
+
+### Fixed
+
+- **Peer-oriented direct pre-pass**: direct candidate dialing now carries the authenticated `PeerId` hint when available so peer-oriented connects do not lose identity context before fallback.
+- **Feature-matrix CI stability**: full node-level peer-connect hint tests now run in the default-feature matrix instead of the stripped `--no-default-features` portability matrix, which does not guarantee loopback connection establishment.
+
 ## [0.26.2] - 2026-04-09
 
 ### Added
