@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.4] - 2026-04-10
+
+### Fixed
+
+- **Inbound accept reliability**: `accept_connection()` now uses a dedicated pending-accept queue so background polling paths cannot steal accepted inbound connections before `P2pEndpoint::accept()` surfaces them.
+- **x0x reverse-connect regression**: patched nodes now surface accepted inbound peer IDs consistently enough for x0x to reconcile agent-level direct messaging on the accept side.
+
 ## [0.26.3] - 2026-04-09
 
 ### Fixed

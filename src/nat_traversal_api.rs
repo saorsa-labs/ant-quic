@@ -280,9 +280,14 @@ pub struct NatTraversalEndpoint {
     /// Receiver for internal event notifications
     /// Uses parking_lot::Mutex for faster, non-poisoning access
     event_rx: ParkingMutex<mpsc::UnboundedReceiver<NatTraversalEvent>>,
-    /// Notify waiters when a new ConnectionEstablished event is available.
+    /// Notify waiters when a new accepted connection is available.
     /// Eliminates the 10ms polling loop in accept_connection().
     incoming_notify: Arc<tokio::sync::Notify>,
+    /// Queue of accepted inbound peer IDs waiting to be surfaced via
+    /// `accept_connection()`. This prevents unrelated poll/drain paths from
+    /// stealing inbound connection-established events before the accept API sees
+    /// them.
+    pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PeerId>>>,
     /// Notify waiters when the endpoint is shutting down.
     /// Eliminates polling loops that check the AtomicBool in transport listeners.
     shutdown_notify: Arc<tokio::sync::Notify>,
@@ -1381,6 +1386,7 @@ impl NatTraversalEndpoint {
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             local_peer_id: Self::generate_local_peer_id(),
@@ -1573,6 +1579,7 @@ impl NatTraversalEndpoint {
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
+            let pending_accepts_clone = endpoint.pending_accepts.clone();
 
             tokio::spawn(async move {
                 Self::accept_connections(
@@ -1583,6 +1590,7 @@ impl NatTraversalEndpoint {
                     emitted_events_clone,
                     relay_server_clone,
                     incoming_notify_clone,
+                    pending_accepts_clone,
                 )
                 .await;
             });
@@ -1858,6 +1866,7 @@ impl NatTraversalEndpoint {
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             local_peer_id: Self::generate_local_peer_id(),
@@ -2050,6 +2059,7 @@ impl NatTraversalEndpoint {
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
+            let pending_accepts_clone = endpoint.pending_accepts.clone();
 
             tokio::spawn(async move {
                 Self::accept_connections(
@@ -2060,6 +2070,7 @@ impl NatTraversalEndpoint {
                     emitted_events_clone,
                     relay_server_clone,
                     incoming_notify_clone,
+                    pending_accepts_clone,
                 )
                 .await;
             });
@@ -2228,6 +2239,7 @@ impl NatTraversalEndpoint {
         // (spawning reader tasks, registering PeerConnection, etc.).
         let connections = self.connections.clone();
         let incoming_notify = self.incoming_notify.clone();
+        let pending_accepts = self.pending_accepts.clone();
         let relay_event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             loop {
@@ -2258,6 +2270,7 @@ impl NatTraversalEndpoint {
                             // Emit ConnectionEstablished so accept_connection()
                             // returns this to P2pEndpoint::accept(), which spawns
                             // the reader task and stores the PeerConnection.
+                            pending_accepts.lock().push_back(peer_id);
                             if let Some(ref tx) = relay_event_tx {
                                 let _ = tx.send(NatTraversalEvent::ConnectionEstablished {
                                     peer_id,
@@ -4311,6 +4324,7 @@ impl NatTraversalEndpoint {
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
+        let pending_accepts_clone = self.pending_accepts.clone();
 
         tokio::spawn(async move {
             Self::accept_connections(
@@ -4321,6 +4335,7 @@ impl NatTraversalEndpoint {
                 emitted_events_clone,
                 relay_server_clone,
                 incoming_notify_clone,
+                pending_accepts_clone,
             )
             .await;
         });
@@ -4337,6 +4352,7 @@ impl NatTraversalEndpoint {
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         incoming_notify: Arc<tokio::sync::Notify>,
+        pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PeerId>>>,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
@@ -4346,6 +4362,7 @@ impl NatTraversalEndpoint {
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
                     let incoming_notify = incoming_notify.clone();
+                    let pending_accepts = pending_accepts.clone();
                     tokio::spawn(async move {
                         match connecting.await {
                             Ok(connection) => {
@@ -4368,6 +4385,7 @@ impl NatTraversalEndpoint {
                                 let should_emit = emitted_events.insert(peer_id);
 
                                 if should_emit {
+                                    pending_accepts.lock().push_back(peer_id);
                                     // Background accept = they connected to us = Server side
                                     let _ =
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
@@ -5172,7 +5190,7 @@ impl NatTraversalEndpoint {
 
     /// Accept incoming connections on the endpoint
     pub async fn accept_connection(&self) -> Result<(PeerId, InnerConnection), NatTraversalError> {
-        debug!("Waiting for incoming connection via event channel...");
+        debug!("Waiting for incoming connection via accept queue...");
         loop {
             // Check shutdown
             if self.shutdown.load(Ordering::Relaxed) {
@@ -5181,7 +5199,23 @@ impl NatTraversalEndpoint {
                 ));
             }
 
-            // Drain all pending events (non-blocking, under ParkingMutex)
+            if let Some(peer_id) = self.pending_accepts.lock().pop_front() {
+                let connection = self
+                    .connections
+                    .get(&peer_id)
+                    .map(|entry| entry.value().clone())
+                    .ok_or_else(|| {
+                        NatTraversalError::ConnectionFailed(format!(
+                            "Connection for peer {:?} not found in storage",
+                            peer_id
+                        ))
+                    })?;
+                info!("Retrieved accepted connection from peer {:?}", peer_id);
+                return Ok((peer_id, connection));
+            }
+
+            // Drain all pending events (non-blocking, under ParkingMutex) for
+            // relay/legacy paths that may still only signal via event_rx.
             {
                 let mut event_rx = self.event_rx.lock();
                 loop {
@@ -5205,10 +5239,6 @@ impl NatTraversalEndpoint {
                                         peer_id
                                     ))
                                 })?;
-                            info!(
-                                "Retrieved accepted connection from peer {:?} at {}",
-                                peer_id, remote_address
-                            );
                             return Ok((peer_id, connection));
                         }
                         Ok(event) => {
@@ -5227,9 +5257,6 @@ impl NatTraversalEndpoint {
                 }
             }
 
-            // Suspend until the background accept task signals a new event.
-            // notify_one() stores a permit if called between try_recv() and here,
-            // so no events are lost.
             self.incoming_notify.notified().await;
         }
     }
