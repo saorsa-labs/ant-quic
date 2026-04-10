@@ -4384,8 +4384,10 @@ impl NatTraversalEndpoint {
                                 // DashSet::insert returns true if the value was newly inserted
                                 let should_emit = emitted_events.insert(peer_id);
 
+                                pending_accepts.lock().push_back(peer_id);
+                                incoming_notify.notify_one();
+
                                 if should_emit {
-                                    pending_accepts.lock().push_back(peer_id);
                                     // Background accept = they connected to us = Server side
                                     let _ =
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
@@ -4393,7 +4395,6 @@ impl NatTraversalEndpoint {
                                             remote_address: connection.remote_address(),
                                             side: Side::Server,
                                         });
-                                    incoming_notify.notify_one();
                                 }
 
                                 // Symmetric P2P: Spawn relay request handler for this connection

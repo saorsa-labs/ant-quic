@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.5] - 2026-04-10
+
+### Fixed
+
+- **Repeated inbound accepts**: accepted inbound connections are now queued for `accept_connection()` even when a prior connection for the same peer/address already emitted an establishment event.
+- **Reader-task contention**: the reader-exit monitor no longer holds the shared `JoinSet` mutex across `join_next().await`, which could block new inbound connection registration on busy nodes.
+- **Bootstrap-node reverse connectivity**: fixes the remaining case where long-running bootstrap nodes accepted inbound local connections at the low level but failed to surface them into x0x's high-level direct-messaging path.
+
 ## [0.26.4] - 2026-04-10
 
 ### Fixed

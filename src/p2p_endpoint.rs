@@ -4359,32 +4359,30 @@ impl P2pEndpoint {
 
         tokio::spawn(async move {
             loop {
-                let peer_id = {
+                if shutdown.is_cancelled() {
+                    debug!("Reader exit handler shutting down");
+                    return;
+                }
+
+                let maybe_peer_id = {
                     let mut tasks = reader_tasks.lock().await;
-                    tokio::select! {
-                        result = tasks.join_next() => {
-                            match result {
-                                Some(Ok(peer_id)) => peer_id,
-                                Some(Err(join_err)) => {
-                                    // Task was cancelled (aborted) — not a real disconnect.
-                                    // Abort handles are used by reconnection logic to replace
-                                    // stale reader tasks, so this is expected.
-                                    debug!("Reader task cancelled: {}", join_err);
-                                    continue;
-                                }
-                                None => {
-                                    // JoinSet is empty — wait briefly then retry.
-                                    // New reader tasks will be added as connections arrive.
-                                    drop(tasks);
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        _ = shutdown.cancelled() => {
-                            debug!("Reader exit handler shutting down");
-                            return;
-                        }
+                    tasks.try_join_next()
+                };
+
+                let peer_id = match maybe_peer_id {
+                    Some(Ok(peer_id)) => peer_id,
+                    Some(Err(join_err)) => {
+                        // Task was cancelled (aborted) — not a real disconnect.
+                        // Abort handles are used by reconnection logic to replace
+                        // stale reader tasks, so this is expected.
+                        debug!("Reader task cancelled: {}", join_err);
+                        continue;
+                    }
+                    None => {
+                        // JoinSet is empty or no completed tasks are ready yet.
+                        // Sleep briefly, then retry without monopolizing the mutex.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
                     }
                 };
 
