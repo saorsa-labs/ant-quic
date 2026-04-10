@@ -251,6 +251,9 @@ pub struct P2pEndpoint {
 
     /// Per-peer abort handles for targeted reader task cancellation
     reader_handles: Arc<RwLock<HashMap<PeerId, tokio::task::AbortHandle>>>,
+
+    /// Circuit-breaker for coordinator peers (tracks failures by address).
+    pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -1121,6 +1124,7 @@ impl P2pEndpoint {
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
             reader_handles,
+            coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
         // Spawn background constrained poller task
@@ -1484,7 +1488,8 @@ impl P2pEndpoint {
             }
         }
 
-        candidates
+        // Filter out coordinators in cooldown (circuit-breaker).
+        self.coordinator_health.filter_available(&candidates)
     }
 
     pub(crate) async fn runtime_assist_snapshot(&self) -> RuntimeAssistSnapshot {
@@ -2156,9 +2161,10 @@ impl P2pEndpoint {
         });
 
         // Initiate NAT traversal
-        self.inner
-            .initiate_nat_traversal(peer_id, coord_addr)
-            .map_err(EndpointError::NatTraversal)?;
+        if let Err(e) = self.inner.initiate_nat_traversal(peer_id, coord_addr) {
+            self.coordinator_health.record_failure(coord_addr);
+            return Err(EndpointError::NatTraversal(e));
+        }
 
         // Poll for completion using event-driven notification instead of sleep loop
         let deadline = tokio::time::Instant::now()
@@ -2206,6 +2212,7 @@ impl P2pEndpoint {
 
                 self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
                 self.register_connected_peer(peer_conn.clone()).await;
+                self.coordinator_health.record_success(&coord_addr);
 
                 return Ok(peer_conn);
             }
@@ -2262,6 +2269,7 @@ impl P2pEndpoint {
                             &TransportAddr::Udp(remote_address),
                         );
                         self.register_connected_peer(peer_conn.clone()).await;
+                        self.coordinator_health.record_success(&coord_addr);
 
                         return Ok(peer_conn);
                     }
@@ -2270,6 +2278,7 @@ impl P2pEndpoint {
                         error,
                         ..
                     } if evt_peer == peer_id => {
+                        self.coordinator_health.record_failure(coord_addr);
                         return Err(EndpointError::NatTraversal(error));
                     }
                     _ => {}
@@ -2309,6 +2318,7 @@ impl P2pEndpoint {
 
                 self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
                 self.register_connected_peer(peer_conn.clone()).await;
+                self.coordinator_health.record_success(&coord_addr);
 
                 return Ok(peer_conn);
             }
@@ -2322,9 +2332,11 @@ impl P2pEndpoint {
                 _ = self.inner.connection_notify().notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 _ = self.shutdown.cancelled() => {
+                    self.coordinator_health.record_failure(coord_addr);
                     return Err(EndpointError::ShuttingDown);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    self.coordinator_health.record_failure(coord_addr);
                     return Err(EndpointError::Timeout);
                 }
             }
@@ -4502,6 +4514,7 @@ impl Clone for P2pEndpoint {
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
+            coordinator_health: Arc::clone(&self.coordinator_health),
         }
     }
 }

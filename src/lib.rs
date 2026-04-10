@@ -166,6 +166,8 @@ pub mod node_config;
 pub mod node_status;
 
 mod coordinator_control;
+/// Circuit-breaker for NAT traversal coordinators.
+pub(crate) mod coordinator_health;
 /// First-party mDNS discovery state and query types
 pub mod mdns;
 /// Unified events for P2P nodes
