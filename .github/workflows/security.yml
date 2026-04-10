@@ -40,7 +40,7 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ !startsWith(runner.name, 'nektos/act') }}
       
       - name: Set env
@@ -52,7 +52,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo-audit
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-${{ runner.os }}
@@ -92,7 +92,7 @@ jobs:
 
       - name: Upload audit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: audit-results
           path: |
@@ -104,7 +104,7 @@ jobs:
     name: Policy Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ !startsWith(runner.name, 'nektos/act') }}
       
       - name: Set env
@@ -152,7 +152,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true  # Don't block builds on supply chain failures
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ !startsWith(runner.name, 'nektos/act') }}
       
       - name: Set env
@@ -180,7 +180,7 @@ jobs:
 
       - name: Upload supply chain report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: supply-chain-report
           path: supply-chain-report.json
@@ -190,7 +190,7 @@ jobs:
     name: Generate SBOM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ !startsWith(runner.name, 'nektos/act') }}
       
       - name: Set env
@@ -210,7 +210,7 @@ jobs:
           cargo cyclonedx --format xml > sbom.cyclonedx.xml
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sbom
           path: |
@@ -224,10 +224,10 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: security-artifacts/
 
@@ -256,7 +256,7 @@ jobs:
           cat security-report.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload security report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: security-report
           path: security-report.md
@@ -267,10 +267,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
           license-check: true

@@ -38,7 +38,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Prepare networking tools
       run: |
@@ -72,7 +72,7 @@ jobs:
 
     - name: Cache Docker layers
       if: ${{ !env.ACT }}
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: /tmp/.buildx-cache
         key: ${{ runner.os }}-buildx-${{ github.sha }}
@@ -80,7 +80,7 @@ jobs:
           ${{ runner.os }}-buildx-
 
     - name: Cache Cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -177,7 +177,7 @@ jobs:
 
     - name: Upload test artifacts
       if: ${{ always() && !env.ACT }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: nat-test-results-${{ matrix.test-suite }}
         path: |
@@ -187,7 +187,7 @@ jobs:
 
     - name: Upload metrics
       if: ${{ always() && !env.ACT }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: nat-test-metrics-${{ matrix.test-suite }}
         path: docker/results/metrics/

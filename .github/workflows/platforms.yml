@@ -94,7 +94,7 @@ jobs:
       matrix: ${{ fromJson(needs.define-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -163,7 +163,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: results-${{ matrix.target }}-${{ matrix.rust }}
           path: test-results/
@@ -172,7 +172,7 @@ jobs:
     name: MSRV (1.88.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -198,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: results-*
           path: all-results/

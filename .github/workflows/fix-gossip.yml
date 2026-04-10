@@ -60,7 +60,7 @@ jobs:
       test_output: ${{ steps.run_tests.outputs.output }}
       has_failures: ${{ steps.run_tests.outputs.has_failures }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
 
       - name: Upload diagnostic artifacts
         if: steps.run_tests.outputs.has_failures == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: diagnostic-${{ inputs.crate }}-${{ github.run_id }}
           path: test_output.txt
@@ -112,16 +112,16 @@ jobs:
     outputs:
       issue_number: ${{ steps.create_issue.outputs.issue_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download diagnostics
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: diagnostic-${{ inputs.crate }}-${{ github.run_id }}
 
       - name: Create GitHub Issue
         id: create_issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
