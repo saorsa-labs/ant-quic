@@ -142,6 +142,22 @@ impl PeerHintRecord {
     }
 }
 
+fn direct_candidate_rank(addr: SocketAddr) -> (u8, u8) {
+    let scope_rank = match socket_addr_scope(addr) {
+        Some(ReachabilityScope::Global) => 3,
+        Some(ReachabilityScope::LocalNetwork) => 2,
+        Some(ReachabilityScope::Loopback) => 1,
+        None => 0,
+    };
+    let family_rank = if addr.is_ipv6() { 2 } else { 1 };
+    (scope_rank, family_rank)
+}
+
+fn prioritize_direct_candidate_addrs(addrs: &mut Vec<SocketAddr>) {
+    addrs.sort_by_key(|addr| std::cmp::Reverse(direct_candidate_rank(*addr)));
+    addrs.dedup();
+}
+
 /// Derive a synthetic PeerId by hashing a `SocketAddr`.
 ///
 /// Used when the peer's real identity (ML-DSA-65 key) is not yet known.
@@ -1127,8 +1143,9 @@ impl P2pEndpoint {
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
-        // Spawn background constrained poller task
+        // Spawn background pollers for transport and peer-address updates.
         endpoint.spawn_constrained_poller();
+        endpoint.spawn_peer_address_update_poller();
 
         // Spawn stale connection reaper — periodically detects and removes
         // dead connections from tracking structures (issue #137 fix).
@@ -1603,6 +1620,8 @@ impl P2pEndpoint {
         {
             explicit_addrs.push(runtime_addr);
         }
+
+        prioritize_direct_candidate_addrs(&mut explicit_addrs);
 
         if !explicit_addrs.is_empty() && !is_simple_address_only {
             match self
@@ -3011,10 +3030,10 @@ impl P2pEndpoint {
             target, relay_addr
         );
 
-        // Step 1: Establish relay session (control plane handshake)
-        let (public_addr, relay_socket) = self
+        // Step 1: Establish or reuse the shared relay endpoint.
+        let (public_addr, relay_endpoint) = self
             .inner
-            .establish_relay_session(relay_addr)
+            .ensure_shared_relay_endpoint(relay_addr)
             .await
             .map_err(EndpointError::NatTraversal)?;
 
@@ -3023,36 +3042,7 @@ impl P2pEndpoint {
             relay_addr, public_addr
         );
 
-        let relay_socket = relay_socket
-            .ok_or_else(|| EndpointError::Connection("Relay did not provide socket".to_string()))?;
-
-        // Step 4: Create a new Quinn endpoint with the relay socket
-        let existing_endpoint = self
-            .inner
-            .get_endpoint()
-            .ok_or_else(|| EndpointError::Config("QUIC endpoint not available".to_string()))?;
-
-        let client_config = existing_endpoint
-            .default_client_config
-            .clone()
-            .ok_or_else(|| EndpointError::Config("No client config available".to_string()))?;
-
-        let runtime = crate::high_level::default_runtime()
-            .ok_or_else(|| EndpointError::Config("No async runtime available".to_string()))?;
-
-        let mut relay_endpoint = crate::high_level::Endpoint::new_with_abstract_socket(
-            crate::EndpointConfig::default(),
-            None,
-            relay_socket,
-            runtime,
-        )
-        .map_err(|e| {
-            EndpointError::Connection(format!("Failed to create relay endpoint: {}", e))
-        })?;
-
-        relay_endpoint.set_default_client_config(client_config);
-
-        // Step 5: Connect to target through the relay endpoint
+        // Step 2: Connect to target through the relay endpoint
         let connecting = relay_endpoint.connect(target, "peer").map_err(|e| {
             EndpointError::Connection(format!("Failed to initiate relay connection: {}", e))
         })?;
@@ -4181,6 +4171,84 @@ impl P2pEndpoint {
         handles.insert(peer_id, abort_handle);
     }
 
+    async fn apply_peer_address_update(
+        connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+        bootstrap_cache: &BootstrapCache,
+        peer_hint_records: &RwLock<HashMap<PeerId, PeerHintRecord>>,
+        event_tx: &broadcast::Sender<P2pEvent>,
+        peer_addr: SocketAddr,
+        advertised_addr: SocketAddr,
+    ) {
+        let peer_id = connected_peers
+            .read()
+            .await
+            .iter()
+            .find(|(_, peer)| peer.remote_addr.as_socket_addr() == Some(peer_addr))
+            .map(|(peer_id, _)| *peer_id);
+
+        if let Some(peer_id) = peer_id {
+            peer_hint_records
+                .write()
+                .await
+                .entry(peer_id)
+                .or_default()
+                .merge(vec![advertised_addr], None);
+
+            let mut cached_peer = bootstrap_cache
+                .get_peer(&peer_id)
+                .await
+                .unwrap_or_else(|| CachedPeer::new(peer_id, Vec::new(), PeerSource::Merge));
+            cached_peer
+                .capabilities
+                .record_external_address(advertised_addr);
+            bootstrap_cache.upsert(cached_peer).await;
+        } else {
+            debug!(
+                peer_addr = %peer_addr,
+                advertised_addr = %advertised_addr,
+                "peer address update arrived before peer ID mapping was available"
+            );
+        }
+
+        let _ = event_tx.send(P2pEvent::PeerAddressUpdated {
+            peer_addr,
+            advertised_addr,
+        });
+    }
+
+    fn spawn_peer_address_update_poller(&self) {
+        let inner = Arc::clone(&self.inner);
+        let connected_peers = Arc::clone(&self.connected_peers);
+        let bootstrap_cache = Arc::clone(&self.bootstrap_cache);
+        let peer_hint_records = Arc::clone(&self.peer_hint_records);
+        let event_tx = self.event_tx.clone();
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let update = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    update = inner.recv_peer_address_update() => update,
+                };
+
+                let Some((peer_addr, advertised_addr)) = update else {
+                    debug!("Peer address update channel closed, exiting poller");
+                    break;
+                };
+
+                Self::apply_peer_address_update(
+                    connected_peers.as_ref(),
+                    bootstrap_cache.as_ref(),
+                    peer_hint_records.as_ref(),
+                    &event_tx,
+                    peer_addr,
+                    advertised_addr,
+                )
+                .await;
+            }
+        });
+    }
+
     /// Spawn a single background task that polls constrained transport events
     /// and forwards `DataReceived` payloads into the shared `data_tx` channel.
     ///
@@ -4959,10 +5027,11 @@ mod tests {
         let listener = P2pEndpoint::new(config)
             .await
             .expect("listener should create");
+        let private_observed_addr: SocketAddr = "10.0.0.1:42000".parse().expect("valid addr");
         let observed_addr: SocketAddr = "203.0.113.88:42000".parse().expect("valid addr");
         listener
             .inner
-            .set_test_observed_external_addrs(vec![observed_addr]);
+            .set_test_observed_external_addrs(vec![private_observed_addr, observed_addr]);
         let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
         listener.apply_port_mapping_snapshot(PortMappingSnapshot {
             active: true,
@@ -5046,6 +5115,88 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    #[test]
+    fn test_prioritize_direct_candidate_addrs_prefers_global_addresses() {
+        let private_v4: SocketAddr = "10.0.0.1:5483".parse().expect("valid addr");
+        let global_v4: SocketAddr = "198.51.100.20:5483".parse().expect("valid addr");
+        let global_v6: SocketAddr = "[2001:db8::20]:5483".parse().expect("valid addr");
+        let loopback: SocketAddr = "127.0.0.1:5483".parse().expect("valid addr");
+
+        let mut addrs = vec![private_v4, loopback, global_v4, global_v6];
+        prioritize_direct_candidate_addrs(&mut addrs);
+
+        assert_eq!(addrs[0], global_v6);
+        assert_eq!(addrs[1], global_v4);
+        assert_eq!(addrs[2], private_v4);
+        assert_eq!(addrs[3], loopback);
+    }
+
+    #[tokio::test]
+    async fn test_peer_address_update_persists_hints_and_cache() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x44; 32]);
+        let peer_addr: SocketAddr = "127.0.0.1:45000".parse().expect("valid addr");
+        let advertised_addr: SocketAddr = "198.51.100.44:5483".parse().expect("valid addr");
+        let mut events = endpoint.subscribe();
+
+        endpoint
+            .register_connected_peer(PeerConnection {
+                peer_id,
+                remote_addr: TransportAddr::Udp(peer_addr),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Server,
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            })
+            .await;
+
+        P2pEndpoint::apply_peer_address_update(
+            endpoint.connected_peers.as_ref(),
+            endpoint.bootstrap_cache.as_ref(),
+            endpoint.peer_hint_records.as_ref(),
+            &endpoint.event_tx,
+            peer_addr,
+            advertised_addr,
+        )
+        .await;
+
+        assert!(
+            endpoint
+                .hinted_addrs_for_peer(peer_id)
+                .await
+                .contains(&advertised_addr)
+        );
+        let cached_peer = endpoint
+            .bootstrap_cache
+            .get_peer(&peer_id)
+            .await
+            .expect("peer should be cached");
+        assert!(cached_peer.preferred_addresses().contains(&advertised_addr));
+        let observed_events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(observed_events.iter().any(|event| matches!(
+            event,
+            P2pEvent::PeerAddressUpdated {
+                peer_addr: observed_peer_addr,
+                advertised_addr: observed_advertised_addr,
+            } if *observed_peer_addr == peer_addr && *observed_advertised_addr == advertised_addr
+        )));
+
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]

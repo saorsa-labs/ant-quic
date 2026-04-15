@@ -222,6 +222,8 @@ pub struct RelaySession {
     pub connection: InnerConnection,
     /// Public address allocated by the relay for inbound traffic
     pub public_address: Option<SocketAddr>,
+    /// Virtual UDP socket backed by the relay bind stream.
+    pub relay_socket: Option<Arc<crate::masque::MasqueRelaySocket>>,
     /// When the session was established
     pub established_at: std::time::Instant,
     /// Relay server address
@@ -307,6 +309,15 @@ pub struct NatTraversalEndpoint {
     /// Active relay sessions by relay server address
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    /// Shared QUIC endpoint bound to the relay socket.
+    ///
+    /// The relay server allows one CONNECT-UDP bind session per client address,
+    /// so callers must reuse the same abstract socket/endpoint instead of
+    /// trying to create a second independent bind session on the same local
+    /// QUIC endpoint.
+    shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
+    /// Whether the shared relay endpoint already has an accept loop attached.
+    relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
     relay_server: Option<Arc<MasqueRelayServer>>,
@@ -1394,6 +1405,8 @@ impl NatTraversalEndpoint {
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
+            shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -1874,6 +1887,8 @@ impl NatTraversalEndpoint {
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
+            shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -2193,13 +2208,11 @@ impl NatTraversalEndpoint {
             bootstrap_addr
         );
 
-        // Step 1: Establish relay session with bootstrap
-        let (public_addr, relay_socket) = self.establish_relay_session(bootstrap_addr).await?;
+        // Step 1: Establish or reuse the shared relay endpoint.
+        let (public_addr, relay_endpoint) =
+            self.ensure_shared_relay_endpoint(bootstrap_addr).await?;
         let relay_public_addr = public_addr.ok_or_else(|| {
             NatTraversalError::ConnectionFailed("Relay did not provide public address".to_string())
-        })?;
-        let relay_socket = relay_socket.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed("Relay did not provide socket".to_string())
         })?;
 
         info!(
@@ -2207,90 +2220,72 @@ impl NatTraversalEndpoint {
             relay_public_addr
         );
 
-        // Step 2: Create a secondary Quinn endpoint on the MasqueRelaySocket.
-        // This endpoint accepts QUIC connections arriving via the relay's
-        // forwarding loop. We cannot rebind the main endpoint — the relay
-        // connection itself would loop.
-        let runtime = crate::high_level::default_runtime().ok_or_else(|| {
-            NatTraversalError::ConfigError("No async runtime for relay endpoint".to_string())
-        })?;
+        // Step 2: Spawn the accept loop exactly once for the shared relay endpoint.
+        if !self
+            .relay_accept_loop_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                "Shared relay endpoint ready for accepting connections at {}",
+                relay_public_addr
+            );
 
-        let relay_endpoint = crate::high_level::Endpoint::new_with_abstract_socket(
-            crate::EndpointConfig::default(),
-            self.server_config.clone(),
-            relay_socket,
-            runtime,
-        )
-        .map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!(
-                "Failed to create relay accept endpoint: {}",
-                e
-            ))
-        })?;
+            let connections = self.connections.clone();
+            let incoming_notify = self.incoming_notify.clone();
+            let pending_accepts = self.pending_accepts.clone();
+            let relay_event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match relay_endpoint.accept().await {
+                        Some(incoming) => match incoming.await {
+                            Ok(conn) => {
+                                let remote = conn.remote_address();
+                                // Derive a temporary PeerId from the remote address.
+                                // The real identity exchange will update this later
+                                // via extract_peer_id_from_connection in accept().
+                                let peer_id = {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut hasher =
+                                        std::collections::hash_map::DefaultHasher::new();
+                                    remote.hash(&mut hasher);
+                                    let hash = hasher.finish();
+                                    let mut id = [0u8; 32];
+                                    id[..8].copy_from_slice(&hash.to_le_bytes());
+                                    id[8..16].copy_from_slice(&hash.to_be_bytes());
+                                    PeerId(id)
+                                };
+                                info!(
+                                    "Accepted relayed connection from {} (peer {}) — registering",
+                                    remote,
+                                    hex::encode(&peer_id.0[..8])
+                                );
+                                connections.insert(peer_id, conn);
 
-        info!(
-            "Secondary relay endpoint created for accepting connections at {}",
-            relay_public_addr
-        );
-
-        // Step 3: Spawn accept loop — forward accepted connections into the
-        // shared connections map and emit ConnectionEstablished so the normal
-        // accept_connection() → P2pEndpoint::accept() path picks them up
-        // (spawning reader tasks, registering PeerConnection, etc.).
-        let connections = self.connections.clone();
-        let incoming_notify = self.incoming_notify.clone();
-        let pending_accepts = self.pending_accepts.clone();
-        let relay_event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match relay_endpoint.accept().await {
-                    Some(incoming) => match incoming.await {
-                        Ok(conn) => {
-                            let remote = conn.remote_address();
-                            // Derive a temporary PeerId from the remote address.
-                            // The real identity exchange will update this later
-                            // via extract_peer_id_from_connection in accept().
-                            let peer_id = {
-                                use std::hash::{Hash, Hasher};
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                remote.hash(&mut hasher);
-                                let hash = hasher.finish();
-                                let mut id = [0u8; 32];
-                                id[..8].copy_from_slice(&hash.to_le_bytes());
-                                id[8..16].copy_from_slice(&hash.to_be_bytes());
-                                PeerId(id)
-                            };
-                            info!(
-                                "Accepted relayed connection from {} (peer {}) — registering",
-                                remote,
-                                hex::encode(&peer_id.0[..8])
-                            );
-                            connections.insert(peer_id, conn);
-
-                            // Emit ConnectionEstablished so accept_connection()
-                            // returns this to P2pEndpoint::accept(), which spawns
-                            // the reader task and stores the PeerConnection.
-                            pending_accepts.lock().push_back(peer_id);
-                            if let Some(ref tx) = relay_event_tx {
-                                let _ = tx.send(NatTraversalEvent::ConnectionEstablished {
-                                    peer_id,
-                                    remote_address: remote,
-                                    side: Side::Server,
-                                });
+                                // Emit ConnectionEstablished so accept_connection()
+                                // returns this to P2pEndpoint::accept(), which spawns
+                                // the reader task and stores the PeerConnection.
+                                pending_accepts.lock().push_back(peer_id);
+                                if let Some(ref tx) = relay_event_tx {
+                                    let _ = tx.send(NatTraversalEvent::ConnectionEstablished {
+                                        peer_id,
+                                        remote_address: remote,
+                                        side: Side::Server,
+                                    });
+                                }
+                                incoming_notify.notify_waiters();
                             }
-                            incoming_notify.notify_waiters();
+                            Err(e) => {
+                                debug!("Relayed connection handshake failed: {}", e);
+                            }
+                        },
+                        None => {
+                            info!("Relay accept endpoint closed");
+                            break;
                         }
-                        Err(e) => {
-                            debug!("Relayed connection handshake failed: {}", e);
-                        }
-                    },
-                    None => {
-                        info!("Relay accept endpoint closed");
-                        break;
                     }
                 }
-            }
-        });
+            });
+        }
 
         // Step 4: Store relay public address for re-advertisement to future peers
         if let Ok(mut addr) = self.relay_public_addr.lock() {
@@ -2322,58 +2317,67 @@ impl NatTraversalEndpoint {
         self.event_callback.as_ref()
     }
 
-    fn apply_relay_server_public_address(
-        relay_server: Option<&Arc<MasqueRelayServer>>,
-        public_addr: SocketAddr,
-    ) {
-        let public_addr = normalize_socket_addr(public_addr);
-        if public_addr.ip().is_unspecified() {
-            return;
-        }
+    fn select_best_relay_public_address_for_family<I>(
+        candidates: I,
+        want_ipv4: bool,
+    ) -> Option<SocketAddr>
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        let mut addresses: Vec<_> = candidates
+            .into_iter()
+            .map(normalize_socket_addr)
+            .filter(|addr| !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4)
+            .filter(|addr| {
+                matches!(
+                    crate::reachability::socket_addr_scope(*addr),
+                    Some(crate::reachability::ReachabilityScope::Global)
+                )
+            })
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses.into_iter().next()
+    }
 
-        if let Some(server) = relay_server {
-            server.set_public_address(public_addr);
-        }
+    fn select_relay_server_public_addresses(
+        candidates: &[SocketAddr],
+    ) -> (Option<SocketAddr>, Option<SocketAddr>) {
+        (
+            Self::select_best_relay_public_address_for_family(candidates.iter().copied(), true),
+            Self::select_best_relay_public_address_for_family(candidates.iter().copied(), false),
+        )
     }
 
     fn best_observed_external_address_for_family(&self, want_ipv4: bool) -> Option<SocketAddr> {
         #[cfg(test)]
-        if let Ok(addrs) = self.test_observed_external_addrs.lock() {
-            if let Some(addr) = addrs
-                .iter()
-                .copied()
-                .map(normalize_socket_addr)
-                .find(|addr| !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4)
-            {
-                return Some(addr);
-            }
+        if let Ok(addrs) = self.test_observed_external_addrs.lock()
+            && let Some(addr) =
+                Self::select_best_relay_public_address_for_family(addrs.iter().copied(), want_ipv4)
+        {
+            return Some(addr);
         }
 
         let known_peer_addrs: std::collections::HashSet<_> =
             self.config.known_peers.iter().copied().collect();
-
-        for entry in self.connections.iter() {
-            let connection = entry.value();
-            if known_peer_addrs.contains(&connection.remote_address())
-                && let Some(addr) = connection.observed_address()
-            {
-                let addr = normalize_socket_addr(addr);
-                if !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4 {
-                    return Some(addr);
-                }
-            }
+        let known_peer_candidates: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|entry| known_peer_addrs.contains(&entry.value().remote_address()))
+            .flat_map(|entry| entry.value().all_observed_addresses())
+            .collect();
+        if let Some(addr) =
+            Self::select_best_relay_public_address_for_family(known_peer_candidates, want_ipv4)
+        {
+            return Some(addr);
         }
 
-        for entry in self.connections.iter() {
-            if let Some(addr) = entry.value().observed_address() {
-                let addr = normalize_socket_addr(addr);
-                if !addr.ip().is_unspecified() && addr.is_ipv4() == want_ipv4 {
-                    return Some(addr);
-                }
-            }
-        }
-
-        None
+        let all_candidates: Vec<_> = self
+            .connections
+            .iter()
+            .flat_map(|entry| entry.value().all_observed_addresses())
+            .collect();
+        Self::select_best_relay_public_address_for_family(all_candidates, want_ipv4)
     }
 
     pub(crate) fn reconcile_relay_server_public_addresses(&self, mapped_addr: Option<SocketAddr>) {
@@ -4587,6 +4591,7 @@ impl NatTraversalEndpoint {
 
             // Collect newly discovered addresses (need to do in two passes due to borrow rules)
             let mut new_addresses = Vec::new();
+            let mut relay_public_candidates = Vec::new();
 
             // 1. Check active connections for observed addresses and feed them to discovery
             // DashMap allows concurrent iteration without blocking
@@ -4605,7 +4610,7 @@ impl NatTraversalEndpoint {
                     observed
                 );
                 if let Some(observed_addr) = observed {
-                    Self::apply_relay_server_public_address(relay_server.as_ref(), observed_addr);
+                    relay_public_candidates.push(observed_addr);
 
                     // Emit event if this is the first time this peer reported this address
                     if emitted_discovery.insert((*peer_id, observed_addr)) {
@@ -4664,10 +4669,7 @@ impl NatTraversalEndpoint {
                         bootstrap_node,
                     } => {
                         debug!("{}", event);
-                        Self::apply_relay_server_public_address(
-                            relay_server.as_ref(),
-                            candidate.address,
-                        );
+                        relay_public_candidates.push(candidate.address);
 
                         // Notify that our external address was discovered
                         let _ = event_tx.send(NatTraversalEvent::ExternalAddressDiscovered {
@@ -4700,6 +4702,12 @@ impl NatTraversalEndpoint {
                         debug!("{}", event);
                     }
                 }
+            }
+
+            if let Some(server) = relay_server.as_ref() {
+                let (ipv4, ipv6) =
+                    Self::select_relay_server_public_addresses(relay_public_candidates.as_slice());
+                server.reconcile_public_addresses(ipv4, ipv6);
             }
         }
 
@@ -4990,8 +4998,13 @@ impl NatTraversalEndpoint {
     pub fn reset_relay_state(&self) {
         self.relay_setup_attempted
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.relay_accept_loop_started
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
             *addr = None;
+        }
+        if let Ok(mut endpoint) = self.shared_relay_endpoint.lock() {
+            *endpoint = None;
         }
         if let Ok(mut peers) = self.relay_advertised_peers.lock() {
             peers.clear();
@@ -5007,6 +5020,65 @@ impl NatTraversalEndpoint {
             Some(manager) => manager.has_available_relay().await,
             None => false,
         }
+    }
+
+    /// Receive a peer address update originating from an ADD_ADDRESS frame.
+    pub async fn recv_peer_address_update(&self) -> Option<(SocketAddr, SocketAddr)> {
+        self.peer_address_update_rx.lock().await.recv().await
+    }
+
+    /// Get or create the shared QUIC endpoint that runs over the relay socket.
+    pub(crate) async fn ensure_shared_relay_endpoint(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<(Option<SocketAddr>, InnerEndpoint), NatTraversalError> {
+        let relay_addr = normalize_socket_addr(relay_addr);
+
+        if let Some(endpoint) = self
+            .shared_relay_endpoint
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+        {
+            let public_addr = self
+                .relay_sessions
+                .get(&relay_addr)
+                .and_then(|session| session.public_address)
+                .or_else(|| self.relay_public_addr());
+            return Ok((public_addr, endpoint));
+        }
+
+        let (public_addr, relay_socket) = self.establish_relay_session(relay_addr).await?;
+        let relay_socket = relay_socket.ok_or_else(|| {
+            NatTraversalError::ConnectionFailed("Relay did not provide socket".to_string())
+        })?;
+        let runtime = crate::high_level::default_runtime().ok_or_else(|| {
+            NatTraversalError::ConfigError("No async runtime for relay endpoint".to_string())
+        })?;
+
+        let mut relay_endpoint = InnerEndpoint::new_with_abstract_socket(
+            crate::EndpointConfig::default(),
+            self.server_config.clone(),
+            relay_socket,
+            runtime,
+        )
+        .map_err(|e| {
+            NatTraversalError::ConnectionFailed(format!("Failed to create relay endpoint: {}", e))
+        })?;
+
+        if let Some(client_config) = self
+            .inner_endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.default_client_config.clone())
+        {
+            relay_endpoint.set_default_client_config(client_config);
+        }
+
+        if let Ok(mut shared) = self.shared_relay_endpoint.lock() {
+            *shared = Some(relay_endpoint.clone());
+        }
+
+        Ok((public_addr, relay_endpoint))
     }
 
     /// Establish a relay session with a MASQUE relay server
@@ -5037,7 +5109,7 @@ impl NatTraversalEndpoint {
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
                 debug!("Reusing existing relay session to {}", relay_addr);
-                return Ok((session.public_address, None));
+                return Ok((session.public_address, session.relay_socket.clone()));
             }
         }
 
@@ -5135,6 +5207,7 @@ impl NatTraversalEndpoint {
         let session = RelaySession {
             connection,
             public_address,
+            relay_socket: relay_socket.clone(),
             established_at: std::time::Instant::now(),
             relay_addr,
         };
@@ -8089,6 +8162,28 @@ mod tests {
         endpoint.reconcile_relay_server_public_addresses(Some(refreshed_addr));
 
         assert_eq!(endpoint.relay_server_public_address(), Some(refreshed_addr));
+    }
+
+    #[test]
+    fn test_best_relay_public_address_ignores_private_candidates() {
+        let private_v4: SocketAddr = "10.0.0.1:5483".parse().expect("valid addr");
+        let global_v4: SocketAddr = "198.51.100.44:5483".parse().expect("valid addr");
+        let global_v6: SocketAddr = "[2001:db8::44]:5483".parse().expect("valid addr");
+
+        assert_eq!(
+            NatTraversalEndpoint::select_best_relay_public_address_for_family(
+                [private_v4, global_v4],
+                true,
+            ),
+            Some(global_v4)
+        );
+        assert_eq!(
+            NatTraversalEndpoint::select_best_relay_public_address_for_family(
+                [private_v4, global_v6],
+                false,
+            ),
+            Some(global_v6)
+        );
     }
 
     #[test]
