@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.8] - 2026-04-15
+
+### Security
+
+- **RUSTSEC-2026-0098 / RUSTSEC-2026-0099 (rustls-webpki)**: bump `rustls-webpki` to `0.103.12` to pick up the name-constraint validation fixes.
+- **RUSTSEC-2026-0097 (rand)**: update `rand` 0.9 → 0.9.4 and 0.10 → 0.10.1 to patch the `ThreadRng` unsound-aliasing advisory. The remaining `rand 0.8` path (direct dep + saorsa-pqc) is explicitly documented as non-exploitable in `deny.toml` — the advisory requires a custom logger that reentrantly calls `rand::rng()`, which ant-quic does not install.
+
+### Fixed
+
+- **Direct-candidate selection no longer truncates viable addresses**: `connect_direct_candidates()` previously capped dialing at the first four hints, which could mask the only reachable path when bridge/ULA or overlay addresses were listed ahead of a working Tailscale / secondary-LAN address. All supplied candidates are now tried.
+- **Direct pre-pass gate broadened**: the fast direct-connect pre-pass in `P2pEndpoint::connect*` is now entered whenever explicit addresses exist and the request is not the degenerate single-address, no-peer-id case — instead of requiring `peer_id.is_some()`. Peer-less address bundles can now take the direct path.
+
 ## [0.26.6] - 2026-04-10
 
 ### Fixed

@@ -1393,10 +1393,12 @@ impl P2pEndpoint {
         addrs: &[SocketAddr],
         hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
-        const MAX_DIRECT_CANDIDATES: usize = 4;
-
+        // Explicit address hints often include multiple viable local-network,
+        // overlay, and global candidates. Truncating to the first few can miss
+        // the only actually reachable path, for example when bridge/ULA addrs
+        // appear before a working Tailscale or secondary LAN address.
         let mut last_err: Option<EndpointError> = None;
-        for addr in addrs.iter().take(MAX_DIRECT_CANDIDATES) {
+        for addr in addrs {
             match self
                 .connect_direct_addr_with_hint(*addr, hint_peer_id)
                 .await
@@ -1602,7 +1604,7 @@ impl P2pEndpoint {
             explicit_addrs.push(runtime_addr);
         }
 
-        if peer_id.is_some() && !explicit_addrs.is_empty() {
+        if !explicit_addrs.is_empty() && !is_simple_address_only {
             match self
                 .connect_direct_candidates(&explicit_addrs, peer_id)
                 .await
