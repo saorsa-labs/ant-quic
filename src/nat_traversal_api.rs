@@ -2357,6 +2357,20 @@ impl NatTraversalEndpoint {
         )
     }
 
+    fn select_best_relay_public_address_with_known_preference<I, J>(
+        preferred_candidates: I,
+        fallback_candidates: J,
+        want_ipv4: bool,
+    ) -> Option<SocketAddr>
+    where
+        I: IntoIterator<Item = SocketAddr>,
+        J: IntoIterator<Item = SocketAddr>,
+    {
+        Self::select_best_relay_public_address_for_family(preferred_candidates, want_ipv4).or_else(
+            || Self::select_best_relay_public_address_for_family(fallback_candidates, want_ipv4),
+        )
+    }
+
     fn best_observed_external_address_for_family(&self, want_ipv4: bool) -> Option<SocketAddr> {
         #[cfg(test)]
         if let Ok(addrs) = self.test_observed_external_addrs.lock()
@@ -2374,18 +2388,17 @@ impl NatTraversalEndpoint {
             .filter(|entry| known_peer_addrs.contains(&entry.value().remote_address()))
             .flat_map(|entry| entry.value().all_observed_addresses())
             .collect();
-        if let Some(addr) =
-            Self::select_best_relay_public_address_for_family(known_peer_candidates, want_ipv4)
-        {
-            return Some(addr);
-        }
 
         let all_candidates: Vec<_> = self
             .connections
             .iter()
             .flat_map(|entry| entry.value().all_observed_addresses())
             .collect();
-        Self::select_best_relay_public_address_for_family(all_candidates, want_ipv4)
+        Self::select_best_relay_public_address_with_known_preference(
+            known_peer_candidates,
+            all_candidates,
+            want_ipv4,
+        )
     }
 
     pub(crate) fn reconcile_relay_server_public_addresses(&self, mapped_addr: Option<SocketAddr>) {
@@ -8210,6 +8223,51 @@ mod tests {
                 false,
             ),
             Some(global_v6)
+        );
+    }
+
+    #[test]
+    fn test_best_relay_public_address_prefers_known_peer_candidates() {
+        let known_peer_addr: SocketAddr = "198.51.100.44:5483".parse().expect("valid addr");
+        let arbitrary_peer_addr: SocketAddr = "198.51.100.99:5483".parse().expect("valid addr");
+
+        assert_eq!(
+            NatTraversalEndpoint::select_best_relay_public_address_with_known_preference(
+                [known_peer_addr],
+                [arbitrary_peer_addr],
+                true,
+            ),
+            Some(known_peer_addr)
+        );
+    }
+
+    #[test]
+    fn test_relay_public_address_selection_is_stable_across_conflicting_observers() {
+        let private_v4: SocketAddr = "10.0.0.1:5483".parse().expect("valid addr");
+        let public_v4_a: SocketAddr = "198.51.100.80:5483".parse().expect("valid addr");
+        let public_v4_b: SocketAddr = "198.51.100.44:5483".parse().expect("valid addr");
+        let public_v6_a: SocketAddr = "[2001:db8::80]:5483".parse().expect("valid addr");
+        let public_v6_b: SocketAddr = "[2001:db8::44]:5483".parse().expect("valid addr");
+
+        assert_eq!(
+            NatTraversalEndpoint::select_relay_server_public_addresses(&[
+                public_v4_a,
+                private_v4,
+                public_v6_a,
+                public_v4_b,
+                public_v6_b,
+            ]),
+            (Some(public_v4_b), Some(public_v6_b))
+        );
+        assert_eq!(
+            NatTraversalEndpoint::select_relay_server_public_addresses(&[
+                public_v6_b,
+                public_v4_b,
+                public_v4_a,
+                public_v6_a,
+                private_v4,
+            ]),
+            (Some(public_v4_b), Some(public_v6_b))
         );
     }
 
