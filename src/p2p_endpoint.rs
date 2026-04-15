@@ -1778,7 +1778,7 @@ impl P2pEndpoint {
                 // Store peer
                 drop(router); // Release lock before acquiring connected_peers lock
                 self.register_connected_peer(peer_conn.clone()).await;
-                self.observe_direct_peer_reachability(actual_peer_id, &addr);
+                self.observe_peer_reachability(&peer_conn);
 
                 Ok(peer_conn)
             }
@@ -2231,7 +2231,7 @@ impl P2pEndpoint {
                     endpoint.spawn_reader_task(peer_id, conn).await;
                 });
 
-                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
                 self.coordinator_health.record_success(&coord_addr);
 
@@ -2285,10 +2285,7 @@ impl P2pEndpoint {
                             });
                         }
 
-                        self.observe_direct_peer_reachability(
-                            peer_id,
-                            &TransportAddr::Udp(remote_address),
-                        );
+                        self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
                         self.coordinator_health.record_success(&coord_addr);
 
@@ -2337,7 +2334,7 @@ impl P2pEndpoint {
                     endpoint.spawn_reader_task(peer_id, conn).await;
                 });
 
-                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
                 self.coordinator_health.record_success(&coord_addr);
 
@@ -2847,7 +2844,7 @@ impl P2pEndpoint {
         // Use the cloned connection directly — do NOT re-fetch from the DashMap.
         self.spawn_reader_task(peer_id, reader_conn).await;
 
-        self.observe_direct_peer_reachability(peer_id, &peer_conn.remote_addr);
+        self.observe_peer_reachability(&peer_conn);
         self.register_connected_peer(peer_conn.clone()).await;
 
         Ok(peer_conn)
@@ -2940,10 +2937,7 @@ impl P2pEndpoint {
                             });
                         }
 
-                        self.observe_direct_peer_reachability(
-                            evt_peer,
-                            &TransportAddr::Udp(remote_address),
-                        );
+                        self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
 
                         let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
@@ -2992,7 +2986,7 @@ impl P2pEndpoint {
                     endpoint.spawn_reader_task(peer_id, conn).await;
                 });
 
-                self.observe_direct_peer_reachability(peer_id, &TransportAddr::Udp(remote_address));
+                self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
 
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
@@ -3122,15 +3116,27 @@ impl P2pEndpoint {
         Ok(peer_conn)
     }
 
-    fn observe_direct_peer_reachability(&self, peer_id: PeerId, addr: &TransportAddr) {
-        if let Some(socket_addr) = addr.as_socket_addr() {
-            let cache = Arc::clone(&self.bootstrap_cache);
-            tokio::spawn(async move {
-                cache
-                    .observe_direct_reachability(peer_id, socket_addr)
-                    .await;
-            });
+    async fn persist_direct_peer_reachability_if_applicable(
+        bootstrap_cache: &BootstrapCache,
+        peer_conn: &PeerConnection,
+    ) {
+        if !peer_conn.traversal_method.is_direct() {
+            return;
         }
+
+        if let Some(socket_addr) = peer_conn.remote_addr.as_socket_addr() {
+            bootstrap_cache
+                .observe_direct_reachability(peer_conn.peer_id, socket_addr)
+                .await;
+        }
+    }
+
+    fn observe_peer_reachability(&self, peer_conn: &PeerConnection) {
+        let cache = Arc::clone(&self.bootstrap_cache);
+        let peer_conn = peer_conn.clone();
+        tokio::spawn(async move {
+            Self::persist_direct_peer_reachability_if_applicable(cache.as_ref(), &peer_conn).await;
+        });
     }
 
     async fn register_connected_peer(&self, peer_conn: PeerConnection) {
@@ -3227,7 +3233,7 @@ impl P2pEndpoint {
                 // Use the cloned connection directly — do NOT re-fetch from the DashMap.
                 self.spawn_reader_task(resolved_peer_id, reader_conn).await;
 
-                self.observe_direct_peer_reachability(resolved_peer_id, &peer_conn.remote_addr);
+                self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
 
                 Some(peer_conn)
@@ -5131,6 +5137,86 @@ mod tests {
         assert_eq!(addrs[1], global_v4);
         assert_eq!(addrs[2], private_v4);
         assert_eq!(addrs[3], loopback);
+    }
+
+    #[tokio::test]
+    async fn test_persist_direct_reachability_if_applicable_skips_hole_punch() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x33; 32]);
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp("198.51.100.33:5483".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::HolePunch,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        P2pEndpoint::persist_direct_peer_reachability_if_applicable(
+            endpoint.bootstrap_cache.as_ref(),
+            &peer_conn,
+        )
+        .await;
+
+        assert!(endpoint.bootstrap_cache.get_peer(&peer_id).await.is_none());
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_persist_direct_reachability_if_applicable_records_direct() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x34; 32]);
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp("198.51.100.34:5483".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        P2pEndpoint::persist_direct_peer_reachability_if_applicable(
+            endpoint.bootstrap_cache.as_ref(),
+            &peer_conn,
+        )
+        .await;
+
+        let cached_peer = endpoint
+            .bootstrap_cache
+            .get_peer(&peer_id)
+            .await
+            .expect("direct peer should be cached");
+        assert_eq!(
+            cached_peer.capabilities.direct_reachability_scope,
+            Some(ReachabilityScope::Global)
+        );
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]
