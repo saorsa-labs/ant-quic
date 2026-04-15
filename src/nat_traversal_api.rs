@@ -100,6 +100,14 @@ fn broadcast_address_to_peers(
     }
 }
 
+fn encode_relay_response_frame(response: &ConnectUdpResponse) -> Vec<u8> {
+    let response_bytes = response.encode();
+    let mut frame = Vec::with_capacity(4 + response_bytes.len());
+    frame.extend_from_slice(&(response_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&response_bytes);
+    frame
+}
+
 /// Multi-transport candidate advertisement
 ///
 /// Stores information about an advertised transport address with optional capability flags.
@@ -4487,19 +4495,10 @@ impl NatTraversalEndpoint {
                                                 );
 
                                                 // Send response with length prefix (stream stays open for data)
-                                                let response_bytes = response.encode();
-                                                let len = response_bytes.len() as u32;
+                                                let response_frame =
+                                                    encode_relay_response_frame(&response);
                                                 if let Err(e) =
-                                                    send_stream.write_all(&len.to_be_bytes()).await
-                                                {
-                                                    warn!(
-                                                        "Failed to send relay response length to {}: {}",
-                                                        addr, e
-                                                    );
-                                                    return;
-                                                }
-                                                if let Err(e) =
-                                                    send_stream.write_all(&response_bytes).await
+                                                    send_stream.write_all(&response_frame).await
                                                 {
                                                     warn!(
                                                         "Failed to send relay response to {}: {}",
@@ -4538,8 +4537,10 @@ impl NatTraversalEndpoint {
                                                     500,
                                                     format!("Internal error: {}", e),
                                                 );
+                                                let response_frame =
+                                                    encode_relay_response_frame(&response);
                                                 let _ =
-                                                    send_stream.write_all(&response.encode()).await;
+                                                    send_stream.write_all(&response_frame).await;
                                                 let _ = send_stream.finish();
                                             }
                                         }
@@ -5260,6 +5261,32 @@ impl NatTraversalEndpoint {
     /// Get active relay sessions
     pub fn relay_sessions(&self) -> Arc<dashmap::DashMap<SocketAddr, RelaySession>> {
         self.relay_sessions.clone()
+    }
+
+    /// Best-effort runtime metrics for the embedded relay server.
+    pub(crate) fn relay_server_runtime_metrics(&self) -> (usize, u64) {
+        let Some(server) = self.relay_server.as_ref() else {
+            return (0, 0);
+        };
+
+        let stats = server.stats();
+        let active_sessions =
+            usize::try_from(stats.current_active_sessions()).unwrap_or(usize::MAX);
+        let bytes_forwarded = stats.total_bytes_relayed();
+        (active_sessions, bytes_forwarded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_test_relay_server_activity(&self, active_sessions: u64, bytes: u64) {
+        if let Some(server) = self.relay_server.as_ref() {
+            let stats = server.stats();
+            for _ in 0..active_sessions {
+                stats.record_session_created();
+            }
+            if bytes > 0 {
+                stats.record_bytes(bytes);
+            }
+        }
     }
 
     /// Accept incoming connections on the endpoint
@@ -8184,6 +8211,20 @@ mod tests {
             ),
             Some(global_v6)
         );
+    }
+
+    #[test]
+    fn test_encode_relay_response_frame_prefixes_length() {
+        let response =
+            ConnectUdpResponse::success(Some("198.51.100.55:5483".parse().expect("valid addr")));
+        let frame = encode_relay_response_frame(&response);
+        let len = u32::from_be_bytes(frame[..4].try_into().expect("length prefix")) as usize;
+        assert_eq!(len, frame.len() - 4);
+
+        let decoded = ConnectUdpResponse::decode(&mut bytes::Bytes::from(frame[4..].to_vec()))
+            .expect("framed response should decode");
+        assert_eq!(decoded.status, response.status);
+        assert_eq!(decoded.proxy_public_address, response.proxy_public_address);
     }
 
     #[test]

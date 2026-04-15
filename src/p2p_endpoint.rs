@@ -330,6 +330,7 @@ pub struct ConnectionMetrics {
 pub(crate) struct RuntimeAssistSnapshot {
     pub successful_coordinations: u32,
     pub active_relay_sessions: usize,
+    pub relay_bytes_forwarded: u64,
 }
 
 /// P2P endpoint statistics
@@ -1517,11 +1518,13 @@ impl P2pEndpoint {
             .get_statistics()
             .map(|stats| stats.successful_coordinations)
             .unwrap_or(0);
-        let active_relay_sessions = self.inner.relay_sessions().len();
+        let (active_relay_sessions, relay_bytes_forwarded) =
+            self.inner.relay_server_runtime_metrics();
 
         RuntimeAssistSnapshot {
             successful_coordinations,
             active_relay_sessions,
+            relay_bytes_forwarded,
         }
     }
 
@@ -5094,6 +5097,30 @@ mod tests {
             "future connected peers should trigger proactive relay re-advertisement"
         );
         relay_endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_runtime_assist_snapshot_reports_relay_bytes_forwarded() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("valid config"),
+        )
+        .await
+        .expect("endpoint should create");
+
+        endpoint.inner.record_test_relay_server_activity(2, 4096);
+        let snapshot = endpoint.runtime_assist_snapshot().await;
+
+        assert_eq!(snapshot.active_relay_sessions, 2);
+        assert_eq!(snapshot.relay_bytes_forwarded, 4096);
+
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]

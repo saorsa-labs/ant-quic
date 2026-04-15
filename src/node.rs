@@ -698,7 +698,7 @@ impl Node {
         let bootstrap_service_enabled = self.inner.bootstrap_service_enabled();
         let is_relaying = runtime_assist.active_relay_sessions > 0;
         let relay_sessions = runtime_assist.active_relay_sessions;
-        let relay_bytes_forwarded = 0u64;
+        let relay_bytes_forwarded = runtime_assist.relay_bytes_forwarded;
         let is_coordinating = runtime_assist.successful_coordinations > 0;
         let coordination_sessions =
             usize::try_from(runtime_assist.successful_coordinations).unwrap_or(usize::MAX);
