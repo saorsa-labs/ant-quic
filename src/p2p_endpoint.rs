@@ -166,6 +166,59 @@ fn prioritize_direct_candidate_addrs(addrs: &mut Vec<SocketAddr>) {
     addrs.dedup();
 }
 
+fn relay_target_rank(addr: SocketAddr) -> u8 {
+    match socket_addr_scope(addr) {
+        Some(ReachabilityScope::Global) => 3,
+        Some(ReachabilityScope::LocalNetwork) => 2,
+        Some(ReachabilityScope::Loopback) => 1,
+        None => 0,
+    }
+}
+
+fn prioritize_relay_target_addrs(addrs: &mut Vec<SocketAddr>) {
+    addrs.sort_by_key(|addr| std::cmp::Reverse(relay_target_rank(*addr)));
+    addrs.dedup();
+}
+
+fn extend_unique_socket_addrs(
+    addrs: &mut Vec<SocketAddr>,
+    incoming: impl IntoIterator<Item = SocketAddr>,
+) {
+    for addr in incoming {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+}
+
+fn select_preferred_relay_target_addr(
+    listener_addrs: &[SocketAddr],
+    reachable_addrs: &[SocketAddr],
+    external_addrs: &[SocketAddr],
+    fallback_ipv4: Option<SocketAddr>,
+    fallback_ipv6: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    let mut ordered = Vec::new();
+
+    let mut listeners = listener_addrs.to_vec();
+    prioritize_relay_target_addrs(&mut listeners);
+    extend_unique_socket_addrs(&mut ordered, listeners);
+
+    let mut reachable = reachable_addrs.to_vec();
+    prioritize_relay_target_addrs(&mut reachable);
+    extend_unique_socket_addrs(&mut ordered, reachable);
+
+    let mut external = external_addrs.to_vec();
+    prioritize_relay_target_addrs(&mut external);
+    extend_unique_socket_addrs(&mut ordered, external);
+
+    ordered
+        .into_iter()
+        .next()
+        .or(fallback_ipv4)
+        .or(fallback_ipv6)
+}
+
 fn normalize_direct_path_unavailable_reason(
     error: &NatTraversalError,
 ) -> DirectPathUnavailableReason {
@@ -3005,9 +3058,18 @@ impl P2pEndpoint {
                 }
 
                 ConnectionStage::Relay { relay_addr, .. } => {
-                    let target = target_ipv4
-                        .or(target_ipv6)
+                    let fallback_target = target_ipv4.or(target_ipv6);
+                    let target = self
+                        .select_relay_target_addr(peer_id, target_ipv4, target_ipv6)
+                        .await
                         .ok_or(EndpointError::NoAddress)?;
+
+                    if Some(target) != fallback_target {
+                        debug!(
+                            "Relay target selection preferred durable address {} over fallback {:?}",
+                            target, fallback_target
+                        );
+                    }
 
                     info!("Trying relay connection to {} via {}", target, relay_addr);
 
@@ -3312,6 +3374,59 @@ impl P2pEndpoint {
                 }
             }
         }
+    }
+
+    async fn select_relay_target_addr(
+        &self,
+        peer_id: Option<PeerId>,
+        fallback_ipv4: Option<SocketAddr>,
+        fallback_ipv6: Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        let mut listener_addrs = Vec::new();
+        let mut reachable_addrs = Vec::new();
+        let mut external_addrs = Vec::new();
+
+        if let Some(peer_id) = peer_id {
+            if let Some(cached_peer) = self.bootstrap_cache.get_peer(&peer_id).await {
+                extend_unique_socket_addrs(&mut listener_addrs, cached_peer.addresses);
+                extend_unique_socket_addrs(
+                    &mut reachable_addrs,
+                    cached_peer
+                        .capabilities
+                        .reachable_addresses
+                        .iter()
+                        .map(|entry| entry.address),
+                );
+                extend_unique_socket_addrs(
+                    &mut external_addrs,
+                    cached_peer.capabilities.external_addresses,
+                );
+            }
+
+            if let Some(hints) = self.peer_hint_records.read().await.get(&peer_id).cloned() {
+                extend_unique_socket_addrs(&mut listener_addrs, hints.addrs);
+                extend_unique_socket_addrs(
+                    &mut reachable_addrs,
+                    hints
+                        .capabilities
+                        .reachable_addresses
+                        .iter()
+                        .map(|entry| entry.address),
+                );
+                extend_unique_socket_addrs(
+                    &mut external_addrs,
+                    hints.capabilities.external_addresses,
+                );
+            }
+        }
+
+        select_preferred_relay_target_addr(
+            &listener_addrs,
+            &reachable_addrs,
+            &external_addrs,
+            fallback_ipv4,
+            fallback_ipv6,
+        )
     }
 
     async fn try_relay_connection(
@@ -5822,6 +5937,38 @@ mod tests {
         assert_eq!(addrs[1], global_v4);
         assert_eq!(addrs[2], private_v4);
         assert_eq!(addrs[3], loopback);
+    }
+
+    #[test]
+    fn test_select_preferred_relay_target_addr_prefers_listener_port() {
+        let listener: SocketAddr = "[2001:db8::20]:5483".parse().expect("valid addr");
+        let observed_ephemeral: SocketAddr = "[2001:db8::20]:37616".parse().expect("valid addr");
+
+        let selected = select_preferred_relay_target_addr(
+            &[listener],
+            &[],
+            &[observed_ephemeral],
+            Some(observed_ephemeral),
+            None,
+        );
+
+        assert_eq!(selected, Some(listener));
+    }
+
+    #[test]
+    fn test_select_preferred_relay_target_addr_prefers_reachable_over_external() {
+        let reachable: SocketAddr = "198.51.100.20:5483".parse().expect("valid addr");
+        let observed_ephemeral: SocketAddr = "198.51.100.20:37616".parse().expect("valid addr");
+
+        let selected = select_preferred_relay_target_addr(
+            &[],
+            &[reachable],
+            &[observed_ephemeral],
+            Some(observed_ephemeral),
+            None,
+        );
+
+        assert_eq!(selected, Some(reachable));
     }
 
     #[tokio::test]
