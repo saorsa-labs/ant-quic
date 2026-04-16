@@ -2159,7 +2159,7 @@ impl NatTraversalState {
     fn sort_and_reindex_pairs(&mut self) {
         // Sort pairs by priority (highest first) - use unstable sort for better performance
         self.candidate_pairs
-            .sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
+            .sort_unstable_by_key(|pair| std::cmp::Reverse(pair.priority));
 
         // Rebuild index after sorting - since pairs are sorted by priority (highest first),
         // we iterate in reverse to ensure the HIGHEST priority pair for each remote_addr
