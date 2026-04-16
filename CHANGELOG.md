@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.12] - 2026-04-16
+
+### Fixed
+
+- **Stable-clippy release parity**: replaced the remaining priority sort in NAT traversal pair reindexing with the key-based form expected by the Rust 1.95 clippy job used in GitHub Actions quick checks.
+
+### Tests
+
+- **Release gate rerun**: `cargo fmt --all -- --check`, `cargo clippy --all-features --lib --bins --examples -- -D warnings`, `cargo test --lib --no-default-features`, `cargo test --lib --all-features`, `cargo test --lib`, `cargo nextest run`, and `cargo publish --dry-run --allow-dirty` passed for the release candidate.
+
 ## [0.26.11] - 2026-04-16
 
 ### Fixed
