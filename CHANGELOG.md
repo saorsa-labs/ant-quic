@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.11] - 2026-04-16
+
+### Fixed
+
+- **Release workflow gating**: crates.io publish and GitHub release creation now wait for validate, test, build, and changelog jobs to succeed, preventing partial releases when upstream checks fail.
+- **Rust 1.95 clippy compatibility**: updated relay/migration/support utilities to satisfy the newer lint set used by CI quick checks.
+- **Coordinator-control test stability**: the local-and-target rejection namespacing test now uses a live request expiry in the future, avoiding sweep-timer flakes during the full lib test matrix.
+- **Minimal-feature lib matrix coverage**: the port-mapping connectivity regression test now runs only when the full default feature set is enabled, matching the feature combinations that exercise that behavior in CI.
+
+### Tests
+
+- **CI parity checks**: `cargo fmt --all -- --check`, `cargo clippy --all-features --lib --bins --examples -- -D warnings`, `cargo test --lib --no-default-features`, `cargo test --lib --all-features`, `cargo test --lib`, and `cargo nextest run` passed for the release candidate.
+
 ## [0.26.10] - 2026-04-16
 
 ### Fixed
