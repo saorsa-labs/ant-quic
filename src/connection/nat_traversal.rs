@@ -2392,7 +2392,7 @@ impl NatTraversalState {
             .map(|(k, v)| (*k, v))
             .collect();
         // Sort by priority (higher priority first)
-        candidates.sort_by(|a, b| b.1.priority.cmp(&a.1.priority));
+        candidates.sort_by_key(|(_, candidate)| std::cmp::Reverse(candidate.priority));
         candidates
     }
 
@@ -3278,14 +3278,12 @@ impl NatTraversalState {
                         }
                     }
                 }
-                CoordinationPhase::Preparing => {
-                    // Check if it's time to start punching
-                    if now >= coord.punch_start {
-                        debug!("Starting coordinated hole punching");
-                        coord.state = CoordinationPhase::Punching;
-                        actions.push(TimeoutAction::StartValidation);
-                    }
+                CoordinationPhase::Preparing if now >= coord.punch_start => {
+                    debug!("Starting coordinated hole punching");
+                    coord.state = CoordinationPhase::Punching;
+                    actions.push(TimeoutAction::StartValidation);
                 }
+                CoordinationPhase::Preparing => {}
                 CoordinationPhase::Punching | CoordinationPhase::Validating => {
                     let timeout_at = coord.round_start + coord.timeout_state.get_timeout();
                     if now >= timeout_at {

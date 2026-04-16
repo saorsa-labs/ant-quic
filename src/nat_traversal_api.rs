@@ -6438,7 +6438,7 @@ impl NatTraversalEndpoint {
         }
 
         // Sort by priority (highest first)
-        candidate_pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidate_pairs.sort_by_key(|pair| std::cmp::Reverse(pair.priority));
 
         // Limit to reasonable number for initial attempts
         candidate_pairs.truncate(8);

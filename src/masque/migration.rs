@@ -170,8 +170,9 @@ impl MigrationStats {
             let ms = duration.as_millis() as u64;
             let prev_avg = self.avg_migration_time_ms.load(Ordering::Relaxed);
             let successful = self.successful.load(Ordering::Relaxed);
-            if successful > 0 {
-                let new_avg = ((prev_avg * (successful - 1)) + ms) / successful;
+            if let Some(new_avg) = successful.checked_sub(1).and_then(|completed_before| {
+                ((prev_avg * completed_before) + ms).checked_div(successful)
+            }) {
                 self.avg_migration_time_ms.store(new_avg, Ordering::Relaxed);
             }
         } else {
@@ -370,21 +371,18 @@ impl MigrationCoordinator {
         let state = self.state(peer).await;
 
         match &state {
-            MigrationState::WaitingToProbe { probe_at } => {
-                if Instant::now() >= *probe_at {
-                    // Time to start probing
-                    self.begin_probing(peer).await;
-                }
+            MigrationState::WaitingToProbe { probe_at } if Instant::now() >= *probe_at => {
+                // Time to start probing
+                self.begin_probing(peer).await;
             }
-            MigrationState::ProbeInProgress {
-                candidates: _,
-                started_at,
-            } => {
-                if started_at.elapsed() > self.config.validation_timeout {
-                    // Probing timed out
-                    self.handle_probe_timeout(peer).await;
-                }
+            MigrationState::WaitingToProbe { .. } => {}
+            MigrationState::ProbeInProgress { started_at, .. }
+                if started_at.elapsed() > self.config.validation_timeout =>
+            {
+                // Probing timed out
+                self.handle_probe_timeout(peer).await;
             }
+            MigrationState::ProbeInProgress { .. } => {}
             _ => {}
         }
 

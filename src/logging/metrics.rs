@@ -214,11 +214,12 @@ impl LatencyTracker {
                 Duration::from_micros(min_rtt)
             },
             max_rtt: Duration::from_micros(self.max_rtt.load(Ordering::Relaxed)),
-            avg_rtt: if count > 0 {
-                Duration::from_micros(self.sum_rtt.load(Ordering::Relaxed) / count)
-            } else {
-                Duration::from_micros(0)
-            },
+            avg_rtt: self
+                .sum_rtt
+                .load(Ordering::Relaxed)
+                .checked_div(count)
+                .map(Duration::from_micros)
+                .unwrap_or_else(|| Duration::from_micros(0)),
             sample_count: count,
         }
     }

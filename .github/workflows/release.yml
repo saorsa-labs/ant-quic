@@ -348,9 +348,9 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    needs: [validate, build, changelog]
+    needs: [validate, test, build, changelog]
     runs-on: ubuntu-latest
-    if: always() && github.event.inputs.dry_run != 'true' && needs.validate.result == 'success'
+    if: github.event.inputs.dry_run != 'true' && needs.validate.result == 'success' && needs.test.result == 'success' && needs.build.result == 'success' && needs.changelog.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -368,12 +368,11 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [validate, build, changelog]
+    needs: [validate, test, build, changelog]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Run even if some builds failed, but skip if validation failed
-    if: always() && github.event.inputs.dry_run != 'true' && needs.validate.result == 'success' && needs.changelog.result == 'success'
+    if: github.event.inputs.dry_run != 'true' && needs.validate.result == 'success' && needs.test.result == 'success' && needs.build.result == 'success' && needs.changelog.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v5

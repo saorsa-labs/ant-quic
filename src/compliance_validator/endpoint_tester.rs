@@ -160,7 +160,7 @@ impl EndpointTester {
 
         // Extract most common issues
         let mut common_issues_vec: Vec<_> = common_issues.into_iter().collect();
-        common_issues_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        common_issues_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         let common_issues = common_issues_vec
             .into_iter()
             .take(5)

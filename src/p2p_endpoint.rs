@@ -5730,6 +5730,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn test_port_mapping_startup_failure_is_non_fatal_for_endpoint_connectivity() {
         let listener = P2pEndpoint::new(

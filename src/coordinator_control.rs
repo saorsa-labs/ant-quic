@@ -509,7 +509,7 @@ mod tests {
             LiveRequest {
                 request_id: 301,
                 round: 2,
-                expires_at_unix_ms: 3_000,
+                expires_at_unix_ms: now_ms + 62_000,
                 expected_coordinator: None,
             },
         );
