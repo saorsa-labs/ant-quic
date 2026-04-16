@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 use crate::mdns::MdnsPeerRecord;
 use crate::nat_traversal_api::PeerId;
 use crate::node_status::NatType;
+pub use crate::p2p_endpoint::{DirectPathStatus, DirectPathUnavailableReason};
 pub use crate::reachability::TraversalMethod;
 use crate::transport::TransportAddr;
 
@@ -132,6 +133,14 @@ pub enum NodeEvent {
         external_addr: SocketAddr,
     },
 
+    /// Best-effort router port mapping changed to a different public address.
+    PortMappingAddressChanged {
+        /// Previous mapped public address.
+        previous_addr: SocketAddr,
+        /// Current mapped public address.
+        external_addr: SocketAddr,
+    },
+
     /// Best-effort router port mapping failed.
     PortMappingFailed {
         /// Human-readable failure detail.
@@ -159,6 +168,14 @@ pub enum NodeEvent {
         success: bool,
         /// Connection method used
         method: TraversalMethod,
+    },
+
+    /// Best-effort direct-path status for a peer.
+    DirectPathStatus {
+        /// Authenticated peer identity.
+        peer_id: PeerId,
+        /// Current direct-path status.
+        status: DirectPathStatus,
     },
 
     // --- Relay Events ---
@@ -238,6 +255,14 @@ pub enum NodeEvent {
         reason: String,
     },
 
+    /// A discovered mDNS peer requires explicit approval before auto-connect.
+    MdnsPeerApprovalRequired {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Human-readable policy reason.
+        reason: String,
+    },
+
     /// An mDNS-driven auto-connect attempt was scheduled.
     MdnsAutoConnectAttempted {
         /// Structured mDNS discovery record.
@@ -306,10 +331,12 @@ impl NodeEvent {
             Self::ExternalAddressDiscovered { .. }
                 | Self::PortMappingEstablished { .. }
                 | Self::PortMappingRenewed { .. }
+                | Self::PortMappingAddressChanged { .. }
                 | Self::PortMappingFailed { .. }
                 | Self::PortMappingRemoved { .. }
                 | Self::NatTypeDetected { .. }
                 | Self::NatTraversalComplete { .. }
+                | Self::DirectPathStatus { .. }
         )
     }
 
@@ -340,6 +367,7 @@ impl NodeEvent {
             Self::PeerConnected { peer_id, .. } => Some(peer_id),
             Self::PeerDisconnected { peer_id, .. } => Some(peer_id),
             Self::NatTraversalComplete { peer_id, .. } => Some(peer_id),
+            Self::DirectPathStatus { peer_id, .. } => Some(peer_id),
             Self::RelaySessionStarted { peer_id } => Some(peer_id),
             Self::RelaySessionEnded { peer_id, .. } => Some(peer_id),
             Self::DataReceived { peer_id, .. } => Some(peer_id),
@@ -421,6 +449,19 @@ mod tests {
         assert!(event.is_nat_event());
         assert!(!event.is_connection_event());
         assert!(event.peer_id().is_none());
+    }
+
+    #[test]
+    fn test_direct_path_status_event() {
+        let event = NodeEvent::DirectPathStatus {
+            peer_id: test_peer_id(),
+            status: DirectPathStatus::BestEffortUnavailable {
+                reason: DirectPathUnavailableReason::NatUnreachable,
+            },
+        };
+
+        assert!(event.is_nat_event());
+        assert_eq!(event.peer_id(), Some(&test_peer_id()));
     }
 
     #[test]

@@ -54,6 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock as ParkingRwLock;
@@ -83,10 +84,11 @@ pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
 };
+use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effort_port_mapping};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
-use crate::unified_config::P2pConfig;
+use crate::unified_config::{AutoConnectPolicy, P2pConfig, TrustPolicy};
 
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -115,6 +117,12 @@ fn peer_id_from_transport_addr(addr: &TransportAddr) -> PeerId {
 struct PeerHintRecord {
     addrs: Vec<SocketAddr>,
     capabilities: PeerCapabilities,
+}
+
+#[derive(Debug)]
+struct ReaderTaskHandle {
+    generation: u64,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 impl PeerHintRecord {
@@ -156,6 +164,46 @@ fn direct_candidate_rank(addr: SocketAddr) -> (u8, u8) {
 fn prioritize_direct_candidate_addrs(addrs: &mut Vec<SocketAddr>) {
     addrs.sort_by_key(|addr| std::cmp::Reverse(direct_candidate_rank(*addr)));
     addrs.dedup();
+}
+
+fn normalize_direct_path_unavailable_reason(
+    error: &NatTraversalError,
+) -> DirectPathUnavailableReason {
+    match error {
+        NatTraversalError::NoCandidatesFound | NatTraversalError::CandidateDiscoveryFailed(_) => {
+            DirectPathUnavailableReason::NoCandidates
+        }
+        NatTraversalError::HolePunchingFailed
+        | NatTraversalError::PunchingFailed(_)
+        | NatTraversalError::ValidationFailed(_)
+        | NatTraversalError::ValidationTimeout
+        | NatTraversalError::NetworkError(_)
+        | NatTraversalError::Timeout
+        | NatTraversalError::ConnectionFailed(_)
+        | NatTraversalError::TraversalFailed(_) => DirectPathUnavailableReason::NatUnreachable,
+        _ => DirectPathUnavailableReason::Unknown,
+    }
+}
+
+fn publish_direct_path_status(
+    statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: PeerId,
+    status: DirectPathStatus,
+) {
+    let should_emit = {
+        let mut statuses = statuses.write();
+        if statuses.get(&peer_id) == Some(&status) {
+            false
+        } else {
+            statuses.insert(peer_id, status.clone());
+            true
+        }
+    };
+
+    if should_emit {
+        let _ = event_tx.send(P2pEvent::DirectPathStatus { peer_id, status });
+    }
 }
 
 /// Derive a synthetic PeerId by hashing a `SocketAddr`.
@@ -256,17 +304,23 @@ pub struct P2pEndpoint {
     /// Tracks in-flight mDNS auto-connect attempts by service fullname.
     mdns_auto_connect_inflight: Arc<ParkingRwLock<HashSet<String>>>,
 
+    /// Latest best-effort direct-path status per authenticated peer.
+    direct_path_statuses: Arc<ParkingRwLock<HashMap<PeerId, DirectPathStatus>>>,
+
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
 
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
     data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
 
-    /// JoinSet tracking background reader tasks (each returns PeerId on exit)
-    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<PeerId>>>,
+    /// JoinSet tracking background reader tasks (each returns peer + generation on exit)
+    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<(PeerId, u64)>>>,
 
     /// Per-peer abort handles for targeted reader task cancellation
-    reader_handles: Arc<RwLock<HashMap<PeerId, tokio::task::AbortHandle>>>,
+    reader_handles: Arc<RwLock<HashMap<PeerId, ReaderTaskHandle>>>,
+
+    /// Monotonic generation counter for reader-task replacement.
+    next_reader_generation: Arc<AtomicU64>,
 
     /// Circuit-breaker for coordinator peers (tracks failures by address).
     pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
@@ -529,6 +583,14 @@ pub enum P2pEvent {
         external_addr: SocketAddr,
     },
 
+    /// Best-effort router port mapping changed to a different public address.
+    PortMappingAddressChanged {
+        /// Previous mapped public address.
+        previous_addr: SocketAddr,
+        /// Current mapped public address.
+        external_addr: SocketAddr,
+    },
+
     /// Best-effort router port mapping failed.
     PortMappingFailed {
         /// Human-readable failure detail.
@@ -583,6 +645,14 @@ pub enum P2pEvent {
         reason: String,
     },
 
+    /// A discovered mDNS peer requires explicit approval before auto-connect.
+    MdnsPeerApprovalRequired {
+        /// Structured mDNS discovery record.
+        peer: MdnsPeerRecord,
+        /// Human-readable policy reason.
+        reason: String,
+    },
+
     /// An mDNS-driven auto-connect attempt was scheduled.
     MdnsAutoConnectAttempted {
         /// Structured mDNS discovery record.
@@ -609,6 +679,14 @@ pub enum P2pEvent {
         addresses: Vec<SocketAddr>,
         /// Human-readable failure detail.
         error: String,
+    },
+
+    /// Best-effort direct-path status for a peer.
+    DirectPathStatus {
+        /// Authenticated peer identity.
+        peer_id: PeerId,
+        /// Current direct-path status.
+        status: DirectPathStatus,
     },
 
     /// Bootstrap connection status
@@ -646,6 +724,41 @@ pub enum P2pEvent {
         /// The received data payload
         data: Vec<u8>,
     },
+}
+
+/// Best-effort direct-path status for an authenticated peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectPathStatus {
+    /// Direct-path establishment is still in progress or may still improve later.
+    Pending,
+    /// A direct path has been established.
+    Established {
+        /// Remote socket address for the established direct path.
+        remote_addr: SocketAddr,
+    },
+    /// A direct path is currently unavailable, but overall connectivity can still continue.
+    BestEffortUnavailable {
+        /// Normalized reason for unavailability.
+        reason: DirectPathUnavailableReason,
+    },
+    /// Direct-path establishment failed in a way the caller should treat as a hard failure.
+    Failed {
+        /// Human-readable error detail.
+        error: String,
+    },
+}
+
+/// Normalized reason why a direct path is not currently available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectPathUnavailableReason {
+    /// No viable direct candidates were available.
+    NoCandidates,
+    /// Network reachability or NAT behavior prevented direct establishment.
+    NatUnreachable,
+    /// Connectivity succeeded only via relay fallback.
+    RelayRequired,
+    /// Cause could not be normalized more precisely.
+    Unknown,
 }
 
 /// Reason for peer disconnection
@@ -720,17 +833,21 @@ pub enum EndpointError {
 async fn do_cleanup_connection(
     connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
     inner: &NatTraversalEndpoint,
-    reader_handles: &RwLock<HashMap<PeerId, tokio::task::AbortHandle>>,
+    reader_handles: &RwLock<HashMap<PeerId, ReaderTaskHandle>>,
+    direct_path_statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
     peer_id: &PeerId,
     reason: DisconnectReason,
 ) -> bool {
-    let _ = inner.remove_connection(peer_id);
+    if let Ok(Some(connection)) = inner.remove_connection(peer_id) {
+        connection.close(crate::VarInt::from_u32(0), b"Disconnected");
+    }
+    direct_path_statuses.write().remove(peer_id);
 
     // Abort the background reader task for this peer
     if let Some(handle) = reader_handles.write().await.remove(peer_id) {
-        handle.abort();
+        handle.abort_handle.abort();
     }
 
     let removed = remove_connected_peer(connected_peers, stats, event_tx, peer_id, reason).await;
@@ -865,17 +982,44 @@ async fn store_connected_peer(
 async fn bridge_nat_traversal_event(
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
+    direct_path_statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
     event: NatTraversalEvent,
 ) {
     match event {
         NatTraversalEvent::CoordinationRequested { .. } => {
             stats.write().await.nat_traversal_attempts += 1;
         }
-        NatTraversalEvent::ConnectionEstablished { .. } => {
+        NatTraversalEvent::ConnectionEstablished {
+            peer_id,
+            remote_address,
+            ..
+        } => {
             stats.write().await.nat_traversal_successes += 1;
+            publish_direct_path_status(
+                direct_path_statuses,
+                event_tx,
+                peer_id,
+                DirectPathStatus::Established {
+                    remote_addr: remote_address,
+                },
+            );
         }
-        NatTraversalEvent::TraversalFailed { peer_id, .. } => {
+        NatTraversalEvent::TraversalFailed {
+            peer_id,
+            error,
+            fallback_available,
+        } => {
             stats.write().await.failed_connections += 1;
+            let status = if fallback_available {
+                DirectPathStatus::BestEffortUnavailable {
+                    reason: normalize_direct_path_unavailable_reason(&error),
+                }
+            } else {
+                DirectPathStatus::Failed {
+                    error: error.to_string(),
+                }
+            };
+            publish_direct_path_status(direct_path_statuses, event_tx, peer_id, status);
             let _ = event_tx.send(P2pEvent::NatTraversalProgress {
                 peer_id,
                 phase: TraversalPhase::Failed,
@@ -884,6 +1028,14 @@ async fn bridge_nat_traversal_event(
         NatTraversalEvent::PhaseTransition {
             peer_id, to_phase, ..
         } => {
+            if !matches!(to_phase, TraversalPhase::Connected | TraversalPhase::Failed) {
+                publish_direct_path_status(
+                    direct_path_statuses,
+                    event_tx,
+                    peer_id,
+                    DirectPathStatus::Pending,
+                );
+            }
             let _ = event_tx.send(P2pEvent::NatTraversalProgress {
                 peer_id,
                 phase: to_phase,
@@ -928,15 +1080,24 @@ impl P2pEndpoint {
             ..Default::default()
         }));
         let stats_clone = Arc::clone(&stats);
+        let direct_path_statuses = Arc::new(ParkingRwLock::new(HashMap::new()));
+        let direct_path_statuses_clone = Arc::clone(&direct_path_statuses);
 
         // Create event callback that bridges low-level NAT events into
         // endpoint-level progress/accounting notifications.
         let event_callback = Box::new(move |event: NatTraversalEvent| {
             let event_tx = event_tx_clone.clone();
             let stats = stats_clone.clone();
+            let direct_path_statuses = direct_path_statuses_clone.clone();
 
             tokio::spawn(async move {
-                bridge_nat_traversal_event(stats.as_ref(), &event_tx, event).await;
+                bridge_nat_traversal_event(
+                    stats.as_ref(),
+                    &event_tx,
+                    direct_path_statuses.as_ref(),
+                    event,
+                )
+                .await;
             });
         });
 
@@ -1115,6 +1276,7 @@ impl P2pEndpoint {
         let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
         let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
+        let next_reader_generation = Arc::new(AtomicU64::new(1));
 
         let endpoint = Self {
             inner: inner_arc,
@@ -1137,10 +1299,12 @@ impl P2pEndpoint {
             port_mapping_state: Arc::new(ParkingRwLock::new(PortMappingSnapshot::default())),
             mdns_state: Arc::new(ParkingRwLock::new(MdnsSnapshot::default())),
             mdns_auto_connect_inflight: Arc::new(ParkingRwLock::new(HashSet::new())),
+            direct_path_statuses,
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
             reader_handles,
+            next_reader_generation,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
@@ -1228,6 +1392,11 @@ impl P2pEndpoint {
     /// Returns the current first-party mDNS runtime snapshot.
     pub fn mdns_snapshot(&self) -> MdnsSnapshot {
         self.mdns_state.read().clone()
+    }
+
+    /// Return the latest best-effort direct-path status for a peer, when known.
+    pub fn direct_path_status(&self, peer_id: PeerId) -> Option<DirectPathStatus> {
+        self.direct_path_statuses.read().get(&peer_id).cloned()
     }
 
     /// Returns whether this endpoint is willing to provide relay service for peers.
@@ -1406,6 +1575,99 @@ impl P2pEndpoint {
         addrs
     }
 
+    async fn peer_directory_snapshot(&self) -> PeerDirectorySnapshot {
+        let mut snapshot = PeerDirectorySnapshot::default();
+
+        for addr in self
+            .config
+            .known_peers
+            .iter()
+            .filter_map(TransportAddr::as_socket_addr)
+        {
+            snapshot.add_locator_claim(
+                None,
+                vec![addr],
+                PeerDiscoverySource::StaticKnownPeer,
+                None,
+            );
+        }
+
+        for addr in self
+            .manual_known_peer_udp_addrs
+            .read()
+            .await
+            .iter()
+            .copied()
+        {
+            snapshot.add_locator_claim(
+                None,
+                vec![addr],
+                PeerDiscoverySource::ManualKnownPeer,
+                None,
+            );
+        }
+
+        for addr in self.runtime_known_peer_udp_addrs() {
+            snapshot.add_locator_claim(
+                None,
+                vec![addr],
+                PeerDiscoverySource::RuntimeKnownPeer,
+                None,
+            );
+        }
+
+        {
+            let hints = self.peer_hint_records.read().await;
+            for (peer_id, record) in hints.iter() {
+                for addr in &record.addrs {
+                    snapshot.add_authenticated_addr(
+                        *peer_id,
+                        *addr,
+                        PeerDiscoverySource::PeerHints,
+                    );
+                }
+                snapshot.add_authenticated_capabilities(
+                    *peer_id,
+                    &record.capabilities,
+                    PeerDiscoverySource::PeerHints,
+                );
+            }
+        }
+
+        for peer in self.bootstrap_cache.all_peers().await {
+            snapshot.add_cached_peer(&peer);
+        }
+
+        for peer in self.mdns_snapshot().discovered_peers {
+            snapshot.add_locator_claim(
+                peer.claimed_peer_id,
+                peer.addresses.clone(),
+                PeerDiscoverySource::Mdns,
+                Some(peer),
+            );
+        }
+
+        snapshot
+    }
+
+    fn discovered_peer_allowed(&self, claimed_peer_id: Option<PeerId>) -> Result<(), String> {
+        match &self.config.trust {
+            TrustPolicy::AuthenticateOnly => Ok(()),
+            TrustPolicy::AllowedPeerIds(peer_ids) => {
+                let claimed_peer_id =
+                    claimed_peer_id.ok_or_else(|| "missing claimed peer identity".to_string())?;
+                if peer_ids.contains(&claimed_peer_id) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "peer {} is not in the discovery allowlist",
+                        hex::encode(claimed_peer_id.0)
+                    ))
+                }
+            }
+        }
+    }
+
     async fn connect_direct_candidates(
         &self,
         addrs: &[SocketAddr],
@@ -1435,6 +1697,7 @@ impl P2pEndpoint {
         }
     }
 
+    #[cfg(test)]
     async fn hinted_addrs_for_peer(&self, peer_id: PeerId) -> Vec<SocketAddr> {
         self.peer_hint_records
             .read()
@@ -1600,17 +1863,8 @@ impl P2pEndpoint {
         }
 
         if let Some(peer_id) = peer_id {
-            for addr in self.hinted_addrs_for_peer(peer_id).await {
-                if !explicit_addrs.contains(&addr) {
-                    explicit_addrs.push(addr);
-                }
-            }
-        }
-
-        if let Some(peer_id) = peer_id
-            && let Some(cached_peer) = self.bootstrap_cache.get_peer(&peer_id).await
-        {
-            for addr in cached_peer.preferred_addresses() {
+            let directory = self.peer_directory_snapshot().await;
+            for addr in directory.candidate_addrs_for_peer(peer_id) {
                 if !explicit_addrs.contains(&addr) {
                     explicit_addrs.push(addr);
                 }
@@ -1683,7 +1937,10 @@ impl P2pEndpoint {
                 }
             }
 
-            return self.connect_to_peer(peer_id, None).await;
+            #[allow(deprecated)]
+            {
+                return self.connect_to_peer(peer_id, None).await;
+            }
         }
 
         Err(EndpointError::NoAddress)
@@ -2154,6 +2411,9 @@ impl P2pEndpoint {
     ///
     /// Compatibility-oriented wrapper retained for older callers. Prefer
     /// [`Self::connect_peer`] for the canonical peer-oriented public surface.
+    #[deprecated(
+        note = "use connect_peer(peer_id) to route peer-oriented dials through the unified orchestrator"
+    )]
     pub async fn connect_to_peer(
         &self,
         peer_id: PeerId,
@@ -2237,6 +2497,14 @@ impl P2pEndpoint {
                 self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
                 self.coordinator_health.record_success(&coord_addr);
+                publish_direct_path_status(
+                    self.direct_path_statuses.as_ref(),
+                    &self.event_tx,
+                    peer_id,
+                    DirectPathStatus::Established {
+                        remote_addr: remote_address,
+                    },
+                );
 
                 return Ok(peer_conn);
             }
@@ -2291,6 +2559,14 @@ impl P2pEndpoint {
                         self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
                         self.coordinator_health.record_success(&coord_addr);
+                        publish_direct_path_status(
+                            self.direct_path_statuses.as_ref(),
+                            &self.event_tx,
+                            peer_id,
+                            DirectPathStatus::Established {
+                                remote_addr: remote_address,
+                            },
+                        );
 
                         return Ok(peer_conn);
                     }
@@ -2340,6 +2616,14 @@ impl P2pEndpoint {
                 self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
                 self.coordinator_health.record_success(&coord_addr);
+                publish_direct_path_status(
+                    self.direct_path_statuses.as_ref(),
+                    &self.event_tx,
+                    peer_id,
+                    DirectPathStatus::Established {
+                        remote_addr: remote_address,
+                    },
+                );
 
                 return Ok(peer_conn);
             }
@@ -2738,6 +3022,14 @@ impl P2pEndpoint {
                                 "✓ Relay connection succeeded to {} via {}",
                                 target, relay_addr
                             );
+                            publish_direct_path_status(
+                                self.direct_path_statuses.as_ref(),
+                                &self.event_tx,
+                                conn.peer_id,
+                                DirectPathStatus::BestEffortUnavailable {
+                                    reason: DirectPathUnavailableReason::RelayRequired,
+                                },
+                            );
                             return Ok((conn, ConnectionMethod::Relayed { relay: relay_addr }));
                         }
                         Ok(Err(e)) => {
@@ -2849,6 +3141,12 @@ impl P2pEndpoint {
 
         self.observe_peer_reachability(&peer_conn);
         self.register_connected_peer(peer_conn.clone()).await;
+        publish_direct_path_status(
+            self.direct_path_statuses.as_ref(),
+            &self.event_tx,
+            peer_id,
+            DirectPathStatus::Established { remote_addr: addr },
+        );
 
         Ok(peer_conn)
     }
@@ -3262,6 +3560,7 @@ impl P2pEndpoint {
             &*self.connected_peers,
             &*self.inner,
             &*self.reader_handles,
+            &*self.direct_path_statuses,
             &*self.stats,
             &self.event_tx,
             peer_id,
@@ -3540,29 +3839,45 @@ impl P2pEndpoint {
     /// discovery-oriented outbound connectivity.
     pub async fn connect_known_peers(&self) -> Result<usize, EndpointError> {
         let mut connected = 0;
+        let directory = self.peer_directory_snapshot().await;
         let static_known_peers = if self.config.discovery.static_known_peers {
             self.config.known_peers.clone()
         } else {
             Vec::new()
         };
-        let mdns_discovered_peers = if self.mdns_auto_connect_enabled() {
-            self.mdns_snapshot().discovered_peers
-        } else {
-            Vec::new()
-        };
-        let manual_udp_known_peers = self.manual_known_peer_udp_addrs.read().await.clone();
-        let runtime_udp_known_peers = self.runtime_known_peer_udp_addrs();
-        let auto_runtime_udp_known_peers = if self.config.discovery.auto_connect
-            == crate::unified_config::AutoConnectPolicy::Enabled
-        {
-            runtime_udp_known_peers
-                .iter()
-                .copied()
-                .filter(|addr| !manual_udp_known_peers.contains(addr))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let manual_udp_known_peers = directory
+            .locator_claims()
+            .filter(|record| {
+                record
+                    .sources
+                    .contains(&PeerDiscoverySource::ManualKnownPeer)
+            })
+            .flat_map(|record| record.addresses.clone())
+            .collect::<Vec<_>>();
+        let runtime_udp_known_peers = directory
+            .locator_claims()
+            .filter(|record| {
+                record
+                    .sources
+                    .contains(&PeerDiscoverySource::RuntimeKnownPeer)
+            })
+            .flat_map(|record| record.addresses.clone())
+            .collect::<Vec<_>>();
+        let auto_runtime_udp_known_peers =
+            if self.config.discovery.auto_connect.allows_automatic_dial() {
+                runtime_udp_known_peers
+                    .iter()
+                    .copied()
+                    .filter(|addr| !manual_udp_known_peers.contains(addr))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+        let mdns_discovered_peers = directory
+            .locator_claims()
+            .filter(|record| record.sources.contains(&PeerDiscoverySource::Mdns))
+            .filter_map(|record| record.mdns_peer.clone())
+            .collect::<Vec<_>>();
         let mut connected_udp_addrs = std::collections::HashSet::new();
 
         for addr in &static_known_peers {
@@ -3624,8 +3939,33 @@ impl P2pEndpoint {
                 continue;
             }
 
+            let mdns_policy = self
+                .config
+                .discovery
+                .mdns
+                .as_ref()
+                .map(|mdns| mdns.auto_connect)
+                .unwrap_or(AutoConnectPolicy::Disabled);
+            if !mdns_policy.allows_automatic_dial() {
+                if mdns_policy.requires_approval() {
+                    let _ = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
+                        peer: peer.clone(),
+                        reason: "approval required by discovery policy".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if let Err(reason) = self.discovered_peer_allowed(peer.claimed_peer_id) {
+                let _ = self.event_tx.send(P2pEvent::MdnsPeerIneligible {
+                    peer: peer.clone(),
+                    reason,
+                });
+                continue;
+            }
+
             match self
-                .connect_orchestrated(None, peer.addresses.clone())
+                .connect_orchestrated(peer.claimed_peer_id, peer.addresses.clone())
                 .await
             {
                 Ok(_) => {
@@ -3828,9 +4168,11 @@ impl P2pEndpoint {
     }
 
     fn mdns_auto_connect_enabled(&self) -> bool {
-        self.config.discovery.mdns.as_ref().is_some_and(|mdns| {
-            mdns.enabled && mdns.auto_connect == crate::unified_config::AutoConnectPolicy::Enabled
-        })
+        self.config
+            .discovery
+            .mdns
+            .as_ref()
+            .is_some_and(|mdns| mdns.enabled && mdns.auto_connect.allows_automatic_dial())
     }
 
     fn spawn_mdns_task(&self) {
@@ -3916,7 +4258,19 @@ impl P2pEndpoint {
                 let _ = self
                     .event_tx
                     .send(P2pEvent::MdnsPeerEligible { peer: peer.clone() });
-                if self.mdns_auto_connect_enabled() {
+                let mdns_policy = self
+                    .config
+                    .discovery
+                    .mdns
+                    .as_ref()
+                    .map(|mdns| mdns.auto_connect)
+                    .unwrap_or(AutoConnectPolicy::Disabled);
+                if mdns_policy.requires_approval() {
+                    let _ = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
+                        peer,
+                        reason: "approval required by discovery policy".to_string(),
+                    });
+                } else if self.mdns_auto_connect_enabled() {
                     self.schedule_mdns_auto_connect(peer);
                 }
             }
@@ -3954,6 +4308,13 @@ impl P2pEndpoint {
 
     fn schedule_mdns_auto_connect(&self, peer: MdnsPeerRecord) {
         if peer.addresses.is_empty() {
+            return;
+        }
+
+        if let Err(reason) = self.discovered_peer_allowed(peer.claimed_peer_id) {
+            let _ = self
+                .event_tx
+                .send(P2pEvent::MdnsPeerIneligible { peer, reason });
             return;
         }
 
@@ -4055,6 +4416,12 @@ impl P2pEndpoint {
             && snapshot.external_addr != Some(previous_addr)
         {
             let _ = self.inner.remove_local_external_candidate(previous_addr);
+            if let Some(mapped_addr) = snapshot.external_addr {
+                let _ = self.event_tx.send(P2pEvent::PortMappingAddressChanged {
+                    previous_addr,
+                    external_addr: mapped_addr,
+                });
+            }
         }
 
         if snapshot.active
@@ -4080,7 +4447,7 @@ impl P2pEndpoint {
                 "Aborting previous reader task for peer {:?} before connection replacement",
                 peer_id
             );
-            old_handle.abort();
+            old_handle.abort_handle.abort();
         }
     }
 
@@ -4090,6 +4457,7 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
+        let generation = self.next_reader_generation.fetch_add(1, Ordering::Relaxed);
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             loop {
@@ -4163,7 +4531,7 @@ impl P2pEndpoint {
                 }
             }
 
-            peer_id
+            (peer_id, generation)
         });
 
         // Abort any existing reader task for this peer before inserting the new one.
@@ -4175,9 +4543,15 @@ impl P2pEndpoint {
                 "Aborting previous reader task for peer {:?} (connection replaced)",
                 peer_id
             );
-            old_handle.abort();
+            old_handle.abort_handle.abort();
         }
-        handles.insert(peer_id, abort_handle);
+        handles.insert(
+            peer_id,
+            ReaderTaskHandle {
+                generation,
+                abort_handle,
+            },
+        );
     }
 
     async fn apply_peer_address_update(
@@ -4447,6 +4821,7 @@ impl P2pEndpoint {
         let connected_peers = Arc::clone(&self.connected_peers);
         let inner = Arc::clone(&self.inner);
         let reader_handles = Arc::clone(&self.reader_handles);
+        let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
         let stats = Arc::clone(&self.stats);
         let event_tx = self.event_tx.clone();
         let shutdown = self.shutdown.clone();
@@ -4463,8 +4838,8 @@ impl P2pEndpoint {
                     tasks.try_join_next()
                 };
 
-                let peer_id = match maybe_peer_id {
-                    Some(Ok(peer_id)) => peer_id,
+                let (peer_id, generation) = match maybe_peer_id {
+                    Some(Ok(reader_exit)) => reader_exit,
                     Some(Err(join_err)) => {
                         // Task was cancelled (aborted) — not a real disconnect.
                         // Abort handles are used by reconnection logic to replace
@@ -4480,15 +4855,29 @@ impl P2pEndpoint {
                     }
                 };
 
+                let should_cleanup = reader_handles
+                    .read()
+                    .await
+                    .get(&peer_id)
+                    .is_some_and(|handle| handle.generation == generation);
+                if !should_cleanup {
+                    debug!(
+                        "Ignoring stale reader task exit for peer {:?} (generation {})",
+                        peer_id, generation
+                    );
+                    continue;
+                }
+
                 debug!(
-                    "Reader task exited for peer {:?} — triggering immediate cleanup",
-                    peer_id
+                    "Reader task exited for peer {:?} (generation {}) — triggering immediate cleanup",
+                    peer_id, generation
                 );
 
                 do_cleanup_connection(
                     &*connected_peers,
                     &*inner,
                     &*reader_handles,
+                    &*direct_path_statuses,
                     &*stats,
                     &event_tx,
                     &peer_id,
@@ -4511,6 +4900,7 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
+        let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -4549,6 +4939,7 @@ impl P2pEndpoint {
                         &*connected_peers,
                         &*inner,
                         &*reader_handles,
+                        &*direct_path_statuses,
                         &*stats,
                         &event_tx,
                         peer_id,
@@ -4589,10 +4980,12 @@ impl Clone for P2pEndpoint {
             port_mapping_state: Arc::clone(&self.port_mapping_state),
             mdns_state: Arc::clone(&self.mdns_state),
             mdns_auto_connect_inflight: Arc::clone(&self.mdns_auto_connect_inflight),
+            direct_path_statuses: Arc::clone(&self.direct_path_statuses),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
+            next_reader_generation: Arc::clone(&self.next_reader_generation),
             coordinator_health: Arc::clone(&self.coordinator_health),
         }
     }
@@ -4601,6 +4994,12 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_broadcast_events(
+        events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
+    ) -> Vec<P2pEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
 
     #[test]
     fn test_endpoint_stats_default() {
@@ -4694,15 +5093,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_record_connection_established_updates_hole_punch_stats_once() {
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(4);
+        let remote_addr: SocketAddr = "198.51.100.44:9443".parse().expect("valid addr");
+        let peer_conn = PeerConnection {
+            peer_id: PeerId([0x23; 32]),
+            remote_addr: TransportAddr::Udp(remote_addr),
+            traversal_method: TraversalMethod::HolePunch,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        record_connection_established(&stats, &event_tx, &peer_conn, None).await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.successful_connections, 1);
+        assert_eq!(stats.direct_connections, 0);
+        assert_eq!(stats.relayed_connections, 0);
+        assert_eq!(stats.active_direct_incoming_connections, 0);
+        drop(stats);
+
+        match event_rx.recv().await.expect("peer connected event") {
+            P2pEvent::PeerConnected {
+                peer_id,
+                addr,
+                side,
+                traversal_method,
+            } => {
+                assert_eq!(peer_id, peer_conn.peer_id);
+                assert_eq!(addr, peer_conn.remote_addr);
+                assert_eq!(side, Side::Client);
+                assert_eq!(traversal_method, TraversalMethod::HolePunch);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn test_bridge_nat_traversal_event_does_not_emit_peer_connected() {
         let stats = RwLock::new(EndpointStats::default());
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(4);
+        let direct_path_statuses = ParkingRwLock::new(HashMap::new());
         let peer_id = PeerId([0x33; 32]);
         let remote_addr: SocketAddr = "198.51.100.7:9001".parse().expect("valid addr");
 
         bridge_nat_traversal_event(
             &stats,
             &event_tx,
+            &direct_path_statuses,
             NatTraversalEvent::ConnectionEstablished {
                 peer_id,
                 remote_address: remote_addr,
@@ -4717,10 +5159,72 @@ mod tests {
         assert_eq!(stats.successful_connections, 0);
         drop(stats);
 
-        assert!(matches!(
-            event_rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let collected = collect_broadcast_events(&mut event_rx);
+        assert!(
+            !collected
+                .iter()
+                .any(|event| matches!(event, P2pEvent::PeerConnected { .. })),
+            "NAT traversal bridge should not emit PeerConnected directly"
+        );
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::DirectPathStatus {
+                peer_id: observed_peer_id,
+                status: DirectPathStatus::Established { remote_addr: observed_addr },
+            } if *observed_peer_id == peer_id && *observed_addr == remote_addr
+        )));
+        assert_eq!(
+            direct_path_statuses.read().get(&peer_id),
+            Some(&DirectPathStatus::Established { remote_addr })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_nat_traversal_failure_surfaces_best_effort_status() {
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(4);
+        let direct_path_statuses = ParkingRwLock::new(HashMap::new());
+        let peer_id = PeerId([0x34; 32]);
+
+        bridge_nat_traversal_event(
+            &stats,
+            &event_tx,
+            &direct_path_statuses,
+            NatTraversalEvent::TraversalFailed {
+                peer_id,
+                error: NatTraversalError::HolePunchingFailed,
+                fallback_available: true,
+            },
+        )
+        .await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.failed_connections, 1);
+        drop(stats);
+
+        let collected = collect_broadcast_events(&mut event_rx);
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::DirectPathStatus {
+                peer_id: observed_peer_id,
+                status: DirectPathStatus::BestEffortUnavailable {
+                    reason: DirectPathUnavailableReason::NatUnreachable,
+                },
+            } if *observed_peer_id == peer_id
+        )));
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::NatTraversalProgress {
+                peer_id: observed_peer_id,
+                phase: TraversalPhase::Failed,
+            } if *observed_peer_id == peer_id
+        )));
+        assert_eq!(
+            direct_path_statuses.read().get(&peer_id),
+            Some(&DirectPathStatus::BestEffortUnavailable {
+                reason: DirectPathUnavailableReason::NatUnreachable,
+            })
+        );
     }
 
     #[tokio::test]
@@ -4815,6 +5319,61 @@ mod tests {
             event_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_connection_removes_direct_path_status_and_emits_disconnect() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x56; 32]);
+        let mut events = endpoint.subscribe();
+        endpoint
+            .register_connected_peer(PeerConnection {
+                peer_id,
+                remote_addr: TransportAddr::Udp("127.0.0.1:9556".parse().expect("valid addr")),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Server,
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            })
+            .await;
+        endpoint.direct_path_statuses.write().insert(
+            peer_id,
+            DirectPathStatus::Established {
+                remote_addr: "127.0.0.1:9556".parse().expect("valid addr"),
+            },
+        );
+
+        endpoint
+            .cleanup_connection(&peer_id, DisconnectReason::ConnectionLost)
+            .await;
+
+        assert!(endpoint.direct_path_status(peer_id).is_none());
+        assert!(!endpoint.is_connected(&peer_id).await);
+        assert_eq!(endpoint.stats().await.active_connections, 0);
+
+        let collected = collect_broadcast_events(&mut events);
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::PeerDisconnected {
+                peer_id: observed_peer_id,
+                reason: DisconnectReason::ConnectionLost,
+            } if *observed_peer_id == peer_id
+        )));
+
+        endpoint.shutdown().await;
     }
 
     #[test]
@@ -5020,6 +5579,105 @@ mod tests {
 
             endpoint.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_address_change_event_surfaces() {
+        let config = P2pConfig::builder()
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        if let Ok(endpoint) = P2pEndpoint::new(config).await {
+            let mut events = endpoint.subscribe();
+            let first_addr: SocketAddr = "198.51.100.90:42000".parse().expect("valid addr");
+            let second_addr: SocketAddr = "198.51.100.91:42000".parse().expect("valid addr");
+
+            endpoint.apply_port_mapping_snapshot(PortMappingSnapshot {
+                active: true,
+                external_addr: Some(first_addr),
+            });
+            endpoint.apply_port_mapping_snapshot(PortMappingSnapshot {
+                active: true,
+                external_addr: Some(second_addr),
+            });
+
+            let collected = collect_broadcast_events(&mut events);
+            assert!(collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::PortMappingAddressChanged {
+                    previous_addr,
+                    external_addr,
+                } if *previous_addr == first_addr && *external_addr == second_addr
+            )));
+
+            endpoint.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_port_mapping_startup_failure_is_non_fatal_for_endpoint_connectivity() {
+        let listener = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("listener config should build"),
+        )
+        .await
+        .expect("listener should bind");
+
+        let listener_addr = localhost_addr(listener.local_addr().expect("listener addr"));
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .build()
+                .expect("endpoint config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let mut events = endpoint.subscribe();
+        endpoint.apply_port_mapping_event(PortMappingEvent::Failed {
+            error: "startup mapping failed".to_string(),
+        });
+
+        let accept_handle = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(20), listener.accept())
+                    .await
+                    .expect("listener accept should not time out")
+            }
+        });
+
+        let connection = tokio::time::timeout(
+            Duration::from_secs(20),
+            endpoint.connect_addr(listener_addr),
+        )
+        .await
+        .expect("direct connect should not time out")
+        .expect("direct connect should succeed");
+
+        assert_eq!(connection.remote_addr.as_socket_addr(), Some(listener_addr));
+        assert!(!endpoint.port_mapping_active());
+        assert_eq!(endpoint.port_mapping_addr(), None);
+
+        let collected = collect_broadcast_events(&mut events);
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::PortMappingFailed { error } if error == "startup mapping failed"
+        )));
+
+        endpoint.shutdown().await;
+        listener.shutdown().await;
+        let _ = accept_handle.await;
     }
 
     #[tokio::test]
@@ -5520,6 +6178,114 @@ mod tests {
 
         assert_eq!(endpoint_a.connected_peers().await.len(), 0);
         assert_eq!(endpoint_a.mdns_snapshot().discovered_peers.len(), 1);
+
+        endpoint_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_approval_required_surfaces_without_auto_connecting() {
+        let node_b = crate::Node::bind(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .await
+        .expect("node_b should bind");
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::BrowseOnly,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::ApprovalRequired,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let mut events = endpoint_a.subscribe();
+        let addr_b = localhost_addr(node_b.local_addr().expect("node_b addr"));
+        endpoint_a.apply_mdns_runtime_event(MdnsRuntimeEvent::PeerEligible(mdns_peer_record(
+            addr_b,
+            node_b.peer_id(),
+        )));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(endpoint_a.connected_peers().await.len(), 0);
+        let collected = collect_broadcast_events(&mut events);
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::MdnsPeerApprovalRequired { peer, .. } if peer.claimed_peer_id == Some(node_b.peer_id())
+        )));
+
+        endpoint_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_mdns_allowlist_rejects_unapproved_peer_before_auto_connect() {
+        let node_b = crate::Node::bind(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .await
+        .expect("node_b should bind");
+        let allowed_peer = PeerId([0xac; 32]);
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .allow_discovered_peer(allowed_peer)
+                .mdns(crate::unified_config::MdnsConfig {
+                    enabled: true,
+                    service: Some("ant-quic".to_string()),
+                    namespace: Some("workspace-a".to_string()),
+                    mode: crate::unified_config::MdnsMode::BrowseOnly,
+                    auto_connect: crate::unified_config::AutoConnectPolicy::Enabled,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let mut events = endpoint_a.subscribe();
+        let addr_b = localhost_addr(node_b.local_addr().expect("node_b addr"));
+        endpoint_a.apply_mdns_runtime_event(MdnsRuntimeEvent::PeerEligible(mdns_peer_record(
+            addr_b,
+            node_b.peer_id(),
+        )));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(endpoint_a.connected_peers().await.len(), 0);
+        let collected = collect_broadcast_events(&mut events);
+        assert!(collected.iter().any(|event| matches!(
+            event,
+            P2pEvent::MdnsPeerIneligible { peer, reason }
+                if peer.claimed_peer_id == Some(node_b.peer_id())
+                    && reason.contains("not in the discovery allowlist")
+        )));
+        assert!(
+            !collected
+                .iter()
+                .any(|event| matches!(event, P2pEvent::MdnsAutoConnectAttempted { .. })),
+            "allowlist rejection should happen before scheduling auto-connect"
+        );
 
         endpoint_a.shutdown().await;
         node_b.shutdown().await;

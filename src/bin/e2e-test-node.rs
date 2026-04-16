@@ -37,6 +37,7 @@ use ant_quic::{
     PeerId,
     TraversalPhase,
     // v0.2: AuthConfig removed - TLS handles peer authentication via ML-DSA-65
+    unified_config::{AutoConnectPolicy, MdnsConfig, MdnsMode},
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -107,18 +108,88 @@ struct Args {
     #[arg(long)]
     pqc_mtu: bool,
 
+    /// Disable best-effort router port mapping (UPnP IGD)
+    #[arg(long)]
+    no_port_mapping: bool,
+
     /// JSON output for machine parsing
     #[arg(long)]
     json: bool,
+
+    /// Send incrementing counters to connected peers
+    #[arg(long)]
+    counter_test: bool,
+
+    /// Counter interval in milliseconds
+    #[arg(long, default_value = "1000")]
+    counter_interval: u64,
 
     /// Accept data from peers and echo it back
     #[arg(long)]
     echo: bool,
 
+    /// Enable first-party mDNS browse/advertise support
+    #[arg(long, conflicts_with = "no_mdns")]
+    mdns: bool,
+
+    /// Disable first-party mDNS browse/advertise support
+    #[arg(long, conflicts_with = "mdns")]
+    no_mdns: bool,
+
+    /// mDNS service/application scope
+    #[arg(long)]
+    mdns_service: Option<String>,
+
+    /// Optional mDNS namespace/workspace scope
+    #[arg(long)]
+    mdns_namespace: Option<String>,
+
+    /// mDNS participation mode
+    #[arg(long, value_enum)]
+    mdns_mode: Option<CliMdnsMode>,
+
+    /// Whether eligible mDNS discoveries should auto-connect
+    #[arg(long, value_enum)]
+    mdns_auto_connect: Option<CliMdnsAutoConnect>,
+
     /// Show progress updates during data transfer
     #[arg(long)]
     show_progress: bool,
     // v0.2: no_auth flag removed - TLS handles peer authentication via ML-DSA-65
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliMdnsMode {
+    Browse,
+    Advertise,
+    Both,
+}
+
+impl From<CliMdnsMode> for MdnsMode {
+    fn from(value: CliMdnsMode) -> Self {
+        match value {
+            CliMdnsMode::Browse => Self::BrowseOnly,
+            CliMdnsMode::Advertise => Self::AdvertiseOnly,
+            CliMdnsMode::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliMdnsAutoConnect {
+    Disabled,
+    ApprovalRequired,
+    Enabled,
+}
+
+impl From<CliMdnsAutoConnect> for AutoConnectPolicy {
+    fn from(value: CliMdnsAutoConnect) -> Self {
+        match value {
+            CliMdnsAutoConnect::Disabled => Self::Disabled,
+            CliMdnsAutoConnect::ApprovalRequired => Self::ApprovalRequired,
+            CliMdnsAutoConnect::Enabled => Self::Enabled,
+        }
+    }
 }
 
 /// Peer connection information for metrics
@@ -201,6 +272,9 @@ struct RuntimeStats {
     data_chunks_sent: AtomicU64,
     data_chunks_verified: AtomicU64,
     data_verification_failures: AtomicU64,
+    counters_sent: AtomicU64,
+    counters_received: AtomicU64,
+    echoes_sent: AtomicU64,
 }
 
 /// Peer state tracking
@@ -287,6 +361,41 @@ async fn main() -> anyhow::Result<()> {
         info!("Using PQC-optimized MTU settings");
     }
 
+    if args.no_port_mapping {
+        builder = builder.port_mapping_enabled(false);
+        info!("Best-effort router port mapping disabled");
+    }
+
+    let mdns_requested = args.mdns
+        || args.mdns_service.is_some()
+        || args.mdns_namespace.is_some()
+        || args.mdns_mode.is_some()
+        || args.mdns_auto_connect.is_some();
+    if args.no_mdns && mdns_requested {
+        anyhow::bail!("--no-mdns cannot be combined with other mDNS configuration flags");
+    }
+
+    if args.no_mdns {
+        builder = builder.mdns_enabled(false);
+        info!("First-party mDNS disabled");
+    } else {
+        let mut mdns_config = MdnsConfig::default();
+        if let Some(service) = args.mdns_service.clone() {
+            mdns_config.service = Some(service);
+        }
+        if let Some(namespace) = args.mdns_namespace.clone() {
+            mdns_config.namespace = Some(namespace);
+        }
+        if let Some(mode) = args.mdns_mode {
+            mdns_config.mode = mode.into();
+        }
+        if let Some(auto_connect) = args.mdns_auto_connect {
+            mdns_config.auto_connect = auto_connect.into();
+        }
+
+        builder = builder.mdns(mdns_config);
+    }
+
     // v0.2: Authentication now handled by TLS via ML-DSA-65 - no separate config needed
 
     let config = builder.build()?;
@@ -329,6 +438,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("═══════════════════════════════════════════════════════════════");
+
+    if args.json {
+        if let Some(addr) = endpoint.local_addr() {
+            println!(
+                r#"{{"event":"local_identity","peer_id":"{}","addr":"{}"}}"#,
+                hex::encode(peer_id.0),
+                addr
+            );
+        } else {
+            println!(
+                r#"{{"event":"local_identity","peer_id":"{}"}}"#,
+                hex::encode(peer_id.0)
+            );
+        }
+    }
 
     // Setup state
     let shutdown = CancellationToken::new();
@@ -448,8 +572,25 @@ async fn main() -> anyhow::Result<()> {
                         .bytes_received
                         .fetch_add(data.len() as u64, Ordering::SeqCst);
 
-                    // Try to deserialize as verified chunk
-                    if verify_data {
+                    if data.len() == 8 {
+                        if let Ok(bytes) = data[..8].try_into() {
+                            let counter = u64::from_be_bytes(bytes);
+                            stats_recv.counters_received.fetch_add(1, Ordering::SeqCst);
+                            if json {
+                                println!(
+                                    r#"{{"event":"counter_received","counter":{},"peer":"{}"}}"#,
+                                    counter,
+                                    format_peer_id(&peer_id)
+                                );
+                            } else {
+                                debug!(
+                                    "Received counter {} from {}",
+                                    counter,
+                                    format_peer_id(&peer_id)
+                                );
+                            }
+                        }
+                    } else if verify_data {
                         if let Ok(chunk) = serde_json::from_slice::<VerifiedDataChunk>(&data) {
                             if chunk.verify() {
                                 stats_recv
@@ -497,13 +638,18 @@ async fn main() -> anyhow::Result<()> {
 
                     // Echo back if enabled
                     if echo_enabled {
-                        if let Err(e) = endpoint_recv.send(&peer_id, &data).await {
-                            debug!("Failed to echo: {}", e);
-                        } else {
-                            stats_recv
-                                .bytes_sent
-                                .fetch_add(data.len() as u64, Ordering::SeqCst);
-                        }
+                        let endpoint_send = endpoint_recv.clone();
+                        let stats_send = stats_recv.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = endpoint_send.send(&peer_id, &data).await {
+                                debug!("Failed to echo: {}", e);
+                            } else {
+                                stats_send
+                                    .bytes_sent
+                                    .fetch_add(data.len() as u64, Ordering::SeqCst);
+                                stats_send.echoes_sent.fetch_add(1, Ordering::SeqCst);
+                            }
+                        });
                     }
                 }
                 Err(_) => {
@@ -513,37 +659,76 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let counter_handle = if args.counter_test {
+        let endpoint_counter = endpoint.clone();
+        let shutdown_counter = shutdown.clone();
+        let stats_counter = stats.clone();
+        let interval_ms = args.counter_interval;
+        let json = args.json;
+
+        Some(tokio::spawn(async move {
+            let mut counter: u64 = 0;
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+
+            while !shutdown_counter.is_cancelled() {
+                interval.tick().await;
+                counter += 1;
+
+                let connected_peers = endpoint_counter.connected_peers().await;
+                let mut send_tasks = Vec::with_capacity(connected_peers.len());
+                for peer in connected_peers {
+                    let endpoint_send = endpoint_counter.clone();
+                    let stats_send = stats_counter.clone();
+                    let peer_id = peer.peer_id;
+                    send_tasks.push(tokio::spawn(async move {
+                        let data = counter.to_be_bytes();
+                        match endpoint_send.send(&peer_id, &data).await {
+                            Ok(()) => {
+                                stats_send.counters_sent.fetch_add(1, Ordering::SeqCst);
+                                stats_send
+                                    .bytes_sent
+                                    .fetch_add(data.len() as u64, Ordering::SeqCst);
+                                if json {
+                                    println!(
+                                        r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
+                                        counter,
+                                        format_peer_id(&peer_id)
+                                    );
+                                }
+                            }
+                            Err(e) => debug!(
+                                "Failed to send counter {} to {}: {}",
+                                counter,
+                                format_peer_id(&peer_id),
+                                e
+                            ),
+                        }
+                    }));
+                }
+
+                for task in send_tasks {
+                    if let Err(e) = task.await {
+                        debug!("Counter send task join error: {}", e);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Connect to known peers
     if !args.known_peers.is_empty() {
         info!("Connecting to {} known peer(s)...", args.known_peers.len());
-        for peer_addr in &args.known_peers {
-            info!("Connecting to peer at {}...", peer_addr);
-            match endpoint.connect_addr(*peer_addr).await {
-                Ok(peer) => {
-                    info!(
-                        "Connected to peer: {} at {}",
-                        format_peer_id(&peer.peer_id),
-                        peer_addr
-                    );
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
-
-                    // Track peer
-                    let mut peers_guard = peers.write().await;
-                    peers_guard.insert(
-                        peer.peer_id,
-                        PeerState {
-                            peer_id: peer.peer_id,
-                            remote_addr: TransportAddr::Udp(*peer_addr),
-                            connected_at: Instant::now(),
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                            connection_type: "direct".to_string(),
-                        },
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to connect to {}: {}", peer_addr, e);
-                }
+        match endpoint.connect_known_peers().await {
+            Ok(count) => {
+                info!("Connected to {} known peer(s)", count);
+                stats
+                    .connections_initiated
+                    .fetch_add(count as u64, Ordering::SeqCst);
+            }
+            Err(e) => {
+                error!("Failed to connect to known peers: {}", e);
             }
         }
     }
@@ -713,6 +898,9 @@ async fn main() -> anyhow::Result<()> {
     endpoint.shutdown().await;
     event_handle.abort();
     recv_handle.abort();
+    if let Some(h) = counter_handle {
+        h.abort();
+    }
 
     if let Some(h) = metrics_handle {
         h.abort();
@@ -753,6 +941,17 @@ async fn handle_event(
                 | ant_quic::TraversalMethod::PortPrediction => "nat_traversed",
                 ant_quic::TraversalMethod::Relay => "relayed",
             };
+            peers.write().await.insert(
+                *peer_id,
+                PeerState {
+                    peer_id: *peer_id,
+                    remote_addr: addr.clone(),
+                    connected_at: Instant::now(),
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    connection_type: connection_type.to_string(),
+                },
+            );
             if json {
                 println!(
                     r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}","connection_type":"{}"}}"#,
@@ -785,6 +984,40 @@ async fn handle_event(
                     format_peer_id(peer_id),
                     reason
                 );
+            }
+        }
+        P2pEvent::PortMappingEstablished { external_addr }
+        | P2pEvent::PortMappingRenewed { external_addr } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_established","addr":"{}"}}"#,
+                    external_addr
+                );
+            } else {
+                info!("Port mapping active at {}", external_addr);
+            }
+        }
+        P2pEvent::PortMappingAddressChanged {
+            previous_addr,
+            external_addr,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_address_changed","previous_addr":"{}","external_addr":"{}"}}"#,
+                    previous_addr, external_addr
+                );
+            } else {
+                info!(
+                    "Port mapping address changed from {} to {}",
+                    previous_addr, external_addr
+                );
+            }
+        }
+        P2pEvent::PortMappingFailed { error } => {
+            if json {
+                println!(r#"{{"event":"port_mapping_failed","error":"{}"}}"#, error);
+            } else {
+                warn!("Port mapping failed: {}", error);
             }
         }
         P2pEvent::ExternalAddressDiscovered { addr } => {
@@ -824,6 +1057,83 @@ async fn handle_event(
                     "NAT traversal progress: {} - {:?}",
                     format_peer_id(peer_id),
                     phase
+                );
+            }
+        }
+        P2pEvent::MdnsServiceAdvertised {
+            service,
+            namespace,
+            instance_fullname,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_service_advertised","service":"{}","namespace":{},"instance_fullname":"{}"}}"#,
+                    service,
+                    namespace
+                        .as_ref()
+                        .map(|value| format!("\"{}\"", value))
+                        .unwrap_or_else(|| "null".to_string()),
+                    instance_fullname
+                );
+            } else {
+                info!(
+                    "mDNS service advertised: {} ({})",
+                    instance_fullname,
+                    namespace
+                        .clone()
+                        .unwrap_or_else(|| "no namespace".to_string())
+                );
+            }
+        }
+        P2pEvent::MdnsPeerDiscovered { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_discovered","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    peer.addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                info!("mDNS peer discovered: {}", peer.fullname);
+            }
+        }
+        P2pEvent::MdnsPeerUpdated { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_updated","fullname":"{}","addresses":"{}"}}"#,
+                    peer.fullname,
+                    peer.addresses
+                        .iter()
+                        .map(SocketAddr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        P2pEvent::MdnsPeerRemoved { peer } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_removed","fullname":"{}"}}"#,
+                    peer.fullname
+                );
+            }
+        }
+        P2pEvent::MdnsAutoConnectSucceeded { peer, .. } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_auto_connect_succeeded","fullname":"{}"}}"#,
+                    peer.fullname
+                );
+            }
+        }
+        P2pEvent::MdnsAutoConnectFailed { peer, error, .. } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_auto_connect_failed","fullname":"{}","error":"{}"}}"#,
+                    peer.fullname, error
                 );
             }
         }

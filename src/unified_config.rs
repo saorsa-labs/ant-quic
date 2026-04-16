@@ -33,6 +33,7 @@ use crate::config::nat_timeouts::TimeoutConfig;
 use crate::crypto::pqc::PqcConfig;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::host_identity::HostIdentity;
+use crate::nat_traversal_api::PeerId;
 use crate::transport::{TransportAddr, TransportProvider, TransportRegistry};
 
 /// Policy controlling whether discovered peers should be connected automatically.
@@ -41,8 +42,22 @@ pub enum AutoConnectPolicy {
     /// Do not automatically connect to newly discovered peers.
     #[default]
     Disabled,
+    /// Surface discovered peers for explicit approval before auto-dialing.
+    ApprovalRequired,
     /// Allow automatically connecting to discovered peers.
     Enabled,
+}
+
+impl AutoConnectPolicy {
+    /// Whether this policy allows the transport to dial automatically.
+    pub const fn allows_automatic_dial(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// Whether this policy requires an explicit approval step before auto-dialing.
+    pub const fn requires_approval(self) -> bool {
+        matches!(self, Self::ApprovalRequired)
+    }
 }
 
 /// Mode controlling whether the local node browses, advertises, or does both via mDNS.
@@ -136,11 +151,33 @@ impl DiscoveryPolicy {
 }
 
 /// Lightweight trust policy scaffold for the unified connectivity plan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TrustPolicy {
     /// Require authenticated peers but apply no additional discovery scoping.
     #[default]
     AuthenticateOnly,
+    /// Only allow discovered peers whose durable identity is in the allowlist.
+    AllowedPeerIds(Vec<PeerId>),
+}
+
+impl TrustPolicy {
+    /// Return the configured allowlist, if any.
+    pub fn allowed_peer_ids(&self) -> Option<&[PeerId]> {
+        match self {
+            Self::AuthenticateOnly => None,
+            Self::AllowedPeerIds(peer_ids) => Some(peer_ids.as_slice()),
+        }
+    }
+
+    /// Whether a discovered peer ID is allowed by this policy.
+    pub fn allows_discovered_peer(&self, peer_id: Option<PeerId>) -> bool {
+        match self {
+            Self::AuthenticateOnly => true,
+            Self::AllowedPeerIds(peer_ids) => {
+                peer_id.is_some_and(|peer_id| peer_ids.contains(&peer_id))
+            }
+        }
+    }
 }
 
 /// Configuration for ant-quic P2P endpoints
@@ -743,6 +780,21 @@ impl P2pConfigBuilder {
     /// Set the trust policy scaffold.
     pub fn trust_policy(mut self, trust: TrustPolicy) -> Self {
         self.trust = Some(trust);
+        self
+    }
+
+    /// Allow a discovered peer identity for automatic discovery-driven dialing.
+    pub fn allow_discovered_peer(mut self, peer_id: PeerId) -> Self {
+        let trust = self.trust.unwrap_or_default();
+        self.trust = Some(match trust {
+            TrustPolicy::AuthenticateOnly => TrustPolicy::AllowedPeerIds(vec![peer_id]),
+            TrustPolicy::AllowedPeerIds(mut peer_ids) => {
+                if !peer_ids.contains(&peer_id) {
+                    peer_ids.push(peer_id);
+                }
+                TrustPolicy::AllowedPeerIds(peer_ids)
+            }
+        });
         self
     }
 
@@ -1399,6 +1451,47 @@ mod tests {
         assert_eq!(mdns.mode, MdnsMode::BrowseOnly);
         assert_eq!(mdns.auto_connect, AutoConnectPolicy::Enabled);
         assert_eq!(mdns.metadata, metadata);
+    }
+
+    #[test]
+    fn test_mdns_builder_supports_approval_required() {
+        let config = P2pConfig::builder()
+            .mdns_auto_connect(AutoConnectPolicy::ApprovalRequired)
+            .build()
+            .expect("approval-required mDNS config should build");
+
+        let mdns = config.discovery.mdns.expect("mDNS config should exist");
+        assert_eq!(mdns.auto_connect, AutoConnectPolicy::ApprovalRequired);
+        assert!(mdns.auto_connect.requires_approval());
+        assert!(!mdns.auto_connect.allows_automatic_dial());
+    }
+
+    #[test]
+    fn test_allow_discovered_peer_builder_deduplicates_allowlist() {
+        let peer_id = PeerId([0x42; 32]);
+        let config = P2pConfig::builder()
+            .allow_discovered_peer(peer_id)
+            .allow_discovered_peer(peer_id)
+            .build()
+            .expect("allowlist config should build");
+
+        assert_eq!(
+            config.trust,
+            TrustPolicy::AllowedPeerIds(vec![peer_id]),
+            "allowlist builder should deduplicate peer IDs"
+        );
+    }
+
+    #[test]
+    fn test_trust_policy_allows_discovered_peer() {
+        let allowed = PeerId([0x43; 32]);
+        let denied = PeerId([0x44; 32]);
+        let policy = TrustPolicy::AllowedPeerIds(vec![allowed]);
+
+        assert_eq!(policy.allowed_peer_ids(), Some(&[allowed][..]));
+        assert!(policy.allows_discovered_peer(Some(allowed)));
+        assert!(!policy.allows_discovered_peer(Some(denied)));
+        assert!(!policy.allows_discovered_peer(None));
     }
 
     #[test]

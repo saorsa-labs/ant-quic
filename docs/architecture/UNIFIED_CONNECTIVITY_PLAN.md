@@ -55,8 +55,9 @@ not complete yet.
 
 ### Still not present
 
-- there is **not yet** a generalized cross-provider peer directory abstraction;
-  the current landed mDNS directory is scoped to first-party LAN discovery
+- a provider-neutral peer directory now exists in `src/peer_directory.rs`, but
+  broader discovery providers beyond static peers and first-party mDNS still
+  need to feed it over time
 - future PCP/NAT-PMP extensions are still plan-only; the current landed router
   assist runtime remains UPnP IGD-first
 
@@ -225,7 +226,8 @@ or relays.
 
 ### 1. Peer directory
 
-Add an internal peer directory that stores discovery and reachability state.
+The internal peer directory stores discovery and reachability state across
+providers.
 
 Once a peer is authenticated, its record is keyed by `PeerId`.
 
@@ -681,6 +683,18 @@ strategy.
 - scripted VPS connectivity matrix passes with **100% successful end-to-end connectivity**
 - all validation uses the same pure `ant-quic` binary
 
+### Validation evidence (2026-04-16)
+
+- `scripts/run-connectivity-matrix.sh` executed the release binary across 4 VPS
+  nodes plus the MacBook host and 2 local studio machines
+- the final proof run completed **3 full loops** with logs under
+  `target/connectivity-matrix/20260416-055546`
+- public-to-local NAT traversal succeeded for every public/local pair in every
+  loop, and the public IPv6 matrix succeeded for every public/public pair in
+  every loop
+- the collected `ant-quic` logs were swept for panics, backtraces,
+  segmentation faults, and structured `ERROR` lines before release gating
+
 ## Cross-repo migration notes
 
 ### `saorsa-gossip`
@@ -831,8 +845,10 @@ This plan requires updates to:
 1. land prerequisite relay and identity fixes
 2. implement the internal unified orchestrator
 3. route all public connect surfaces through it
-4. define the peer directory and discovery provider abstraction
-5. land the real optional scoped mDNS provider runtime
+4. finish broad provider ingestion on top of the landed peer directory
+5. keep expanding the real optional scoped mDNS provider runtime where consumer
+   parity still needs work
 6. cut consumers over only after the provider can replace app-local mDNS
-7. remove strategy-selection leakage from the CLI
-8. prove the result locally and on the VPS fleet using only the pure `ant-quic` binary
+7. remove remaining strategy-selection leakage from the CLI
+8. keep proving the result locally and on the VPS fleet using only the pure
+   `ant-quic` binary

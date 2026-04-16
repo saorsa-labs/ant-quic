@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
+use tracing_subscriber::EnvFilter;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -52,6 +53,11 @@ async fn make_node(known: Vec<SocketAddr>) -> P2pEndpoint {
 /// registered in `reader_handles`, shadowing the new reader task.
 #[tokio::test]
 async fn recv_after_reconnect() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
     let b = Arc::new(make_node(vec![]).await);
     let b_addr = normalize(b.local_addr().expect("bound addr"));
     let b_id = b.peer_id();
@@ -65,7 +71,12 @@ async fn recv_after_reconnect() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let conn = a.connect_addr(b_addr).await.expect("connect");
     assert_eq!(conn.peer_id, b_id);
-    let _ = accept1.await;
+    let accepted1 = accept1
+        .await
+        .expect("accept1 join")
+        .expect("accept1 timeout")
+        .expect("accept1 none");
+    assert_eq!(accepted1.peer_id, a_id);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify first session works
@@ -88,8 +99,14 @@ async fn recv_after_reconnect() {
     let b3 = Arc::clone(&b);
     let accept2 = tokio::spawn(async move { timeout(TIMEOUT, b3.accept()).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    a.connect_addr(b_addr).await.expect("reconnect");
-    let _ = accept2.await;
+    let reconnect = a.connect_addr(b_addr).await.expect("reconnect");
+    assert_eq!(reconnect.peer_id, b_id);
+    let accepted2 = accept2
+        .await
+        .expect("accept2 join")
+        .expect("accept2 timeout")
+        .expect("accept2 none");
+    assert_eq!(accepted2.peer_id, a_id);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Regression check: recv() must work on the new connection.

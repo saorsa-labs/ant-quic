@@ -300,6 +300,7 @@ impl From<CliMdnsMode> for MdnsMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliMdnsAutoConnect {
     Disabled,
+    ApprovalRequired,
     Enabled,
 }
 
@@ -307,6 +308,7 @@ impl From<CliMdnsAutoConnect> for AutoConnectPolicy {
     fn from(value: CliMdnsAutoConnect) -> Self {
         match value {
             CliMdnsAutoConnect::Disabled => Self::Disabled,
+            CliMdnsAutoConnect::ApprovalRequired => Self::ApprovalRequired,
             CliMdnsAutoConnect::Enabled => Self::Enabled,
         }
     }
@@ -680,31 +682,43 @@ async fn main() -> anyhow::Result<()> {
                 counter += 1;
 
                 let peers = endpoint_counter.connected_peers().await;
+                let mut send_tasks = Vec::with_capacity(peers.len());
                 for peer in peers {
-                    let data = counter.to_be_bytes();
-                    match endpoint_counter.send(&peer.peer_id, &data).await {
-                        Ok(()) => {
-                            stats_counter.counters_sent.fetch_add(1, Ordering::SeqCst);
-                            stats_counter
-                                .bytes_sent
-                                .fetch_add(data.len() as u64, Ordering::SeqCst);
-                            if json {
-                                println!(
-                                    r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
-                                    counter,
-                                    hex::encode(&peer.peer_id.0[..8])
-                                );
-                            } else {
-                                info!(
-                                    "Sent counter {} to peer {}",
-                                    counter,
-                                    hex::encode(&peer.peer_id.0[..8])
-                                );
+                    let endpoint_send = endpoint_counter.clone();
+                    let stats_send = stats_counter.clone();
+                    let peer_id = peer.peer_id;
+                    send_tasks.push(tokio::spawn(async move {
+                        let data = counter.to_be_bytes();
+                        match endpoint_send.send(&peer_id, &data).await {
+                            Ok(()) => {
+                                stats_send.counters_sent.fetch_add(1, Ordering::SeqCst);
+                                stats_send
+                                    .bytes_sent
+                                    .fetch_add(data.len() as u64, Ordering::SeqCst);
+                                if json {
+                                    println!(
+                                        r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
+                                        counter,
+                                        hex::encode(&peer_id.0[..8])
+                                    );
+                                } else {
+                                    info!(
+                                        "Sent counter {} to peer {}",
+                                        counter,
+                                        hex::encode(&peer_id.0[..8])
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to send counter to {:?}: {}", peer_id, e);
                             }
                         }
-                        Err(e) => {
-                            debug!("Failed to send counter: {}", e);
-                        }
+                    }));
+                }
+
+                for task in send_tasks {
+                    if let Err(e) = task.await {
+                        debug!("Counter send task join error: {}", e);
                     }
                 }
             }
@@ -768,14 +782,18 @@ async fn main() -> anyhow::Result<()> {
 
                         // Echo back if enabled
                         if echo_enabled {
-                            if let Err(e) = endpoint_echo.send(&peer_id, &data).await {
-                                debug!("Failed to echo: {}", e);
-                            } else {
-                                stats_echo.echoes_sent.fetch_add(1, Ordering::SeqCst);
-                                stats_echo
-                                    .bytes_sent
-                                    .fetch_add(data.len() as u64, Ordering::SeqCst);
-                            }
+                            let endpoint_send = endpoint_echo.clone();
+                            let stats_send = stats_echo.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = endpoint_send.send(&peer_id, &data).await {
+                                    debug!("Failed to echo: {}", e);
+                                } else {
+                                    stats_send.echoes_sent.fetch_add(1, Ordering::SeqCst);
+                                    stats_send
+                                        .bytes_sent
+                                        .fetch_add(data.len() as u64, Ordering::SeqCst);
+                                }
+                            });
                         }
                     }
                     Err(_) => {
@@ -1060,6 +1078,22 @@ async fn handle_event_with_state(
                 info!("Port mapping renewed: {}", external_addr);
             }
         }
+        P2pEvent::PortMappingAddressChanged {
+            previous_addr,
+            external_addr,
+        } => {
+            if json {
+                println!(
+                    r#"{{"event":"port_mapping_address_changed","previous_addr":"{}","external_addr":"{}"}}"#,
+                    previous_addr, external_addr
+                );
+            } else {
+                info!(
+                    "Port mapping address changed: {} -> {}",
+                    previous_addr, external_addr
+                );
+            }
+        }
         P2pEvent::PortMappingFailed { error } => {
             if json {
                 println!(r#"{{"event":"port_mapping_failed","error":"{}"}}"#, error);
@@ -1180,6 +1214,19 @@ async fn handle_event_with_state(
                 info!("mDNS peer ineligible: {} ({})", peer.fullname, reason);
             }
         }
+        P2pEvent::MdnsPeerApprovalRequired { peer, reason } => {
+            if json {
+                println!(
+                    r#"{{"event":"mdns_peer_approval_required","fullname":"{}","reason":"{}"}}"#,
+                    peer.fullname, reason
+                );
+            } else {
+                info!(
+                    "mDNS peer approval required: {} ({})",
+                    peer.fullname, reason
+                );
+            }
+        }
         P2pEvent::MdnsAutoConnectAttempted { peer, addresses } => {
             if json {
                 println!(
@@ -1253,6 +1300,21 @@ async fn handle_event_with_state(
             }
 
             debug!("Received {} bytes from {}", bytes, format_peer_id(peer_id));
+        }
+        P2pEvent::DirectPathStatus { peer_id, status } => {
+            if json {
+                println!(
+                    r#"{{"event":"direct_path_status","peer_id":"{}","status":"{:?}"}}"#,
+                    format_peer_id(peer_id),
+                    status
+                );
+            } else {
+                info!(
+                    "Direct path status: {} -> {:?}",
+                    format_peer_id(peer_id),
+                    status
+                );
+            }
         }
         _ => {
             debug!("Event: {:?}", event);

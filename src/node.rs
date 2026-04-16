@@ -360,9 +360,19 @@ impl Node {
             P2pEvent::PortMappingRenewed { external_addr } => {
                 Some(NodeEvent::PortMappingRenewed { external_addr })
             }
+            P2pEvent::PortMappingAddressChanged {
+                previous_addr,
+                external_addr,
+            } => Some(NodeEvent::PortMappingAddressChanged {
+                previous_addr,
+                external_addr,
+            }),
             P2pEvent::PortMappingFailed { error } => Some(NodeEvent::PortMappingFailed { error }),
             P2pEvent::PortMappingRemoved { external_addr } => {
                 Some(NodeEvent::PortMappingRemoved { external_addr })
+            }
+            P2pEvent::DirectPathStatus { peer_id, status } => {
+                Some(NodeEvent::DirectPathStatus { peer_id, status })
             }
             P2pEvent::DataReceived { peer_id, bytes } => Some(NodeEvent::DataReceived {
                 peer_id,
@@ -407,6 +417,9 @@ impl Node {
             P2pEvent::MdnsPeerEligible { peer } => Some(NodeEvent::MdnsPeerEligible { peer }),
             P2pEvent::MdnsPeerIneligible { peer, reason } => {
                 Some(NodeEvent::MdnsPeerIneligible { peer, reason })
+            }
+            P2pEvent::MdnsPeerApprovalRequired { peer, reason } => {
+                Some(NodeEvent::MdnsPeerApprovalRequired { peer, reason })
             }
             P2pEvent::MdnsAutoConnectAttempted { peer, addresses } => {
                 Some(NodeEvent::MdnsAutoConnectAttempted { peer, addresses })
@@ -463,6 +476,11 @@ impl Node {
         self.inner.external_addr()
     }
 
+    /// Return the latest best-effort direct-path status for a peer, when known.
+    pub fn direct_path_status(&self, peer_id: PeerId) -> Option<crate::DirectPathStatus> {
+        self.inner.direct_path_status(peer_id)
+    }
+
     /// Get the ML-DSA-65 public key bytes (1952 bytes)
     pub fn public_key_bytes(&self) -> &[u8] {
         self.inner.public_key_bytes()
@@ -498,11 +516,20 @@ impl Node {
     ///
     /// Thin facade over the unified peer-oriented [`P2pEndpoint`] connect path.
     /// Strategy selection remains internal to the endpoint.
-    pub async fn connect(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
+    pub async fn connect_peer(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
         self.inner
             .connect_peer(peer_id)
             .await
             .map_err(NodeError::Endpoint)
+    }
+
+    /// Connect to a peer by durable peer ID.
+    ///
+    /// Compatibility-oriented alias retained for older callers. Prefer
+    /// [`Self::connect_peer`] as the canonical peer-oriented public surface.
+    #[deprecated(note = "use connect_peer(peer_id) for the canonical peer-oriented API")]
+    pub async fn connect(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
+        self.connect_peer(peer_id).await
     }
 
     /// Connect to a peer by durable peer ID plus explicit address hints.
@@ -1023,11 +1050,13 @@ mod tests {
             .upsert_peer_hints(listener.peer_id(), vec![listener_addr], None)
             .await;
 
-        let peer_conn =
-            tokio::time::timeout(Duration::from_secs(30), dialer.connect(listener.peer_id()))
-                .await
-                .expect("connect should not time out")
-                .expect("dialer should connect using upserted peer hints");
+        let peer_conn = tokio::time::timeout(
+            Duration::from_secs(30),
+            dialer.connect_peer(listener.peer_id()),
+        )
+        .await
+        .expect("connect should not time out")
+        .expect("dialer should connect using upserted peer hints");
         assert_eq!(peer_conn.peer_id, listener.peer_id());
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())

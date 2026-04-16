@@ -37,14 +37,26 @@ use rustc_hash::FxHashMap;
 #[cfg(all(not(wasm_browser), feature = "network-discovery"))]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Notify, futures::Notified, mpsc};
-use tracing::error;
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, debug, error};
 
 use super::{
     ConnectionEvent, IO_LOOP_BOUND, RECV_TIME_BOUND, connection::Connecting,
     work_limiter::WorkLimiter,
 };
 use crate::{EndpointConfig, VarInt};
+
+fn is_expected_background_io_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+    ) || matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
+}
 
 /// A QUIC endpoint.
 ///
@@ -225,7 +237,11 @@ impl Endpoint {
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {}", e);
+                    if is_expected_background_io_error(&e) {
+                        debug!("background I/O path ended: {}", e);
+                    } else {
+                        tracing::error!("I/O error: {}", e);
+                    }
                 }
             }
             .instrument(Span::current()),

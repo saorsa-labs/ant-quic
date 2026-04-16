@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.9] - 2026-04-16
+
+### Added
+
+- **Provider-neutral peer directory and trust-gated discovery flow**: landed the internal peer directory, explicit discovered-peer approval path, and structured endpoint/node events for mDNS approval and port-mapping lifecycle state.
+- **Pure-binary connectivity matrix tooling**: added `scripts/run-connectivity-matrix.sh` and `scripts/vps-test-orchestrator.sh` to deploy the release binary, exercise the public/local/IPv6 matrix, and collect logs from the full fleet.
+
+### Fixed
+
+- **Hole-punch coordination completion**: the coordinator fast-path now notifies both peers with initiator candidate addresses, and the target participates in reverse connection attempts instead of waiting passively.
+- **Direct-path state accuracy**: validated candidates now advance through the correct NAT traversal phases and only become connected after an actual transport-level success.
+- **False-positive NAT success removal**: deleted the test-only simulated punch success path and tightened synchronization checks so validation requires real candidate evidence.
+- **CLI/test-harness backpressure**: counter-test and echo handling now keep draining the receive path under mesh load, preventing stalled probe traffic in the VPS matrix.
+- **Packaging hygiene**: removed the orphaned `external/devp2p` gitlink and added release hygiene coverage to prevent regressing published artifacts.
+
+### Tests
+
+- **Three-loop connectivity proof**: the 2026-04-16 release candidate passed three full matrix loops across 4 VPS nodes plus the MacBook and 2 studio hosts, including public-to-local NAT traversal and public IPv6 reachability, with logs captured under `target/connectivity-matrix/20260416-055546`.
+- **Strict Rust gates**: `cargo fmt --all`, `cargo clippy --all-features --all-targets -- -D warnings -D clippy::panic -D clippy::unwrap_used -D clippy::expect_used`, and `cargo test --all-features` all passed on the release candidate.
+
 ## [0.26.8] - 2026-04-15
 
 ### Security

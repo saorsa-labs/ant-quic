@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn repo_file(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -96,5 +97,48 @@ fn manifest_excludes_known_release_artifacts() -> Result<(), String> {
             "Cargo.toml should exclude {excluded} from packaged releases"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn no_orphaned_gitlinks_without_gitmodules_mapping() -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["ls-files", "--stage"])
+        .current_dir(repo_file("."))
+        .output()
+        .map_err(|error| format!("failed to run git ls-files --stage: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files --stage failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let gitmodules = fs::read_to_string(repo_file(".gitmodules")).unwrap_or_default();
+    let mapped_paths: Vec<String> = gitmodules
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("path = "))
+        .map(ToString::to_string)
+        .collect();
+
+    let gitlinks: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let mode = parts.next()?;
+            let _hash = parts.next()?;
+            let _stage = parts.next()?;
+            let path = parts.next()?;
+            (mode == "160000").then(|| path.to_string())
+        })
+        .collect();
+
+    for path in gitlinks {
+        assert!(
+            mapped_paths.iter().any(|mapped| mapped == &path),
+            "gitlink {path} is tracked without a matching .gitmodules entry"
+        );
+    }
+
     Ok(())
 }

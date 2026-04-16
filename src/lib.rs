@@ -172,6 +172,7 @@ pub(crate) mod coordinator_health;
 pub mod mdns;
 /// Unified events for P2P nodes
 pub mod node_event;
+mod peer_directory;
 mod port_mapping;
 
 /// Reachability scope and traversal metadata shared across APIs
@@ -358,8 +359,8 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 
 /// P2P endpoint - for advanced use, prefer Node for most applications
 pub use p2p_endpoint::{
-    ConnectionMetrics, DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent,
-    PeerConnection, TraversalPhase,
+    ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason, DisconnectReason,
+    EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern

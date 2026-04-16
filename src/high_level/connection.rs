@@ -22,7 +22,7 @@ use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
-use tracing::{Instrument, Span, debug_span, error};
+use tracing::{Instrument, Span, debug, debug_span, error};
 
 use super::{
     ConnectionEvent,
@@ -43,6 +43,19 @@ pub struct Connecting {
     conn: Option<ConnectionRef>,
     connected: oneshot::Receiver<bool>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
+}
+
+fn is_expected_background_io_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+    ) || matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
 }
 
 impl Connecting {
@@ -71,7 +84,11 @@ impl Connecting {
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {e}");
+                    if is_expected_background_io_error(&e) {
+                        debug!("background I/O path ended: {e}");
+                    } else {
+                        tracing::error!("I/O error: {e}");
+                    }
                 }
             }
             .instrument(Span::current()),

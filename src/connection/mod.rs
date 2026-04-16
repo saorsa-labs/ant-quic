@@ -5409,6 +5409,16 @@ impl Connection {
         // This ensures consistent address format across all peers
         let normalized_addr = crate::shared::normalize_socket_addr(address);
 
+        if !is_valid_nat_advertisement_address(normalized_addr) {
+            debug!(
+                "Skipping NAT address advertisement for invalid candidate {}",
+                normalized_addr
+            );
+            return Err(ConnectionError::TransportError(
+                TransportError::PROTOCOL_VIOLATION("invalid NAT candidate address"),
+            ));
+        }
+
         // Verify NAT traversal is enabled
         let nat_state = self.nat_traversal.as_mut().ok_or_else(|| {
             ConnectionError::TransportError(TransportError::PROTOCOL_VIOLATION(
@@ -6065,6 +6075,17 @@ impl SideArgs {
             Self::Client { .. } => Side::Client,
             Self::Server { .. } => Side::Server,
         }
+    }
+}
+
+fn is_valid_nat_advertisement_address(address: SocketAddr) -> bool {
+    if address.port() == 0 {
+        return false;
+    }
+
+    match address.ip() {
+        IpAddr::V4(ipv4) => !ipv4.is_unspecified() && !ipv4.is_broadcast() && !ipv4.is_multicast(),
+        IpAddr::V6(ipv6) => !ipv6.is_unspecified() && !ipv6.is_multicast(),
     }
 }
 
@@ -6870,6 +6891,22 @@ mod tests {
     use super::*;
     use crate::transport_parameters::AddressDiscoveryConfig;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn nat_advertisement_address_validation_rejects_unspecified_and_zero_port() {
+        assert!(!is_valid_nat_advertisement_address(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            5000,
+        )));
+        assert!(!is_valid_nat_advertisement_address(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            0,
+        )));
+        assert!(is_valid_nat_advertisement_address(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            5000,
+        )));
+    }
 
     #[test]
     fn address_discovery_state_new() {

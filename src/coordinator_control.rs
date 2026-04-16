@@ -50,6 +50,7 @@ pub(crate) enum CoordinatorControlMessage {
         initiator: PeerId,
         target: PeerId,
         round: u32,
+        initiator_addrs: Vec<SocketAddr>,
         target_addrs: Vec<SocketAddr>,
     },
     CoordinationRejected {
@@ -102,6 +103,7 @@ pub(crate) struct InboundOffer {
     pub target: PeerId,
     pub request_id: u64,
     pub round: u32,
+    pub initiator_addrs: Vec<SocketAddr>,
     pub expires_at_unix_ms: u64,
 }
 
@@ -375,6 +377,55 @@ mod tests {
     }
 
     #[test]
+    fn coordination_accepted_round_trips_through_codec() {
+        let initiator = peer(0x11);
+        let target = peer(0x22);
+        let request_id = 43;
+        let expires_at_unix_ms = 1_700_000_000_456;
+        let initiator_addrs = vec![
+            "203.0.113.11:9001".parse().expect("valid ipv4 address"),
+            "[2001:db8::11]:9001".parse().expect("valid ipv6 address"),
+        ];
+        let target_addrs = vec![
+            "198.51.100.22:9443".parse().expect("valid ipv4 address"),
+            "[2001:db8::22]:9443".parse().expect("valid ipv6 address"),
+        ];
+        let envelope = CoordinatorControlEnvelope {
+            request_id,
+            expires_at_unix_ms,
+            message: CoordinatorControlMessage::CoordinationAccepted {
+                initiator,
+                target,
+                round: 4,
+                initiator_addrs: initiator_addrs.clone(),
+                target_addrs: target_addrs.clone(),
+            },
+        };
+
+        let encoded = encode_coordinator_control(&envelope).expect("encode should succeed");
+        let decoded = decode_coordinator_control(&encoded)
+            .expect("decode should succeed")
+            .expect("control payload should be recognized");
+
+        match decoded.message {
+            CoordinatorControlMessage::CoordinationAccepted {
+                initiator: decoded_initiator,
+                target: decoded_target,
+                round,
+                initiator_addrs: decoded_initiator_addrs,
+                target_addrs: decoded_target_addrs,
+            } => {
+                assert_eq!(decoded_initiator, initiator);
+                assert_eq!(decoded_target, target);
+                assert_eq!(round, 4);
+                assert_eq!(decoded_initiator_addrs, initiator_addrs);
+                assert_eq!(decoded_target_addrs, target_addrs);
+            }
+            other => panic!("unexpected decoded message: {:?}", other),
+        }
+    }
+
+    #[test]
     fn non_control_payload_decodes_to_none() {
         let decoded = decode_coordinator_control(b"not coordinator control")
             .expect("non-control payload should not error");
@@ -557,6 +608,7 @@ mod tests {
                 target: expired_target,
                 request_id: expired_request_id,
                 round: 1,
+                initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms - 1,
             },
         );
@@ -569,6 +621,7 @@ mod tests {
                 target: fresh_target,
                 request_id: fresh_request_id,
                 round: 2,
+                initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms + 10_000,
             },
         );
