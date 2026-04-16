@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.10] - 2026-04-16
+
+### Fixed
+
+- **MASQUE relay target selection**: relay fallback now prefers durable listener and directly reachable peer addresses before OBSERVED_ADDRESS-derived external addresses, preventing CONNECT-UDP from targeting ephemeral NAT-traversal ports (fixes #165).
+
+### Tests
+
+- **Relay target regression coverage**: added unit tests covering listener-port precedence over observed ephemeral ports and direct-reachability precedence over external-address fallbacks.
+- **Validation gates**: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo nextest run` passed for the release candidate.
+
 ## [0.26.9] - 2026-04-16
 
 ### Added
