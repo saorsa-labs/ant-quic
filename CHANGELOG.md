@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-04-17
+
+### Fixed
+
+- **Connection lifecycle sync for churning peers (#168, #169).** `P2pEndpoint` now tracks per-connection lifecycle generations and explicit `Live`/`Superseded`/`Closing`/`Closed` transitions behind the canonical live-connection lookup. When a newer connection supersedes an older one, the old reader is cooperatively cancelled at the `accept_uni()` boundary so in-flight ACKed bytes still drain, then the connection is actively closed with an ant-quic-reserved application close code instead of waiting for the idle timeout.
+- **Sender-side stale-connection fast-fail.** QUIC sends now check `Connection::close_reason()` before opening a uni stream and map lifecycle closes into `EndpointError::ConnectionClosed { reason: ConnectionCloseReason }`, preventing silent success on connections that have already been superseded or explicitly cleaned up.
+- **Live-connection lookup tightening.** `get_connection(peer_id)` / `get_quic_connection(peer_id)` now only surface the canonical live connection. Superseded, closing, and closed connections remain internal lifecycle entries and no longer leak through the public lookup path.
+
+### Changed
+
+- **Reserved lifecycle close-code range.** ant-quic now reserves `0x4E5B00..=0x4E5BFF` (`"N["`) for connection-lifecycle signaling. The currently-defined application close reasons are:
+  - `0x4E5B00` — `Superseded`
+  - `0x4E5B01` — `ReaderExit`
+  - `0x4E5B02` — `PeerShutdown`
+  - `0x4E5B03` — `Banned`
+  - `0x4E5B04` — `LifecycleCleanup`
+- **Lifecycle-aware endpoint errors.** Added `ConnectionCloseReason` and `EndpointError::ConnectionClosed { reason }` so callers can distinguish lifecycle closes from generic transport failures.
+
+### Observability
+
+- **Structured lifecycle tracing.** Every lifecycle transition now emits an `info` event at target `ant_quic::p2p_endpoint::lifecycle` with consistent `peer_id`, `generation`, `from_state`, `to_state`, `reason`, `connection_id`, and `stable_id` fields.
+
+### Tests
+
+- Added lifecycle regression coverage in `tests/lifecycle_canonical_live.rs`, `tests/lifecycle_active_close.rs`, `tests/lifecycle_sender_stale.rs`, `tests/lifecycle_simultaneous_replace.rs`, and `tests/lifecycle_observability.rs`.
+- Re-ran the existing issue-166 regressions: `tests/reconnect_reader_task.rs`, `tests/regression_166_p2p_endpoint_race.rs`, and `tests/regression_166_mesh_churn.rs`.
+
 ## [0.26.13] - 2026-04-17
 
 ### Fixed

@@ -232,6 +232,9 @@ pub mod chat;
 // P2P API
 // ============================================================================
 
+/// Lifecycle close-reason helpers shared by the transport and P2P layers.
+mod connection_lifecycle;
+
 /// P2P endpoint - the primary API for ant-quic
 ///
 /// This module provides the main API for P2P networking with NAT traversal,
@@ -358,6 +361,7 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 // ============================================================================
 
 /// P2P endpoint - for advanced use, prefer Node for most applications
+pub use connection_lifecycle::ConnectionCloseReason;
 pub use p2p_endpoint::{
     ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason, DisconnectReason,
     EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection, TraversalPhase,

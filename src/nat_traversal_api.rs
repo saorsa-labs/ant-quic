@@ -21,7 +21,7 @@ use crate::coordinator_control::{
     remember_live_request, remember_pending_request, remove_inbound_offer, remove_pending_request,
     take_live_rejection,
 };
-use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
 use crate::transport::TransportRegistry;
@@ -183,7 +183,8 @@ impl TransportCandidate {
 
 use tracing::{debug, error, info, trace, warn};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use blake3::Hasher as Blake3Hasher;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // Use parking_lot for faster, non-poisoning locks that work better with async code
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
@@ -193,6 +194,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+use crate::connection_lifecycle::{ConnectionCloseReason, ConnectionLifecycleState};
 use crate::high_level::default_runtime;
 
 use crate::{
@@ -219,6 +221,59 @@ use crate::{crypto::rustls::QuicClientConfig, crypto::rustls::QuicServerConfig};
 use crate::config::validation::{ConfigValidator, ValidationResult};
 
 use crate::crypto::{pqc::PqcConfig, raw_public_keys::RawPublicKeyConfigBuilder};
+
+#[derive(Debug, Clone, Copy)]
+struct PendingAccept {
+    peer_id: PeerId,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedConnection {
+    connection: InnerConnection,
+    generation: u64,
+    established_at_unix_ms: u64,
+    connection_id: [u8; 32],
+    state: ConnectionLifecycleState,
+}
+
+impl TrackedConnection {
+    fn stable_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
+    fn connection_id_hex(&self) -> String {
+        hex::encode(&self.connection_id[..8])
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnectionLifecycleSnapshot {
+    pub generation: u64,
+    pub stable_id: usize,
+    pub connection_id: [u8; 32],
+    pub state: ConnectionLifecycleState,
+    pub established_at_unix_ms: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ConnectionRegistrationOutcome {
+    Live {
+        generation: u64,
+        superseded_generation: Option<u64>,
+    },
+    Rejected {
+        winner_generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReaderExitOutcome {
+    Noop,
+    ConnectionReaped,
+    PeerDisconnected { close_reason: ConnectionCloseReason },
+}
 
 /// An active relay session for MASQUE CONNECT-UDP
 ///
@@ -293,17 +348,21 @@ pub struct NatTraversalEndpoint {
     /// Notify waiters when a new accepted connection is available.
     /// Eliminates the 10ms polling loop in accept_connection().
     incoming_notify: Arc<tokio::sync::Notify>,
-    /// Queue of accepted inbound peer IDs waiting to be surfaced via
-    /// `accept_connection()`. This prevents unrelated poll/drain paths from
-    /// stealing inbound connection-established events before the accept API sees
-    /// them.
-    pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PeerId>>>,
+    /// Queue of accepted inbound live connections waiting to be surfaced via
+    /// `accept_connection()`. Generation tagging prevents a replaced connection
+    /// from being surfaced twice after a fast reconnect race.
+    pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PendingAccept>>>,
     /// Notify waiters when the endpoint is shutting down.
     /// Eliminates polling loops that check the AtomicBool in transport listeners.
     shutdown_notify: Arc<tokio::sync::Notify>,
-    /// Active connections by peer ID
-    /// Uses DashMap for fine-grained concurrent access without blocking workers
+    /// Active live connections by peer ID.
+    /// Uses DashMap for fine-grained concurrent access without blocking workers.
     connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
+    /// Lifecycle state for all tracked connections, including superseded/closed
+    /// entries retained briefly for diagnostics and deterministic replacement.
+    connection_lifecycle: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
+    /// Monotonic local generation counter used for tracked connections.
+    next_connection_generation: Arc<AtomicU64>,
     /// Local peer ID
     local_peer_id: PeerId,
     /// Timeout configuration
@@ -1431,6 +1490,8 @@ impl NatTraversalEndpoint {
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
+            next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -1620,6 +1681,9 @@ impl NatTraversalEndpoint {
             let shutdown_clone = endpoint.shutdown.clone();
             let event_tx_clone = event_tx.clone();
             let connections_clone = endpoint.connections.clone();
+            let connection_lifecycle_clone = endpoint.connection_lifecycle.clone();
+            let next_connection_generation_clone = endpoint.next_connection_generation.clone();
+            let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -1631,6 +1695,9 @@ impl NatTraversalEndpoint {
                     shutdown_clone,
                     event_tx_clone,
                     connections_clone,
+                    connection_lifecycle_clone,
+                    next_connection_generation_clone,
+                    local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
                     incoming_notify_clone,
@@ -1913,6 +1980,8 @@ impl NatTraversalEndpoint {
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
+            next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -2102,6 +2171,9 @@ impl NatTraversalEndpoint {
             let shutdown_clone = endpoint.shutdown.clone();
             let event_tx_clone = event_tx.clone();
             let connections_clone = endpoint.connections.clone();
+            let connection_lifecycle_clone = endpoint.connection_lifecycle.clone();
+            let next_connection_generation_clone = endpoint.next_connection_generation.clone();
+            let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -2113,6 +2185,9 @@ impl NatTraversalEndpoint {
                     shutdown_clone,
                     event_tx_clone,
                     connections_clone,
+                    connection_lifecycle_clone,
+                    next_connection_generation_clone,
+                    local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
                     incoming_notify_clone,
@@ -2262,6 +2337,10 @@ impl NatTraversalEndpoint {
             );
 
             let connections = self.connections.clone();
+            let connection_lifecycle = self.connection_lifecycle.clone();
+            let next_connection_generation = self.next_connection_generation.clone();
+            let local_peer_id = self.local_peer_id;
+            let emitted_events = self.emitted_established_events.clone();
             let incoming_notify = self.incoming_notify.clone();
             let pending_accepts = self.pending_accepts.clone();
             let relay_event_tx = self.event_tx.clone();
@@ -2290,12 +2369,34 @@ impl NatTraversalEndpoint {
                                     remote,
                                     hex::encode(&peer_id.0[..8])
                                 );
-                                connections.insert(peer_id, conn);
+                                let outcome = Self::register_connection_lifecycle_parts(
+                                    local_peer_id,
+                                    connections.as_ref(),
+                                    connection_lifecycle.as_ref(),
+                                    next_connection_generation.as_ref(),
+                                    emitted_events.as_ref(),
+                                    peer_id,
+                                    conn.clone(),
+                                );
+                                let generation = match outcome {
+                                    ConnectionRegistrationOutcome::Live { generation, .. } => {
+                                        generation
+                                    }
+                                    ConnectionRegistrationOutcome::Rejected {
+                                        winner_generation,
+                                    } => {
+                                        debug!(
+                                            "Rejected relayed connection for peer {:?}; live generation {} kept",
+                                            peer_id, winner_generation
+                                        );
+                                        continue;
+                                    }
+                                };
 
-                                // Emit ConnectionEstablished so accept_connection()
-                                // returns this to P2pEndpoint::accept(), which spawns
-                                // the reader task and stores the PeerConnection.
-                                pending_accepts.lock().push_back(peer_id);
+                                pending_accepts.lock().push_back(PendingAccept {
+                                    peer_id,
+                                    generation,
+                                });
                                 if let Some(ref tx) = relay_event_tx {
                                     let _ = tx.send(NatTraversalEvent::ConnectionEstablished {
                                         peer_id,
@@ -3771,7 +3872,11 @@ impl NatTraversalEndpoint {
     }
 
     fn materialize_authenticated_connection(
+        local_peer_id: PeerId,
         connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
+        next_connection_generation: &AtomicU64,
+        emitted_established_events: &dashmap::DashSet<PeerId>,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -3780,19 +3885,31 @@ impl NatTraversalEndpoint {
             )
         })?;
 
-        if let Some(entry) = connections.get(&peer_id) {
-            if entry.is_alive() {
-                let existing = entry.value().clone();
-                drop(entry);
-                connection.close(0u32.into(), b"duplicate authenticated connection");
-                return Ok((peer_id, existing));
-            }
-            drop(entry);
-            let _ = connections.remove(&peer_id);
-        }
+        let outcome = Self::register_connection_lifecycle_parts(
+            local_peer_id,
+            connections,
+            connection_lifecycle,
+            next_connection_generation,
+            emitted_established_events,
+            peer_id,
+            connection.clone(),
+        );
 
-        connections.insert(peer_id, connection.clone());
-        Ok((peer_id, connection))
+        match outcome {
+            ConnectionRegistrationOutcome::Live { .. } => Ok((peer_id, connection)),
+            ConnectionRegistrationOutcome::Rejected { .. } => {
+                let existing = connections
+                    .get(&peer_id)
+                    .map(|entry| entry.value().clone())
+                    .ok_or_else(|| {
+                        NatTraversalError::ConnectionFailed(
+                            "rejected authenticated connection but no live winner remained"
+                                .to_string(),
+                        )
+                    })?;
+                Ok((peer_id, existing))
+            }
+        }
     }
 
     fn send_coordination_request_v2(
@@ -3904,6 +4021,9 @@ impl NatTraversalEndpoint {
                     );
 
                     let connections = self.connections.clone();
+                    let connection_lifecycle = self.connection_lifecycle.clone();
+                    let next_connection_generation = self.next_connection_generation.clone();
+                    let emitted_established_events = self.emitted_established_events.clone();
                     let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
 
@@ -3913,7 +4033,11 @@ impl NatTraversalEndpoint {
                             Ok(Ok(connection)) => {
                                 let (coordinator_peer_id, coordinator_connection) =
                                     match Self::materialize_authenticated_connection(
+                                        local_peer_id,
                                         connections.as_ref(),
+                                        connection_lifecycle.as_ref(),
+                                        next_connection_generation.as_ref(),
+                                        emitted_established_events.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -4508,6 +4632,9 @@ impl NatTraversalEndpoint {
             }
         };
         let connections_clone = self.connections.clone();
+        let connection_lifecycle_clone = self.connection_lifecycle.clone();
+        let next_connection_generation_clone = self.next_connection_generation.clone();
+        let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
@@ -4519,6 +4646,9 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx,
                 connections_clone,
+                connection_lifecycle_clone,
+                next_connection_generation_clone,
+                local_peer_id,
                 emitted_events_clone,
                 relay_server_clone,
                 incoming_notify_clone,
@@ -4536,16 +4666,21 @@ impl NatTraversalEndpoint {
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
+        connection_lifecycle: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
+        next_connection_generation: Arc<AtomicU64>,
+        local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         incoming_notify: Arc<tokio::sync::Notify>,
-        pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PeerId>>>,
+        pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PendingAccept>>>,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
                 Some(connecting) => {
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
+                    let connection_lifecycle = connection_lifecycle.clone();
+                    let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
                     let incoming_notify = incoming_notify.clone();
@@ -4563,19 +4698,39 @@ impl NatTraversalEndpoint {
                                         )
                                     });
 
-                                // Store the connection
-                                // DashMap provides fine-grained locking internally - no blocking
-                                connections.insert(peer_id, connection.clone());
+                                let outcome = Self::register_connection_lifecycle_parts(
+                                    local_peer_id,
+                                    connections.as_ref(),
+                                    connection_lifecycle.as_ref(),
+                                    next_connection_generation.as_ref(),
+                                    emitted_events.as_ref(),
+                                    peer_id,
+                                    connection.clone(),
+                                );
 
-                                // Only emit ConnectionEstablished if we haven't already for this peer
-                                // DashSet::insert returns true if the value was newly inserted
-                                let should_emit = emitted_events.insert(peer_id);
+                                let generation = match outcome {
+                                    ConnectionRegistrationOutcome::Live { generation, .. } => {
+                                        generation
+                                    }
+                                    ConnectionRegistrationOutcome::Rejected {
+                                        winner_generation,
+                                    } => {
+                                        debug!(
+                                            "Rejected inbound connection for peer {:?}; live generation {} kept",
+                                            peer_id, winner_generation
+                                        );
+                                        return;
+                                    }
+                                };
 
-                                pending_accepts.lock().push_back(peer_id);
+                                pending_accepts.lock().push_back(PendingAccept {
+                                    peer_id,
+                                    generation,
+                                });
                                 incoming_notify.notify_one();
 
+                                let should_emit = emitted_events.insert(peer_id);
                                 if should_emit {
-                                    // Background accept = they connected to us = Server side
                                     let _ =
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
                                             peer_id,
@@ -4584,8 +4739,6 @@ impl NatTraversalEndpoint {
                                         });
                                 }
 
-                                // Symmetric P2P: Spawn relay request handler for this connection
-                                // This allows any connected peer to use us as a relay
                                 if let Some(ref server) = relay_server {
                                     let conn_clone = connection.clone();
                                     let server_clone = Arc::clone(server);
@@ -4594,7 +4747,6 @@ impl NatTraversalEndpoint {
                                     });
                                 }
 
-                                // Handle connection streams
                                 Self::handle_connection(peer_id, connection, event_tx).await;
                             }
                             Err(e) => {
@@ -5475,20 +5627,35 @@ impl NatTraversalEndpoint {
                 ));
             }
 
-            if let Some(peer_id) = self.pending_accepts.lock().pop_front() {
+            if let Some(pending) = self.pending_accepts.lock().pop_front() {
+                let still_live = self
+                    .lifecycle_snapshot_for_generation(&pending.peer_id, pending.generation)
+                    .is_some_and(|snapshot| {
+                        matches!(snapshot.state, ConnectionLifecycleState::Live)
+                    });
+                if !still_live {
+                    debug!(
+                        "Skipping stale pending accept for peer {:?}: generation {:?} no longer live",
+                        pending.peer_id, pending.generation
+                    );
+                    continue;
+                }
                 let Some(connection) = self
                     .connections
-                    .get(&peer_id)
+                    .get(&pending.peer_id)
                     .map(|entry| entry.value().clone())
                 else {
                     debug!(
                         "Skipping stale pending accept for peer {:?}: connection no longer in storage",
-                        peer_id
+                        pending.peer_id
                     );
                     continue;
                 };
-                info!("Retrieved accepted connection from peer {:?}", peer_id);
-                return Ok((peer_id, connection));
+                info!(
+                    "Retrieved accepted connection from peer {:?}",
+                    pending.peer_id
+                );
+                return Ok((pending.peer_id, connection));
             }
 
             // Drain all pending events (non-blocking, under ParkingMutex) for
@@ -5553,6 +5720,418 @@ impl NatTraversalEndpoint {
         &self.incoming_notify
     }
 
+    fn lifecycle_peer_prefix(peer_id: &PeerId) -> String {
+        hex::encode(&peer_id.0[..4])
+    }
+
+    fn log_lifecycle_transition(
+        peer_id: &PeerId,
+        generation: u64,
+        connection_id: &[u8; 32],
+        stable_id: usize,
+        from_state: &str,
+        to_state: &str,
+        reason: ConnectionCloseReason,
+    ) {
+        info!(
+            target: "ant_quic::p2p_endpoint::lifecycle",
+            peer_id = %Self::lifecycle_peer_prefix(peer_id),
+            generation,
+            from_state,
+            to_state,
+            reason = %reason,
+            connection_id = %hex::encode(&connection_id[..8]),
+            stable_id,
+            "connection lifecycle transition"
+        );
+    }
+
+    fn log_lifecycle_live(peer_id: &PeerId, tracked: &TrackedConnection) {
+        info!(
+            target: "ant_quic::p2p_endpoint::lifecycle",
+            peer_id = %Self::lifecycle_peer_prefix(peer_id),
+            generation = tracked.generation,
+            from_state = "Init",
+            to_state = "Live",
+            reason = "None",
+            connection_id = %tracked.connection_id_hex(),
+            stable_id = tracked.stable_id(),
+            "connection lifecycle transition"
+        );
+    }
+
+    #[allow(dead_code)]
+    fn candidate_wins(existing: &TrackedConnection, candidate: &TrackedConnection) -> bool {
+        if candidate.connection_id != existing.connection_id {
+            candidate.connection_id > existing.connection_id
+        } else {
+            (
+                candidate.generation,
+                candidate.established_at_unix_ms,
+                candidate.stable_id(),
+            ) > (
+                existing.generation,
+                existing.established_at_unix_ms,
+                existing.stable_id(),
+            )
+        }
+    }
+
+    fn lifecycle_connection_id_for(
+        local_peer_id: PeerId,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> [u8; 32] {
+        let initiator = if connection.side().is_client() {
+            local_peer_id
+        } else {
+            peer_id
+        };
+        let (left, right) = if local_peer_id.0 <= peer_id.0 {
+            (local_peer_id, peer_id)
+        } else {
+            (peer_id, local_peer_id)
+        };
+
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"ant-quic.lifecycle.v1");
+        hasher.update(&left.0);
+        hasher.update(&right.0);
+        hasher.update(&initiator.0);
+
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hasher.finalize().as_bytes());
+        out
+    }
+
+    fn register_connection_lifecycle_parts(
+        local_peer_id: PeerId,
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
+        next_connection_generation: &AtomicU64,
+        emitted_established_events: &dashmap::DashSet<PeerId>,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) -> ConnectionRegistrationOutcome {
+        let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
+        let tracked = TrackedConnection {
+            connection: connection.clone(),
+            generation,
+            established_at_unix_ms: now_unix_ms(),
+            connection_id: Self::lifecycle_connection_id_for(local_peer_id, peer_id, &connection),
+            state: ConnectionLifecycleState::Live,
+        };
+
+        let mut superseded_generation = None;
+
+        {
+            let mut lifecycle = connection_lifecycle.write();
+            let entries = lifecycle.entry(peer_id).or_default();
+            if let Some(live_idx) = entries
+                .iter()
+                .position(|entry| matches!(entry.state, ConnectionLifecycleState::Live))
+            {
+                let live = &entries[live_idx];
+                superseded_generation = Some(live.generation);
+                Self::log_lifecycle_transition(
+                    &peer_id,
+                    live.generation,
+                    &live.connection_id,
+                    live.stable_id(),
+                    live.state.name(),
+                    ConnectionLifecycleState::Superseded {
+                        replaced_by_generation: generation,
+                    }
+                    .name(),
+                    ConnectionCloseReason::Superseded,
+                );
+                entries[live_idx].state = ConnectionLifecycleState::Superseded {
+                    replaced_by_generation: generation,
+                };
+            }
+            Self::log_lifecycle_live(&peer_id, &tracked);
+            entries.push(tracked.clone());
+            Self::prune_closed_lifecycle_entries(entries);
+        }
+
+        connections.insert(peer_id, connection);
+        emitted_established_events.remove(&peer_id);
+        ConnectionRegistrationOutcome::Live {
+            generation,
+            superseded_generation,
+        }
+    }
+
+    fn lifecycle_snapshot_for_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+    ) -> Option<ConnectionLifecycleSnapshot> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .and_then(|entries| entries.iter().find(|entry| entry.generation == generation))
+            .map(|entry| ConnectionLifecycleSnapshot {
+                generation: entry.generation,
+                stable_id: entry.stable_id(),
+                connection_id: entry.connection_id,
+                state: entry.state,
+                established_at_unix_ms: entry.established_at_unix_ms,
+            })
+    }
+
+    pub(crate) fn connection_snapshot_by_stable_id(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+    ) -> Option<ConnectionLifecycleSnapshot> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .and_then(|entries| entries.iter().find(|entry| entry.stable_id() == stable_id))
+            .map(|entry| ConnectionLifecycleSnapshot {
+                generation: entry.generation,
+                stable_id: entry.stable_id(),
+                connection_id: entry.connection_id,
+                state: entry.state,
+                established_at_unix_ms: entry.established_at_unix_ms,
+            })
+    }
+
+    fn prune_closed_lifecycle_entries(entries: &mut Vec<TrackedConnection>) {
+        const MAX_CLOSED_ENTRIES: usize = 4;
+        let closed_count = entries
+            .iter()
+            .filter(|entry| matches!(entry.state, ConnectionLifecycleState::Closed { .. }))
+            .count();
+        if closed_count <= MAX_CLOSED_ENTRIES {
+            return;
+        }
+
+        let mut to_remove = closed_count - MAX_CLOSED_ENTRIES;
+        entries.retain(|entry| {
+            if to_remove > 0 && matches!(entry.state, ConnectionLifecycleState::Closed { .. }) {
+                to_remove -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn register_connection_lifecycle(
+        &self,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) -> Result<ConnectionRegistrationOutcome, NatTraversalError> {
+        Ok(Self::register_connection_lifecycle_parts(
+            self.local_peer_id,
+            self.connections.as_ref(),
+            self.connection_lifecycle.as_ref(),
+            self.next_connection_generation.as_ref(),
+            self.emitted_established_events.as_ref(),
+            peer_id,
+            connection,
+        ))
+    }
+
+    fn mark_connection_closed(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        default_reason: ConnectionCloseReason,
+    ) -> Option<ConnectionCloseReason> {
+        let mut lifecycle = self.connection_lifecycle.write();
+        let entries = lifecycle.get_mut(peer_id)?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.stable_id() == stable_id)?;
+        let effective_reason = if matches!(
+            default_reason,
+            ConnectionCloseReason::Superseded
+                | ConnectionCloseReason::ReaderExit
+                | ConnectionCloseReason::PeerShutdown
+                | ConnectionCloseReason::Banned
+                | ConnectionCloseReason::LifecycleCleanup
+        ) {
+            default_reason
+        } else {
+            entries[index]
+                .connection
+                .close_reason()
+                .as_ref()
+                .map(ConnectionCloseReason::from_connection_error)
+                .unwrap_or(default_reason)
+        };
+
+        let from_state = entries[index].state;
+        if !matches!(from_state, ConnectionLifecycleState::Closing { .. }) {
+            Self::log_lifecycle_transition(
+                peer_id,
+                entries[index].generation,
+                &entries[index].connection_id,
+                entries[index].stable_id(),
+                from_state.name(),
+                ConnectionLifecycleState::Closing {
+                    reason: effective_reason,
+                }
+                .name(),
+                effective_reason,
+            );
+            entries[index].state = ConnectionLifecycleState::Closing {
+                reason: effective_reason,
+            };
+        }
+
+        Self::log_lifecycle_transition(
+            peer_id,
+            entries[index].generation,
+            &entries[index].connection_id,
+            entries[index].stable_id(),
+            entries[index].state.name(),
+            ConnectionLifecycleState::Closed {
+                reason: effective_reason,
+                closed_at_unix_ms: now_unix_ms(),
+            }
+            .name(),
+            effective_reason,
+        );
+        entries[index].state = ConnectionLifecycleState::Closed {
+            reason: effective_reason,
+            closed_at_unix_ms: now_unix_ms(),
+        };
+        Some(effective_reason)
+    }
+
+    pub(crate) fn handle_reader_exit(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        stable_id: usize,
+    ) -> ReaderExitOutcome {
+        let snapshot = self
+            .lifecycle_snapshot_for_generation(peer_id, generation)
+            .or_else(|| self.connection_snapshot_by_stable_id(peer_id, stable_id));
+        let Some(snapshot) = snapshot else {
+            return ReaderExitOutcome::Noop;
+        };
+
+        match snapshot.state {
+            ConnectionLifecycleState::Superseded { .. } => {
+                if let Some(connection) =
+                    self.connection_lifecycle
+                        .read()
+                        .get(peer_id)
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.stable_id() == snapshot.stable_id)
+                                .map(|entry| entry.connection.clone())
+                        })
+                    && connection.close_reason().is_none()
+                    && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+                {
+                    connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+                }
+                let _ = self.mark_connection_closed(
+                    peer_id,
+                    snapshot.stable_id,
+                    ConnectionCloseReason::Superseded,
+                );
+
+                let mut lifecycle = self.connection_lifecycle.write();
+                if let Some(entries) = lifecycle.get_mut(peer_id) {
+                    entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
+                    if entries.is_empty() {
+                        lifecycle.remove(peer_id);
+                    }
+                }
+                ReaderExitOutcome::ConnectionReaped
+            }
+            ConnectionLifecycleState::Live => {
+                let current_live_stable_id = self
+                    .connections
+                    .get(peer_id)
+                    .map(|entry| entry.value().stable_id());
+                if current_live_stable_id.is_some()
+                    && current_live_stable_id != Some(snapshot.stable_id)
+                {
+                    if let Some(connection) = self
+                        .connection_lifecycle
+                        .read()
+                        .get(peer_id)
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.stable_id() == snapshot.stable_id)
+                                .map(|entry| entry.connection.clone())
+                        })
+                        && connection.close_reason().is_none()
+                        && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+                    {
+                        connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+                    }
+                    let _ = self.mark_connection_closed(
+                        peer_id,
+                        snapshot.stable_id,
+                        ConnectionCloseReason::Superseded,
+                    );
+                    let mut lifecycle = self.connection_lifecycle.write();
+                    if let Some(entries) = lifecycle.get_mut(peer_id) {
+                        entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
+                        if entries.is_empty() {
+                            lifecycle.remove(peer_id);
+                        }
+                    }
+                    return ReaderExitOutcome::ConnectionReaped;
+                }
+
+                if let Some(connection) =
+                    self.connection_lifecycle
+                        .read()
+                        .get(peer_id)
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.stable_id() == snapshot.stable_id)
+                                .map(|entry| entry.connection.clone())
+                        })
+                    && connection.close_reason().is_none()
+                    && let Some(code) = ConnectionCloseReason::ReaderExit.app_error_code()
+                {
+                    connection.close(code, ConnectionCloseReason::ReaderExit.reason_bytes());
+                }
+                let close_reason = self
+                    .mark_connection_closed(
+                        peer_id,
+                        snapshot.stable_id,
+                        ConnectionCloseReason::ReaderExit,
+                    )
+                    .unwrap_or(ConnectionCloseReason::ReaderExit);
+                self.connections.remove(peer_id);
+                self.emitted_established_events.remove(peer_id);
+                let mut lifecycle = self.connection_lifecycle.write();
+                if let Some(entries) = lifecycle.get_mut(peer_id) {
+                    entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
+                    if entries.is_empty() {
+                        lifecycle.remove(peer_id);
+                    }
+                }
+                ReaderExitOutcome::PeerDisconnected { close_reason }
+            }
+            ConnectionLifecycleState::Closing { .. } | ConnectionLifecycleState::Closed { .. } => {
+                let mut lifecycle = self.connection_lifecycle.write();
+                if let Some(entries) = lifecycle.get_mut(peer_id) {
+                    entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
+                    if entries.is_empty() {
+                        lifecycle.remove(peer_id);
+                    }
+                }
+                ReaderExitOutcome::ConnectionReaped
+            }
+        }
+    }
+
     /// Check if we have a live connection to the given peer.
     ///
     /// If the connection exists but is dead (closed/draining), removes it
@@ -5560,48 +6139,91 @@ impl NatTraversalEndpoint {
     /// cleanup of phantom connections during deduplication checks.
     pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
         if let Some(conn) = self.connections.get(peer_id) {
-            if conn.is_alive() {
+            if conn.is_alive() && conn.close_reason().is_none() {
                 return true;
             }
-            // Connection is dead — drop the DashMap ref before removing
             drop(conn);
-            // Clean up dead connection
             let _ = self.remove_connection(peer_id);
         }
         false
     }
 
-    /// Get an active connection by peer ID
+    /// Get an active live connection by peer ID.
     pub fn get_connection(
         &self,
         peer_id: &PeerId,
     ) -> Result<Option<InnerConnection>, NatTraversalError> {
-        // DashMap provides lock-free .get()
-        Ok(self
+        let Some(connection) = self
             .connections
             .get(peer_id)
-            .map(|entry| entry.value().clone()))
+            .map(|entry| entry.value().clone())
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = connection.close_reason() {
+            let _ = self.remove_connection_with_reason(
+                peer_id,
+                ConnectionCloseReason::from_connection_error(&reason),
+            );
+            return Ok(None);
+        }
+        Ok(Some(connection))
     }
 
-    /// Add or update a connection for a peer
-    pub fn add_connection(
+    /// Add or update a connection for a peer using lifecycle-aware replacement.
+    pub(crate) fn add_connection_with_outcome(
         &self,
         peer_id: PeerId,
         connection: InnerConnection,
-    ) -> Result<(), NatTraversalError> {
+    ) -> Result<ConnectionRegistrationOutcome, NatTraversalError> {
         let remote_addr = connection.remote_address();
         let observed = connection.observed_address();
         info!(
             "add_connection: peer {:?} at {} observed_address={:?}",
             peer_id, remote_addr, observed
         );
-        // DashMap provides lock-free .insert()
-        self.connections.insert(peer_id, connection);
+        let outcome = self.register_connection_lifecycle(peer_id, connection)?;
         info!(
-            "add_connection: now have {} connections",
+            "add_connection: now have {} live connections",
             self.connections.len()
         );
+        Ok(outcome)
+    }
+
+    /// Add or update a connection for a peer.
+    pub fn add_connection(
+        &self,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) -> Result<(), NatTraversalError> {
+        let _ = self.add_connection_with_outcome(peer_id, connection)?;
         Ok(())
+    }
+
+    pub fn remove_connection_with_reason(
+        &self,
+        peer_id: &PeerId,
+        close_reason: ConnectionCloseReason,
+    ) -> Result<Option<InnerConnection>, NatTraversalError> {
+        self.emitted_established_events.remove(peer_id);
+        let removed = self
+            .connections
+            .remove(peer_id)
+            .map(|(_, connection)| connection);
+        if let Some(connection) = removed.as_ref() {
+            let effective_reason = self
+                .mark_connection_closed(peer_id, connection.stable_id(), close_reason)
+                .unwrap_or(close_reason);
+            if connection.close_reason().is_none()
+                && let Some(code) = effective_reason.app_error_code()
+            {
+                connection.close(code, effective_reason.reason_bytes());
+            }
+            if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                peers.remove(&connection.remote_address());
+            }
+        }
+        Ok(removed)
     }
 
     /// Spawn the NAT traversal handler loop for an existing connection referenced by the endpoint.
@@ -5653,11 +6275,15 @@ impl NatTraversalEndpoint {
         self.emitted_established_events.remove(peer_id);
 
         // DashMap provides lock-free .remove() that returns Option<(K, V)>
-        Ok(self.connections.remove(peer_id).map(|(_, connection)| {
+        let removed = self
+            .connections
+            .remove(peer_id)
+            .map(|(_, connection)| connection);
+        self.connection_lifecycle.write().remove(peer_id);
+        Ok(removed.inspect(|connection| {
             if let Ok(mut peers) = self.relay_advertised_peers.lock() {
                 peers.remove(&connection.remote_address());
             }
-            connection
         }))
     }
 
@@ -7403,6 +8029,9 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let connection_lifecycle = self.connection_lifecycle.clone();
+                    let next_connection_generation = self.next_connection_generation.clone();
+                    let emitted_established_events = self.emitted_established_events.clone();
                     let low_level_endpoint = endpoint.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
@@ -7416,7 +8045,11 @@ impl NatTraversalEndpoint {
 
                                 let (coordinator_peer_id, coordinator_connection) =
                                     match Self::materialize_authenticated_connection(
+                                        local_peer_id,
                                         connections.as_ref(),
+                                        connection_lifecycle.as_ref(),
+                                        next_connection_generation.as_ref(),
+                                        emitted_established_events.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,

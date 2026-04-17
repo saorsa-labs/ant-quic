@@ -54,7 +54,6 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock as ParkingRwLock;
@@ -63,7 +62,6 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::Side;
 use crate::bootstrap_cache::{
     BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
 };
@@ -89,6 +87,7 @@ use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effo
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::{AutoConnectPolicy, P2pConfig, TrustPolicy};
+use crate::{ConnectionCloseReason, Side};
 
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -412,9 +411,6 @@ pub struct P2pEndpoint {
     /// so ACKed bytes in flight on the old connection are always delivered
     /// (issue #166).
     reader_handles: Arc<RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>>,
-
-    /// Monotonic generation counter for reader-task replacement.
-    next_reader_generation: Arc<AtomicU64>,
 
     /// Circuit-breaker for coordinator peers (tracks failures by address).
     pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
@@ -872,6 +868,50 @@ pub enum DisconnectReason {
     RemoteClosed,
 }
 
+fn close_reason_from_connection(
+    connection: &crate::high_level::Connection,
+) -> Option<ConnectionCloseReason> {
+    connection
+        .close_reason()
+        .as_ref()
+        .map(ConnectionCloseReason::from_connection_error)
+}
+
+fn endpoint_error_from_connection_error(error: crate::ConnectionError) -> EndpointError {
+    EndpointError::ConnectionClosed {
+        reason: ConnectionCloseReason::from_connection_error(&error),
+    }
+}
+
+fn endpoint_error_from_write_error(error: crate::high_level::WriteError) -> EndpointError {
+    match error {
+        crate::high_level::WriteError::ConnectionLost(error) => {
+            endpoint_error_from_connection_error(error)
+        }
+        other => EndpointError::Connection(other.to_string()),
+    }
+}
+
+fn endpoint_error_from_stopped_error(error: crate::high_level::StoppedError) -> EndpointError {
+    match error {
+        crate::high_level::StoppedError::ConnectionLost(error) => {
+            endpoint_error_from_connection_error(error)
+        }
+        other => EndpointError::Connection(other.to_string()),
+    }
+}
+
+fn close_reason_for_disconnect(reason: &DisconnectReason) -> ConnectionCloseReason {
+    match reason {
+        DisconnectReason::Normal => ConnectionCloseReason::LifecycleCleanup,
+        DisconnectReason::Timeout => ConnectionCloseReason::TimedOut,
+        DisconnectReason::ProtocolError(_) => ConnectionCloseReason::LifecycleCleanup,
+        DisconnectReason::AuthenticationFailed => ConnectionCloseReason::Banned,
+        DisconnectReason::ConnectionLost => ConnectionCloseReason::ReaderExit,
+        DisconnectReason::RemoteClosed => ConnectionCloseReason::ConnectionClosed,
+    }
+}
+
 // TraversalPhase is re-exported from nat_traversal_api
 
 /// Error type for P2pEndpoint operations
@@ -884,6 +924,13 @@ pub enum EndpointError {
     /// Connection error
     #[error("Connection error: {0}")]
     Connection(String),
+
+    /// Lifecycle-aware connection closure.
+    #[error("Connection closed: {reason}")]
+    ConnectionClosed {
+        /// Lifecycle-aware close reason.
+        reason: ConnectionCloseReason,
+    },
 
     /// NAT traversal error
     #[error("NAT traversal error: {0}")]
@@ -933,10 +980,9 @@ async fn do_cleanup_connection(
     event_tx: &broadcast::Sender<P2pEvent>,
     peer_id: &PeerId,
     reason: DisconnectReason,
+    close_reason: ConnectionCloseReason,
 ) -> bool {
-    if let Ok(Some(connection)) = inner.remove_connection(peer_id) {
-        connection.close(crate::VarInt::from_u32(0), b"Disconnected");
-    }
+    let _ = inner.remove_connection_with_reason(peer_id, close_reason);
     direct_path_statuses.write().remove(peer_id);
 
     // Tear down all background readers for this peer. Cooperative cancel first
@@ -1375,7 +1421,6 @@ impl P2pEndpoint {
         let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
         let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
-        let next_reader_generation = Arc::new(AtomicU64::new(1));
 
         let endpoint = Self {
             inner: inner_arc,
@@ -1403,7 +1448,6 @@ impl P2pEndpoint {
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
             reader_handles,
-            next_reader_generation,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
@@ -3190,31 +3234,40 @@ impl P2pEndpoint {
             .or(hint_peer_id)
             .unwrap_or_else(|| peer_id_from_socket_addr(addr));
 
-        // Post-handshake dedup: if we already have a live connection to this
-        // peer (e.g. from a simultaneous open), just overwrite it with the new
-        // outgoing connection. This matches the already-working direct-only
-        // connect path and avoids returning a connection that was closed as a
-        // duplicate during tie-breaking.
-        if self.inner.is_peer_connected(&peer_id) {
-            let has_peer_entry = self.connected_peers.read().await.contains_key(&peer_id);
-            if has_peer_entry {
-                debug!(
-                    "finalize_direct_connection: simultaneous open for peer {:?} — overwriting existing connection",
-                    peer_id
-                );
-            } else {
-                debug!(
-                    "finalize_direct_connection: removing stale low-level connection state for peer {:?} before registering new connection",
-                    peer_id
-                );
-                let _ = self.inner.remove_connection(&peer_id);
-            }
-        }
-
         // Store in NAT traversal layer
-        self.inner
-            .add_connection(peer_id, connection.clone())
+        let registration = self
+            .inner
+            .add_connection_with_outcome(peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
+        if matches!(
+            registration,
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
+        ) {
+            if let Some(existing) = self.connected_peers.read().await.get(&peer_id).cloned() {
+                return Ok(existing);
+            }
+            let live_connection = self
+                .inner
+                .get_connection(&peer_id)
+                .map_err(EndpointError::NatTraversal)?
+                .ok_or_else(|| {
+                    EndpointError::Connection(
+                        "connection lost lifecycle race with no live winner".to_string(),
+                    )
+                })?;
+            let peer_conn = PeerConnection {
+                peer_id,
+                remote_addr: TransportAddr::Udp(live_connection.remote_address()),
+                traversal_method: TraversalMethod::Direct,
+                side: live_connection.side(),
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            };
+            self.observe_peer_reachability(&peer_conn);
+            self.register_connected_peer(peer_conn.clone()).await;
+            return Ok(peer_conn);
+        }
 
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner.register_connection_peer_id(addr, peer_id);
@@ -3251,6 +3304,13 @@ impl P2pEndpoint {
 
         self.observe_peer_reachability(&peer_conn);
         self.register_connected_peer(peer_conn.clone()).await;
+        if let crate::nat_traversal_api::ConnectionRegistrationOutcome::Live {
+            superseded_generation: Some(generation),
+            ..
+        } = registration
+        {
+            self.cancel_reader_generation(&peer_id, generation).await;
+        }
         publish_direct_path_status(
             self.direct_path_statuses.as_ref(),
             &self.event_tx,
@@ -3541,9 +3601,44 @@ impl P2pEndpoint {
                 )
             })?;
 
-        self.inner
-            .add_connection(relay_peer_id, connection.clone())
+        let registration = self
+            .inner
+            .add_connection_with_outcome(relay_peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
+        if matches!(
+            registration,
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
+        ) {
+            if let Some(existing) = self
+                .connected_peers
+                .read()
+                .await
+                .get(&relay_peer_id)
+                .cloned()
+            {
+                return Ok(existing);
+            }
+            let live_connection = self
+                .inner
+                .get_connection(&relay_peer_id)
+                .map_err(EndpointError::NatTraversal)?
+                .ok_or_else(|| {
+                    EndpointError::Connection(
+                        "relay connection lost lifecycle race with no live winner".to_string(),
+                    )
+                })?;
+            let peer_conn = PeerConnection {
+                peer_id: relay_peer_id,
+                remote_addr: TransportAddr::Udp(live_connection.remote_address()),
+                traversal_method: TraversalMethod::Relay,
+                side: live_connection.side(),
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            };
+            self.register_connected_peer(peer_conn.clone()).await;
+            return Ok(peer_conn);
+        }
 
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner
@@ -3571,6 +3666,14 @@ impl P2pEndpoint {
 
         // Store peer connection
         self.register_connected_peer(peer_conn.clone()).await;
+        if let crate::nat_traversal_api::ConnectionRegistrationOutcome::Live {
+            superseded_generation: Some(generation),
+            ..
+        } = registration
+        {
+            self.cancel_reader_generation(&relay_peer_id, generation)
+                .await;
+        }
 
         info!(
             "MASQUE relay connection succeeded to {} via {}",
@@ -3643,6 +3746,7 @@ impl P2pEndpoint {
             Ok((peer_id, connection)) => {
                 let remote_addr = connection.remote_address();
                 let mut resolved_peer_id = peer_id;
+                let mut registration = None;
 
                 if let Some(actual_peer_id) = self
                     .inner
@@ -3651,10 +3755,26 @@ impl P2pEndpoint {
                 {
                     if actual_peer_id != peer_id {
                         let _ = self.inner.remove_connection(&peer_id);
-                        let _ = self
+                        match self
                             .inner
-                            .add_connection(actual_peer_id, connection.clone());
-                        resolved_peer_id = actual_peer_id;
+                            .add_connection_with_outcome(actual_peer_id, connection.clone())
+                            .map_err(EndpointError::NatTraversal)
+                        {
+                            Ok(outcome) => {
+                                if matches!(
+                                    outcome,
+                                    crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
+                                ) {
+                                    return None;
+                                }
+                                registration = Some(outcome);
+                                resolved_peer_id = actual_peer_id;
+                            }
+                            Err(e) => {
+                                error!("Failed to register re-keyed inbound connection: {}", e);
+                                return None;
+                            }
+                        }
                     }
                 }
 
@@ -3700,6 +3820,14 @@ impl P2pEndpoint {
 
                 self.observe_peer_reachability(&peer_conn);
                 self.register_connected_peer(peer_conn.clone()).await;
+                if let Some(crate::nat_traversal_api::ConnectionRegistrationOutcome::Live {
+                    superseded_generation: Some(generation),
+                    ..
+                }) = registration
+                {
+                    self.cancel_reader_generation(&resolved_peer_id, generation)
+                        .await;
+                }
 
                 Some(peer_conn)
             }
@@ -3721,6 +3849,7 @@ impl P2pEndpoint {
     ///
     /// Safe to call even if the peer is not in all structures (idempotent).
     async fn cleanup_connection(&self, peer_id: &PeerId, reason: DisconnectReason) {
+        let close_reason = close_reason_for_disconnect(&reason);
         do_cleanup_connection(
             &*self.connected_peers,
             &*self.inner,
@@ -3730,6 +3859,7 @@ impl P2pEndpoint {
             &self.event_tx,
             peer_id,
             reason,
+            close_reason,
         )
         .await;
     }
@@ -3789,13 +3919,23 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Get peer's transport address to determine which engine/transport to use
-        let peer_info = self.connected_peers.read().await;
-        let transport_addr = peer_info
-            .get(peer_id)
-            .map(|conn| conn.remote_addr.clone())
-            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
-        drop(peer_info); // Release read lock before async operations
+        // Get peer's transport address to determine which engine/transport to use.
+        // Fall back to the canonical live QUIC connection if `connected_peers`
+        // lagged a lifecycle transition.
+        let transport_addr = {
+            let peer_info = self.connected_peers.read().await;
+            if let Some(conn) = peer_info.get(peer_id) {
+                conn.remote_addr.clone()
+            } else if let Some(connection) = self
+                .inner
+                .get_connection(peer_id)
+                .map_err(EndpointError::NatTraversal)?
+            {
+                TransportAddr::Udp(connection.remote_address())
+            } else {
+                return Err(EndpointError::PeerNotFound(*peer_id));
+            }
+        };
 
         // Select protocol engine based on transport address
         let engine = {
@@ -3812,19 +3952,25 @@ impl P2pEndpoint {
                     .map_err(EndpointError::NatTraversal)?
                     .ok_or(EndpointError::PeerNotFound(*peer_id))?;
 
+                if let Some(reason) = close_reason_from_connection(&connection) {
+                    return Err(EndpointError::ConnectionClosed { reason });
+                }
+
                 let mut send_stream = connection
                     .open_uni()
                     .await
-                    .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                    .map_err(endpoint_error_from_connection_error)?;
 
                 send_stream
                     .write_all(data)
                     .await
-                    .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                    .map_err(endpoint_error_from_write_error)?;
 
-                send_stream
-                    .finish()
-                    .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                send_stream.finish().map_err(|e| {
+                    close_reason_from_connection(&connection)
+                        .map(|reason| EndpointError::ConnectionClosed { reason })
+                        .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
+                })?;
 
                 // Wait for peer to acknowledge receipt. Without this, finish()
                 // returns immediately (it only queues a FIN) and dead connections
@@ -3833,11 +3979,12 @@ impl P2pEndpoint {
                 match tokio::time::timeout(Duration::from_secs(5), send_stream.stopped()).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        return Err(EndpointError::Connection(format!(
-                            "peer did not acknowledge send: {e}"
-                        )));
+                        return Err(endpoint_error_from_stopped_error(e));
                     }
                     Err(_) => {
+                        if let Some(reason) = close_reason_from_connection(&connection) {
+                            return Err(EndpointError::ConnectionClosed { reason });
+                        }
                         return Err(EndpointError::Connection(
                             "send acknowledgement timed out (peer may be dead)".into(),
                         ));
@@ -4618,15 +4765,46 @@ impl P2pEndpoint {
     /// that Quinn has buffered) is NEVER interrupted — this is the core
     /// correctness property against issue #166. Explicit teardown
     /// (`cleanup_connection`, `shutdown`) also calls `abort()` as a backstop.
+    async fn cancel_reader_generation(&self, peer_id: &PeerId, generation: u64) {
+        let handles = self.reader_handles.read().await;
+        if let Some(handle) = handles
+            .get(peer_id)
+            .and_then(|entries| entries.iter().find(|entry| entry.generation == generation))
+        {
+            handle.cancel.cancel();
+        }
+    }
+
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
-        let generation = self.next_reader_generation.fetch_add(1, Ordering::Relaxed);
         let conn_stable_id = connection.stable_id();
+        let lifecycle_snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
+        let generation = lifecycle_snapshot
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or(conn_stable_id as u64);
         let cancel = CancellationToken::new();
+        if let Some(snapshot) = lifecycle_snapshot {
+            debug!(
+                peer_id = ?peer_id,
+                generation = snapshot.generation,
+                connection_id = %hex::encode(&snapshot.connection_id[..8]),
+                established_at_unix_ms = snapshot.established_at_unix_ms,
+                state = ?snapshot.state,
+                "spawning reader task with lifecycle snapshot"
+            );
+            if !matches!(
+                snapshot.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Live
+            ) {
+                cancel.cancel();
+            }
+        }
         let reader_cancel = cancel.clone();
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
@@ -5059,30 +5237,52 @@ impl P2pEndpoint {
                     }
                 };
 
-                if !last_reader {
-                    debug!(
-                        "Reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still active, skipping cleanup",
-                        peer_id, generation, conn_stable_id
-                    );
-                    continue;
+                let exit_outcome = inner.handle_reader_exit(&peer_id, generation, conn_stable_id);
+                match exit_outcome {
+                    crate::nat_traversal_api::ReaderExitOutcome::Noop => {
+                        debug!(
+                            "Reader task exited for peer {:?} (generation {}, conn stable_id {}); no lifecycle entry remained",
+                            peer_id, generation, conn_stable_id
+                        );
+                        continue;
+                    }
+                    crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped => {
+                        debug!(
+                            "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped",
+                            peer_id, generation, conn_stable_id
+                        );
+                        continue;
+                    }
+                    crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected {
+                        close_reason,
+                    } => {
+                        if !last_reader {
+                            debug!(
+                                "Live reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still draining, deferring peer cleanup",
+                                peer_id, generation, conn_stable_id
+                            );
+                            continue;
+                        }
+
+                        debug!(
+                            "Last live reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
+                            peer_id, generation, conn_stable_id
+                        );
+
+                        do_cleanup_connection(
+                            &*connected_peers,
+                            &*inner,
+                            &*reader_handles,
+                            &*direct_path_statuses,
+                            &*stats,
+                            &event_tx,
+                            &peer_id,
+                            DisconnectReason::ConnectionLost,
+                            close_reason,
+                        )
+                        .await;
+                    }
                 }
-
-                debug!(
-                    "Last reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
-                    peer_id, generation, conn_stable_id
-                );
-
-                do_cleanup_connection(
-                    &*connected_peers,
-                    &*inner,
-                    &*reader_handles,
-                    &*direct_path_statuses,
-                    &*stats,
-                    &event_tx,
-                    &peer_id,
-                    DisconnectReason::ConnectionLost,
-                )
-                .await;
             }
         });
     }
@@ -5143,6 +5343,7 @@ impl P2pEndpoint {
                         &event_tx,
                         peer_id,
                         DisconnectReason::Timeout,
+                        ConnectionCloseReason::TimedOut,
                     )
                     .await;
                 }
@@ -5184,7 +5385,6 @@ impl Clone for P2pEndpoint {
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
-            next_reader_generation: Arc::clone(&self.next_reader_generation),
             coordinator_health: Arc::clone(&self.coordinator_health),
         }
     }

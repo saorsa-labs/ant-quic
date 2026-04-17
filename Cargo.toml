@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "ant-quic"
-version = "0.26.13"
+version = "0.27.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
@@ -84,6 +84,7 @@ ble = ["dep:btleplug"]
 # Core dependencies
 async-trait = "0.1"
 bytes = ">=1.11.1"
+blake3 = "1"
 rustc-hash = "2"
 rand = "0.8"
 thiserror = "2.0.3"
