@@ -163,7 +163,9 @@ async fn run_client(server_addr: SocketAddr, chain: Arc<Vec<CertificateDer<'stat
     let mut client = Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client ep");
     client.set_default_client_config(client_config(chain.as_slice()));
 
-    let connecting = client.connect(server_addr, "localhost").expect("start connect");
+    let connecting = client
+        .connect(server_addr, "localhost")
+        .expect("start connect");
     let conn = timeout(Duration::from_secs(10), connecting)
         .await
         .expect("client connect timeout")
@@ -172,15 +174,17 @@ async fn run_client(server_addr: SocketAddr, chain: Arc<Vec<CertificateDer<'stat
     // Build the 2 MiB slow-stream payload, seq=0 in first 4 bytes.
     let mut slow_payload = vec![0u8; SLOW_STREAM_BYTES];
     slow_payload[..4].copy_from_slice(&0u32.to_be_bytes());
-    for i in 4..SLOW_STREAM_BYTES {
-        slow_payload[i] = (i & 0xff) as u8;
+    for (i, byte) in slow_payload.iter_mut().enumerate().skip(4) {
+        *byte = (i & 0xff) as u8;
     }
 
     // Open and start writing the slow stream first. DO NOT await
     // finish — we want the server to be mid-`read_to_end` while the
     // short bursts arrive.
     let mut slow = conn.open_uni().await.expect("client open_uni slow");
-    slow.write_all(&slow_payload).await.expect("client slow write");
+    slow.write_all(&slow_payload)
+        .await
+        .expect("client slow write");
     // Yield so the slow write actually gets flushed into quinn's send
     // buffer and starts being read by the server before we burst.
     sleep(Duration::from_millis(5)).await;
@@ -206,7 +210,8 @@ async fn run_client(server_addr: SocketAddr, chain: Arc<Vec<CertificateDer<'stat
     // datagrams, but at that point the server's in-order stream queue
     // must contain all of them).
     for (idx, jh) in burst.into_iter().enumerate() {
-        jh.await.unwrap_or_else(|e| panic!("short write {idx}: {e}"));
+        jh.await
+            .unwrap_or_else(|e| panic!("short write {idx}: {e}"));
     }
 
     // Now finish the slow stream.

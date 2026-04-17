@@ -510,7 +510,7 @@ pub struct NatTraversalConfig {
     /// windows are **not** derived from this value — they use transport-layer
     /// defaults based on bandwidth-delay products.
     ///
-    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
+    /// Default: [`crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 
@@ -911,6 +911,29 @@ impl CandidateAddress {
             CandidateState::Removed => 0,
         }
     }
+}
+
+/// Drop non-Global NAT-traversal candidates when at least one Global-scope
+/// address is present (issue #163).
+///
+/// When a peer's `ADD_ADDRESS` / `CoordinationAccepted` payload leaks RFC1918,
+/// link-local, ULA, or loopback entries alongside its public address(es),
+/// running hole-punch probes against those private entries from an off-LAN
+/// peer stalls for the full NAT probe window and never produces a usable
+/// path. Keep non-globals only when the list has nothing better (e.g. pure
+/// LAN peers).
+fn drop_non_global_nat_candidates_when_global_present(addrs: &mut Vec<SocketAddr>) {
+    let has_global = addrs.iter().any(|addr| {
+        crate::reachability::socket_addr_scope(*addr)
+            == Some(crate::reachability::ReachabilityScope::Global)
+    });
+    if !has_global {
+        return;
+    }
+    addrs.retain(|addr| {
+        crate::reachability::socket_addr_scope(*addr)
+            == Some(crate::reachability::ReachabilityScope::Global)
+    });
 }
 
 fn allow_loopback_from_env() -> bool {
@@ -3456,6 +3479,14 @@ impl NatTraversalEndpoint {
                         .collect();
                     normalized_target_addrs.sort_unstable();
                     normalized_target_addrs.dedup();
+
+                    // Issue #163: drop non-Global candidates before they enter
+                    // the NAT-traversal session. See
+                    // `drop_non_global_nat_candidates_when_global_present` for
+                    // rationale.
+                    drop_non_global_nat_candidates_when_global_present(
+                        &mut normalized_target_addrs,
+                    );
 
                     if let Some(mut entry) = self.active_sessions.get_mut(target) {
                         let session = entry.value_mut();
@@ -8276,6 +8307,51 @@ mod tests {
         assert_eq!(config.max_candidates, 8);
         assert!(config.enable_symmetric_nat);
         assert!(config.enable_relay_fallback);
+    }
+
+    /// Regression for issue #163.
+    ///
+    /// A mixed list of Global + private/link-local/loopback candidates from
+    /// `CoordinationAccepted` must be stripped down to Global only before the
+    /// session fires hole-punch probes — otherwise we stall on RFC1918
+    /// entries (like `10.x.y.z`) that cannot be reached from an off-LAN
+    /// peer.
+    #[test]
+    fn test_drop_non_global_nat_candidates_filters_mixed_list() {
+        let private_v4: SocketAddr = "10.200.0.1:5483".parse().unwrap();
+        let global_v4: SocketAddr = "198.51.100.20:5483".parse().unwrap();
+        let global_v6: SocketAddr = "[2001:db8::20]:5483".parse().unwrap();
+        let link_local: SocketAddr = "169.254.10.1:5483".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:5483".parse().unwrap();
+        let ula_v6: SocketAddr = "[fc00::1]:5483".parse().unwrap();
+
+        let mut addrs = vec![
+            private_v4, link_local, loopback, ula_v6, global_v4, global_v6,
+        ];
+        drop_non_global_nat_candidates_when_global_present(&mut addrs);
+        addrs.sort();
+        let mut expected = vec![global_v4, global_v6];
+        expected.sort();
+        assert_eq!(
+            addrs, expected,
+            "private/link-local/loopback/ULA must be dropped when Global candidates are present"
+        );
+    }
+
+    /// The filter is a no-op on a purely non-global list so that pure-LAN
+    /// peers (e.g. mDNS-discovered `192.168.x` neighbours) remain dialable.
+    #[test]
+    fn test_drop_non_global_nat_candidates_preserves_lan_only() {
+        let private_v4: SocketAddr = "192.168.1.25:5483".parse().unwrap();
+        let link_local_v6: SocketAddr = "[fe80::1]:5483".parse().unwrap();
+
+        let original = vec![private_v4, link_local_v6];
+        let mut addrs = original.clone();
+        drop_non_global_nat_candidates_when_global_present(&mut addrs);
+        assert_eq!(
+            addrs, original,
+            "LAN-only candidate sets must not be emptied"
+        );
     }
 
     #[test]

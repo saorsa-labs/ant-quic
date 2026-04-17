@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.13] - 2026-04-17
+
+### Fixed
+
+- **#166 — `Node::send` succeeded, `Node::recv` silently dropped data in a multi-peer mesh.** `P2pEndpoint::spawn_reader_task` previously aborted the previous reader for a peer whenever a redundant connection was established (simultaneous-open under mesh churn). The abort could fire between `accept_uni()` returning a `RecvStream` and `read_to_end()` completing, cancelling the reader mid-read and silently dropping bytes that QUIC had already ACKed to the sender. The reader now uses a `CancellationToken` honored only at the `accept_uni()` boundary — in-flight reads always finish and forward their bytes before the task exits. Reader handles are stored per-peer as a `Vec<ReaderTaskHandle>` so multiple concurrent connections to the same peer each run their own reader until their underlying QUIC connection terminates. Peer-wide cleanup now fires only when the last reader for that peer exits. New regression test `tests/regression_166_mesh_churn.rs` reproduces the original bug (0 / 240 streams delivered, 90 s timeout) and validates the fix (240 / 240 delivered, < 7 s).
+- **#163 — NAT traversal fired on public-IP peers, hole-punch success rate 0 % on bootstrap mesh.** `CoordinationAccepted` previously accepted RFC1918, link-local, ULA, and loopback addresses into the NAT-traversal candidate set, causing hole-punch probes against private addresses visible only inside the peer's LAN. `connect_orchestrated` likewise dialed leaked private candidates and stalled for the full QUIC handshake timeout per entry (~50 s). Two new helpers, `drop_non_global_nat_candidates_when_global_present` and `drop_non_global_direct_candidates_when_global_present`, strip non-Global entries from both paths whenever at least one Global-scope candidate is available, while preserving pure-LAN peer lists so mDNS-discovered neighbours remain dialable. Four new unit tests cover the filter on mixed and LAN-only inputs.
+
+### Tests
+
+- **#164 — relay `bytes_forwarded=0` regression gate.** Added `test_handle_client_datagram_records_bytes_and_datagram_count` driving `handle_client_datagram` end-to-end with an uncompressed datagram and asserting `stats.total_bytes_relayed` and `stats.datagrams_forwarded` both advance. Locks in the observability wiring landed in 0.26.10/0.26.11 against future regressions.
+- **Release gate**: `cargo fmt --all -- --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`, and `cargo nextest run --all-features --workspace` (2240/2240 passed) all green on the fix commit.
+
 ## [0.26.12] - 2026-04-16
 
 ### Fixed

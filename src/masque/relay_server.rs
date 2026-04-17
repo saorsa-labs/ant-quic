@@ -1442,6 +1442,68 @@ mod tests {
         assert_eq!(stats.sessions_created.load(Ordering::Relaxed), 1);
     }
 
+    /// Regression for issue #164.
+    ///
+    /// `bytes_relayed` / `datagrams_forwarded` must increment each time the
+    /// relay forwards a client datagram. The original bug showed
+    /// `is_relaying: true` with `bytes_forwarded: 0` across every VPS in a
+    /// long-running mesh. We cover the datagram accounting path end-to-end
+    /// by driving `handle_client_datagram` with an uncompressed datagram
+    /// whose target is carried in-line and asserting both counters advance
+    /// by the encoded payload length.
+    #[tokio::test]
+    async fn test_handle_client_datagram_records_bytes_and_datagram_count() {
+        use crate::VarInt;
+        use crate::masque::{Datagram, UncompressedDatagram};
+        use bytes::Bytes;
+
+        let config = MasqueRelayConfig::default();
+        let server = MasqueRelayServer::new(config, test_addr(9000));
+        let client = client_addr(42);
+
+        server
+            .handle_connect_request(&ConnectUdpRequest::bind_any(), client)
+            .await
+            .unwrap();
+
+        let target: SocketAddr = "203.0.113.77:4444".parse().unwrap();
+        let payload = Bytes::from_static(b"PROBE0123456789-relay-forwarding-check");
+        let payload_len = payload.len() as u64;
+
+        // Uncompressed datagram carries the target in-line; session resolves
+        // it directly without needing a prior COMPRESSION_ASSIGN roundtrip.
+        let uncompressed = UncompressedDatagram::new(VarInt::from_u32(2), target, payload.clone());
+        let datagram = Datagram::from(uncompressed);
+
+        let result = server
+            .handle_client_datagram(client, datagram, payload)
+            .await;
+
+        match result {
+            DatagramResult::Forward(out) => {
+                assert_eq!(
+                    out.target, target,
+                    "forwarded datagram must address the peer target"
+                );
+            }
+            other => panic!(
+                "expected DatagramResult::Forward, got {other:?} — relay forwarding is broken"
+            ),
+        }
+
+        let stats = server.stats();
+        assert_eq!(
+            stats.total_bytes_relayed(),
+            payload_len,
+            "bytes_relayed must advance by the forwarded payload size (#164)"
+        );
+        assert_eq!(
+            stats.datagrams_forwarded.load(Ordering::Relaxed),
+            1,
+            "datagrams_forwarded must advance for each forwarded datagram (#164)"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_session_info() {
         let config = MasqueRelayConfig::default();

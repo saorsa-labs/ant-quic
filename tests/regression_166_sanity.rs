@@ -42,7 +42,10 @@ async fn sanity_single_send_surfaces_at_recv() {
             .expect("server new"),
     );
     let server_addr = normalize_local_addr(server.local_addr().expect("server addr"));
-    eprintln!("server_addr={server_addr} server_peer_id={:?}", server.peer_id());
+    eprintln!(
+        "server_addr={server_addr} server_peer_id={:?}",
+        server.peer_id()
+    );
 
     // Server must accept incoming connections — otherwise the reader
     // task never spawns and recv() never surfaces anything.
@@ -64,7 +67,10 @@ async fn sanity_single_send_surfaces_at_recv() {
         .await
         .expect("connect timeout")
         .expect("connect failed");
-    eprintln!("connected: peer_id={:?} authenticated={}", conn.peer_id, conn.authenticated);
+    eprintln!(
+        "connected: peer_id={:?} authenticated={}",
+        conn.peer_id, conn.authenticated
+    );
 
     // Give any background auth + reader spawn time to settle.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -74,7 +80,7 @@ async fn sanity_single_send_surfaces_at_recv() {
     let target = conn.peer_id;
     eprintln!("sending 40 bytes to {target:?}");
     client
-        .send(&target, b"0000sanity-payload-40-bytes-pad1234567890")
+        .send(&target, b"0000sanity-payload-40-bytes-pad123456789")
         .await
         .expect("client send");
     eprintln!("send returned Ok");

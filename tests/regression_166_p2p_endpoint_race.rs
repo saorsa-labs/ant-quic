@@ -129,8 +129,8 @@ async fn p2p_endpoint_send_surfaces_all_short_streams_under_concurrent_large_sen
     // runs concurrently with the short burst.
     let mut large_payload = vec![0u8; LARGE_PAYLOAD_LEN];
     large_payload[..4].copy_from_slice(&0u32.to_be_bytes());
-    for i in 4..LARGE_PAYLOAD_LEN {
-        large_payload[i] = (i & 0xff) as u8;
+    for (i, byte) in large_payload.iter_mut().enumerate().skip(4) {
+        *byte = (i & 0xff) as u8;
     }
     let client_for_large = Arc::clone(&client);
     let large_task = tokio::spawn(async move {
@@ -178,7 +178,10 @@ async fn p2p_endpoint_send_surfaces_all_short_streams_under_concurrent_large_sen
     let _ = timeout(Duration::from_secs(15), recv_task).await;
 
     let received = received.lock().await.clone();
-    let large_count = received.iter().filter(|(len, _)| *len >= LARGE_PAYLOAD_LEN).count();
+    let large_count = received
+        .iter()
+        .filter(|(len, _)| *len >= LARGE_PAYLOAD_LEN)
+        .count();
     let short_seqs: HashSet<u32> = received
         .iter()
         .filter(|(len, _)| *len == SHORT_PAYLOAD_LEN)
