@@ -121,7 +121,18 @@ struct PeerHintRecord {
 
 #[derive(Debug)]
 struct ReaderTaskHandle {
+    /// Monotonic id used by the reader-exit handler to locate the exiting task
+    /// within the per-peer vector. A peer may briefly have multiple live QUIC
+    /// connections (simultaneous-open races, coordinated + direct paths
+    /// converging); each has its own reader, uniquely identified by this id.
     generation: u64,
+    /// Cooperative shutdown signal. Honored at the `accept_uni()` boundary only,
+    /// so an in-flight `read_to_end()` always completes before the task exits.
+    /// This prevents silent loss of already-ACKed bytes during connection
+    /// replacement (issue #166).
+    cancel: CancellationToken,
+    /// Fallback abort handle used by `shutdown()` and as a backstop during
+    /// explicit `cleanup_connection` after cooperative cancellation.
     abort_handle: tokio::task::AbortHandle,
 }
 
@@ -164,6 +175,24 @@ fn direct_candidate_rank(addr: SocketAddr) -> (u8, u8) {
 fn prioritize_direct_candidate_addrs(addrs: &mut Vec<SocketAddr>) {
     addrs.sort_by_key(|addr| std::cmp::Reverse(direct_candidate_rank(*addr)));
     addrs.dedup();
+}
+
+/// Drop LocalNetwork / Loopback candidates from the dial list when at least one
+/// Global-scope address is present (issue #163).
+///
+/// When a peer advertises both globally-routable and private addresses (for
+/// example, a VPS whose interface scan leaked `10.x.y.z` alongside its public
+/// IP), dialing the private entries from an off-LAN caller stalls for the
+/// per-address QUIC handshake timeout before failing. Keep them only when the
+/// list contains nothing better so pure-LAN peers (e.g. discovered via mDNS)
+/// still work.
+fn drop_non_global_direct_candidates_when_global_present(addrs: &mut Vec<SocketAddr>) {
+    let has_global = addrs
+        .iter()
+        .any(|addr| socket_addr_scope(*addr) == Some(ReachabilityScope::Global));
+    if has_global {
+        addrs.retain(|addr| socket_addr_scope(*addr) == Some(ReachabilityScope::Global));
+    }
 }
 
 fn relay_target_rank(addr: SocketAddr) -> u8 {
@@ -366,11 +395,23 @@ pub struct P2pEndpoint {
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
     data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
 
-    /// JoinSet tracking background reader tasks (each returns peer + generation on exit)
-    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<(PeerId, u64)>>>,
+    /// JoinSet tracking background reader tasks.
+    ///
+    /// Each task returns `(peer_id, generation, conn_stable_id)` on exit so the
+    /// reader-exit handler can identify which `(peer_id, generation)` slot to
+    /// clear and include the stable connection id in diagnostics.
+    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<(PeerId, u64, usize)>>>,
 
-    /// Per-peer abort handles for targeted reader task cancellation
-    reader_handles: Arc<RwLock<HashMap<PeerId, ReaderTaskHandle>>>,
+    /// Per-peer reader-task handles.
+    ///
+    /// Keyed on `PeerId` but stores a `Vec` because a single peer may briefly
+    /// have multiple live QUIC connections (simultaneous-open races, or the
+    /// coordinated and direct paths converging). Each entry is uniquely
+    /// identified by its `generation`. Readers are not pre-empted on
+    /// connection replacement — each runs until its own connection terminates,
+    /// so ACKed bytes in flight on the old connection are always delivered
+    /// (issue #166).
+    reader_handles: Arc<RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>>,
 
     /// Monotonic generation counter for reader-task replacement.
     next_reader_generation: Arc<AtomicU64>,
@@ -886,7 +927,7 @@ pub enum EndpointError {
 async fn do_cleanup_connection(
     connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
     inner: &NatTraversalEndpoint,
-    reader_handles: &RwLock<HashMap<PeerId, ReaderTaskHandle>>,
+    reader_handles: &RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>,
     direct_path_statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
@@ -898,9 +939,14 @@ async fn do_cleanup_connection(
     }
     direct_path_statuses.write().remove(peer_id);
 
-    // Abort the background reader task for this peer
-    if let Some(handle) = reader_handles.write().await.remove(peer_id) {
-        handle.abort_handle.abort();
+    // Tear down all background readers for this peer. Cooperative cancel first
+    // (allows any in-flight `read_to_end()` to complete and deliver its bytes),
+    // then `abort()` as a backstop in case a reader is wedged.
+    if let Some(handles) = reader_handles.write().await.remove(peer_id) {
+        for handle in handles {
+            handle.cancel.cancel();
+            handle.abort_handle.abort();
+        }
     }
 
     let removed = remove_connected_peer(connected_peers, stats, event_tx, peer_id, reason).await;
@@ -1932,6 +1978,7 @@ impl P2pEndpoint {
         }
 
         prioritize_direct_candidate_addrs(&mut explicit_addrs);
+        drop_non_global_direct_candidates_when_global_present(&mut explicit_addrs);
 
         if !explicit_addrs.is_empty() && !is_simple_address_only {
             match self
@@ -3178,9 +3225,10 @@ impl P2pEndpoint {
         // Do NOT re-fetch via get_connection() — see simultaneous-connect fix.
         let reader_conn = connection.clone();
 
-        // In simultaneous-open races, abort any previous reader for this peer
-        // before installing the replacement connection lifecycle.
-        self.abort_existing_reader_task(peer_id).await;
+        // No abort-old: under simultaneous-open, the previous connection may
+        // still carry ACKed-but-undrained bytes. Aborting its reader here would
+        // silently lose those bytes (issue #166). The old reader will exit on
+        // its own when its connection terminates or idles out.
 
         // Spawn connection handler (Client side - we initiated)
         self.inner
@@ -3620,9 +3668,10 @@ impl P2pEndpoint {
                 // QUIC connection (simultaneous-connect recv() hang).
                 let reader_conn = connection.clone();
 
-                // In simultaneous-open races, abort any previous reader for this peer
-                // before installing the replacement connection lifecycle.
-                self.abort_existing_reader_task(resolved_peer_id).await;
+                // No abort-old: see spawn_reader_task — the old connection may
+                // still carry undrained ACKed bytes (issue #166). Multiple
+                // concurrent readers per peer are tolerated; each exits when
+                // its own connection closes.
 
                 // They initiated the connection to us = Server side
                 if let Err(e) =
@@ -3666,7 +3715,8 @@ impl P2pEndpoint {
     /// This is the single point of cleanup for connections — it removes the peer from:
     /// - `connected_peers` HashMap
     /// - `NatTraversalEndpoint.connections` DashMap (via `remove_connection()`)
-    /// - `reader_handles` (aborts the background reader task)
+    /// - `reader_handles` (cooperative cancel + abort backstop on all readers
+    ///   for this peer)
     /// - Updates stats and emits a disconnect event
     ///
     /// Safe to call even if the peer is not in all structures (idempotent).
@@ -4554,18 +4604,20 @@ impl P2pEndpoint {
     /// Spawn a background tokio task that reads uni streams from a QUIC connection
     /// and forwards received data into the shared `data_tx` channel.
     ///
-    /// The task exits naturally when the connection is closed or the channel is dropped.
-    async fn abort_existing_reader_task(&self, peer_id: PeerId) {
-        let mut handles = self.reader_handles.write().await;
-        if let Some(old_handle) = handles.remove(&peer_id) {
-            tracing::debug!(
-                "Aborting previous reader task for peer {:?} before connection replacement",
-                peer_id
-            );
-            old_handle.abort_handle.abort();
-        }
-    }
-
+    /// # Multiple readers per peer (issue #166)
+    ///
+    /// A peer may briefly have two live QUIC connections (simultaneous-open,
+    /// coordinated + direct paths converging). Each connection gets its own
+    /// reader; readers are never pre-empted on connection replacement. They
+    /// exit when their own connection terminates or idles out.
+    ///
+    /// # Cooperative cancellation
+    ///
+    /// The reader honors a [`CancellationToken`] only at the `accept_uni()`
+    /// boundary. An in-flight `read_to_end()` (which drains already-ACKed bytes
+    /// that Quinn has buffered) is NEVER interrupted — this is the core
+    /// correctness property against issue #166. Explicit teardown
+    /// (`cleanup_connection`, `shutdown`) also calls `abort()` as a backstop.
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
@@ -4573,35 +4625,58 @@ impl P2pEndpoint {
         let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
         let generation = self.next_reader_generation.fetch_add(1, Ordering::Relaxed);
+        let conn_stable_id = connection.stable_id();
+        let cancel = CancellationToken::new();
+        let reader_cancel = cancel.clone();
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             loop {
-                // Accept the next unidirectional stream
-                let mut recv_stream = match connection.accept_uni().await {
-                    Ok(stream) => stream,
-                    Err(e) => {
+                // Cancel only between streams. If the token fires while we're
+                // mid-`read_to_end()`, the read completes first (Quinn already
+                // holds the ACKed bytes) and the NEXT iteration exits here.
+                let mut recv_stream = tokio::select! {
+                    biased;
+                    _ = reader_cancel.cancelled() => {
                         debug!(
-                            "Reader task for peer {:?} ending: accept_uni error: {}",
-                            peer_id, e
+                            "Reader task for peer {:?} (conn stable_id={}) exiting on graceful cancel",
+                            peer_id, conn_stable_id
                         );
                         break;
                     }
+                    result = connection.accept_uni() => match result {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            debug!(
+                                "Reader task for peer {:?} (conn stable_id={}) ending: accept_uni error: {}",
+                                peer_id, conn_stable_id, e
+                            );
+                            break;
+                        }
+                    }
                 };
 
+                // Uncancellable: drain the already-ACKed bytes. Cancelling here
+                // would silently lose data the sender has already seen as ACKed
+                // (the root cause of issue #166).
                 let data = match recv_stream.read_to_end(max_read_bytes).await {
                     Ok(data) if data.is_empty() => continue,
                     Ok(data) => data,
                     Err(e) => {
                         debug!(
-                            "Reader task for peer {:?}: read_to_end error: {}",
-                            peer_id, e
+                            "Reader task for peer {:?} (conn stable_id={}): read_to_end error: {}",
+                            peer_id, conn_stable_id, e
                         );
                         break;
                     }
                 };
 
                 let data_len = data.len();
-                tracing::trace!("Reader task: {} bytes from peer {:?}", data_len, peer_id);
+                tracing::trace!(
+                    "Reader task: {} bytes from peer {:?} (conn stable_id={})",
+                    data_len,
+                    peer_id,
+                    conn_stable_id
+                );
 
                 match inner
                     .handle_coordinator_control_message(peer_id, connection.clone(), &data)
@@ -4646,27 +4721,16 @@ impl P2pEndpoint {
                 }
             }
 
-            (peer_id, generation)
+            (peer_id, generation, conn_stable_id)
         });
 
-        // Abort any existing reader task for this peer before inserting the new one.
-        // Without this, reconnections leave zombie reader tasks on dead connections
-        // that never deliver data, causing send_direct() to succeed but recv() to hang.
+        // Append — DO NOT pre-empt existing readers. See function doc.
         let mut handles = self.reader_handles.write().await;
-        if let Some(old_handle) = handles.remove(&peer_id) {
-            tracing::debug!(
-                "Aborting previous reader task for peer {:?} (connection replaced)",
-                peer_id
-            );
-            old_handle.abort_handle.abort();
-        }
-        handles.insert(
-            peer_id,
-            ReaderTaskHandle {
-                generation,
-                abort_handle,
-            },
-        );
+        handles.entry(peer_id).or_default().push(ReaderTaskHandle {
+            generation,
+            cancel,
+            abort_handle,
+        });
     }
 
     async fn apply_peer_address_update(
@@ -4953,12 +5017,13 @@ impl P2pEndpoint {
                     tasks.try_join_next()
                 };
 
-                let (peer_id, generation) = match maybe_peer_id {
+                let (peer_id, generation, conn_stable_id) = match maybe_peer_id {
                     Some(Ok(reader_exit)) => reader_exit,
                     Some(Err(join_err)) => {
-                        // Task was cancelled (aborted) — not a real disconnect.
-                        // Abort handles are used by reconnection logic to replace
-                        // stale reader tasks, so this is expected.
+                        // Task was cancelled (aborted) — `cleanup_connection`
+                        // and `shutdown` use `abort()` as a backstop after
+                        // cooperative cancel. This is expected and not a signal
+                        // of an unexpected disconnect.
                         debug!("Reader task cancelled: {}", join_err);
                         continue;
                     }
@@ -4970,22 +5035,41 @@ impl P2pEndpoint {
                     }
                 };
 
-                let should_cleanup = reader_handles
-                    .read()
-                    .await
-                    .get(&peer_id)
-                    .is_some_and(|handle| handle.generation == generation);
-                if !should_cleanup {
+                // With per-connection readers (issue #166), a peer may have
+                // several live readers. Only the LAST one to exit should trigger
+                // peer-wide cleanup. Remove the exiting handle from the vec; if
+                // other readers remain, this peer is still alive on another
+                // connection and we skip cleanup.
+                let last_reader = {
+                    let mut handles = reader_handles.write().await;
+                    match handles.get_mut(&peer_id) {
+                        Some(vec) => {
+                            vec.retain(|h| h.generation != generation);
+                            if vec.is_empty() {
+                                handles.remove(&peer_id);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        // The peer was already removed by an explicit
+                        // `cleanup_connection` (e.g., shutdown, stale reaper).
+                        // No further cleanup needed.
+                        None => false,
+                    }
+                };
+
+                if !last_reader {
                     debug!(
-                        "Ignoring stale reader task exit for peer {:?} (generation {})",
-                        peer_id, generation
+                        "Reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still active, skipping cleanup",
+                        peer_id, generation, conn_stable_id
                     );
                     continue;
                 }
 
                 debug!(
-                    "Reader task exited for peer {:?} (generation {}) — triggering immediate cleanup",
-                    peer_id, generation
+                    "Last reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
+                    peer_id, generation, conn_stable_id
                 );
 
                 do_cleanup_connection(
@@ -5938,6 +6022,51 @@ mod tests {
         assert_eq!(addrs[1], global_v4);
         assert_eq!(addrs[2], private_v4);
         assert_eq!(addrs[3], loopback);
+    }
+
+    /// Regression for issue #163.
+    ///
+    /// When a peer advertises a globally-routable address plus some RFC1918 /
+    /// link-local / loopback leftovers, dialing those private entries from a
+    /// WAN caller stalls for the full QUIC handshake timeout before failing.
+    /// `drop_non_global_direct_candidates_when_global_present` must strip them
+    /// when a Global candidate is available.
+    #[test]
+    fn test_drop_non_global_direct_candidates_when_global_present() {
+        let private_v4: SocketAddr = "10.200.0.1:5483".parse().expect("valid addr");
+        let global_v4: SocketAddr = "198.51.100.20:5483".parse().expect("valid addr");
+        let global_v6: SocketAddr = "[2001:db8::20]:5483".parse().expect("valid addr");
+        let link_local: SocketAddr = "169.254.10.1:5483".parse().expect("valid addr");
+        let loopback: SocketAddr = "127.0.0.1:5483".parse().expect("valid addr");
+
+        let mut addrs = vec![private_v4, link_local, loopback, global_v4, global_v6];
+        drop_non_global_direct_candidates_when_global_present(&mut addrs);
+        addrs.sort();
+        let expected = {
+            let mut v = vec![global_v4, global_v6];
+            v.sort();
+            v
+        };
+        assert_eq!(
+            addrs, expected,
+            "private/link-local/loopback must be dropped when Global candidates are present"
+        );
+    }
+
+    /// Pure-LAN peers (no Global candidates — e.g. mDNS-discovered LAN peer)
+    /// must still be reachable. The filter must be a no-op in this case.
+    #[test]
+    fn test_drop_non_global_direct_candidates_preserves_lan_only_list() {
+        let private_v4: SocketAddr = "192.168.1.25:5483".parse().expect("valid addr");
+        let link_local_v6: SocketAddr = "[fe80::1]:5483".parse().expect("valid addr");
+
+        let original = vec![private_v4, link_local_v6];
+        let mut addrs = original.clone();
+        drop_non_global_direct_candidates_when_global_present(&mut addrs);
+        assert_eq!(
+            addrs, original,
+            "LAN-only candidate sets must not be emptied — the caller would have nothing to dial"
+        );
     }
 
     #[test]
