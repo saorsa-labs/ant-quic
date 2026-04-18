@@ -106,6 +106,7 @@ use std::{
 };
 
 // Core modules
+mod ack_frame;
 mod cid_queue;
 pub mod coding;
 mod constant_time;
@@ -361,6 +362,7 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 // ============================================================================
 
 /// P2P endpoint - for advanced use, prefer Node for most applications
+pub use ack_frame::ReceiveRejectReason;
 pub use connection_lifecycle::ConnectionCloseReason;
 pub use p2p_endpoint::{
     ConnectionHealth, ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason,

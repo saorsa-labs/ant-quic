@@ -496,6 +496,14 @@ impl Connection {
         self.0.state.lock("close_reason").error.clone()
     }
 
+    pub(crate) fn supports_ack_receive_v1(&self) -> bool {
+        self.0
+            .state
+            .lock("supports_ack_receive_v1")
+            .inner
+            .supports_ack_receive_v1()
+    }
+
     /// Close the connection immediately.
     ///
     /// Pending operations will fail immediately with [`ConnectionError::LocallyClosed`]. No

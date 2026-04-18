@@ -1,0 +1,44 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod support;
+
+use std::time::Duration;
+use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
+use tokio::time::{sleep, timeout};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    sender
+        .send_with_receive_ack(&receiver_id, b"ack-v1 payload", Duration::from_secs(5))
+        .await
+        .expect("send_with_receive_ack");
+
+    let (peer_id, payload) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv result");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(payload, b"ack-v1 payload");
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}

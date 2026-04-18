@@ -6886,6 +6886,12 @@ impl AddressObservationRateLimiter {
     }
 }
 
+impl Connection {
+    pub(crate) fn supports_ack_receive_v1(&self) -> bool {
+        self.peer_params.ack_receive_v1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

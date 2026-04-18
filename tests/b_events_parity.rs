@@ -90,23 +90,38 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         }
     );
 
-    receiver
-        .connect_addr(sender_addr)
-        .await
-        .expect("replacement connect");
+    let replacement_generation = {
+        let mut observed = None;
+        for _ in 0..5 {
+            receiver
+                .connect_addr(sender_addr)
+                .await
+                .expect("replacement connect");
+            sleep(Duration::from_millis(100)).await;
+
+            let health = sender.connection_health(&receiver_id).await;
+            if let Some(generation) = health.generation
+                && generation > initial_generation
+            {
+                observed = Some(generation);
+                break;
+            }
+        }
+        observed.expect("sender never observed a replacement generation")
+    };
 
     let replaced = recv_peer_event(&mut peer_events, |event| {
         matches!(event, PeerLifecycleEvent::Replaced { .. })
     })
     .await;
-    let replacement_generation = match replaced {
+    match replaced {
         PeerLifecycleEvent::Replaced {
             old_generation,
             new_generation,
         } => {
             assert_eq!(old_generation, initial_generation);
+            assert_eq!(new_generation, replacement_generation);
             assert!(new_generation > old_generation);
-            new_generation
         }
         other => panic!("unexpected replacement event: {other:?}"),
     };

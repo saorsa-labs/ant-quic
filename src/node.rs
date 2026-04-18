@@ -646,6 +646,19 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Send data and wait until the remote receive pipeline accepts it.
+    pub async fn send_with_receive_ack(
+        &self,
+        peer_id: &PeerId,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), NodeError> {
+        self.inner
+            .send_with_receive_ack(peer_id, data, timeout)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Receive data from any peer
     pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), NodeError> {
         self.inner.recv().await.map_err(NodeError::Endpoint)

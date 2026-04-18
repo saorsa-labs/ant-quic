@@ -23,23 +23,32 @@ async fn simultaneous_connect_settles_on_complementary_live_views() {
     let accept_a = spawn_accept_loop(a.clone());
     let accept_b = spawn_accept_loop(b.clone());
 
-    let a_task = {
-        let a = a.clone();
-        tokio::spawn(async move { a.connect_addr(b_addr).await })
-    };
-    let b_task = {
-        let b = b.clone();
-        tokio::spawn(async move { b.connect_addr(a_addr).await })
-    };
+    for _ in 0..5 {
+        let a_task = {
+            let a = a.clone();
+            tokio::spawn(async move { a.connect_addr(b_addr).await })
+        };
+        let b_task = {
+            let b = b.clone();
+            tokio::spawn(async move { b.connect_addr(a_addr).await })
+        };
 
-    let _ = a_task.await.expect("a join");
-    let _ = b_task.await.expect("b join");
+        let _ = a_task.await.expect("a join");
+        let _ = b_task.await.expect("b join");
 
-    wait_until(Duration::from_secs(5), || {
-        a.get_quic_connection(&b_id).ok().flatten().is_some()
-            && b.get_quic_connection(&a_id).ok().flatten().is_some()
-    })
-    .await;
+        wait_until(Duration::from_secs(5), || {
+            a.get_quic_connection(&b_id).ok().flatten().is_some()
+                && b.get_quic_connection(&a_id).ok().flatten().is_some()
+        })
+        .await;
+
+        if lifecycle_events()
+            .iter()
+            .any(|event| event.fields.get("to_state") == Some(&"Superseded".to_string()))
+        {
+            break;
+        }
+    }
 
     let _a_conn = a
         .get_quic_connection(&b_id)

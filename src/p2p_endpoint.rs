@@ -57,11 +57,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock as ParkingRwLock;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use rand::RngCore;
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::ack_frame::{
+    AckControlOutcome, ReceiveRejectReason, decode_ack_control, decode_ack_payload,
+    encode_ack_control, encode_ack_payload,
+};
 use crate::bootstrap_cache::{
     BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
 };
@@ -417,6 +422,9 @@ pub struct P2pEndpoint {
     /// Directional application activity timestamps per peer.
     peer_activity: Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
 
+    /// Pending ACK-v1 waiters keyed by live connection stable id + request tag.
+    ack_waiters: Arc<ParkingRwLock<HashMap<usize, AckWaiterMap>>>,
+
     /// Global broadcast fanout for peer lifecycle transitions.
     peer_event_tx: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
 
@@ -557,6 +565,15 @@ enum PeerActivityKind {
     Sent,
     Received,
 }
+
+#[derive(Debug)]
+enum AckWaiterResult {
+    Accepted,
+    Rejected(ReceiveRejectReason),
+    Closed(ConnectionCloseReason),
+}
+
+type AckWaiterMap = HashMap<[u8; 16], oneshot::Sender<AckWaiterResult>>;
 
 /// Best-effort runtime assist snapshot for higher-level status surfaces.
 #[derive(Debug, Clone, Default)]
@@ -1069,6 +1086,21 @@ pub enum EndpointError {
     #[error("Operation timed out")]
     Timeout,
 
+    /// The peer/connection does not support this optional feature.
+    #[error("Feature not supported by peer or transport")]
+    NotSupported,
+
+    /// Timed out waiting for the remote receive pipeline ACK.
+    #[error("Timed out waiting for remote receive acknowledgement")]
+    AckTimeout,
+
+    /// The remote receive pipeline rejected the payload.
+    #[error("Remote receive pipeline rejected payload: {reason}")]
+    ReceiveRejected {
+        /// Rejection reason supplied by the remote endpoint.
+        reason: ReceiveRejectReason,
+    },
+
     /// Peer not found
     #[error("Peer not found: {0:?}")]
     PeerNotFound(PeerId),
@@ -1106,6 +1138,7 @@ async fn do_cleanup_connection(
     peer_event_tx: &broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
     peer_event_channels: &ParkingRwLock<HashMap<PeerId, broadcast::Sender<PeerLifecycleEvent>>>,
     peer_event_generations: &ParkingRwLock<HashMap<PeerId, u64>>,
+    ack_waiters: &ParkingRwLock<HashMap<usize, AckWaiterMap>>,
     peer_id: &PeerId,
     reason: DisconnectReason,
     close_reason: ConnectionCloseReason,
@@ -1143,6 +1176,7 @@ async fn do_cleanup_connection(
                 reason: close_reason,
             },
         );
+        fail_ack_waiters_for_connection(ack_waiters, snapshot.stable_id, close_reason);
         let mut generations = peer_event_generations.write();
         if generations.get(peer_id) == Some(&snapshot.generation) {
             generations.remove(peer_id);
@@ -1327,6 +1361,58 @@ fn emit_peer_lifecycle_event(
     let _ = peer_event_tx.send((peer_id, event.clone()));
     if let Some(sender) = peer_event_channels.read().get(&peer_id).cloned() {
         let _ = sender.send(event);
+    }
+}
+
+fn register_ack_waiter(
+    ack_waiters: &ParkingRwLock<HashMap<usize, AckWaiterMap>>,
+    stable_id: usize,
+    tag: [u8; 16],
+    tx: oneshot::Sender<AckWaiterResult>,
+) -> bool {
+    let mut waiters = ack_waiters.write();
+    let entry = waiters.entry(stable_id).or_default();
+    if entry.contains_key(&tag) {
+        return false;
+    }
+    entry.insert(tag, tx);
+    true
+}
+
+fn resolve_ack_waiter(
+    ack_waiters: &ParkingRwLock<HashMap<usize, AckWaiterMap>>,
+    stable_id: usize,
+    tag: [u8; 16],
+    result: AckWaiterResult,
+) -> bool {
+    let tx = {
+        let mut waiters = ack_waiters.write();
+        let sender = waiters
+            .get_mut(&stable_id)
+            .and_then(|entry| entry.remove(&tag));
+        if waiters.get(&stable_id).is_some_and(HashMap::is_empty) {
+            waiters.remove(&stable_id);
+        }
+        sender
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(result);
+        true
+    } else {
+        false
+    }
+}
+
+fn fail_ack_waiters_for_connection(
+    ack_waiters: &ParkingRwLock<HashMap<usize, AckWaiterMap>>,
+    stable_id: usize,
+    reason: ConnectionCloseReason,
+) {
+    let waiters = ack_waiters.write().remove(&stable_id);
+    if let Some(waiters) = waiters {
+        for (_, tx) in waiters {
+            let _ = tx.send(AckWaiterResult::Closed(reason));
+        }
     }
 }
 
@@ -1632,6 +1718,7 @@ impl P2pEndpoint {
         let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
+        let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
         let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
         let peer_event_channels = Arc::new(ParkingRwLock::new(HashMap::new()));
         let peer_event_generations = Arc::new(ParkingRwLock::new(HashMap::new()));
@@ -1663,6 +1750,7 @@ impl P2pEndpoint {
             reader_tasks,
             reader_handles,
             peer_activity,
+            ack_waiters,
             peer_event_tx,
             peer_event_channels,
             peer_event_generations,
@@ -3947,6 +4035,43 @@ impl P2pEndpoint {
         );
     }
 
+    fn next_ack_request_tag(&self, stable_id: usize) -> [u8; 16] {
+        loop {
+            let mut tag = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut tag);
+            let exists = self
+                .ack_waiters
+                .read()
+                .get(&stable_id)
+                .is_some_and(|entry| entry.contains_key(&tag));
+            if !exists {
+                return tag;
+            }
+        }
+    }
+
+    async fn send_ack_control_frame(
+        connection: crate::high_level::Connection,
+        tag: [u8; 16],
+        outcome: AckControlOutcome,
+    ) {
+        let bytes = encode_ack_control(tag, outcome);
+        match connection.open_uni().await {
+            Ok(mut stream) => {
+                if let Err(error) = stream.write_all(&bytes).await {
+                    warn!(error = %error, "failed to send ACK control frame");
+                    return;
+                }
+                if let Err(error) = stream.finish() {
+                    warn!(error = %error, "failed to finish ACK control frame stream");
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to open ACK control stream");
+            }
+        }
+    }
+
     async fn register_connected_peer(&self, peer_conn: PeerConnection) {
         store_connected_peer(
             self.connected_peers.as_ref(),
@@ -4129,6 +4254,7 @@ impl P2pEndpoint {
             &self.peer_event_tx,
             self.peer_event_channels.as_ref(),
             self.peer_event_generations.as_ref(),
+            self.ack_waiters.as_ref(),
             peer_id,
             reason,
             close_reason,
@@ -4327,6 +4453,134 @@ impl P2pEndpoint {
         .await;
 
         Ok(())
+    }
+
+    /// Send data and wait until the remote ant-quic receive pipeline accepts it.
+    ///
+    /// This is a stronger guarantee than [`P2pEndpoint::send`]: success means the
+    /// remote reader task decoded the payload and enqueued it into the receiver
+    /// pipeline that backs `recv()`. It does not imply the remote application has
+    /// consumed or processed the payload.
+    pub async fn send_with_receive_ack(
+        &self,
+        peer_id: &PeerId,
+        data: &[u8],
+        timeout_duration: Duration,
+    ) -> Result<(), EndpointError> {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let transport_addr = {
+            let peer_info = self.connected_peers.read().await;
+            if let Some(conn) = peer_info.get(peer_id) {
+                conn.remote_addr.clone()
+            } else if let Some(connection) = self
+                .inner
+                .get_connection(peer_id)
+                .map_err(EndpointError::NatTraversal)?
+            {
+                TransportAddr::Udp(connection.remote_address())
+            } else {
+                return Err(EndpointError::PeerNotFound(*peer_id));
+            }
+        };
+
+        let engine = {
+            let mut router = self.router.write().await;
+            router.select_engine_for_addr(&transport_addr)
+        };
+        if !matches!(engine, crate::transport::ProtocolEngine::Quic) {
+            return Err(EndpointError::NotSupported);
+        }
+
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+
+        if !connection.supports_ack_receive_v1() {
+            return Err(EndpointError::NotSupported);
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+
+        let stable_id = connection.stable_id();
+        let tag = self.next_ack_request_tag(stable_id);
+        let (tx, rx) = oneshot::channel();
+        let inserted = register_ack_waiter(self.ack_waiters.as_ref(), stable_id, tag, tx);
+        if !inserted {
+            return Err(EndpointError::Connection(
+                "failed to reserve unique ACK request tag".to_string(),
+            ));
+        }
+
+        let envelope = encode_ack_payload(tag, data);
+        let send_result = async {
+            let mut send_stream = connection
+                .open_uni()
+                .await
+                .map_err(endpoint_error_from_connection_error)?;
+            send_stream
+                .write_all(&envelope)
+                .await
+                .map_err(endpoint_error_from_write_error)?;
+            send_stream.finish().map_err(|e| {
+                close_reason_from_connection(&connection)
+                    .map(|reason| EndpointError::ConnectionClosed { reason })
+                    .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
+            })
+        }
+        .await;
+
+        if let Err(error) = send_result {
+            let _ = resolve_ack_waiter(
+                self.ack_waiters.as_ref(),
+                stable_id,
+                tag,
+                AckWaiterResult::Closed(ConnectionCloseReason::LocallyClosed),
+            );
+            return Err(error);
+        }
+
+        note_peer_activity(
+            &self.connected_peers,
+            &self.peer_activity,
+            *peer_id,
+            PeerActivityKind::Sent,
+            Instant::now(),
+        )
+        .await;
+
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(AckWaiterResult::Accepted)) => Ok(()),
+            Ok(Ok(AckWaiterResult::Rejected(reason))) => {
+                Err(EndpointError::ReceiveRejected { reason })
+            }
+            Ok(Ok(AckWaiterResult::Closed(reason))) => {
+                Err(EndpointError::ConnectionClosed { reason })
+            }
+            Ok(Err(_)) => {
+                if let Some(reason) = close_reason_from_connection(&connection) {
+                    Err(EndpointError::ConnectionClosed { reason })
+                } else {
+                    Err(EndpointError::Connection(
+                        "ACK waiter dropped before completion".to_string(),
+                    ))
+                }
+            }
+            Err(_) => {
+                let _ = resolve_ack_waiter(
+                    self.ack_waiters.as_ref(),
+                    stable_id,
+                    tag,
+                    AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
+                );
+                Err(EndpointError::AckTimeout)
+            }
+        }
     }
 
     /// Receive data from any connected peer.
@@ -5136,6 +5390,7 @@ impl P2pEndpoint {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
+        let ack_waiters = Arc::clone(&self.ack_waiters);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
@@ -5236,6 +5491,35 @@ impl P2pEndpoint {
                     }
                 }
 
+                if let Some((tag, outcome)) = decode_ack_control(&data) {
+                    let waiter_result = match outcome {
+                        AckControlOutcome::Accepted => AckWaiterResult::Accepted,
+                        AckControlOutcome::Rejected(reason) => AckWaiterResult::Rejected(reason),
+                        AckControlOutcome::Closed(reason) => AckWaiterResult::Closed(reason),
+                    };
+                    let resolved = resolve_ack_waiter(
+                        ack_waiters.as_ref(),
+                        conn_stable_id,
+                        tag,
+                        waiter_result,
+                    );
+                    if !resolved {
+                        debug!(
+                            peer_id = ?peer_id,
+                            conn_stable_id,
+                            "received ACK control frame with no matching waiter"
+                        );
+                    }
+                    continue;
+                }
+
+                let (payload, ack_tag) = if let Some((tag, payload)) = decode_ack_payload(&data) {
+                    (payload.to_vec(), Some(tag))
+                } else {
+                    (data, None)
+                };
+                let payload_len = payload.len();
+
                 let now = Instant::now();
                 note_peer_activity(
                     &connected_peers,
@@ -5249,16 +5533,29 @@ impl P2pEndpoint {
                 // Emit DataReceived event
                 let _ = event_tx.send(P2pEvent::DataReceived {
                     peer_id,
-                    bytes: data_len,
+                    bytes: payload_len,
                 });
 
                 // Send through channel; if the receiver is dropped, exit
-                if data_tx.send((peer_id, data)).await.is_err() {
+                if data_tx.send((peer_id, payload)).await.is_err() {
+                    if let Some(tag) = ack_tag {
+                        Self::send_ack_control_frame(
+                            connection.clone(),
+                            tag,
+                            AckControlOutcome::Rejected(ReceiveRejectReason::ConsumerGone),
+                        )
+                        .await;
+                    }
                     debug!(
                         "Reader task for peer {:?}: channel closed, exiting",
                         peer_id
                     );
                     break;
+                }
+
+                if let Some(tag) = ack_tag {
+                    Self::send_ack_control_frame(connection.clone(), tag, AckControlOutcome::Accepted)
+                        .await;
                 }
             }
 
@@ -5554,6 +5851,7 @@ impl P2pEndpoint {
         let peer_event_tx = self.peer_event_tx.clone();
         let peer_event_channels = Arc::clone(&self.peer_event_channels);
         let peer_event_generations = Arc::clone(&self.peer_event_generations);
+        let ack_waiters = Arc::clone(&self.ack_waiters);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -5630,6 +5928,11 @@ impl P2pEndpoint {
                     }
                     crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped => {
                         if let Some(snapshot) = snapshot_before {
+                            fail_ack_waiters_for_connection(
+                                ack_waiters.as_ref(),
+                                snapshot.stable_id,
+                                ConnectionCloseReason::Superseded,
+                            );
                             match snapshot.state {
                                 crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
                                 | crate::connection_lifecycle::ConnectionLifecycleState::Live => {
@@ -5674,6 +5977,11 @@ impl P2pEndpoint {
                                 reason: close_reason,
                             },
                         );
+                        fail_ack_waiters_for_connection(
+                            ack_waiters.as_ref(),
+                            conn_stable_id,
+                            close_reason,
+                        );
                         {
                             let mut generations = peer_event_generations.write();
                             if generations.get(&peer_id) == Some(&generation) {
@@ -5704,6 +6012,7 @@ impl P2pEndpoint {
                             &peer_event_tx,
                             peer_event_channels.as_ref(),
                             peer_event_generations.as_ref(),
+                            ack_waiters.as_ref(),
                             &peer_id,
                             DisconnectReason::ConnectionLost,
                             close_reason,
@@ -5728,6 +6037,7 @@ impl P2pEndpoint {
         let peer_event_tx = self.peer_event_tx.clone();
         let peer_event_channels = Arc::clone(&self.peer_event_channels);
         let peer_event_generations = Arc::clone(&self.peer_event_generations);
+        let ack_waiters = Arc::clone(&self.ack_waiters);
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
@@ -5775,6 +6085,7 @@ impl P2pEndpoint {
                         &peer_event_tx,
                         peer_event_channels.as_ref(),
                         peer_event_generations.as_ref(),
+                        ack_waiters.as_ref(),
                         peer_id,
                         DisconnectReason::Timeout,
                         ConnectionCloseReason::TimedOut,
@@ -5820,6 +6131,7 @@ impl Clone for P2pEndpoint {
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
             peer_activity: Arc::clone(&self.peer_activity),
+            ack_waiters: Arc::clone(&self.ack_waiters),
             peer_event_tx: self.peer_event_tx.clone(),
             peer_event_channels: Arc::clone(&self.peer_event_channels),
             peer_event_generations: Arc::clone(&self.peer_event_generations),
@@ -5844,6 +6156,23 @@ mod tests {
         assert_eq!(stats.active_connections, 0);
         assert_eq!(stats.successful_connections, 0);
         assert_eq!(stats.nat_traversal_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ack_waiter_cleanup_on_connection_failure() {
+        let ack_waiters = ParkingRwLock::new(HashMap::new());
+        let (tx, rx) = oneshot::channel();
+        let stable_id = 42usize;
+        let tag = [0xAA; 16];
+
+        assert!(register_ack_waiter(&ack_waiters, stable_id, tag, tx));
+        fail_ack_waiters_for_connection(&ack_waiters, stable_id, ConnectionCloseReason::TimedOut);
+
+        match rx.await.expect("ack waiter result") {
+            AckWaiterResult::Closed(ConnectionCloseReason::TimedOut) => {}
+            other => panic!("unexpected waiter result: {other:?}"),
+        }
+        assert!(ack_waiters.read().is_empty());
     }
 
     #[test]
