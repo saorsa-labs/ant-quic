@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-04-18
+
+### Added
+
+- **Connection health snapshots (#170).** Added `P2pEndpoint::connection_health(&PeerId)` and `Node::connection_health(&PeerId)` to surface lifecycle state, generation, directional activity timestamps, and the most recent lifecycle close reason for a peer.
+- **Peer lifecycle subscriptions (#171).** Added `subscribe_peer_events(peer_id)` and `subscribe_all_peer_events()` so callers can observe `Established`, `Replaced`, `Closing`, `Closed`, and `ReaderExited` transitions without polling.
+- **Receive-ACK send primitive (#172).** Added `P2pEndpoint::send_with_receive_ack(...)` and `Node::send_with_receive_ack(...)` using a QUIC-only ACK-v1 protocol built on uni-stream control frames. The sender now tracks per-connection ACK waiters, gates use on negotiated capability support, and fails pending waiters immediately when the live connection is superseded or closed.
+
+### Tests
+
+- Added focused coverage in `tests/b_health_snapshot.rs`, `tests/b_events_parity.rs`, and `tests/b_send_with_receive_ack.rs`.
+- Re-ran the full release gate: `cargo fmt --all -- --check`, `cargo clippy --all-features --all-targets -- -D warnings`, and `cargo nextest run --all-features --workspace`.
+
 ## [0.27.0] - 2026-04-17
 
 ### Fixed

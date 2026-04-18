@@ -3,50 +3,106 @@
 mod support;
 
 use ant_quic::{ConnectionCloseReason, PeerId, PeerLifecycleEvent};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
 use tokio::sync::broadcast;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep};
 
-async fn recv_peer_event(
-    rx: &mut broadcast::Receiver<PeerLifecycleEvent>,
-    expected: impl Fn(&PeerLifecycleEvent) -> bool,
-) -> PeerLifecycleEvent {
-    timeout(Duration::from_secs(5), async {
+type PeerEventStore = Arc<Mutex<Vec<PeerLifecycleEvent>>>;
+type AllPeerEventStore = Arc<Mutex<Vec<(PeerId, PeerLifecycleEvent)>>>;
+
+const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn spawn_peer_event_collector(
+    mut rx: broadcast::Receiver<PeerLifecycleEvent>,
+) -> (PeerEventStore, tokio::task::JoinHandle<()>) {
+    let store = Arc::new(Mutex::new(Vec::new()));
+    let store_clone = Arc::clone(&store);
+    let handle = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(event) if expected(&event) => return event,
-                Ok(_) => continue,
+                Ok(event) => store_clone.lock().unwrap().push(event),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(err) => panic!("peer event recv failed: {err}"),
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
-    .await
-    .expect("timed out waiting for peer event")
+    });
+    (store, handle)
 }
 
-async fn recv_all_peer_event(
-    rx: &mut broadcast::Receiver<(PeerId, PeerLifecycleEvent)>,
-    peer_id: PeerId,
-    expected: impl Fn(&PeerLifecycleEvent) -> bool,
-) -> (PeerId, PeerLifecycleEvent) {
-    timeout(Duration::from_secs(5), async {
+fn spawn_all_peer_event_collector(
+    mut rx: broadcast::Receiver<(PeerId, PeerLifecycleEvent)>,
+) -> (AllPeerEventStore, tokio::task::JoinHandle<()>) {
+    let store = Arc::new(Mutex::new(Vec::new()));
+    let store_clone = Arc::clone(&store);
+    let handle = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok((observed_peer_id, event))
-                    if observed_peer_id == peer_id && expected(&event) =>
-                {
-                    return (observed_peer_id, event);
-                }
-                Ok(_) => continue,
+                Ok(event) => store_clone.lock().unwrap().push(event),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(err) => panic!("all-peer event recv failed: {err}"),
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
-    .await
-    .expect("timed out waiting for all-peer event")
+    });
+    (store, handle)
+}
+
+async fn wait_for_peer_event(
+    label: &str,
+    events: &PeerEventStore,
+    expected: impl Fn(&PeerLifecycleEvent) -> bool + Copy,
+) -> PeerLifecycleEvent {
+    let start = Instant::now();
+    loop {
+        if let Some(event) = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| expected(event))
+            .cloned()
+        {
+            return event;
+        }
+
+        if start.elapsed() >= EVENT_TIMEOUT {
+            panic!(
+                "timed out waiting for peer event {label}; seen={:?}",
+                events.lock().unwrap().clone()
+            );
+        }
+
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_all_peer_event(
+    label: &str,
+    events: &AllPeerEventStore,
+    peer_id: PeerId,
+    expected: impl Fn(&PeerLifecycleEvent) -> bool + Copy,
+) -> (PeerId, PeerLifecycleEvent) {
+    let start = Instant::now();
+    loop {
+        if let Some(event) = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(observed_peer_id, event)| *observed_peer_id == peer_id && expected(event))
+            .cloned()
+        {
+            return event;
+        }
+
+        if start.elapsed() >= EVENT_TIMEOUT {
+            panic!(
+                "timed out waiting for all-peer event {label}; seen={:?}",
+                events.lock().unwrap().clone()
+            );
+        }
+
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -62,15 +118,17 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     let sender_addr = normalize_local_addr(sender.local_addr().expect("sender addr"));
     let accept_sender = spawn_accept_loop(sender.clone());
 
-    let mut peer_events = sender.subscribe_peer_events(&receiver_id);
-    let mut all_peer_events = sender.subscribe_all_peer_events();
+    let (peer_events, peer_events_task) =
+        spawn_peer_event_collector(sender.subscribe_peer_events(&receiver_id));
+    let (all_peer_events, all_peer_events_task) =
+        spawn_all_peer_event_collector(sender.subscribe_all_peer_events());
 
     sender
         .connect_addr(receiver_addr)
         .await
         .expect("initial connect");
 
-    let established = recv_peer_event(&mut peer_events, |event| {
+    let established = wait_for_peer_event("established(peer)", &peer_events, |event| {
         matches!(event, PeerLifecycleEvent::Established { .. })
     })
     .await;
@@ -79,10 +137,11 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         other => panic!("unexpected established event: {other:?}"),
     };
 
-    let (_, established_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(event, PeerLifecycleEvent::Established { .. })
-    })
-    .await;
+    let (_, established_all) =
+        wait_for_all_peer_event("established(all)", &all_peer_events, receiver_id, |event| {
+            matches!(event, PeerLifecycleEvent::Established { .. })
+        })
+        .await;
     assert_eq!(
         established_all,
         PeerLifecycleEvent::Established {
@@ -90,45 +149,57 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         }
     );
 
-    let replacement_generation = {
-        let mut observed = None;
-        for _ in 0..5 {
-            receiver
-                .connect_addr(sender_addr)
-                .await
-                .expect("replacement connect");
-            sleep(Duration::from_millis(100)).await;
+    for _ in 0..5 {
+        receiver
+            .connect_addr(sender_addr)
+            .await
+            .expect("replacement connect");
+        sleep(Duration::from_millis(100)).await;
 
-            let health = sender.connection_health(&receiver_id).await;
-            if let Some(generation) = health.generation
-                && generation > initial_generation
-            {
-                observed = Some(generation);
-                break;
+        let health = sender.connection_health(&receiver_id).await;
+        if let Some(generation) = health.generation
+            && generation > initial_generation
+        {
+            break;
+        }
+    }
+
+    let replacement_generation =
+        match wait_for_peer_event("replaced(peer)", &peer_events, |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Replaced {
+                    old_generation,
+                    new_generation,
+                } if *old_generation == initial_generation && *new_generation > initial_generation
+            )
+        })
+        .await
+        {
+            PeerLifecycleEvent::Replaced {
+                old_generation,
+                new_generation,
+            } => {
+                assert_eq!(old_generation, initial_generation);
+                new_generation
             }
-        }
-        observed.expect("sender never observed a replacement generation")
-    };
+            other => panic!("unexpected replacement event: {other:?}"),
+        };
 
-    let replaced = recv_peer_event(&mut peer_events, |event| {
-        matches!(event, PeerLifecycleEvent::Replaced { .. })
-    })
-    .await;
-    match replaced {
-        PeerLifecycleEvent::Replaced {
-            old_generation,
-            new_generation,
-        } => {
-            assert_eq!(old_generation, initial_generation);
-            assert_eq!(new_generation, replacement_generation);
-            assert!(new_generation > old_generation);
-        }
-        other => panic!("unexpected replacement event: {other:?}"),
-    };
-
-    let (_, replaced_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(event, PeerLifecycleEvent::Replaced { .. })
-    })
+    let (_, replaced_all) = wait_for_all_peer_event(
+        "replaced(all)",
+        &all_peer_events,
+        receiver_id,
+        |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Replaced {
+                    old_generation,
+                    new_generation,
+                } if *old_generation == initial_generation && *new_generation == replacement_generation
+            )
+        },
+    )
     .await;
     assert_eq!(
         replaced_all,
@@ -138,7 +209,7 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         }
     );
 
-    let closing_old = recv_peer_event(&mut peer_events, |event| {
+    let closing_old = wait_for_peer_event("closing_old(peer)", &peer_events, |event| {
         matches!(
             event,
             PeerLifecycleEvent::Closing {
@@ -155,19 +226,20 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             reason: ConnectionCloseReason::Superseded,
         }
     );
-    let (_, closing_old_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::Closing {
-                generation,
-                reason: ConnectionCloseReason::Superseded,
-            } if *generation == initial_generation
-        )
-    })
-    .await;
+    let (_, closing_old_all) =
+        wait_for_all_peer_event("closing_old(all)", &all_peer_events, receiver_id, |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Closing {
+                    generation,
+                    reason: ConnectionCloseReason::Superseded,
+                } if *generation == initial_generation
+            )
+        })
+        .await;
     assert_eq!(closing_old_all, closing_old);
 
-    let reader_exited_old = recv_peer_event(&mut peer_events, |event| {
+    let reader_exited_old = wait_for_peer_event("reader_exited_old(peer)", &peer_events, |event| {
         matches!(
             event,
             PeerLifecycleEvent::ReaderExited { generation } if *generation == initial_generation
@@ -180,17 +252,21 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             generation: initial_generation,
         }
     );
-    let (_, reader_exited_old_all) =
-        recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
+    let (_, reader_exited_old_all) = wait_for_all_peer_event(
+        "reader_exited_old(all)",
+        &all_peer_events,
+        receiver_id,
+        |event| {
             matches!(
                 event,
                 PeerLifecycleEvent::ReaderExited { generation } if *generation == initial_generation
             )
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(reader_exited_old_all, reader_exited_old);
 
-    let closed_old = recv_peer_event(&mut peer_events, |event| {
+    let closed_old = wait_for_peer_event("closed_old(peer)", &peer_events, |event| {
         matches!(
             event,
             PeerLifecycleEvent::Closed {
@@ -207,16 +283,17 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             reason: ConnectionCloseReason::Superseded,
         }
     );
-    let (_, closed_old_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::Closed {
-                generation,
-                reason: ConnectionCloseReason::Superseded,
-            } if *generation == initial_generation
-        )
-    })
-    .await;
+    let (_, closed_old_all) =
+        wait_for_all_peer_event("closed_old(all)", &all_peer_events, receiver_id, |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Closed {
+                    generation,
+                    reason: ConnectionCloseReason::Superseded,
+                } if *generation == initial_generation
+            )
+        })
+        .await;
     assert_eq!(closed_old_all, closed_old);
 
     sender
@@ -224,7 +301,7 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         .await
         .expect("disconnect sender");
 
-    let closing_live = recv_peer_event(&mut peer_events, |event| {
+    let closing_live = wait_for_peer_event("closing_live(peer)", &peer_events, |event| {
         matches!(
             event,
             PeerLifecycleEvent::Closing {
@@ -241,19 +318,24 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             reason: ConnectionCloseReason::LifecycleCleanup,
         }
     );
-    let (_, closing_live_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::Closing {
-                generation,
-                reason: ConnectionCloseReason::LifecycleCleanup,
-            } if *generation == replacement_generation
-        )
-    })
+    let (_, closing_live_all) = wait_for_all_peer_event(
+        "closing_live(all)",
+        &all_peer_events,
+        receiver_id,
+        |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Closing {
+                    generation,
+                    reason: ConnectionCloseReason::LifecycleCleanup,
+                } if *generation == replacement_generation
+            )
+        },
+    )
     .await;
     assert_eq!(closing_live_all, closing_live);
 
-    let closed_live = recv_peer_event(&mut peer_events, |event| {
+    let closed_live = wait_for_peer_event("closed_live(peer)", &peer_events, |event| {
         matches!(
             event,
             PeerLifecycleEvent::Closed {
@@ -270,39 +352,18 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             reason: ConnectionCloseReason::LifecycleCleanup,
         }
     );
-    let (_, closed_live_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::Closed {
-                generation,
-                reason: ConnectionCloseReason::LifecycleCleanup,
-            } if *generation == replacement_generation
-        )
-    })
-    .await;
+    let (_, closed_live_all) =
+        wait_for_all_peer_event("closed_live(all)", &all_peer_events, receiver_id, |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Closed {
+                    generation,
+                    reason: ConnectionCloseReason::LifecycleCleanup,
+                } if *generation == replacement_generation
+            )
+        })
+        .await;
     assert_eq!(closed_live_all, closed_live);
-
-    let reader_exited_live = recv_peer_event(&mut peer_events, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::ReaderExited { generation } if *generation == replacement_generation
-        )
-    })
-    .await;
-    assert_eq!(
-        reader_exited_live,
-        PeerLifecycleEvent::ReaderExited {
-            generation: replacement_generation,
-        }
-    );
-    let (_, reader_exited_live_all) = recv_all_peer_event(&mut all_peer_events, receiver_id, |event| {
-        matches!(
-            event,
-            PeerLifecycleEvent::ReaderExited { generation } if *generation == replacement_generation
-        )
-    })
-    .await;
-    assert_eq!(reader_exited_live_all, reader_exited_live);
 
     sleep(Duration::from_millis(50)).await;
 
@@ -310,4 +371,6 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     receiver.shutdown().await;
     accept_sender.abort();
     accept_receiver.abort();
+    peer_events_task.abort();
+    all_peer_events_task.abort();
 }

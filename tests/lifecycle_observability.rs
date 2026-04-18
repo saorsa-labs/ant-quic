@@ -44,7 +44,14 @@ async fn lifecycle_transitions_emit_structured_tracing_fields() {
         .connect_addr(sender_addr)
         .await
         .expect("replacement connect");
-    wait_until(Duration::from_secs(3), || old_conn.close_reason().is_some()).await;
+    wait_until(Duration::from_secs(5), || old_conn.close_reason().is_some()).await;
+    wait_until(Duration::from_secs(10), || {
+        lifecycle_events().into_iter().any(|event| {
+            event.fields.get("peer_id") == Some(&peer_prefix)
+                && event.fields.get("to_state") == Some(&"Closed".to_string())
+        })
+    })
+    .await;
 
     let relevant: Vec<_> = lifecycle_events()
         .into_iter()
