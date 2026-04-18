@@ -365,7 +365,7 @@ pub use connection_lifecycle::ConnectionCloseReason;
 pub use p2p_endpoint::{
     ConnectionHealth, ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason,
     DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection,
-    TraversalPhase,
+    PeerLifecycleEvent, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern

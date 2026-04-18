@@ -58,7 +58,9 @@ use crate::nat_traversal_api::PeerId;
 use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
-use crate::p2p_endpoint::{ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection};
+use crate::p2p_endpoint::{
+    ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent,
+};
 use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
 use crate::unified_config::load_or_generate_endpoint_keypair;
@@ -619,6 +621,19 @@ impl Node {
     /// Get a best-effort connection health snapshot for a peer.
     pub async fn connection_health(&self, peer_id: &PeerId) -> ConnectionHealth {
         self.inner.connection_health(peer_id).await
+    }
+
+    /// Subscribe to lifecycle events for a specific peer.
+    pub fn subscribe_peer_events(
+        &self,
+        peer_id: &PeerId,
+    ) -> broadcast::Receiver<PeerLifecycleEvent> {
+        self.inner.subscribe_peer_events(peer_id)
+    }
+
+    /// Subscribe to lifecycle events for all peers.
+    pub fn subscribe_all_peer_events(&self) -> broadcast::Receiver<(PeerId, PeerLifecycleEvent)> {
+        self.inner.subscribe_all_peer_events()
     }
 
     // === Messaging ===

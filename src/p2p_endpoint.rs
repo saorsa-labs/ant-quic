@@ -91,6 +91,8 @@ use crate::{ConnectionCloseReason, Side};
 
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Peer lifecycle event channel capacity.
+const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -415,6 +417,15 @@ pub struct P2pEndpoint {
     /// Directional application activity timestamps per peer.
     peer_activity: Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
 
+    /// Global broadcast fanout for peer lifecycle transitions.
+    peer_event_tx: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
+
+    /// Peer-scoped lifecycle broadcast channels, created lazily on subscribe.
+    peer_event_channels: Arc<ParkingRwLock<HashMap<PeerId, broadcast::Sender<PeerLifecycleEvent>>>>,
+
+    /// Last live generation published for each peer.
+    peer_event_generations: Arc<ParkingRwLock<HashMap<PeerId, u64>>>,
+
     /// Circuit-breaker for coordinator peers (tracks failures by address).
     pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
 }
@@ -624,6 +635,42 @@ impl Default for EndpointStats {
             average_coordination_time: Duration::ZERO,
         }
     }
+}
+
+/// Peer lifecycle events for a specific authenticated peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerLifecycleEvent {
+    /// A live connection generation became established for the peer.
+    Established {
+        /// The live local lifecycle generation.
+        generation: u64,
+    },
+    /// A newer live generation replaced the previously active one.
+    Replaced {
+        /// The previous live generation.
+        old_generation: u64,
+        /// The new live generation.
+        new_generation: u64,
+    },
+    /// A generation is actively closing.
+    Closing {
+        /// The affected generation.
+        generation: u64,
+        /// Lifecycle-aware close reason.
+        reason: ConnectionCloseReason,
+    },
+    /// A generation fully closed from the endpoint's perspective.
+    Closed {
+        /// The affected generation.
+        generation: u64,
+        /// Lifecycle-aware close reason.
+        reason: ConnectionCloseReason,
+    },
+    /// The background reader task for a generation exited.
+    ReaderExited {
+        /// The affected generation.
+        generation: u64,
+    },
 }
 
 /// P2P event for connection and network state changes.
@@ -1056,12 +1103,51 @@ async fn do_cleanup_connection(
     direct_path_statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
+    peer_event_tx: &broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
+    peer_event_channels: &ParkingRwLock<HashMap<PeerId, broadcast::Sender<PeerLifecycleEvent>>>,
+    peer_event_generations: &ParkingRwLock<HashMap<PeerId, u64>>,
     peer_id: &PeerId,
     reason: DisconnectReason,
     close_reason: ConnectionCloseReason,
 ) -> bool {
+    let lifecycle_snapshot = inner
+        .get_connection(peer_id)
+        .ok()
+        .flatten()
+        .and_then(|connection| {
+            inner.connection_snapshot_by_stable_id(peer_id, connection.stable_id())
+        });
+
+    if let Some(snapshot) = lifecycle_snapshot {
+        emit_peer_lifecycle_event(
+            peer_event_tx,
+            peer_event_channels,
+            *peer_id,
+            PeerLifecycleEvent::Closing {
+                generation: snapshot.generation,
+                reason: close_reason,
+            },
+        );
+    }
+
     let _ = inner.remove_connection_with_reason(peer_id, close_reason);
     direct_path_statuses.write().remove(peer_id);
+
+    if let Some(snapshot) = lifecycle_snapshot {
+        emit_peer_lifecycle_event(
+            peer_event_tx,
+            peer_event_channels,
+            *peer_id,
+            PeerLifecycleEvent::Closed {
+                generation: snapshot.generation,
+                reason: close_reason,
+            },
+        );
+        let mut generations = peer_event_generations.write();
+        if generations.get(peer_id) == Some(&snapshot.generation) {
+            generations.remove(peer_id);
+        }
+    }
 
     // Tear down all background readers for this peer. Cooperative cancel first
     // (allows any in-flight `read_to_end()` to complete and deliver its bytes),
@@ -1214,6 +1300,33 @@ async fn note_peer_activity(
     match kind {
         PeerActivityKind::Sent => entry.last_sent_at = Some(at),
         PeerActivityKind::Received => entry.last_received_at = Some(at),
+    }
+}
+
+fn peer_event_sender(
+    peer_event_channels: &ParkingRwLock<HashMap<PeerId, broadcast::Sender<PeerLifecycleEvent>>>,
+    peer_id: PeerId,
+) -> broadcast::Sender<PeerLifecycleEvent> {
+    if let Some(sender) = peer_event_channels.read().get(&peer_id).cloned() {
+        return sender;
+    }
+
+    let mut channels = peer_event_channels.write();
+    channels
+        .entry(peer_id)
+        .or_insert_with(|| broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY).0)
+        .clone()
+}
+
+fn emit_peer_lifecycle_event(
+    peer_event_tx: &broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
+    peer_event_channels: &ParkingRwLock<HashMap<PeerId, broadcast::Sender<PeerLifecycleEvent>>>,
+    peer_id: PeerId,
+    event: PeerLifecycleEvent,
+) {
+    let _ = peer_event_tx.send((peer_id, event.clone()));
+    if let Some(sender) = peer_event_channels.read().get(&peer_id).cloned() {
+        let _ = sender.send(event);
     }
 }
 
@@ -1519,6 +1632,9 @@ impl P2pEndpoint {
         let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
+        let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
+        let peer_event_channels = Arc::new(ParkingRwLock::new(HashMap::new()));
+        let peer_event_generations = Arc::new(ParkingRwLock::new(HashMap::new()));
 
         let endpoint = Self {
             inner: inner_arc,
@@ -1547,6 +1663,9 @@ impl P2pEndpoint {
             reader_tasks,
             reader_handles,
             peer_activity,
+            peer_event_tx,
+            peer_event_channels,
+            peer_event_generations,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
@@ -3805,6 +3924,29 @@ impl P2pEndpoint {
         });
     }
 
+    fn live_connection_snapshot(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<crate::nat_traversal_api::ConnectionLifecycleSnapshot> {
+        self.inner
+            .get_connection(peer_id)
+            .ok()
+            .flatten()
+            .and_then(|connection| {
+                self.inner
+                    .connection_snapshot_by_stable_id(peer_id, connection.stable_id())
+            })
+    }
+
+    fn emit_peer_lifecycle_event(&self, peer_id: PeerId, event: PeerLifecycleEvent) {
+        emit_peer_lifecycle_event(
+            &self.peer_event_tx,
+            self.peer_event_channels.as_ref(),
+            peer_id,
+            event,
+        );
+    }
+
     async fn register_connected_peer(&self, peer_conn: PeerConnection) {
         store_connected_peer(
             self.connected_peers.as_ref(),
@@ -3813,6 +3955,34 @@ impl P2pEndpoint {
             peer_conn.clone(),
         )
         .await;
+
+        if let Some(snapshot) = self.live_connection_snapshot(&peer_conn.peer_id) {
+            let lifecycle_events = {
+                let mut generations = self.peer_event_generations.write();
+                match generations.insert(peer_conn.peer_id, snapshot.generation) {
+                    None => vec![PeerLifecycleEvent::Established {
+                        generation: snapshot.generation,
+                    }],
+                    Some(previous_generation) if previous_generation != snapshot.generation => {
+                        vec![
+                            PeerLifecycleEvent::Replaced {
+                                old_generation: previous_generation,
+                                new_generation: snapshot.generation,
+                            },
+                            PeerLifecycleEvent::Closing {
+                                generation: previous_generation,
+                                reason: ConnectionCloseReason::Superseded,
+                            },
+                        ]
+                    }
+                    Some(_) => Vec::new(),
+                }
+            };
+
+            for event in lifecycle_events {
+                self.emit_peer_lifecycle_event(peer_conn.peer_id, event);
+            }
+        }
 
         if peer_conn.remote_addr.as_socket_addr().is_some() {
             let _ = self.inner.publish_active_relay_to_peer(peer_conn.peer_id);
@@ -3956,6 +4126,9 @@ impl P2pEndpoint {
             &*self.direct_path_statuses,
             &*self.stats,
             &self.event_tx,
+            &self.peer_event_tx,
+            self.peer_event_channels.as_ref(),
+            self.peer_event_generations.as_ref(),
             peer_id,
             reason,
             close_reason,
@@ -4217,9 +4390,25 @@ impl P2pEndpoint {
 
     // === Events ===
 
-    /// Subscribe to endpoint events
+    /// Subscribe to endpoint events.
     pub fn subscribe(&self) -> broadcast::Receiver<P2pEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Subscribe to lifecycle events for a specific peer.
+    ///
+    /// Slow subscribers may observe `RecvError::Lagged`; callers can reconcile
+    /// with [`P2pEndpoint::connection_health`].
+    pub fn subscribe_peer_events(
+        &self,
+        peer_id: &PeerId,
+    ) -> broadcast::Receiver<PeerLifecycleEvent> {
+        peer_event_sender(self.peer_event_channels.as_ref(), *peer_id).subscribe()
+    }
+
+    /// Subscribe to lifecycle events for all peers.
+    pub fn subscribe_all_peer_events(&self) -> broadcast::Receiver<(PeerId, PeerLifecycleEvent)> {
+        self.peer_event_tx.subscribe()
     }
 
     // === Statistics ===
@@ -5362,6 +5551,9 @@ impl P2pEndpoint {
         let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
         let stats = Arc::clone(&self.stats);
         let event_tx = self.event_tx.clone();
+        let peer_event_tx = self.peer_event_tx.clone();
+        let peer_event_channels = Arc::clone(&self.peer_event_channels);
+        let peer_event_generations = Arc::clone(&self.peer_event_generations);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -5418,6 +5610,15 @@ impl P2pEndpoint {
                     }
                 };
 
+                let snapshot_before =
+                    inner.connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
+                emit_peer_lifecycle_event(
+                    &peer_event_tx,
+                    peer_event_channels.as_ref(),
+                    peer_id,
+                    PeerLifecycleEvent::ReaderExited { generation },
+                );
+
                 let exit_outcome = inner.handle_reader_exit(&peer_id, generation, conn_stable_id);
                 match exit_outcome {
                     crate::nat_traversal_api::ReaderExitOutcome::Noop => {
@@ -5428,6 +5629,24 @@ impl P2pEndpoint {
                         continue;
                     }
                     crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped => {
+                        if let Some(snapshot) = snapshot_before {
+                            match snapshot.state {
+                                crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
+                                | crate::connection_lifecycle::ConnectionLifecycleState::Live => {
+                                    emit_peer_lifecycle_event(
+                                        &peer_event_tx,
+                                        peer_event_channels.as_ref(),
+                                        peer_id,
+                                        PeerLifecycleEvent::Closed {
+                                            generation: snapshot.generation,
+                                            reason: ConnectionCloseReason::Superseded,
+                                        },
+                                    );
+                                }
+                                crate::connection_lifecycle::ConnectionLifecycleState::Closing { .. }
+                                | crate::connection_lifecycle::ConnectionLifecycleState::Closed { .. } => {}
+                            }
+                        }
                         debug!(
                             "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped",
                             peer_id, generation, conn_stable_id
@@ -5437,6 +5656,31 @@ impl P2pEndpoint {
                     crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected {
                         close_reason,
                     } => {
+                        emit_peer_lifecycle_event(
+                            &peer_event_tx,
+                            peer_event_channels.as_ref(),
+                            peer_id,
+                            PeerLifecycleEvent::Closing {
+                                generation,
+                                reason: close_reason,
+                            },
+                        );
+                        emit_peer_lifecycle_event(
+                            &peer_event_tx,
+                            peer_event_channels.as_ref(),
+                            peer_id,
+                            PeerLifecycleEvent::Closed {
+                                generation,
+                                reason: close_reason,
+                            },
+                        );
+                        {
+                            let mut generations = peer_event_generations.write();
+                            if generations.get(&peer_id) == Some(&generation) {
+                                generations.remove(&peer_id);
+                            }
+                        }
+
                         if !last_reader {
                             debug!(
                                 "Live reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still draining, deferring peer cleanup",
@@ -5457,6 +5701,9 @@ impl P2pEndpoint {
                             &*direct_path_statuses,
                             &*stats,
                             &event_tx,
+                            &peer_event_tx,
+                            peer_event_channels.as_ref(),
+                            peer_event_generations.as_ref(),
                             &peer_id,
                             DisconnectReason::ConnectionLost,
                             close_reason,
@@ -5478,6 +5725,9 @@ impl P2pEndpoint {
         let connected_peers = Arc::clone(&self.connected_peers);
         let inner = Arc::clone(&self.inner);
         let event_tx = self.event_tx.clone();
+        let peer_event_tx = self.peer_event_tx.clone();
+        let peer_event_channels = Arc::clone(&self.peer_event_channels);
+        let peer_event_generations = Arc::clone(&self.peer_event_generations);
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
@@ -5522,6 +5772,9 @@ impl P2pEndpoint {
                         &*direct_path_statuses,
                         &*stats,
                         &event_tx,
+                        &peer_event_tx,
+                        peer_event_channels.as_ref(),
+                        peer_event_generations.as_ref(),
                         peer_id,
                         DisconnectReason::Timeout,
                         ConnectionCloseReason::TimedOut,
@@ -5567,6 +5820,9 @@ impl Clone for P2pEndpoint {
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
             peer_activity: Arc::clone(&self.peer_activity),
+            peer_event_tx: self.peer_event_tx.clone(),
+            peer_event_channels: Arc::clone(&self.peer_event_channels),
+            peer_event_generations: Arc::clone(&self.peer_event_generations),
             coordinator_health: Arc::clone(&self.coordinator_health),
         }
     }
