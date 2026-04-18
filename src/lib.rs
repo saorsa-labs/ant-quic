@@ -363,8 +363,9 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 /// P2P endpoint - for advanced use, prefer Node for most applications
 pub use connection_lifecycle::ConnectionCloseReason;
 pub use p2p_endpoint::{
-    ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason, DisconnectReason,
-    EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection, TraversalPhase,
+    ConnectionHealth, ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason,
+    DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection,
+    TraversalPhase,
 };
 
 /// P2P configuration with builder pattern

@@ -5898,6 +5898,34 @@ impl NatTraversalEndpoint {
             })
     }
 
+    pub(crate) fn recent_close_reason_for_peer(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<ConnectionCloseReason> {
+        let lifecycle = self.connection_lifecycle.read();
+        let entries = lifecycle.get(peer_id)?;
+        if entries
+            .iter()
+            .any(|entry| matches!(entry.state, ConnectionLifecycleState::Live))
+        {
+            return None;
+        }
+
+        entries
+            .iter()
+            .filter_map(|entry| match entry.state {
+                ConnectionLifecycleState::Closing { reason }
+                | ConnectionLifecycleState::Closed { reason, .. } => {
+                    Some((entry.generation, reason))
+                }
+                ConnectionLifecycleState::Live | ConnectionLifecycleState::Superseded { .. } => {
+                    None
+                }
+            })
+            .max_by_key(|(generation, _)| *generation)
+            .map(|(_, reason)| reason)
+    }
+
     fn prune_closed_lifecycle_entries(entries: &mut Vec<TrackedConnection>) {
         const MAX_CLOSED_ENTRIES: usize = 4;
         let closed_count = entries

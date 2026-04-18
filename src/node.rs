@@ -58,7 +58,7 @@ use crate::nat_traversal_api::PeerId;
 use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
-use crate::p2p_endpoint::{EndpointError, P2pEndpoint, P2pEvent, PeerConnection};
+use crate::p2p_endpoint::{ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection};
 use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
 use crate::unified_config::load_or_generate_endpoint_keypair;
@@ -614,6 +614,11 @@ impl Node {
     /// Check if connected to a peer
     pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.inner.is_connected(peer_id).await
+    }
+
+    /// Get a best-effort connection health snapshot for a peer.
+    pub async fn connection_health(&self, peer_id: &PeerId) -> ConnectionHealth {
+        self.inner.connection_health(peer_id).await
     }
 
     // === Messaging ===

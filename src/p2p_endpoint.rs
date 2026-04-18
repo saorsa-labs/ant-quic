@@ -412,6 +412,9 @@ pub struct P2pEndpoint {
     /// (issue #166).
     reader_handles: Arc<RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>>,
 
+    /// Directional application activity timestamps per peer.
+    peer_activity: Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
+
     /// Circuit-breaker for coordinator peers (tracks failures by address).
     pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
 }
@@ -467,6 +470,81 @@ pub struct ConnectionMetrics {
 
     /// Last activity timestamp
     pub last_activity: Option<Instant>,
+}
+
+/// Best-effort connection health snapshot for a peer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionHealth {
+    /// Whether the peer currently has a live transport connection.
+    pub connected: bool,
+
+    /// Current local lifecycle generation for the live QUIC connection, when available.
+    pub generation: Option<u64>,
+
+    /// Whether a background reader task is currently active for the live connection.
+    ///
+    /// This is `None` when the peer is disconnected.
+    pub reader_task_active: Option<bool>,
+
+    /// The last time this endpoint accepted application data from the peer into
+    /// its receive pipeline, if any.
+    pub last_received_at: Option<Instant>,
+
+    /// The last time this endpoint successfully sent application data to the peer,
+    /// if any.
+    pub last_sent_at: Option<Instant>,
+
+    /// Time since the most recent send/receive activity while the peer is live.
+    pub idle_for: Option<Duration>,
+
+    /// Most recent lifecycle-aware close reason, if a recent QUIC connection closed.
+    pub close_reason: Option<ConnectionCloseReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConnectionHealthObservation {
+    connected: bool,
+    generation: Option<u64>,
+    reader_task_active: Option<bool>,
+    last_received_at: Option<Instant>,
+    last_sent_at: Option<Instant>,
+    close_reason: Option<ConnectionCloseReason>,
+}
+
+impl ConnectionHealth {
+    fn from_observation(observation: ConnectionHealthObservation, now: Instant) -> Self {
+        let last_live_activity = match (observation.last_sent_at, observation.last_received_at) {
+            (Some(sent), Some(received)) => Some(sent.max(received)),
+            (Some(sent), None) => Some(sent),
+            (None, Some(received)) => Some(received),
+            (None, None) => None,
+        };
+
+        Self {
+            connected: observation.connected,
+            generation: observation.generation,
+            reader_task_active: observation.reader_task_active,
+            last_received_at: observation.last_received_at,
+            last_sent_at: observation.last_sent_at,
+            idle_for: observation
+                .connected
+                .then(|| last_live_activity.map(|instant| now.saturating_duration_since(instant)))
+                .flatten(),
+            close_reason: observation.close_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerActivityRecord {
+    last_sent_at: Option<Instant>,
+    last_received_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeerActivityKind {
+    Sent,
+    Received,
 }
 
 /// Best-effort runtime assist snapshot for higher-level status surfaces.
@@ -1120,6 +1198,25 @@ async fn store_connected_peer(
     record_connection_established(stats, event_tx, &peer_conn, previous.as_ref()).await;
 }
 
+async fn note_peer_activity(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    peer_activity: &RwLock<HashMap<PeerId, PeerActivityRecord>>,
+    peer_id: PeerId,
+    kind: PeerActivityKind,
+    at: Instant,
+) {
+    if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
+        peer_conn.last_activity = at;
+    }
+
+    let mut activity = peer_activity.write().await;
+    let entry = activity.entry(peer_id).or_default();
+    match kind {
+        PeerActivityKind::Sent => entry.last_sent_at = Some(at),
+        PeerActivityKind::Received => entry.last_received_at = Some(at),
+    }
+}
+
 /// Bridge low-level NAT traversal events into endpoint-level progress/accounting.
 ///
 /// Connection-established accounting is intentionally excluded here; that happens
@@ -1421,6 +1518,7 @@ impl P2pEndpoint {
         let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
         let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
+        let peer_activity = Arc::new(RwLock::new(HashMap::new()));
 
         let endpoint = Self {
             inner: inner_arc,
@@ -1448,6 +1546,7 @@ impl P2pEndpoint {
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
             reader_handles,
+            peer_activity,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
 
@@ -4044,10 +4143,15 @@ impl P2pEndpoint {
             }
         }
 
-        // Update last activity
-        if let Some(peer_conn) = self.connected_peers.write().await.get_mut(peer_id) {
-            peer_conn.last_activity = Instant::now();
-        }
+        let now = Instant::now();
+        note_peer_activity(
+            &self.connected_peers,
+            &self.peer_activity,
+            *peer_id,
+            PeerActivityKind::Sent,
+            now,
+        )
+        .await;
 
         Ok(())
     }
@@ -4079,10 +4183,15 @@ impl P2pEndpoint {
                     peer_id
                 );
 
-                // Update last_activity for the peer
-                if let Some(peer_conn) = self.connected_peers.write().await.get_mut(&peer_id) {
-                    peer_conn.last_activity = Instant::now();
-                }
+                let now = Instant::now();
+                note_peer_activity(
+                    &self.connected_peers,
+                    &self.peer_activity,
+                    peer_id,
+                    PeerActivityKind::Received,
+                    now,
+                )
+                .await;
 
                 // Emit DataReceived event
                 let _ = self.event_tx.send(P2pEvent::DataReceived {
@@ -4141,6 +4250,65 @@ impl P2pEndpoint {
                 / (stats.path.sent_packets + stats.path.lost_packets).max(1) as f64,
             last_activity,
         })
+    }
+
+    /// Get a best-effort snapshot of connection health for a peer.
+    ///
+    /// This is an additive observability surface intended for subscribers and
+    /// higher-level status loops. It reports current live-connection state when
+    /// available, recent directional activity timestamps, and the most recent
+    /// lifecycle close reason retained by the endpoint.
+    pub async fn connection_health(&self, peer_id: &PeerId) -> ConnectionHealth {
+        let live_snapshot =
+            self.inner
+                .get_connection(peer_id)
+                .ok()
+                .flatten()
+                .and_then(|connection| {
+                    self.inner
+                        .connection_snapshot_by_stable_id(peer_id, connection.stable_id())
+                });
+        let constrained_connected = self
+            .constrained_connections
+            .read()
+            .await
+            .contains_key(peer_id);
+        let reader_task_active = if live_snapshot.is_some() {
+            Some(
+                self.reader_handles
+                    .read()
+                    .await
+                    .get(peer_id)
+                    .is_some_and(|handles| !handles.is_empty()),
+            )
+        } else if constrained_connected {
+            Some(false)
+        } else {
+            None
+        };
+        let activity = self
+            .peer_activity
+            .read()
+            .await
+            .get(peer_id)
+            .copied()
+            .unwrap_or_default();
+
+        ConnectionHealth::from_observation(
+            ConnectionHealthObservation {
+                connected: live_snapshot.is_some() || constrained_connected,
+                generation: live_snapshot.map(|snapshot| snapshot.generation),
+                reader_task_active,
+                last_received_at: activity.last_received_at,
+                last_sent_at: activity.last_sent_at,
+                close_reason: if live_snapshot.is_none() && !constrained_connected {
+                    self.inner.recent_close_reason_for_peer(peer_id)
+                } else {
+                    None
+                },
+            },
+            Instant::now(),
+        )
     }
 
     // === Known Peers ===
@@ -4778,6 +4946,7 @@ impl P2pEndpoint {
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
+        let peer_activity = Arc::clone(&self.peer_activity);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let max_read_bytes = self.config.max_message_size;
@@ -4878,10 +5047,15 @@ impl P2pEndpoint {
                     }
                 }
 
-                // Update last_activity
-                if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
-                    peer_conn.last_activity = Instant::now();
-                }
+                let now = Instant::now();
+                note_peer_activity(
+                    &connected_peers,
+                    &peer_activity,
+                    peer_id,
+                    PeerActivityKind::Received,
+                    now,
+                )
+                .await;
 
                 // Emit DataReceived event
                 let _ = event_tx.send(P2pEvent::DataReceived {
@@ -4998,6 +5172,7 @@ impl P2pEndpoint {
         let inner = Arc::clone(&self.inner);
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
+        let peer_activity = Arc::clone(&self.peer_activity);
         let event_tx = self.event_tx.clone();
         let constrained_peer_addrs = Arc::clone(&self.constrained_peer_addrs);
         let constrained_connections = Arc::clone(&self.constrained_connections);
@@ -5081,9 +5256,15 @@ impl P2pEndpoint {
                             peer_id
                         );
 
-                        if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
-                            peer_conn.last_activity = Instant::now();
-                        }
+                        let now = Instant::now();
+                        note_peer_activity(
+                            &connected_peers,
+                            &peer_activity,
+                            peer_id,
+                            PeerActivityKind::Received,
+                            now,
+                        )
+                        .await;
                         let _ = event_tx.send(P2pEvent::DataReceived {
                             peer_id,
                             bytes: data_len,
@@ -5385,6 +5566,7 @@ impl Clone for P2pEndpoint {
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
             reader_handles: Arc::clone(&self.reader_handles),
+            peer_activity: Arc::clone(&self.peer_activity),
             coordinator_health: Arc::clone(&self.coordinator_health),
         }
     }
@@ -5406,6 +5588,106 @@ mod tests {
         assert_eq!(stats.active_connections, 0);
         assert_eq!(stats.successful_connections, 0);
         assert_eq!(stats.nat_traversal_attempts, 0);
+    }
+
+    #[test]
+    fn test_connection_health_observation_never_seen_patterns() {
+        let now = Instant::now();
+        let health =
+            ConnectionHealth::from_observation(ConnectionHealthObservation::default(), now);
+
+        assert!(!health.connected);
+        assert_eq!(health.generation, None);
+        assert_eq!(health.reader_task_active, None);
+        assert_eq!(health.last_received_at, None);
+        assert_eq!(health.last_sent_at, None);
+        assert_eq!(health.idle_for, None);
+        assert_eq!(health.close_reason, None);
+    }
+
+    #[test]
+    fn test_connection_health_observation_connected_patterns() {
+        let now = Instant::now();
+        let last_sent_at = now
+            .checked_sub(Duration::from_secs(3))
+            .expect("sent instant");
+        let last_received_at = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("received instant");
+        let health = ConnectionHealth::from_observation(
+            ConnectionHealthObservation {
+                connected: true,
+                generation: Some(42),
+                reader_task_active: Some(true),
+                last_received_at: Some(last_received_at),
+                last_sent_at: Some(last_sent_at),
+                close_reason: None,
+            },
+            now,
+        );
+
+        assert!(health.connected);
+        assert_eq!(health.generation, Some(42));
+        assert_eq!(health.reader_task_active, Some(true));
+        assert_eq!(health.last_received_at, Some(last_received_at));
+        assert_eq!(health.last_sent_at, Some(last_sent_at));
+        assert_eq!(health.idle_for, Some(Duration::from_secs(1)));
+        assert_eq!(health.close_reason, None);
+    }
+
+    #[test]
+    fn test_connection_health_observation_closing_patterns() {
+        let now = Instant::now();
+        let health = ConnectionHealth::from_observation(
+            ConnectionHealthObservation {
+                connected: false,
+                generation: None,
+                reader_task_active: None,
+                last_received_at: None,
+                last_sent_at: Some(
+                    now.checked_sub(Duration::from_secs(2))
+                        .expect("sent instant"),
+                ),
+                close_reason: Some(ConnectionCloseReason::ReaderExit),
+            },
+            now,
+        );
+
+        assert!(!health.connected);
+        assert_eq!(health.generation, None);
+        assert_eq!(health.reader_task_active, None);
+        assert!(health.last_sent_at.is_some());
+        assert_eq!(health.idle_for, None);
+        assert_eq!(health.close_reason, Some(ConnectionCloseReason::ReaderExit));
+    }
+
+    #[test]
+    fn test_connection_health_observation_closed_patterns() {
+        let now = Instant::now();
+        let health = ConnectionHealth::from_observation(
+            ConnectionHealthObservation {
+                connected: false,
+                generation: None,
+                reader_task_active: None,
+                last_received_at: Some(
+                    now.checked_sub(Duration::from_secs(4))
+                        .expect("received instant"),
+                ),
+                last_sent_at: None,
+                close_reason: Some(ConnectionCloseReason::LifecycleCleanup),
+            },
+            now,
+        );
+
+        assert!(!health.connected);
+        assert_eq!(health.generation, None);
+        assert_eq!(health.reader_task_active, None);
+        assert!(health.last_received_at.is_some());
+        assert_eq!(health.idle_for, None);
+        assert_eq!(
+            health.close_reason,
+            Some(ConnectionCloseReason::LifecycleCleanup)
+        );
     }
 
     #[tokio::test]
