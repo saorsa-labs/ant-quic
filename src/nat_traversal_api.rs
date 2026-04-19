@@ -4155,9 +4155,9 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
                     let traversal_event_notify = self.traversal_event_notify.clone();
+                    let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
-                        let connect_timeout = Duration::from_secs(10);
                         match timeout(connect_timeout, connecting).await {
                             Ok(Ok(connection)) => {
                                 let (coordinator_peer_id, coordinator_connection) =
@@ -4356,6 +4356,28 @@ impl NatTraversalEndpoint {
 
     // Private implementation methods
 
+    fn build_nat_transport_config(config: &NatTraversalConfig) -> TransportConfig {
+        let mut transport_config = TransportConfig::default();
+        transport_config.enable_address_discovery(true);
+        transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+        transport_config.max_concurrent_uni_streams(
+            crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
+        );
+
+        // QUIC keep-alive is a transport-level concern. Do not couple it to NAT
+        // traversal retry cadence; use the transport default unless/until we add
+        // an explicit transport-level override to NatTraversalConfig/P2pConfig.
+        let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
+            concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
+        };
+        transport_config.nat_traversal_config(Some(nat_config));
+        transport_config
+    }
+
+    fn coordination_connect_timeout(config: &NatTraversalConfig) -> Duration {
+        config.coordination_timeout
+    }
+
     /// Create a QUIC endpoint with NAT traversal configured (async version)
     ///
     /// v0.13.0: role parameter removed - all nodes are symmetric P2P nodes.
@@ -4421,25 +4443,11 @@ impl NatTraversalEndpoint {
             let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
 
             // Configure transport parameters for NAT traversal
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            transport_config
-                .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
-            transport_config.max_concurrent_uni_streams(
-                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
-            );
+            let transport_config = Self::build_nat_transport_config(config);
 
             // QUIC flow-control windows (stream_receive_window, send_window) use
             // TransportConfig defaults — calculated from bandwidth-delay products.
             // max_message_size is a read-side guard only, not a flow-control knob.
-
-            // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
-            // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
 
             server_config.transport_config(Arc::new(transport_config));
 
@@ -4494,24 +4502,11 @@ impl NatTraversalEndpoint {
             }
 
             // Configure transport parameters for NAT traversal
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
-            transport_config.max_concurrent_uni_streams(
-                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
-            );
+            let transport_config = Self::build_nat_transport_config(config);
 
             // QUIC flow-control windows (stream_receive_window, send_window) use
             // TransportConfig defaults — calculated from bandwidth-delay products.
             // max_message_size is a read-side guard only, not a flow-control knob.
-
-            // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
-            // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
 
             client_config.transport_config(Arc::new(transport_config));
 
@@ -4649,19 +4644,7 @@ impl NatTraversalEndpoint {
 
             let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
 
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            transport_config
-                .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
-            transport_config.max_concurrent_uni_streams(
-                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
-            );
-
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
+            let transport_config = Self::build_nat_transport_config(config);
             server_config.transport_config(Arc::new(transport_config));
             Some(server_config)
         };
@@ -4696,18 +4679,7 @@ impl NatTraversalEndpoint {
                 client_config.token_store(store);
             }
 
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
-            transport_config.max_concurrent_uni_streams(
-                crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
-            );
-
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
+            let transport_config = Self::build_nat_transport_config(config);
             client_config.transport_config(Arc::new(transport_config));
             client_config
         };
@@ -5806,7 +5778,7 @@ impl NatTraversalEndpoint {
             ))
         })?;
 
-        let connection = timeout(self.config.coordination_timeout, connecting)
+        let connection = timeout(Self::coordination_connect_timeout(&self.config), connecting)
             .await
             .map_err(|_| NatTraversalError::Timeout)?
             .map_err(|e| {
@@ -8536,10 +8508,10 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
+                    let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
-                        // Use 10-second timeout to prevent indefinite waiting if coordinator is frozen
-                        let connect_timeout = Duration::from_secs(10);
+                        // Bound coordinator dial by the configured coordination budget.
                         match timeout(connect_timeout, connecting).await {
                             Ok(Ok(connection)) => {
                                 info!("Connected to coordinator {}", coordinator);
@@ -9288,7 +9260,7 @@ impl NatTraversalEndpoint {
             // parking_lot::RwLock doesn't poison - always succeeds
             total_bootstrap_nodes: self.bootstrap_nodes.read().len(),
             successful_coordinations: 7,
-            average_coordination_time: self.timeout_config.nat_traversal.retry_interval,
+            average_coordination_time: self.config.coordination_timeout,
             total_attempts: 10,
             successful_connections: 7,
             direct_connections: 5,
@@ -10115,6 +10087,44 @@ mod tests {
         );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[test]
+    fn test_build_nat_transport_config_uses_transport_default_keepalive() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            timeouts: crate::config::nat_timeouts::TimeoutConfig {
+                nat_traversal: crate::config::nat_timeouts::NatTraversalTimeouts {
+                    retry_interval: Duration::from_millis(250),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let transport_config = NatTraversalEndpoint::build_nat_transport_config(&config);
+        let default_keepalive = TransportConfig::default().keep_alive_interval;
+
+        assert_eq!(transport_config.keep_alive_interval, default_keepalive);
+        assert_ne!(
+            transport_config.keep_alive_interval,
+            Some(config.timeouts.nat_traversal.retry_interval),
+            "QUIC keepalive must not follow NAT retry cadence"
+        );
+    }
+
+    #[test]
+    fn test_coordination_connect_timeout_uses_configured_budget() {
+        let config = NatTraversalConfig {
+            coordination_timeout: Duration::from_millis(321),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            NatTraversalEndpoint::coordination_connect_timeout(&config),
+            Duration::from_millis(321)
+        );
     }
 
     #[tokio::test]
