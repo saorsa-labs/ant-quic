@@ -233,6 +233,77 @@ fn extend_unique_socket_addrs(
     }
 }
 
+async fn try_addrs_with_shared_stage_budget<T, E, F, Fut>(
+    addresses: &[SocketAddr],
+    family_name: &str,
+    stage_budget: Duration,
+    mut attempt: F,
+) -> Option<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    if addresses.is_empty() {
+        debug!("{}: No addresses to try", family_name);
+        return None;
+    }
+
+    if stage_budget.is_zero() {
+        debug!("{}: zero direct-stage budget, skipping family", family_name);
+        return None;
+    }
+
+    debug!(
+        "Trying {} {} addresses within a shared {:?} budget",
+        addresses.len(),
+        family_name,
+        stage_budget
+    );
+
+    let stage_deadline = Instant::now() + stage_budget;
+
+    for (idx, addr) in addresses.iter().enumerate() {
+        let remaining_budget = stage_deadline.saturating_duration_since(Instant::now());
+        if remaining_budget.is_zero() {
+            debug!(
+                "{}: shared direct-stage budget {:?} exhausted before address {}",
+                family_name, stage_budget, addr
+            );
+            break;
+        }
+
+        debug!(
+            "  {} attempt {}/{}: {} (remaining budget: {:?})",
+            family_name,
+            idx + 1,
+            addresses.len(),
+            addr,
+            remaining_budget
+        );
+
+        match timeout(remaining_budget, attempt(*addr)).await {
+            Ok(Ok(result)) => {
+                info!("✓ {} connection successful to {}", family_name, addr);
+                return Some(result);
+            }
+            Ok(Err(error)) => {
+                debug!("  {} to {} failed: {}", family_name, addr, error);
+            }
+            Err(_) => {
+                debug!(
+                    "  {} to {} timed out after consuming the remaining {:?} family budget",
+                    family_name, addr, remaining_budget
+                );
+                break;
+            }
+        }
+    }
+
+    debug!("{}: All {} addresses failed", family_name, addresses.len());
+    None
+}
+
 fn cached_peer_avg_rtt(peer: &CachedPeer) -> Option<Duration> {
     (peer.stats.avg_rtt_ms > 0).then(|| Duration::from_millis(u64::from(peer.stats.avg_rtt_ms)))
 }
@@ -2683,11 +2754,21 @@ impl P2pEndpoint {
             .copied()
             .collect();
 
+        let mut direct_candidate_addrs = Vec::new();
+        extend_unique_socket_addrs(&mut direct_candidate_addrs, ipv4_addrs.iter().copied());
+        extend_unique_socket_addrs(&mut direct_candidate_addrs, ipv6_addrs.iter().copied());
+        let (direct_strategy, rtt_hint) = self
+            .adaptive_strategy_config_for_candidates(peer_id, &direct_candidate_addrs, None, &[])
+            .await;
+
         info!(
-            "Dual-stack connect: {} IPv4, {} IPv6 addresses (PeerId: {:?})",
+            "Dual-stack connect: {} IPv4, {} IPv6 addresses (PeerId: {:?}, direct budgets: v4={:?}, v6={:?}, rtt_hint={:?})",
             ipv4_addrs.len(),
             ipv6_addrs.len(),
-            peer_id
+            peer_id,
+            direct_strategy.ipv4_timeout,
+            direct_strategy.ipv6_timeout,
+            rtt_hint,
         );
 
         // Use "peer" as SNI for all P2P connections
@@ -2695,8 +2776,8 @@ impl P2pEndpoint {
         // so we don't need/use SNI for authentication. A fixed SNI avoids
         // "invalid server name" errors from hex peer IDs being too long.
         let (ipv4_result, ipv6_result) = tokio::join!(
-            self.try_connect_family(&ipv4_addrs, "IPv4"),
-            self.try_connect_family(&ipv6_addrs, "IPv6"),
+            self.try_connect_family(&ipv4_addrs, "IPv4", direct_strategy.ipv4_timeout, peer_id,),
+            self.try_connect_family(&ipv6_addrs, "IPv6", direct_strategy.ipv6_timeout, peer_id,),
         );
 
         // Handle all possible outcomes
@@ -2747,41 +2828,16 @@ impl P2pEndpoint {
         &self,
         addresses: &[SocketAddr],
         family_name: &str,
+        stage_budget: Duration,
+        hint_peer_id: Option<PeerId>,
     ) -> Option<PeerConnection> {
-        if addresses.is_empty() {
-            debug!("{}: No addresses to try", family_name);
-            return None;
-        }
-
-        debug!("Trying {} {} addresses", addresses.len(), family_name);
-
-        for (idx, addr) in addresses.iter().enumerate() {
-            debug!(
-                "  {} attempt {}/{}: {}",
-                family_name,
-                idx + 1,
-                addresses.len(),
-                addr
-            );
-
-            match timeout(Duration::from_secs(5), self.connect_direct_addr(*addr)).await {
-                Ok(Ok(peer_conn)) => {
-                    info!("✓ {} connection successful to {}", family_name, addr);
-                    return Some(peer_conn);
-                }
-                Ok(Err(e)) => {
-                    debug!("  {} to {} failed: {}", family_name, addr, e);
-                    // Try next address
-                }
-                Err(_) => {
-                    debug!("  {} to {} timed out (5s)", family_name, addr);
-                    // Try next address
-                }
-            }
-        }
-
-        debug!("{}: All {} addresses failed", family_name, addresses.len());
-        None
+        try_addrs_with_shared_stage_budget(
+            addresses,
+            family_name,
+            stage_budget,
+            |addr| async move { self.connect_direct_addr_with_hint(addr, hint_peer_id).await },
+        )
+        .await
     }
 
     /// Connect to a peer using cached information (addresses, tokens).
@@ -3171,11 +3227,10 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
-    async fn connection_strategy_rtt_hint(
+    async fn connection_strategy_rtt_hint_for_candidates(
         &self,
         peer_id: Option<PeerId>,
-        target_ipv4: Option<SocketAddr>,
-        target_ipv6: Option<SocketAddr>,
+        direct_candidate_addrs: &[SocketAddr],
         coordinator: Option<SocketAddr>,
         relay_addrs: &[SocketAddr],
     ) -> Option<Duration> {
@@ -3189,10 +3244,7 @@ impl P2pEndpoint {
         }
 
         let mut candidate_addrs = Vec::new();
-        extend_unique_socket_addrs(
-            &mut candidate_addrs,
-            [target_ipv4, target_ipv6].into_iter().flatten(),
-        );
+        extend_unique_socket_addrs(&mut candidate_addrs, direct_candidate_addrs.iter().copied());
         extend_unique_socket_addrs(&mut candidate_addrs, coordinator);
         extend_unique_socket_addrs(&mut candidate_addrs, relay_addrs.iter().copied());
 
@@ -3204,6 +3256,33 @@ impl P2pEndpoint {
         }
 
         hints.into_iter().max()
+    }
+
+    async fn adaptive_strategy_config_for_candidates(
+        &self,
+        peer_id: Option<PeerId>,
+        direct_candidate_addrs: &[SocketAddr],
+        coordinator: Option<SocketAddr>,
+        relay_addrs: &[SocketAddr],
+    ) -> (StrategyConfig, Option<Duration>) {
+        let rtt_hint = self
+            .connection_strategy_rtt_hint_for_candidates(
+                peer_id,
+                direct_candidate_addrs,
+                coordinator,
+                relay_addrs,
+            )
+            .await;
+        let mut config = StrategyConfig::default();
+        config.apply_adaptive_timeouts(
+            self.config
+                .timeouts
+                .nat_traversal
+                .connection_establishment_timeout,
+            self.config.timeouts.nat_traversal.coordination_timeout,
+            rtt_hint,
+        );
+        (config, rtt_hint)
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
@@ -3310,23 +3389,23 @@ impl P2pEndpoint {
         }
 
         if !custom_strategy_supplied {
-            let rtt_hint = self
-                .connection_strategy_rtt_hint(
+            let mut direct_candidate_addrs = Vec::new();
+            extend_unique_socket_addrs(
+                &mut direct_candidate_addrs,
+                [target_ipv4, target_ipv6].into_iter().flatten(),
+            );
+            let (adaptive_config, rtt_hint) = self
+                .adaptive_strategy_config_for_candidates(
                     peer_id,
-                    target_ipv4,
-                    target_ipv6,
+                    &direct_candidate_addrs,
                     config.coordinator,
                     &config.relay_addrs,
                 )
                 .await;
-            config.apply_adaptive_timeouts(
-                self.config
-                    .timeouts
-                    .nat_traversal
-                    .connection_establishment_timeout,
-                self.config.timeouts.nat_traversal.coordination_timeout,
-                rtt_hint,
-            );
+            config.ipv4_timeout = adaptive_config.ipv4_timeout;
+            config.ipv6_timeout = adaptive_config.ipv6_timeout;
+            config.holepunch_timeout = adaptive_config.holepunch_timeout;
+            config.relay_timeout = adaptive_config.relay_timeout;
             debug!(
                 "Adaptive connection strategy budgets: direct={:?}, holepunch={:?}, relay={:?}, rtt_hint={:?}",
                 config.ipv4_timeout, config.holepunch_timeout, config.relay_timeout, rtt_hint
@@ -6490,6 +6569,124 @@ mod tests {
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
     ) -> Vec<P2pEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_try_addrs_with_shared_stage_budget_stops_after_budget_exhaustion() {
+        let first: SocketAddr = "203.0.113.10:9000".parse().expect("first addr");
+        let second: SocketAddr = "203.0.113.11:9000".parse().expect("second addr");
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = Instant::now();
+
+        let result = try_addrs_with_shared_stage_budget(
+            &[first, second],
+            "IPv4",
+            Duration::from_millis(40),
+            {
+                let attempts = std::sync::Arc::clone(&attempts);
+                move |addr| {
+                    let attempts = std::sync::Arc::clone(&attempts);
+                    async move {
+                        attempts.lock().expect("attempt log").push(addr);
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Ok::<SocketAddr, EndpointError>(addr)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "stage budget exhaustion should stop the family"
+        );
+        assert_eq!(attempts.lock().expect("attempt log").as_slice(), &[first]);
+        assert!(
+            Instant::now().duration_since(start) < Duration::from_millis(120),
+            "shared family budgeting should stop before retrying the second address"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_addrs_with_shared_stage_budget_allows_later_success_before_deadline() {
+        let first: SocketAddr = "203.0.113.20:9000".parse().expect("first addr");
+        let second: SocketAddr = "203.0.113.21:9000".parse().expect("second addr");
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let result = try_addrs_with_shared_stage_budget(
+            &[first, second],
+            "IPv4",
+            Duration::from_millis(80),
+            {
+                let attempts = std::sync::Arc::clone(&attempts);
+                move |addr| {
+                    let attempts = std::sync::Arc::clone(&attempts);
+                    async move {
+                        attempts.lock().expect("attempt log").push(addr);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if addr == first {
+                            Err(EndpointError::Connection(
+                                "first candidate failed".to_string(),
+                            ))
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            Ok(addr)
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result, Some(second));
+        assert_eq!(
+            attempts.lock().expect("attempt log").as_slice(),
+            &[first, second]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_strategy_config_for_candidates_uses_same_budget_model() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_id = PeerId([0x77; 32]);
+        let direct_addr: SocketAddr = "203.0.113.77:9000".parse().expect("direct addr");
+        let mut cached_peer = CachedPeer::new(peer_id, vec![direct_addr], PeerSource::Seed);
+        cached_peer.stats.avg_rtt_ms = 420;
+        endpoint.bootstrap_cache.upsert(cached_peer).await;
+
+        let (config, rtt_hint) = endpoint
+            .adaptive_strategy_config_for_candidates(Some(peer_id), &[direct_addr], None, &[])
+            .await;
+        let mut expected = StrategyConfig::default();
+        expected.apply_adaptive_timeouts(
+            endpoint
+                .config
+                .timeouts
+                .nat_traversal
+                .connection_establishment_timeout,
+            endpoint.config.timeouts.nat_traversal.coordination_timeout,
+            Some(Duration::from_millis(420)),
+        );
+
+        assert_eq!(rtt_hint, Some(Duration::from_millis(420)));
+        assert_eq!(config.ipv4_timeout, expected.ipv4_timeout);
+        assert_eq!(config.ipv6_timeout, expected.ipv6_timeout);
+        assert_eq!(config.holepunch_timeout, expected.holepunch_timeout);
+        assert_eq!(config.relay_timeout, expected.relay_timeout);
+
+        endpoint.shutdown().await;
     }
 
     #[test]
