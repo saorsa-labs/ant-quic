@@ -3798,6 +3798,9 @@ impl P2pEndpoint {
         peer_id: PeerId,
         deadline: tokio::time::Instant,
     ) -> Result<(), EndpointError> {
+        let traversal_notified = self.inner.traversal_event_notify().notified();
+        tokio::pin!(traversal_notified);
+
         let wake_at = self
             .inner
             .next_session_poll_deadline(peer_id, Instant::now())
@@ -3806,7 +3809,7 @@ impl P2pEndpoint {
             .unwrap_or(deadline);
 
         tokio::select! {
-            _ = self.inner.traversal_event_notify().notified() => Ok(()),
+            _ = traversal_notified.as_mut() => Ok(()),
             _ = tokio::time::sleep_until(wake_at) => {
                 if wake_at >= deadline {
                     Err(EndpointError::Timeout)

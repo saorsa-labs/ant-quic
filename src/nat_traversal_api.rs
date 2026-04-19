@@ -765,6 +765,17 @@ pub struct SessionStateUpdate {
     pub reason: StateChangeReason,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SessionStateUpdateKind {
+    Timeout,
+    Disconnected,
+    UpdateMetrics,
+    InvalidState,
+    Retry,
+    MigrationTimeout,
+    Remove,
+}
+
 /// Reason for connection state change
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateChangeReason {
@@ -801,25 +812,6 @@ pub enum TraversalPhase {
     Connected,
     /// Failed, may retry or fallback
     Failed,
-}
-
-/// Session state update types for polling
-#[derive(Debug, Clone, Copy)]
-enum SessionUpdate {
-    /// Connection attempt timed out
-    Timeout,
-    /// Connection was disconnected
-    Disconnected,
-    /// Update connection metrics
-    UpdateMetrics,
-    /// Session is in an invalid state
-    InvalidState,
-    /// Should retry the connection
-    Retry,
-    /// Migration timeout occurred
-    MigrationTimeout,
-    /// Remove the session entirely
-    Remove,
 }
 
 /// Address candidate discovered during NAT traversal
@@ -2953,7 +2945,7 @@ impl NatTraversalEndpoint {
                 ConnectionState::Migrating => {
                     // Check migration timeout
                     let elapsed = now.duration_since(session.session_state.last_transition);
-                    if elapsed > Duration::from_secs(10) {
+                    if elapsed > self.timeout_config.nat_traversal.migration_timeout {
                         // Migration timed out, return to connected or close
 
                         if session.session_state.connection.is_some() {
@@ -2998,24 +2990,80 @@ impl NatTraversalEndpoint {
         Ok(updates)
     }
 
-    /// Start periodic session polling task
+    /// Start a legacy session-state driver task.
+    ///
+    /// The public API remains the same, but the implementation is no longer a
+    /// fixed-interval ticker. Runtime events and explicit deadlines drive wakeups;
+    /// `interval` is now only a maximum silence cap for refreshing connected
+    /// metrics or catching straggler legacy state transitions.
     pub fn start_session_polling(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let sessions = self.active_sessions.clone();
         let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let traversal_event_notify = self.traversal_event_notify.clone();
+        let discovery_state_notify = self.discovery_state_notify.clone();
         let timeout_config = self.timeout_config.clone();
+        let interval_cap = if interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            interval
+        };
 
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-
             loop {
-                ticker.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let traversal_notified = traversal_event_notify.notified();
+                let discovery_notified = discovery_state_notify.notified();
+                tokio::pin!(traversal_notified);
+                tokio::pin!(discovery_notified);
+
+                let now = std::time::Instant::now();
+                let wake_at = sessions
+                    .iter()
+                    .filter_map(|entry| {
+                        let session = entry.value();
+                        let deadline = match session.session_state.state {
+                            ConnectionState::Connecting => Some(
+                                session.session_state.last_transition
+                                    + timeout_config
+                                        .nat_traversal
+                                        .connection_establishment_timeout,
+                            ),
+                            ConnectionState::Connected => None,
+                            ConnectionState::Idle => Some(
+                                session.session_state.last_transition
+                                    + timeout_config.discovery.server_reflexive_cache_ttl,
+                            ),
+                            ConnectionState::Migrating => Some(
+                                session.session_state.last_transition
+                                    + timeout_config.nat_traversal.migration_timeout,
+                            ),
+                            ConnectionState::Closed => Some(
+                                session.session_state.last_transition
+                                    + timeout_config.discovery.interface_cache_ttl,
+                            ),
+                        }?;
+                        Some(deadline.max(now))
+                    })
+                    .min()
+                    .map(tokio::time::Instant::from_std)
+                    .map(|next| next.min(tokio::time::Instant::now() + interval_cap))
+                    .unwrap_or_else(|| tokio::time::Instant::now() + interval_cap);
+
+                tokio::select! {
+                    _ = traversal_notified.as_mut() => {}
+                    _ = discovery_notified.as_mut() => {}
+                    _ = tokio::time::sleep_until(wake_at) => {}
+                    _ = shutdown_notify.notified() => break,
+                }
 
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // Poll sessions and handle updates
-                // DashMap provides lock-free .iter() that yields Ref entries
                 let sessions_to_update: Vec<_> = sessions
                     .iter()
                     .filter_map(|entry| {
@@ -3026,50 +3074,44 @@ impl NatTraversalEndpoint {
 
                         match session.session_state.state {
                             ConnectionState::Connecting => {
-                                // Check for connection timeout
                                 if elapsed
                                     > timeout_config
                                         .nat_traversal
                                         .connection_establishment_timeout
                                 {
-                                    Some((peer_id, SessionUpdate::Timeout))
+                                    Some((peer_id, SessionStateUpdateKind::Timeout))
                                 } else {
                                     None
                                 }
                             }
                             ConnectionState::Connected => {
-                                // Check if connection is still alive
                                 if let Some(ref conn) = session.session_state.connection {
                                     if conn.close_reason().is_some() {
-                                        Some((peer_id, SessionUpdate::Disconnected))
+                                        Some((peer_id, SessionStateUpdateKind::Disconnected))
                                     } else {
-                                        // Update metrics
-                                        Some((peer_id, SessionUpdate::UpdateMetrics))
+                                        Some((peer_id, SessionStateUpdateKind::UpdateMetrics))
                                     }
                                 } else {
-                                    Some((peer_id, SessionUpdate::InvalidState))
+                                    Some((peer_id, SessionStateUpdateKind::InvalidState))
                                 }
                             }
                             ConnectionState::Idle => {
-                                // Check if we should retry
                                 if elapsed > timeout_config.discovery.server_reflexive_cache_ttl {
-                                    Some((peer_id, SessionUpdate::Retry))
+                                    Some((peer_id, SessionStateUpdateKind::Retry))
                                 } else {
                                     None
                                 }
                             }
                             ConnectionState::Migrating => {
-                                // Check migration timeout
-                                if elapsed > timeout_config.nat_traversal.probe_timeout {
-                                    Some((peer_id, SessionUpdate::MigrationTimeout))
+                                if elapsed > timeout_config.nat_traversal.migration_timeout {
+                                    Some((peer_id, SessionStateUpdateKind::MigrationTimeout))
                                 } else {
                                     None
                                 }
                             }
                             ConnectionState::Closed => {
-                                // Clean up old closed sessions
                                 if elapsed > timeout_config.discovery.interface_cache_ttl {
-                                    Some((peer_id, SessionUpdate::Remove))
+                                    Some((peer_id, SessionStateUpdateKind::Remove))
                                 } else {
                                     None
                                 }
@@ -3078,17 +3120,16 @@ impl NatTraversalEndpoint {
                     })
                     .collect();
 
-                // Apply updates using DashMap's lock-free .get_mut() and .remove()
                 for (peer_id, update) in sessions_to_update {
                     match update {
-                        SessionUpdate::Timeout => {
+                        SessionStateUpdateKind::Timeout => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Closed;
                                 session.session_state.last_transition = std::time::Instant::now();
                                 tracing::warn!("Connection to {:?} timed out", peer_id);
                             }
                         }
-                        SessionUpdate::Disconnected => {
+                        SessionStateUpdateKind::Disconnected => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Closed;
                                 session.session_state.last_transition = std::time::Instant::now();
@@ -3096,10 +3137,9 @@ impl NatTraversalEndpoint {
                                 tracing::info!("Connection to {:?} closed", peer_id);
                             }
                         }
-                        SessionUpdate::UpdateMetrics => {
+                        SessionStateUpdateKind::UpdateMetrics => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 if let Some(ref conn) = session.session_state.connection {
-                                    // Update RTT and other metrics
                                     let stats = conn.stats();
                                     session.session_state.metrics.rtt = Some(stats.path.rtt);
                                     session.session_state.metrics.loss_rate =
@@ -3108,14 +3148,14 @@ impl NatTraversalEndpoint {
                                 }
                             }
                         }
-                        SessionUpdate::InvalidState => {
+                        SessionStateUpdateKind::InvalidState => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Closed;
                                 session.session_state.last_transition = std::time::Instant::now();
                                 tracing::error!("Session {:?} in invalid state", peer_id);
                             }
                         }
-                        SessionUpdate::Retry => {
+                        SessionStateUpdateKind::Retry => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Connecting;
                                 session.session_state.last_transition = std::time::Instant::now();
@@ -3127,14 +3167,14 @@ impl NatTraversalEndpoint {
                                 );
                             }
                         }
-                        SessionUpdate::MigrationTimeout => {
+                        SessionStateUpdateKind::MigrationTimeout => {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Closed;
                                 session.session_state.last_transition = std::time::Instant::now();
                                 tracing::warn!("Migration timeout for {:?}", peer_id);
                             }
                         }
-                        SessionUpdate::Remove => {
+                        SessionStateUpdateKind::Remove => {
                             sessions.remove(&peer_id);
                             tracing::debug!("Removed old session for {:?}", peer_id);
                         }
@@ -7920,9 +7960,6 @@ impl NatTraversalEndpoint {
         // Handle closed connections
         self.poll_closed_connections(&mut events);
 
-        // Check connections for observed addresses
-        self.check_connections_for_observed_addresses(&mut events)?;
-
         // Poll candidate discovery
         self.poll_discovery_manager(now, &mut events);
 
@@ -8231,6 +8268,44 @@ impl NatTraversalEndpoint {
         Ok(events)
     }
 
+    /// Compute the next deadline at which the legacy session-state driver may
+    /// need to wake.
+    #[cfg(test)]
+    fn next_session_state_poll_deadline(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        self.active_sessions
+            .iter()
+            .filter_map(|entry| {
+                let session = entry.value();
+                let deadline = match session.session_state.state {
+                    ConnectionState::Connecting => Some(
+                        session.session_state.last_transition
+                            + self
+                                .timeout_config
+                                .nat_traversal
+                                .connection_establishment_timeout,
+                    ),
+                    ConnectionState::Connected => None,
+                    ConnectionState::Idle => Some(
+                        session.session_state.last_transition
+                            + self.timeout_config.discovery.server_reflexive_cache_ttl,
+                    ),
+                    ConnectionState::Migrating => Some(
+                        session.session_state.last_transition
+                            + self.timeout_config.nat_traversal.migration_timeout,
+                    ),
+                    ConnectionState::Closed => Some(
+                        session.session_state.last_transition
+                            + self.timeout_config.discovery.interface_cache_ttl,
+                    ),
+                }?;
+                Some(deadline.max(now))
+            })
+            .min()
+    }
+
     /// Compute the next deadline at which polling this peer's session may make
     /// forward progress.
     ///
@@ -8284,47 +8359,6 @@ impl NatTraversalEndpoint {
         let backoff = base * 2u32.pow(attempt.saturating_sub(1));
         let jitter = std::time::Duration::from_millis((rand::random::<u64>() % 200) as u64);
         backoff.min(max) + jitter
-    }
-
-    /// Check connections for observed addresses and feed them to discovery
-    fn check_connections_for_observed_addresses(
-        &self,
-        _events: &mut Vec<NatTraversalEvent>,
-    ) -> Result<(), NatTraversalError> {
-        // Look for bootstrap connections - they should send us OBSERVED_ADDRESS frames
-        // In the current implementation, we need to wait for the low-level connection
-        // to receive OBSERVED_ADDRESS frames and propagate them up
-
-        // For now, simulate the discovery for testing
-        // In production, this would be triggered by actual OBSERVED_ADDRESS frames
-        // v0.13.0+: All nodes can discover their external address from any connected peer
-        // DashMap provides lock-free iteration
-        if !self.connections.is_empty() {
-            // Check if we have any bootstrap connections
-            for entry in self.connections.iter() {
-                let remote_addr = entry.value().remote_address();
-
-                // Check if this is a bootstrap node connection
-                // parking_lot::RwLock doesn't poison
-                let is_bootstrap = self.bootstrap_nodes.read().iter().any(|node| {
-                    normalize_socket_addr(node.address) == normalize_socket_addr(remote_addr)
-                });
-
-                if is_bootstrap {
-                    // In a real implementation, we would check the connection for observed addresses
-                    // For now, emit a debug message
-                    debug!(
-                        "Bootstrap connection to {} should provide our external address via OBSERVED_ADDRESS frames",
-                        remote_addr
-                    );
-
-                    // The actual observed address would come from the OBSERVED_ADDRESS frame
-                    // received on this connection
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Handle phase failure with retry logic
@@ -10110,6 +10144,101 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_next_session_state_poll_deadline_uses_earliest_transition() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let closed_deadline = now + Duration::from_millis(20);
+        let connecting_deadline = now + Duration::from_secs(2);
+
+        endpoint.active_sessions.insert(
+            PeerId([0x52; 32]),
+            NatTraversalSession {
+                peer_id: PeerId([0x52; 32]),
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: now,
+                phase: TraversalPhase::Discovery,
+                candidates: Vec::new(),
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: connecting_deadline
+                        - endpoint
+                            .timeout_config
+                            .nat_traversal
+                            .connection_establishment_timeout,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+        endpoint.active_sessions.insert(
+            PeerId([0x53; 32]),
+            NatTraversalSession {
+                peer_id: PeerId([0x53; 32]),
+                coordinator: "127.0.0.1:9001".parse().unwrap(),
+                attempt: 1,
+                started_at: now,
+                phase: TraversalPhase::Failed,
+                candidates: Vec::new(),
+                session_state: SessionState {
+                    state: ConnectionState::Closed,
+                    last_transition: closed_deadline
+                        - endpoint.timeout_config.discovery.interface_cache_ttl,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let deadline = endpoint
+            .next_session_state_poll_deadline(now)
+            .expect("legacy session-state driver should have pending work");
+
+        assert!(deadline >= now, "deadline must not move backwards");
+        assert!(
+            deadline <= now + Duration::from_millis(50),
+            "earliest closed-session cleanup deadline should win"
+        );
+        assert!(
+            deadline < connecting_deadline,
+            "closed-session cleanup should wake before the slower connecting deadline"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_start_session_polling_exits_promptly_on_shutdown_notify() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let handle = endpoint.start_session_polling(Duration::from_secs(3600));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+
+        tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("session driver should not wait for the long interval to exit")
+            .expect("session driver should join cleanly");
     }
 
     #[tokio::test]

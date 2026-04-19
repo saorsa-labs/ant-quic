@@ -23,13 +23,13 @@ async fn peer_shutdown_cleans_up_remote_view_without_waiting_for_reaper() {
     let start = Instant::now();
     b.shutdown().await;
 
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(2), || {
         a.get_quic_connection(&b_id).ok().flatten().is_none()
     })
     .await;
 
     assert!(
-        start.elapsed() < Duration::from_secs(3),
+        start.elapsed() < Duration::from_secs(2),
         "disconnect cleanup should be driven by reader exit, not the 30s stale reaper"
     );
 
