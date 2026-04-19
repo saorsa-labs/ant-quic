@@ -722,6 +722,11 @@ impl Connection {
             .all_observed_addresses()
     }
 
+    /// Wait for the connection's observed-address set to change.
+    pub(crate) fn observed_address_updated(&self) -> Notified<'_> {
+        self.0.shared.observed_address_updated.notified()
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///
@@ -1238,6 +1243,7 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     datagram_dropped: Notify,
+    observed_address_updated: Notify,
     closed: Notify,
 }
 
@@ -1360,7 +1366,18 @@ impl State {
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                    let mut observed_before = self.inner.all_observed_addresses();
+                    observed_before.sort_unstable();
+                    observed_before.dedup();
+
                     self.inner.handle_event(event);
+
+                    let mut observed_after = self.inner.all_observed_addresses();
+                    observed_after.sort_unstable();
+                    observed_after.dedup();
+                    if observed_before != observed_after {
+                        shared.observed_address_updated.notify_one();
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
                     self.close(error_code, reason, shared);
@@ -1516,6 +1533,7 @@ impl State {
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
         shared.datagram_dropped.notify_waiters();
+        shared.observed_address_updated.notify_waiters();
         if let Some(x) = self.on_connected.take() {
             let _ = x.send(false);
         }

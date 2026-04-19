@@ -1142,6 +1142,15 @@ impl CandidateDiscoveryManager {
         }
     }
 
+    /// Compute the earliest discovery deadline across all active sessions.
+    pub(crate) fn next_global_poll_deadline(&self, now: Instant) -> Option<Instant> {
+        self.active_sessions
+            .keys()
+            .copied()
+            .filter_map(|peer_id| self.next_poll_deadline_for_peer(peer_id, now))
+            .min()
+    }
+
     /// Clean up sessions that have been completed for longer than the specified duration
     pub fn cleanup_stale_sessions(&mut self, max_age: Duration) {
         let now = Instant::now();
@@ -2607,5 +2616,43 @@ mod tests {
                 .next_poll_deadline_for_peer(peer_id, started_at)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn next_global_poll_deadline_uses_earliest_active_session() {
+        let mut manager = create_test_manager();
+        let now = Instant::now();
+        let first_peer = PeerId([9; 32]);
+        let second_peer = PeerId([10; 32]);
+
+        manager.active_sessions.insert(
+            first_peer,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at: now },
+                started_at: now,
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+        manager.active_sessions.insert(
+            second_peer,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning {
+                    started_at: now + Duration::from_millis(30),
+                },
+                started_at: now + Duration::from_millis(30),
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+
+        let first_deadline = manager
+            .next_poll_deadline_for_peer(first_peer, now)
+            .expect("first peer deadline");
+        let global_deadline = manager
+            .next_global_poll_deadline(now)
+            .expect("global deadline");
+
+        assert_eq!(global_deadline, first_deadline);
     }
 }

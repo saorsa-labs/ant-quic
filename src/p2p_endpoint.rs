@@ -1773,6 +1773,7 @@ impl P2pEndpoint {
         endpoint.spawn_reader_exit_handler();
         endpoint.spawn_port_mapping_task();
         endpoint.spawn_mdns_task();
+        endpoint.spawn_proactive_relay_manager();
 
         Ok(endpoint)
     }
@@ -5110,42 +5111,6 @@ impl P2pEndpoint {
             .event_tx
             .send(P2pEvent::BootstrapStatus { connected, total });
 
-        // After bootstrap, check for symmetric NAT and set up relay if needed
-        if connected > 0 {
-            let inner = Arc::clone(&self.inner);
-            let bootstrap_addrs = runtime_udp_known_peers;
-            let event_tx = self.event_tx.clone();
-
-            tokio::spawn(async move {
-                // Wait for OBSERVED_ADDRESS frames to arrive from peers
-                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                if inner.is_symmetric_nat() {
-                    info!("Symmetric NAT detected — setting up proactive relay");
-
-                    for bootstrap in &bootstrap_addrs {
-                        match inner.setup_proactive_relay(*bootstrap).await {
-                            Ok(relay_addr) => {
-                                info!(
-                                    "Proactive relay active at {} via bootstrap {}",
-                                    relay_addr, bootstrap
-                                );
-                                let _ = event_tx.send(P2pEvent::RelayEstablished { relay_addr });
-                                return;
-                            }
-                            Err(e) => {
-                                warn!("Failed to set up relay via {}: {}", bootstrap, e);
-                            }
-                        }
-                    }
-
-                    warn!("Failed to set up proactive relay on any bootstrap node");
-                } else {
-                    debug!("NAT check: not symmetric NAT, no relay needed");
-                }
-            });
-        }
-
         Ok(connected)
     }
 
@@ -5241,6 +5206,81 @@ impl P2pEndpoint {
     }
 
     // === Internal helpers ===
+
+    fn spawn_proactive_relay_manager(&self) {
+        if !self.config.nat.enable_relay_fallback {
+            return;
+        }
+
+        let endpoint = self.clone();
+        let mut events = self.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = endpoint.shutdown.cancelled() => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    },
+                };
+
+                if !matches!(
+                    event,
+                    P2pEvent::ExternalAddressDiscovered { .. }
+                        | P2pEvent::PeerConnected { .. }
+                        | P2pEvent::BootstrapStatus { .. }
+                ) {
+                    continue;
+                }
+
+                if endpoint.inner.relay_public_addr().is_some() {
+                    if endpoint.inner.is_relay_healthy() {
+                        continue;
+                    }
+                    endpoint.inner.reset_relay_state();
+                }
+
+                if !endpoint.inner.is_symmetric_nat() {
+                    continue;
+                }
+
+                let relay_candidates = endpoint.runtime_known_peer_udp_addrs();
+                if relay_candidates.is_empty() {
+                    debug!("Symmetric NAT detected but no relay candidates are currently known");
+                    continue;
+                }
+
+                info!(
+                    candidate_count = relay_candidates.len(),
+                    "Symmetric NAT detected — attempting proactive relay immediately"
+                );
+
+                let mut established = None;
+                for bootstrap in relay_candidates {
+                    match endpoint.inner.setup_proactive_relay(bootstrap).await {
+                        Ok(relay_addr) => {
+                            info!(
+                                "Proactive relay active at {} via bootstrap {}",
+                                relay_addr, bootstrap
+                            );
+                            established = Some(relay_addr);
+                            break;
+                        }
+                        Err(error) => {
+                            warn!("Failed to set up relay via {}: {}", bootstrap, error);
+                        }
+                    }
+                }
+
+                if let Some(relay_addr) = established {
+                    let _ = endpoint
+                        .event_tx
+                        .send(P2pEvent::RelayEstablished { relay_addr });
+                }
+            }
+        });
+    }
 
     fn spawn_port_mapping_task(&self) {
         if !self.config.nat.port_mapping.enabled {

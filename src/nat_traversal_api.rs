@@ -21,7 +21,13 @@ use crate::coordinator_control::{
     remember_live_request, remember_pending_request, remove_inbound_offer, remove_pending_request,
     take_live_rejection,
 };
-use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
 use crate::transport::TransportRegistry;
@@ -228,6 +234,13 @@ struct PendingAccept {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ObservedAddressReport {
+    reporter_peer_id: PeerId,
+    reported_by: SocketAddr,
+    address: SocketAddr,
+}
+
 #[derive(Debug, Clone)]
 struct TrackedConnection {
     connection: InnerConnection,
@@ -354,6 +367,10 @@ pub struct NatTraversalEndpoint {
     /// Receiver for internal event notifications
     /// Uses parking_lot::Mutex for faster, non-poisoning access
     event_rx: ParkingMutex<mpsc::UnboundedReceiver<NatTraversalEvent>>,
+    /// Sender for observed-address updates surfaced by per-connection watchers.
+    observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
+    /// Notify the discovery/orchestration driver that discovery state changed.
+    discovery_state_notify: Arc<tokio::sync::Notify>,
     /// Notify traversal waiters when session progress or runtime events arrive.
     traversal_event_notify: Arc<tokio::sync::Notify>,
     /// Notify waiters when a new accepted connection is available.
@@ -1487,6 +1504,8 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        let (observed_address_tx, observed_address_rx) = mpsc::unbounded_channel();
+
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
@@ -1497,6 +1516,8 @@ impl NatTraversalEndpoint {
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
+            observed_address_tx,
+            discovery_state_notify: Arc::new(tokio::sync::Notify::new()),
             traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
@@ -1698,6 +1719,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
@@ -1713,6 +1735,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
@@ -1723,9 +1746,11 @@ impl NatTraversalEndpoint {
             info!("Started accepting connections (symmetric P2P node)");
         }
 
-        // Start background discovery polling task
+        // Start background discovery/orchestration task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
+        let discovery_state_notify_for_poll = endpoint.discovery_state_notify.clone();
         let shutdown_clone = endpoint.shutdown.clone();
+        let shutdown_notify_for_poll = endpoint.shutdown_notify.clone();
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
         let relay_server_for_poll = endpoint.relay_server.clone();
@@ -1736,7 +1761,10 @@ impl NatTraversalEndpoint {
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
+                discovery_state_notify_for_poll,
+                observed_address_rx,
                 shutdown_clone,
+                shutdown_notify_for_poll,
                 event_tx_clone,
                 connections_clone,
                 relay_server_for_poll,
@@ -1748,7 +1776,7 @@ impl NatTraversalEndpoint {
             .await;
         });
 
-        info!("Started discovery polling task");
+        info!("Started discovery/orchestration task");
 
         // Start local candidate discovery for our own address
         {
@@ -1768,6 +1796,7 @@ impl NatTraversalEndpoint {
                 local_peer_id
             );
         }
+        endpoint.discovery_state_notify.notify_waiters();
 
         Ok(endpoint)
     }
@@ -1982,6 +2011,8 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        let (observed_address_tx, observed_address_rx) = mpsc::unbounded_channel();
+
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
@@ -1992,6 +2023,8 @@ impl NatTraversalEndpoint {
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
+            observed_address_tx,
+            discovery_state_notify: Arc::new(tokio::sync::Notify::new()),
             traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
@@ -2193,6 +2226,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
@@ -2208,6 +2242,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
@@ -2218,9 +2253,11 @@ impl NatTraversalEndpoint {
             info!("Started accepting connections (symmetric P2P node)");
         }
 
-        // Start background discovery polling task
+        // Start background discovery/orchestration task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
+        let discovery_state_notify_for_poll = endpoint.discovery_state_notify.clone();
         let shutdown_clone = endpoint.shutdown.clone();
+        let shutdown_notify_for_poll = endpoint.shutdown_notify.clone();
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
         let relay_server_for_poll = endpoint.relay_server.clone();
@@ -2231,7 +2268,10 @@ impl NatTraversalEndpoint {
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
+                discovery_state_notify_for_poll,
+                observed_address_rx,
                 shutdown_clone,
+                shutdown_notify_for_poll,
                 event_tx_clone,
                 connections_clone,
                 relay_server_for_poll,
@@ -2243,7 +2283,7 @@ impl NatTraversalEndpoint {
             .await;
         });
 
-        info!("Started discovery polling task");
+        info!("Started discovery/orchestration task");
 
         // Start local candidate discovery for our own address
         {
@@ -2263,6 +2303,7 @@ impl NatTraversalEndpoint {
                 local_peer_id
             );
         }
+        endpoint.discovery_state_notify.notify_waiters();
 
         Ok(endpoint)
     }
@@ -2362,6 +2403,7 @@ impl NatTraversalEndpoint {
             let next_connection_generation = self.next_connection_generation.clone();
             let local_peer_id = self.local_peer_id;
             let emitted_events = self.emitted_established_events.clone();
+            let observed_address_tx = self.observed_address_tx.clone();
             let traversal_event_notify = self.traversal_event_notify.clone();
             let incoming_notify = self.incoming_notify.clone();
             let pending_accepts = self.pending_accepts.clone();
@@ -2429,6 +2471,11 @@ impl NatTraversalEndpoint {
                                 }
                                 incoming_notify.notify_waiters();
                                 traversal_event_notify.notify_waiters();
+                                Self::spawn_observed_address_watch_task_parts(
+                                    observed_address_tx.clone(),
+                                    peer_id,
+                                    conn.clone(),
+                                );
                             }
                             Err(e) => {
                                 debug!("Relayed connection handshake failed: {}", e);
@@ -2444,6 +2491,8 @@ impl NatTraversalEndpoint {
         }
 
         // Step 4: Store relay public address for re-advertisement to future peers
+        self.relay_setup_attempted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
             *addr = Some(relay_public_addr);
         }
@@ -2802,6 +2851,7 @@ impl NatTraversalEndpoint {
                 .start_discovery(peer_id, bootstrap_nodes_vec)
                 .map_err(|e| NatTraversalError::CandidateDiscoveryFailed(e.to_string()))?;
         }
+        self.discovery_state_notify.notify_waiters();
 
         // Emit event
         if let Some(ref callback) = self.event_callback {
@@ -3645,6 +3695,7 @@ impl NatTraversalEndpoint {
                     let incoming_notify = Arc::clone(&self.incoming_notify);
                     let event_tx = self.event_tx.clone();
                     let event_callback = self.event_callback.clone();
+                    let observed_address_tx = self.observed_address_tx.clone();
                     let connection_timeout = self
                         .timeout_config
                         .nat_traversal
@@ -3662,6 +3713,7 @@ impl NatTraversalEndpoint {
                                 Arc::clone(&active_sessions),
                                 Arc::clone(&connections),
                                 Arc::clone(&emitted_established_events),
+                                observed_address_tx.clone(),
                                 Arc::clone(&traversal_event_notify),
                                 Arc::clone(&incoming_notify),
                                 event_tx.clone(),
@@ -3755,6 +3807,7 @@ impl NatTraversalEndpoint {
                         let incoming_notify = Arc::clone(&self.incoming_notify);
                         let event_tx = self.event_tx.clone();
                         let event_callback = self.event_callback.clone();
+                        let observed_address_tx = self.observed_address_tx.clone();
                         let connection_timeout = self
                             .timeout_config
                             .nat_traversal
@@ -3769,6 +3822,7 @@ impl NatTraversalEndpoint {
                                     Arc::clone(&active_sessions),
                                     Arc::clone(&connections),
                                     Arc::clone(&emitted_established_events),
+                                    observed_address_tx.clone(),
                                     Arc::clone(&traversal_event_notify),
                                     Arc::clone(&incoming_notify),
                                     event_tx.clone(),
@@ -4676,6 +4730,7 @@ impl NatTraversalEndpoint {
         let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
+        let observed_address_tx_clone = self.observed_address_tx.clone();
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
         let pending_accepts_clone = self.pending_accepts.clone();
@@ -4691,6 +4746,7 @@ impl NatTraversalEndpoint {
                 local_peer_id,
                 emitted_events_clone,
                 relay_server_clone,
+                observed_address_tx_clone,
                 traversal_event_notify_clone,
                 incoming_notify_clone,
                 pending_accepts_clone,
@@ -4712,6 +4768,7 @@ impl NatTraversalEndpoint {
         local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
+        observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
         pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PendingAccept>>>,
@@ -4725,6 +4782,7 @@ impl NatTraversalEndpoint {
                     let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
+                    let observed_address_tx = observed_address_tx.clone();
                     let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
                     let pending_accepts = pending_accepts.clone();
@@ -4791,6 +4849,12 @@ impl NatTraversalEndpoint {
                                         Self::handle_relay_requests(conn_clone, server_clone).await;
                                     });
                                 }
+
+                                Self::spawn_observed_address_watch_task_parts(
+                                    observed_address_tx.clone(),
+                                    peer_id,
+                                    connection.clone(),
+                                );
 
                                 Self::handle_connection(
                                     peer_id,
@@ -4947,10 +5011,14 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Poll discovery manager in background
+    /// Drive discovery progression and observed-address ingestion without a
+    /// coarse fixed polling interval.
     async fn poll_discovery(
         discovery_manager: Arc<ParkingMutex<CandidateDiscoveryManager>>,
+        discovery_state_notify: Arc<tokio::sync::Notify>,
+        mut observed_address_rx: mpsc::UnboundedReceiver<ObservedAddressReport>,
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<tokio::sync::Notify>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
@@ -4959,89 +5027,48 @@ impl NatTraversalEndpoint {
         local_peer_id: PeerId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        use tokio::time::{Duration, interval};
+        let mut observed_address_reports = HashSet::new();
 
-        let mut poll_interval = interval(Duration::from_secs(1));
-        let mut emitted_discovery = std::collections::HashSet::new();
-        // Track addresses we've already advertised to avoid spamming
-        let mut advertised_addresses = std::collections::HashSet::new();
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
 
-        while !shutdown.load(Ordering::Relaxed) {
-            poll_interval.tick().await;
+            let now = std::time::Instant::now();
+            let next_deadline = discovery_manager.lock().next_global_poll_deadline(now);
 
-            // Collect newly discovered addresses (need to do in two passes due to borrow rules)
-            let mut new_addresses = Vec::new();
-            let mut relay_public_candidates = Vec::new();
-
-            // 1. Check active connections for observed addresses and feed them to discovery
-            // DashMap allows concurrent iteration without blocking
-            tracing::trace!(
-                "poll_discovery_task: checking {} connections for observed addresses",
-                connections.len()
-            );
-            for entry in connections.iter() {
-                let peer_id = entry.key();
-                let conn = entry.value();
-                let observed = conn.observed_address();
-                tracing::trace!(
-                    "poll_discovery_task: peer {:?} at {} observed_address={:?}",
-                    peer_id,
-                    conn.remote_address(),
-                    observed
-                );
-                if let Some(observed_addr) = observed {
-                    relay_public_candidates.push(observed_addr);
-
-                    // Emit event if this is the first time this peer reported this address
-                    if emitted_discovery.insert((*peer_id, observed_addr)) {
-                        info!(
-                            "poll_discovery_task: FOUND external address {} from peer {:?}",
-                            observed_addr, peer_id
-                        );
-                        let event = NatTraversalEvent::ExternalAddressDiscovered {
-                            reported_by: conn.remote_address(),
-                            address: observed_addr,
-                        };
-                        // Send via channel (for poll() to drain)
-                        let _ = event_tx.send(event.clone());
-                        // Also invoke callback directly (critical for P2pEndpoint bridge)
-                        if let Some(ref callback) = event_callback {
-                            info!(
-                                "poll_discovery_task: invoking event_callback for ExternalAddressDiscovered"
-                            );
-                            callback(event);
-                        }
-
-                        // Track this address for ADD_ADDRESS advertisement
-                        if advertised_addresses.insert(observed_addr) {
-                            new_addresses.push(observed_addr);
-                        }
+            tokio::select! {
+                _ = shutdown_notify.notified() => break,
+                maybe_report = observed_address_rx.recv() => {
+                    let Some(report) = maybe_report else {
+                        break;
+                    };
+                    Self::process_observed_address_report(
+                        discovery_manager.as_ref(),
+                        &discovery_state_notify,
+                        &mut observed_address_reports,
+                        &event_tx,
+                        connections.as_ref(),
+                        relay_server.as_ref(),
+                        event_callback.as_ref(),
+                        &traversal_event_notify,
+                        local_peer_id,
+                        &relay_setup_attempted,
+                        report,
+                    )
+                    .await;
+                }
+                _ = discovery_state_notify.notified() => {}
+                _ = async {
+                    if let Some(deadline) = next_deadline {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
-
-                    // Feed the observed address to discovery manager for OUR local peer
-                    // (OBSERVED_ADDRESS tells us our external address as seen by the remote peer)
-                    // parking_lot::Mutex doesn't poison - always succeeds
-                    let mut discovery = discovery_manager.lock();
-                    let _ = discovery.accept_quic_discovered_address(local_peer_id, observed_addr);
-                }
+                } => {}
             }
 
-            // 2. Send ADD_ADDRESS to all peers for newly discovered addresses
-            // (Critical for CGNAT - peers need to know our external address to hole-punch back)
-            // Skip if relay is active — only the relay address should be advertised.
-            if !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed) {
-                for addr in &new_addresses {
-                    broadcast_address_to_peers(&connections, *addr, 100);
-                }
-            }
-
-            // 3. Poll the discovery manager
-            // parking_lot::Mutex doesn't poison - always succeeds
             let events = discovery_manager.lock().poll(std::time::Instant::now());
-
-            // Process discovery events
-            // Events that only need logging use the Display implementation.
-            // Events requiring action are handled explicitly.
             for event in events {
                 match &event {
                     DiscoveryEvent::ServerReflexiveCandidateDiscovered {
@@ -5049,50 +5076,40 @@ impl NatTraversalEndpoint {
                         bootstrap_node,
                     } => {
                         debug!("{}", event);
-                        relay_public_candidates.push(candidate.address);
-
-                        // Notify that our external address was discovered
-                        let _ = event_tx.send(NatTraversalEvent::ExternalAddressDiscovered {
-                            reported_by: *bootstrap_node,
-                            address: candidate.address,
-                        });
-                        traversal_event_notify.notify_waiters();
-
-                        // Send ADD_ADDRESS frame to all connected peers so they know
-                        // how to reach us (critical for CGNAT hole punching)
-                        broadcast_address_to_peers(
-                            &connections,
-                            candidate.address,
-                            candidate.priority,
-                        );
+                        Self::process_observed_address_report(
+                            discovery_manager.as_ref(),
+                            &discovery_state_notify,
+                            &mut observed_address_reports,
+                            &event_tx,
+                            connections.as_ref(),
+                            relay_server.as_ref(),
+                            event_callback.as_ref(),
+                            &traversal_event_notify,
+                            local_peer_id,
+                            &relay_setup_attempted,
+                            ObservedAddressReport {
+                                reporter_peer_id: Self::generate_peer_id_from_address(
+                                    *bootstrap_node,
+                                ),
+                                reported_by: *bootstrap_node,
+                                address: candidate.address,
+                            },
+                        )
+                        .await;
                     }
-                    DiscoveryEvent::DiscoveryCompleted { .. } => {
-                        // Use info! level for successful completion
-                        info!("{}", event);
-                    }
-                    DiscoveryEvent::DiscoveryFailed { .. } => {
-                        // Use warn! level for failures
-                        // Note: We don't send a TraversalFailed event here because:
-                        // 1. This is general discovery, not for a specific peer
-                        // 2. We might have partial results that are still usable
-                        // 3. The actual NAT traversal attempt will handle failure if needed
-                        warn!("{}", event);
-                    }
-                    // All other events only need logging at debug level
-                    _ => {
-                        debug!("{}", event);
-                    }
+                    DiscoveryEvent::DiscoveryCompleted { .. } => info!("{}", event),
+                    DiscoveryEvent::DiscoveryFailed { .. } => warn!("{}", event),
+                    _ => debug!("{}", event),
                 }
             }
 
-            if let Some(server) = relay_server.as_ref() {
-                let (ipv4, ipv6) =
-                    Self::select_relay_server_public_addresses(relay_public_candidates.as_slice());
-                server.reconcile_public_addresses(ipv4, ipv6);
-            }
+            Self::reconcile_relay_server_public_addresses_from_connections(
+                connections.as_ref(),
+                relay_server.as_ref(),
+            );
         }
 
-        info!("Discovery polling task shutting down");
+        info!("Discovery/orchestration task shutting down");
     }
 
     /// Handle an established connection
@@ -5122,6 +5139,125 @@ impl NatTraversalEndpoint {
             .unwrap_or_else(|| "Connection closed".to_string());
         let _ = event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason });
         traversal_event_notify.notify_waiters();
+    }
+
+    fn emit_runtime_event_parts(
+        event_tx: &mpsc::UnboundedSender<NatTraversalEvent>,
+        event_callback: Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        traversal_event_notify: &Arc<tokio::sync::Notify>,
+        event: NatTraversalEvent,
+    ) {
+        let _ = event_tx.send(event.clone());
+        if let Some(callback) = event_callback {
+            callback(event);
+        }
+        traversal_event_notify.notify_waiters();
+    }
+
+    fn reconcile_relay_server_public_addresses_from_connections(
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        relay_server: Option<&Arc<MasqueRelayServer>>,
+    ) {
+        let Some(server) = relay_server else {
+            return;
+        };
+
+        let mut candidates = Vec::new();
+        for entry in connections.iter() {
+            for addr in entry.value().all_observed_addresses() {
+                candidates.push(normalize_socket_addr(addr));
+            }
+        }
+        let (ipv4, ipv6) = Self::select_relay_server_public_addresses(candidates.as_slice());
+        server.reconcile_public_addresses(ipv4, ipv6);
+    }
+
+    async fn process_observed_address_report(
+        discovery_manager: &ParkingMutex<CandidateDiscoveryManager>,
+        discovery_state_notify: &Arc<tokio::sync::Notify>,
+        observed_address_reports: &mut HashSet<(PeerId, SocketAddr)>,
+        event_tx: &mpsc::UnboundedSender<NatTraversalEvent>,
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        relay_server: Option<&Arc<MasqueRelayServer>>,
+        event_callback: Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        traversal_event_notify: &Arc<tokio::sync::Notify>,
+        local_peer_id: PeerId,
+        relay_setup_attempted: &Arc<std::sync::atomic::AtomicBool>,
+        report: ObservedAddressReport,
+    ) {
+        let address = normalize_socket_addr(report.address);
+        let reported_by = normalize_socket_addr(report.reported_by);
+
+        let should_emit = observed_address_reports.insert((report.reporter_peer_id, address));
+        if !should_emit {
+            return;
+        }
+
+        Self::emit_runtime_event_parts(
+            event_tx,
+            event_callback,
+            traversal_event_notify,
+            NatTraversalEvent::ExternalAddressDiscovered {
+                reported_by,
+                address,
+            },
+        );
+
+        let accepted = {
+            let mut discovery = discovery_manager.lock();
+            discovery
+                .accept_quic_discovered_address(local_peer_id, address)
+                .unwrap_or(false)
+        };
+        if accepted {
+            discovery_state_notify.notify_waiters();
+        }
+
+        if !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed) {
+            broadcast_address_to_peers(connections, address, 100);
+        }
+
+        Self::reconcile_relay_server_public_addresses_from_connections(connections, relay_server);
+    }
+
+    fn spawn_observed_address_watch_task_parts(
+        observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) {
+        tokio::spawn(async move {
+            let mut seen = HashSet::new();
+            loop {
+                let reported_by = normalize_socket_addr(connection.remote_address());
+                for address in connection
+                    .all_observed_addresses()
+                    .into_iter()
+                    .map(normalize_socket_addr)
+                {
+                    if seen.insert(address) {
+                        let _ = observed_address_tx.send(ObservedAddressReport {
+                            reporter_peer_id: peer_id,
+                            reported_by,
+                            address,
+                        });
+                    }
+                }
+
+                let observed_change = connection.observed_address_updated();
+                tokio::select! {
+                    _ = observed_change => {}
+                    _ = connection.closed() => break,
+                }
+            }
+        });
+    }
+
+    fn spawn_observed_address_watch_task(&self, peer_id: PeerId, connection: InnerConnection) {
+        Self::spawn_observed_address_watch_task_parts(
+            self.observed_address_tx.clone(),
+            peer_id,
+            connection,
+        );
     }
 
     /// Connect to a peer using NAT traversal
@@ -6456,7 +6592,11 @@ impl NatTraversalEndpoint {
             "add_connection: peer {:?} at {} observed_address={:?}",
             peer_id, remote_addr, observed
         );
+        let observed_watch_connection = connection.clone();
         let outcome = self.register_connection_lifecycle(peer_id, connection)?;
+        if matches!(outcome, ConnectionRegistrationOutcome::Live { .. }) {
+            self.spawn_observed_address_watch_task(peer_id, observed_watch_connection);
+        }
         info!(
             "add_connection: now have {} live connections",
             self.connections.len()
@@ -7187,6 +7327,7 @@ impl NatTraversalEndpoint {
                 .start_discovery(peer_id, bootstrap_nodes)
                 .map_err(|e| NatTraversalError::CandidateDiscoveryFailed(e.to_string()))?;
         }
+        self.discovery_state_notify.notify_waiters();
 
         // Poll for discovery results with timeout
         let timeout_duration = self.config.coordination_timeout;
@@ -7257,7 +7398,10 @@ impl NatTraversalEndpoint {
             if wake_at <= now {
                 continue;
             }
-            sleep(wake_at.saturating_duration_since(now)).await;
+            tokio::select! {
+                _ = self.discovery_state_notify.notified() => {}
+                _ = sleep(wake_at.saturating_duration_since(now)) => {}
+            }
         }
 
         if candidates.is_empty() {
@@ -7640,6 +7784,7 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let observed_address_tx = self.observed_address_tx.clone();
                         let traversal_event_notify = self.traversal_event_notify.clone();
                         let incoming_notify = self.incoming_notify.clone();
                         let peer_id_clone = peer_id;
@@ -7678,6 +7823,11 @@ impl NatTraversalEndpoint {
                                         });
                                     incoming_notify.notify_one();
                                     traversal_event_notify.notify_waiters();
+                                    Self::spawn_observed_address_watch_task_parts(
+                                        observed_address_tx.clone(),
+                                        peer_id_clone,
+                                        connection.clone(),
+                                    );
 
                                     // Handle the connection
                                     Self::handle_connection(
@@ -8922,6 +9072,7 @@ impl NatTraversalEndpoint {
             Arc::clone(&self.active_sessions),
             Arc::clone(&self.connections),
             Arc::clone(&self.emitted_established_events),
+            self.observed_address_tx.clone(),
             Arc::clone(&self.traversal_event_notify),
             Arc::clone(&self.incoming_notify),
             self.event_tx.clone(),
@@ -8940,6 +9091,7 @@ impl NatTraversalEndpoint {
         active_sessions: Arc<dashmap::DashMap<PeerId, NatTraversalSession>>,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         emitted_established_events: Arc<dashmap::DashSet<PeerId>>,
+        observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
         event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
@@ -8990,6 +9142,12 @@ impl NatTraversalEndpoint {
         let event_tx = event_tx.ok_or_else(|| {
             NatTraversalError::ConfigError("NAT traversal event channel not configured".to_string())
         })?;
+
+        Self::spawn_observed_address_watch_task_parts(
+            observed_address_tx.clone(),
+            peer_id,
+            connection.clone(),
+        );
 
         let should_emit = emitted_established_events.insert(peer_id);
         if should_emit {
@@ -10005,6 +10163,87 @@ mod tests {
         );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_process_observed_address_report_deduplicates_and_wakes_discovery() {
+        let local_peer_id = PeerId([0x44; 32]);
+        let mut manager = CandidateDiscoveryManager::new(DiscoveryConfig::test_default());
+        manager
+            .start_discovery(local_peer_id, Vec::new())
+            .expect("discovery should start");
+        let discovery_manager = ParkingMutex::new(manager);
+        let discovery_state_notify = Arc::new(tokio::sync::Notify::new());
+        let traversal_event_notify = Arc::new(tokio::sync::Notify::new());
+        let relay_setup_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut observed_address_reports = HashSet::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let connections = dashmap::DashMap::new();
+        let report = ObservedAddressReport {
+            reporter_peer_id: PeerId([0x45; 32]),
+            reported_by: "127.0.0.1:9000".parse().unwrap(),
+            address: "203.0.113.44:45000".parse().unwrap(),
+        };
+
+        let discovery_notified = discovery_state_notify.notified();
+        let traversal_notified = traversal_event_notify.notified();
+        NatTraversalEndpoint::process_observed_address_report(
+            &discovery_manager,
+            &discovery_state_notify,
+            &mut observed_address_reports,
+            &event_tx,
+            &connections,
+            None,
+            None,
+            &traversal_event_notify,
+            local_peer_id,
+            &relay_setup_attempted,
+            report,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_millis(50), discovery_notified)
+            .await
+            .expect("discovery notify should fire");
+        tokio::time::timeout(Duration::from_millis(50), traversal_notified)
+            .await
+            .expect("traversal notify should fire");
+
+        let event = event_rx.try_recv().expect("external address event");
+        assert!(matches!(
+            event,
+            NatTraversalEvent::ExternalAddressDiscovered { address, .. }
+                if address == report.address
+        ));
+        assert_eq!(observed_address_reports.len(), 1);
+        assert_eq!(
+            discovery_manager
+                .lock()
+                .get_discovery_status(local_peer_id)
+                .expect("discovery status")
+                .statistics
+                .server_reflexive_candidates_found,
+            1
+        );
+
+        NatTraversalEndpoint::process_observed_address_report(
+            &discovery_manager,
+            &discovery_state_notify,
+            &mut observed_address_reports,
+            &event_tx,
+            &connections,
+            None,
+            None,
+            &traversal_event_notify,
+            local_peer_id,
+            &relay_setup_attempted,
+            report,
+        )
+        .await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "duplicate reports must be suppressed"
+        );
     }
 
     /// Test that transport listener handles field is properly initialized
