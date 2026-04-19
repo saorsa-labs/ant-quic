@@ -3,11 +3,40 @@
 mod support;
 
 use ant_quic::{ConnectionCloseReason, ConnectionError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{
-    make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop, test_guard,
-    wait_until,
+    connect_pair, make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop,
+    test_guard, wait_until,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_shutdown_cleans_up_remote_view_without_waiting_for_reaper() {
+    let _guard = test_guard().await;
+    reset_lifecycle_events();
+
+    let a = make_node(vec![]).await;
+    let b = make_node(vec![]).await;
+    let accept_a = spawn_accept_loop(a.clone());
+    let accept_b = spawn_accept_loop(b.clone());
+    let (_, b_id, _) = connect_pair(&a, &b).await;
+
+    let start = Instant::now();
+    b.shutdown().await;
+
+    wait_until(Duration::from_secs(3), || {
+        a.get_quic_connection(&b_id).ok().flatten().is_none()
+    })
+    .await;
+
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "disconnect cleanup should be driven by reader exit, not the 30s stale reaper"
+    );
+
+    a.shutdown().await;
+    accept_a.abort();
+    accept_b.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn superseded_connection_surfaces_close_reason_quickly() {

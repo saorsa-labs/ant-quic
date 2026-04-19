@@ -354,6 +354,8 @@ pub struct NatTraversalEndpoint {
     /// Receiver for internal event notifications
     /// Uses parking_lot::Mutex for faster, non-poisoning access
     event_rx: ParkingMutex<mpsc::UnboundedReceiver<NatTraversalEvent>>,
+    /// Notify traversal waiters when session progress or runtime events arrive.
+    traversal_event_notify: Arc<tokio::sync::Notify>,
     /// Notify waiters when a new accepted connection is available.
     /// Eliminates the 10ms polling loop in accept_connection().
     incoming_notify: Arc<tokio::sync::Notify>,
@@ -1495,6 +1497,7 @@ impl NatTraversalEndpoint {
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
+            traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1695,6 +1698,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
@@ -1709,6 +1713,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
                 )
@@ -1724,6 +1729,7 @@ impl NatTraversalEndpoint {
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
         let relay_server_for_poll = endpoint.relay_server.clone();
+        let traversal_event_notify_for_poll = endpoint.traversal_event_notify.clone();
 
         let local_peer_id_for_poll = endpoint.local_peer_id;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
@@ -1735,6 +1741,7 @@ impl NatTraversalEndpoint {
                 connections_clone,
                 relay_server_for_poll,
                 event_callback_for_poll,
+                traversal_event_notify_for_poll,
                 local_peer_id_for_poll,
                 relay_setup_attempted_clone,
             )
@@ -1985,6 +1992,7 @@ impl NatTraversalEndpoint {
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
             event_rx: ParkingMutex::new(event_rx),
+            traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
             incoming_notify: Arc::new(tokio::sync::Notify::new()),
             pending_accepts: Arc::new(ParkingMutex::new(std::collections::VecDeque::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2185,6 +2193,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
@@ -2199,6 +2208,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
                 )
@@ -2214,6 +2224,7 @@ impl NatTraversalEndpoint {
         let event_tx_clone = event_tx;
         let connections_clone = endpoint.connections.clone();
         let relay_server_for_poll = endpoint.relay_server.clone();
+        let traversal_event_notify_for_poll = endpoint.traversal_event_notify.clone();
 
         let local_peer_id_for_poll = endpoint.local_peer_id;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
@@ -2225,6 +2236,7 @@ impl NatTraversalEndpoint {
                 connections_clone,
                 relay_server_for_poll,
                 event_callback_for_poll,
+                traversal_event_notify_for_poll,
                 local_peer_id_for_poll,
                 relay_setup_attempted_clone,
             )
@@ -2350,6 +2362,7 @@ impl NatTraversalEndpoint {
             let next_connection_generation = self.next_connection_generation.clone();
             let local_peer_id = self.local_peer_id;
             let emitted_events = self.emitted_established_events.clone();
+            let traversal_event_notify = self.traversal_event_notify.clone();
             let incoming_notify = self.incoming_notify.clone();
             let pending_accepts = self.pending_accepts.clone();
             let relay_event_tx = self.event_tx.clone();
@@ -2412,8 +2425,10 @@ impl NatTraversalEndpoint {
                                         remote_address: remote,
                                         side: Side::Server,
                                     });
+                                    traversal_event_notify.notify_waiters();
                                 }
                                 incoming_notify.notify_waiters();
+                                traversal_event_notify.notify_waiters();
                             }
                             Err(e) => {
                                 debug!("Relayed connection handshake failed: {}", e);
@@ -2715,6 +2730,7 @@ impl NatTraversalEndpoint {
         if let Some(ref callback) = self.event_callback {
             callback(event.clone());
         }
+        self.traversal_event_notify.notify_waiters();
         events.push(event);
     }
 
@@ -2805,6 +2821,7 @@ impl NatTraversalEndpoint {
                 );
             }
             self.incoming_notify.notify_waiters();
+            self.traversal_event_notify.notify_waiters();
         }
 
         // NAT traversal will proceed via poll() calls and state machine updates
@@ -3624,6 +3641,7 @@ impl NatTraversalEndpoint {
                     let active_sessions = Arc::clone(&self.active_sessions);
                     let connections = Arc::clone(&self.connections);
                     let emitted_established_events = Arc::clone(&self.emitted_established_events);
+                    let traversal_event_notify = Arc::clone(&self.traversal_event_notify);
                     let incoming_notify = Arc::clone(&self.incoming_notify);
                     let event_tx = self.event_tx.clone();
                     let event_callback = self.event_callback.clone();
@@ -3635,6 +3653,7 @@ impl NatTraversalEndpoint {
                     let target_peer = *target;
 
                     self.incoming_notify.notify_waiters();
+                    self.traversal_event_notify.notify_waiters();
                     tokio::spawn(async move {
                         let mut last_error = None;
                         for addr in candidate_addrs {
@@ -3643,6 +3662,7 @@ impl NatTraversalEndpoint {
                                 Arc::clone(&active_sessions),
                                 Arc::clone(&connections),
                                 Arc::clone(&emitted_established_events),
+                                Arc::clone(&traversal_event_notify),
                                 Arc::clone(&incoming_notify),
                                 event_tx.clone(),
                                 event_callback.clone(),
@@ -3731,6 +3751,7 @@ impl NatTraversalEndpoint {
                         let connections = Arc::clone(&self.connections);
                         let emitted_established_events =
                             Arc::clone(&self.emitted_established_events);
+                        let traversal_event_notify = Arc::clone(&self.traversal_event_notify);
                         let incoming_notify = Arc::clone(&self.incoming_notify);
                         let event_tx = self.event_tx.clone();
                         let event_callback = self.event_callback.clone();
@@ -3748,6 +3769,7 @@ impl NatTraversalEndpoint {
                                     Arc::clone(&active_sessions),
                                     Arc::clone(&connections),
                                     Arc::clone(&emitted_established_events),
+                                    Arc::clone(&traversal_event_notify),
                                     Arc::clone(&incoming_notify),
                                     event_tx.clone(),
                                     event_callback.clone(),
@@ -3823,6 +3845,7 @@ impl NatTraversalEndpoint {
                         *reason,
                     );
                     self.incoming_notify.notify_waiters();
+                    self.traversal_event_notify.notify_waiters();
                     info!(
                         "coordinator control rejected handled request_id={} from_peer={:?} initiator={:?} target={:?} round={} reason={:?}",
                         envelope.request_id, from_peer_id, initiator, target, round, reason
@@ -3989,6 +4012,7 @@ impl NatTraversalEndpoint {
 
                 let connection = conn.clone();
                 let envelope = envelope.clone();
+                let traversal_event_notify = self.traversal_event_notify.clone();
                 tokio::spawn(async move {
                     let send_result: Result<(), ()> = async {
                         let bytes = encode_coordinator_control(&envelope).map_err(|_| ())?;
@@ -4008,6 +4032,7 @@ impl NatTraversalEndpoint {
                             Some(coordinator_peer_id),
                             RejectionReason::InternalError,
                         );
+                        traversal_event_notify.notify_waiters();
                     }
                 });
                 return Ok(());
@@ -4035,6 +4060,7 @@ impl NatTraversalEndpoint {
                     let emitted_established_events = self.emitted_established_events.clone();
                     let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
+                    let traversal_event_notify = self.traversal_event_notify.clone();
 
                     tokio::spawn(async move {
                         let connect_timeout = Duration::from_secs(10);
@@ -4063,6 +4089,7 @@ impl NatTraversalEndpoint {
                                                 None,
                                                 RejectionReason::InternalError,
                                             );
+                                            traversal_event_notify.notify_waiters();
                                             return;
                                         }
                                     };
@@ -4099,6 +4126,7 @@ impl NatTraversalEndpoint {
                                         Some(coordinator_peer_id),
                                         RejectionReason::InternalError,
                                     );
+                                    traversal_event_notify.notify_waiters();
                                 }
                             }
                             Ok(Err(e)) => {
@@ -4111,6 +4139,7 @@ impl NatTraversalEndpoint {
                                     None,
                                     RejectionReason::InternalError,
                                 );
+                                traversal_event_notify.notify_waiters();
                             }
                             Err(_) => {
                                 warn!("Timeout connecting to coordinator {}", coordinator);
@@ -4122,6 +4151,7 @@ impl NatTraversalEndpoint {
                                     None,
                                     RejectionReason::InternalError,
                                 );
+                                traversal_event_notify.notify_waiters();
                             }
                         }
                     });
@@ -4646,6 +4676,7 @@ impl NatTraversalEndpoint {
         let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
+        let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
         let pending_accepts_clone = self.pending_accepts.clone();
 
@@ -4660,6 +4691,7 @@ impl NatTraversalEndpoint {
                 local_peer_id,
                 emitted_events_clone,
                 relay_server_clone,
+                traversal_event_notify_clone,
                 incoming_notify_clone,
                 pending_accepts_clone,
             )
@@ -4680,6 +4712,7 @@ impl NatTraversalEndpoint {
         local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
+        traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
         pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PendingAccept>>>,
     ) {
@@ -4692,6 +4725,7 @@ impl NatTraversalEndpoint {
                     let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
+                    let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
                     let pending_accepts = pending_accepts.clone();
                     tokio::spawn(async move {
@@ -4737,6 +4771,7 @@ impl NatTraversalEndpoint {
                                     generation,
                                 });
                                 incoming_notify.notify_one();
+                                traversal_event_notify.notify_waiters();
 
                                 let should_emit = emitted_events.insert(peer_id);
                                 if should_emit {
@@ -4746,6 +4781,7 @@ impl NatTraversalEndpoint {
                                             remote_address: connection.remote_address(),
                                             side: Side::Server,
                                         });
+                                    traversal_event_notify.notify_waiters();
                                 }
 
                                 if let Some(ref server) = relay_server {
@@ -4756,7 +4792,13 @@ impl NatTraversalEndpoint {
                                     });
                                 }
 
-                                Self::handle_connection(peer_id, connection, event_tx).await;
+                                Self::handle_connection(
+                                    peer_id,
+                                    connection,
+                                    event_tx,
+                                    traversal_event_notify,
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 debug!("Connection failed: {}", e);
@@ -4913,6 +4955,7 @@ impl NatTraversalEndpoint {
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        traversal_event_notify: Arc<tokio::sync::Notify>,
         local_peer_id: PeerId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
     ) {
@@ -5013,6 +5056,7 @@ impl NatTraversalEndpoint {
                             reported_by: *bootstrap_node,
                             address: candidate.address,
                         });
+                        traversal_event_notify.notify_waiters();
 
                         // Send ADD_ADDRESS frame to all connected peers so they know
                         // how to reach us (critical for CGNAT hole punching)
@@ -5056,6 +5100,7 @@ impl NatTraversalEndpoint {
         peer_id: PeerId,
         connection: InnerConnection,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
+        traversal_event_notify: Arc<tokio::sync::Notify>,
     ) {
         let remote_address = connection.remote_address();
         let closed = connection.closed();
@@ -5076,6 +5121,7 @@ impl NatTraversalEndpoint {
             .map(|reason| format!("Connection closed: {reason}"))
             .unwrap_or_else(|| "Connection closed".to_string());
         let _ = event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason });
+        traversal_event_notify.notify_waiters();
     }
 
     /// Connect to a peer using NAT traversal
@@ -5119,6 +5165,7 @@ impl NatTraversalEndpoint {
                 side: Side::Client,
             });
             self.incoming_notify.notify_one();
+            self.traversal_event_notify.notify_waiters();
         }
 
         Ok(connection)
@@ -5720,11 +5767,20 @@ impl NatTraversalEndpoint {
         self.local_peer_id
     }
 
+    /// Returns a reference to the traversal progress notification handle.
+    ///
+    /// This `Notify` is triggered whenever NAT-traversal session progress or
+    /// runtime connection events occur. Callers still need an explicit timeout
+    /// or next-deadline budget for phases that are driven by absence of events.
+    pub(crate) fn traversal_event_notify(&self) -> &tokio::sync::Notify {
+        &self.traversal_event_notify
+    }
+
     /// Returns a reference to the connection notification handle.
     ///
     /// This `Notify` is triggered whenever a `ConnectionEstablished` event
-    /// is produced, allowing callers to await connection events without
-    /// polling in a sleep loop.
+    /// is produced, allowing callers waiting in `accept_connection()` to sleep
+    /// without polling.
     pub fn connection_notify(&self) -> &tokio::sync::Notify {
         &self.incoming_notify
     }
@@ -6473,11 +6529,13 @@ impl NatTraversalEndpoint {
                 side,
             });
             self.incoming_notify.notify_one();
+            self.traversal_event_notify.notify_waiters();
         }
 
         // Spawn connection monitoring task
+        let traversal_event_notify = Arc::clone(&self.traversal_event_notify);
         tokio::spawn(async move {
-            Self::handle_connection(peer_id, connection, event_tx).await;
+            Self::handle_connection(peer_id, connection, event_tx, traversal_event_notify).await;
         });
 
         Ok(())
@@ -7056,6 +7114,7 @@ impl NatTraversalEndpoint {
         // or transport listener loops
         self.shutdown.store(true, Ordering::Relaxed);
         self.incoming_notify.notify_waiters();
+        self.traversal_event_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
 
         // Close all active connections
@@ -7183,16 +7242,22 @@ impl NatTraversalEndpoint {
                 }
             }
 
-            // Wait briefly for more events, but respect the overall timeout.
-            // The discovery manager uses a synchronous poll() model, so we still
-            // need a brief interval. This avoids overshooting the deadline.
-            let remaining = timeout_duration
-                .checked_sub(start_time.elapsed())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                break;
+            // Wait until the discovery manager's next meaningful deadline instead
+            // of blindly polling on a fixed cadence. Local interface scans still
+            // use a small poll interval because the platform abstraction does not
+            // yet expose a waitable completion event.
+            let now = std::time::Instant::now();
+            let overall_deadline = start_time + timeout_duration;
+            let wake_at = self
+                .discovery_manager
+                .lock()
+                .next_poll_deadline_for_peer(peer_id, now)
+                .unwrap_or(overall_deadline)
+                .min(overall_deadline);
+            if wake_at <= now {
+                continue;
             }
-            sleep(remaining.min(Duration::from_millis(10))).await;
+            sleep(wake_at.saturating_duration_since(now)).await;
         }
 
         if candidates.is_empty() {
@@ -7575,6 +7640,7 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let traversal_event_notify = self.traversal_event_notify.clone();
                         let incoming_notify = self.incoming_notify.clone();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
@@ -7611,10 +7677,16 @@ impl NatTraversalEndpoint {
                                             side: Side::Client,
                                         });
                                     incoming_notify.notify_one();
+                                    traversal_event_notify.notify_waiters();
 
                                     // Handle the connection
-                                    Self::handle_connection(peer_id_clone, connection, event_tx)
-                                        .await;
+                                    Self::handle_connection(
+                                        peer_id_clone,
+                                        connection,
+                                        event_tx,
+                                        traversal_event_notify,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     warn!("Connection to {} failed: {}", address, e);
@@ -8007,6 +8079,33 @@ impl NatTraversalEndpoint {
         }
 
         Ok(events)
+    }
+
+    /// Compute the next deadline at which polling this peer's session may make
+    /// forward progress.
+    ///
+    /// This replaces blanket sleep-loop polling with the earliest meaningful
+    /// phase timeout or discovery-manager wakeup for the specific peer.
+    pub(crate) fn next_session_poll_deadline(
+        &self,
+        peer_id: PeerId,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        let phase_deadline = self.active_sessions.get(&peer_id).and_then(|entry| {
+            let session = entry.value();
+            let phase_timeout = self.get_phase_timeout(session.phase);
+            (!phase_timeout.is_zero()).then_some(session.started_at + phase_timeout)
+        });
+        let discovery_deadline = self
+            .discovery_manager
+            .lock()
+            .next_poll_deadline_for_peer(peer_id, now);
+
+        match (phase_deadline, discovery_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     /// Get timeout duration for a specific traversal phase
@@ -8823,6 +8922,7 @@ impl NatTraversalEndpoint {
             Arc::clone(&self.active_sessions),
             Arc::clone(&self.connections),
             Arc::clone(&self.emitted_established_events),
+            Arc::clone(&self.traversal_event_notify),
             Arc::clone(&self.incoming_notify),
             self.event_tx.clone(),
             self.event_callback.clone(),
@@ -8840,6 +8940,7 @@ impl NatTraversalEndpoint {
         active_sessions: Arc<dashmap::DashMap<PeerId, NatTraversalSession>>,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         emitted_established_events: Arc<dashmap::DashSet<PeerId>>,
+        traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
         event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
@@ -8902,10 +9003,11 @@ impl NatTraversalEndpoint {
                 callback(event);
             }
             incoming_notify.notify_waiters();
+            traversal_event_notify.notify_waiters();
         }
 
         tokio::spawn(async move {
-            Self::handle_connection(peer_id, connection, event_tx).await;
+            Self::handle_connection(peer_id, connection, event_tx, traversal_event_notify).await;
         });
 
         info!(
@@ -9818,6 +9920,88 @@ mod tests {
         assert_eq!(
             endpoint.check_punch_results_for_session(&session),
             Some(candidate_addr)
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_traversal_event_notify_wakes_waiters_on_emit_event() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let notified = endpoint.traversal_event_notify().notified();
+        let mut events = Vec::new();
+        endpoint.emit_event(
+            &mut events,
+            NatTraversalEvent::TraversalFailed {
+                peer_id: PeerId([0x42; 32]),
+                error: NatTraversalError::Timeout,
+                fallback_available: true,
+            },
+        );
+
+        tokio::time::timeout(Duration::from_millis(50), notified)
+            .await
+            .expect("traversal event notify should fire");
+        assert_eq!(events.len(), 1);
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_next_session_poll_deadline_prefers_discovery_cadence() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x43; 32]);
+        endpoint
+            .discovery_manager
+            .lock()
+            .start_discovery(peer_id, Vec::new())
+            .expect("discovery should start");
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: std::time::Instant::now(),
+                phase: TraversalPhase::Discovery,
+                candidates: Vec::new(),
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: std::time::Instant::now(),
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let now = std::time::Instant::now();
+        let deadline = endpoint
+            .next_session_poll_deadline(peer_id, now)
+            .expect("active discovery session should schedule a wakeup");
+
+        assert!(deadline >= now, "deadline must not move backwards");
+        assert!(
+            deadline <= now + Duration::from_millis(20),
+            "discovery cadence should win over the coarse phase timeout"
+        );
+        assert!(
+            deadline < now + endpoint.get_phase_timeout(TraversalPhase::Discovery),
+            "session-specific discovery polling should wake before the phase timeout"
         );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");

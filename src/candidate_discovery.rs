@@ -1101,6 +1101,47 @@ impl CandidateDiscoveryManager {
         all_events
     }
 
+    /// Compute the next deadline at which polling this peer's discovery state may
+    /// make forward progress.
+    ///
+    /// Local interface discovery still requires a small polling cadence because
+    /// the platform abstraction currently exposes `check_scan_complete()` rather
+    /// than a waitable completion event. The cadence is scoped only to active
+    /// local scans instead of driving unrelated traversal loops.
+    pub(crate) fn next_poll_deadline_for_peer(
+        &self,
+        peer_id: PeerId,
+        now: Instant,
+    ) -> Option<Instant> {
+        let session = self.active_sessions.get(&peer_id)?;
+        match &session.current_phase {
+            DiscoveryPhase::Idle
+            | DiscoveryPhase::Completed { .. }
+            | DiscoveryPhase::Failed { .. } => None,
+            DiscoveryPhase::LocalInterfaceScanning { started_at } => {
+                let scan_timeout_deadline = *started_at + self.config.local_scan_timeout;
+                let scan_kickoff_deadline = *started_at + Duration::from_millis(50);
+                let discovery_floor_deadline = session.started_at + self.config.min_discovery_time;
+                let next_scan_check = now + Duration::from_millis(10);
+
+                let mut deadline = scan_timeout_deadline.min(next_scan_check);
+                if now < scan_kickoff_deadline {
+                    deadline = deadline.min(scan_kickoff_deadline);
+                }
+                if !self.config.min_discovery_time.is_zero() {
+                    deadline = deadline.min(discovery_floor_deadline);
+                }
+                Some(deadline)
+            }
+            DiscoveryPhase::ServerReflexiveQuerying { started_at, .. } => {
+                Some(*started_at + self.config.bootstrap_query_timeout)
+            }
+            DiscoveryPhase::CandidateValidation { started_at, .. } => {
+                Some(*started_at + self.config.total_timeout)
+            }
+        }
+    }
+
     /// Clean up sessions that have been completed for longer than the specified duration
     pub fn cleanup_stale_sessions(&mut self, max_age: Duration) {
         let now = Instant::now();
@@ -2509,5 +2550,62 @@ mod tests {
             CandidateAddress::validate_address(&"[::ffff:192.168.1.1]:8080".parse().unwrap()),
             Err(CandidateValidationError::IPv4MappedAddress)
         ));
+    }
+
+    #[test]
+    fn next_poll_deadline_tracks_active_local_scan() {
+        let manager = create_test_manager();
+        let peer_id = PeerId([7; 32]);
+        let started_at = Instant::now();
+
+        let mut manager = manager;
+        manager.active_sessions.insert(
+            peer_id,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
+                started_at,
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+
+        let now = started_at + Duration::from_millis(5);
+        let deadline = manager
+            .next_poll_deadline_for_peer(peer_id, now)
+            .expect("active local scan should produce a wake deadline");
+
+        assert!(deadline >= now, "deadline must not move backwards");
+        assert!(
+            deadline <= now + Duration::from_millis(10),
+            "local scans should keep their small scoped poll cadence"
+        );
+        assert!(deadline <= started_at + manager.config.local_scan_timeout);
+    }
+
+    #[test]
+    fn next_poll_deadline_is_none_for_completed_session() {
+        let manager = create_test_manager();
+        let peer_id = PeerId([8; 32]);
+        let started_at = Instant::now();
+
+        let mut manager = manager;
+        manager.active_sessions.insert(
+            peer_id,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::Completed {
+                    final_candidates: Vec::new(),
+                    completion_time: started_at,
+                },
+                started_at,
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+
+        assert!(
+            manager
+                .next_poll_deadline_for_peer(peer_id, started_at)
+                .is_none()
+        );
     }
 }
