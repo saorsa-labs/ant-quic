@@ -1142,6 +1142,25 @@ impl CandidateDiscoveryManager {
         }
     }
 
+    /// Compute the contract deadline by which this peer's current discovery
+    /// phase should either make progress or be treated as timed out.
+    pub(crate) fn phase_timeout_deadline_for_peer(&self, peer_id: PeerId) -> Option<Instant> {
+        let session = self.active_sessions.get(&peer_id)?;
+        match &session.current_phase {
+            DiscoveryPhase::Idle
+            | DiscoveryPhase::Completed { .. }
+            | DiscoveryPhase::Failed { .. } => None,
+            DiscoveryPhase::LocalInterfaceScanning { started_at } => Some(
+                (*started_at + self.config.local_scan_timeout)
+                    .max(session.started_at + self.config.min_discovery_time),
+            ),
+            DiscoveryPhase::ServerReflexiveQuerying { .. }
+            | DiscoveryPhase::CandidateValidation { .. } => {
+                Some(session.started_at + self.config.total_timeout)
+            }
+        }
+    }
+
     /// Compute the earliest discovery deadline across all active sessions.
     pub(crate) fn next_global_poll_deadline(&self, now: Instant) -> Option<Instant> {
         self.active_sessions
@@ -2615,6 +2634,30 @@ mod tests {
             manager
                 .next_poll_deadline_for_peer(peer_id, started_at)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn phase_timeout_deadline_for_local_scan_respects_min_discovery_time_floor() {
+        let mut manager = create_test_manager();
+        manager.config.local_scan_timeout = Duration::from_secs(2);
+        manager.config.min_discovery_time = Duration::from_secs(10);
+
+        let peer_id = PeerId([9; 32]);
+        let started_at = Instant::now();
+        manager.active_sessions.insert(
+            peer_id,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
+                started_at,
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+
+        assert_eq!(
+            manager.phase_timeout_deadline_for_peer(peer_id),
+            Some(started_at + Duration::from_secs(10))
         );
     }
 

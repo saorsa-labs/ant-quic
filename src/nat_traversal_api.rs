@@ -7946,148 +7946,154 @@ impl NatTraversalEndpoint {
         // to avoid locking discovery_manager while iter_mut() holds all shard guards
         let mut early_discovery_peers: Vec<(PeerId, Duration)> = Vec::new();
         let mut timeout_discovery_peers: Vec<PeerId> = Vec::new();
+        let active_session_ids: Vec<PeerId> = self
+            .active_sessions
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        let discovery_phase_deadlines: HashMap<PeerId, std::time::Instant> = {
+            let discovery = self.discovery_manager.lock();
+            active_session_ids
+                .iter()
+                .filter_map(|peer_id| {
+                    discovery
+                        .phase_timeout_deadline_for_peer(*peer_id)
+                        .map(|deadline| (*peer_id, deadline))
+                })
+                .collect()
+        };
 
         // Phase 1: Collect work and update session states (brief DashMap access)
         for mut entry in self.active_sessions.iter_mut() {
             let session = entry.value_mut();
             let elapsed = now.duration_since(session.started_at);
+            let timed_out = match session.phase {
+                TraversalPhase::Discovery => discovery_phase_deadlines
+                    .get(&session.peer_id)
+                    .copied()
+                    .is_some_and(|deadline| now >= deadline),
+                _ => self
+                    .non_discovery_phase_timeout_deadline(session)
+                    .is_some_and(|deadline| now >= deadline),
+            };
 
-            // Get timeout for current phase
-            let timeout = self.get_phase_timeout(session.phase);
-
-            // Record Discovery-phase sessions for deferred processing
-            // (discovery_manager.lock() cannot be called while iter_mut() holds all shard guards)
-            if session.phase == TraversalPhase::Discovery && elapsed <= timeout {
-                early_discovery_peers.push((session.peer_id, timeout - elapsed));
-            }
-
-            // Check if we've exceeded the timeout
-            if elapsed > timeout {
-                match session.phase {
-                    TraversalPhase::Discovery => {
-                        // Defer discovery_manager access to after iter_mut loop
+            match session.phase {
+                TraversalPhase::Discovery => {
+                    if timed_out {
                         timeout_discovery_peers.push(session.peer_id);
+                    } else if let Some(deadline) =
+                        discovery_phase_deadlines.get(&session.peer_id).copied()
+                    {
+                        early_discovery_peers
+                            .push((session.peer_id, deadline.saturating_duration_since(now)));
                     }
-                    TraversalPhase::Coordination => {
-                        // DEFER: coordination request (accesses connections DashMap)
-                        if let Some(coordinator) = self.select_coordinator() {
-                            // Update phase now, execute request later
-                            Self::set_session_phase(session, now, TraversalPhase::Synchronization);
-                            coordination_requests.push((session.peer_id, coordinator));
-                        } else {
-                            self.handle_phase_failure(
-                                session,
-                                now,
-                                &mut events,
-                                NatTraversalError::NoBootstrapNodes,
-                            );
+                }
+                TraversalPhase::Coordination => {
+                    if let Some(coordinator) = self.select_coordinator() {
+                        // Coordination is now event-driven: once candidates exist and a
+                        // coordinator is available, request help immediately. The timeout
+                        // only governs absence of an available coordinator.
+                        Self::set_session_phase(session, now, TraversalPhase::Synchronization);
+                        coordination_requests.push((session.peer_id, coordinator));
+                    } else if timed_out {
+                        self.handle_phase_failure(
+                            session,
+                            now,
+                            &mut events,
+                            NatTraversalError::NoBootstrapNodes,
+                        );
+                    }
+                }
+                TraversalPhase::Synchronization => {
+                    if Self::session_is_synchronized(session) {
+                        Self::set_session_phase(session, now, TraversalPhase::Punching);
+                        self.emit_event(
+                            &mut events,
+                            NatTraversalEvent::HolePunchingStarted {
+                                peer_id: session.peer_id,
+                                targets: session.candidates.iter().map(|c| c.address).collect(),
+                            },
+                        );
+                        hole_punch_requests.push((session.peer_id, session.candidates.clone()));
+                    } else if timed_out {
+                        self.handle_phase_failure(
+                            session,
+                            now,
+                            &mut events,
+                            NatTraversalError::ProtocolError("Synchronization timeout".to_string()),
+                        );
+                    }
+                }
+                TraversalPhase::Punching => {
+                    if let Some(successful_path) = self.check_punch_results_for_session(session) {
+                        Self::set_session_phase(session, now, TraversalPhase::Validation);
+                        if let Some(candidate) = session.candidates.iter_mut().find(|candidate| {
+                            normalize_socket_addr(candidate.address)
+                                == normalize_socket_addr(successful_path)
+                        }) {
+                            candidate.state = CandidateState::Validating;
                         }
-                    }
-                    TraversalPhase::Synchronization => {
-                        // Avoid re-locking active_sessions while iter_mut() holds shard guards.
-                        if Self::session_is_synchronized(session) {
-                            Self::set_session_phase(session, now, TraversalPhase::Punching);
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::HolePunchingStarted {
-                                    peer_id: session.peer_id,
-                                    targets: session.candidates.iter().map(|c| c.address).collect(),
-                                },
-                            );
-                            // DEFER: hole punching (may access connections)
-                            hole_punch_requests.push((session.peer_id, session.candidates.clone()));
-                        } else {
-                            self.handle_phase_failure(
-                                session,
-                                now,
-                                &mut events,
-                                NatTraversalError::ProtocolError(
-                                    "Synchronization timeout".to_string(),
-                                ),
-                            );
-                        }
-                    }
-                    TraversalPhase::Punching => {
-                        // Avoid re-locking active_sessions while iter_mut() holds shard guards.
-                        if let Some(successful_path) = self.check_punch_results_for_session(session)
-                        {
-                            Self::set_session_phase(session, now, TraversalPhase::Validation);
-                            if let Some(candidate) =
-                                session.candidates.iter_mut().find(|candidate| {
-                                    normalize_socket_addr(candidate.address)
-                                        == normalize_socket_addr(successful_path)
-                                })
-                            {
-                                candidate.state = CandidateState::Validating;
-                            }
 
-                            if self.has_existing_connection(&session.peer_id) {
-                                self.emit_event(
-                                    &mut events,
-                                    NatTraversalEvent::PathValidated {
-                                        peer_id: session.peer_id,
-                                        address: successful_path,
-                                        rtt: Duration::from_millis(50), // TODO: Get actual RTT
-                                    },
-                                );
-                                // DEFER: path validation (may access connections)
-                                validation_requests.push((session.peer_id, successful_path));
-                            }
-                        } else {
-                            self.handle_phase_failure(
-                                session,
-                                now,
-                                &mut events,
-                                NatTraversalError::PunchingFailed(
-                                    "No successful punch".to_string(),
-                                ),
-                            );
-                        }
-                    }
-                    TraversalPhase::Validation => {
-                        // Check if path is validated
-                        if self.is_path_validated(&session.peer_id) {
-                            Self::set_session_phase(session, now, TraversalPhase::Connected);
+                        if self.has_existing_connection(&session.peer_id) {
                             self.emit_event(
                                 &mut events,
-                                NatTraversalEvent::TraversalSucceeded {
+                                NatTraversalEvent::PathValidated {
                                     peer_id: session.peer_id,
-                                    final_address: session
-                                        .candidates
-                                        .first()
-                                        .map(|c| c.address)
-                                        .unwrap_or_else(create_random_port_bind_addr),
-                                    total_time: elapsed,
+                                    address: successful_path,
+                                    rtt: Duration::from_millis(50), // TODO: Get actual RTT
                                 },
                             );
-                            info!(
-                                "NAT traversal succeeded for peer {:?} in {:?}",
-                                session.peer_id, elapsed
-                            );
-                        } else {
-                            self.handle_phase_failure(
-                                session,
-                                now,
-                                &mut events,
-                                NatTraversalError::ValidationFailed(
-                                    "Path validation timeout".to_string(),
-                                ),
-                            );
+                            validation_requests.push((session.peer_id, successful_path));
                         }
+                    } else if timed_out {
+                        self.handle_phase_failure(
+                            session,
+                            now,
+                            &mut events,
+                            NatTraversalError::PunchingFailed("No successful punch".to_string()),
+                        );
                     }
-                    TraversalPhase::Connected => {
-                        // Monitor connection health
-                        if !self.is_connection_healthy(&session.peer_id) {
-                            warn!(
-                                "Connection to peer {:?} is no longer healthy",
-                                session.peer_id
-                            );
-                            // Could trigger reconnection logic here
-                        }
+                }
+                TraversalPhase::Validation => {
+                    if self.is_path_validated(&session.peer_id) {
+                        Self::set_session_phase(session, now, TraversalPhase::Connected);
+                        self.emit_event(
+                            &mut events,
+                            NatTraversalEvent::TraversalSucceeded {
+                                peer_id: session.peer_id,
+                                final_address: session
+                                    .candidates
+                                    .first()
+                                    .map(|c| c.address)
+                                    .unwrap_or_else(create_random_port_bind_addr),
+                                total_time: elapsed,
+                            },
+                        );
+                        info!(
+                            "NAT traversal succeeded for peer {:?} in {:?}",
+                            session.peer_id, elapsed
+                        );
+                    } else if timed_out {
+                        self.handle_phase_failure(
+                            session,
+                            now,
+                            &mut events,
+                            NatTraversalError::ValidationFailed(
+                                "Path validation timeout".to_string(),
+                            ),
+                        );
                     }
-                    TraversalPhase::Failed => {
-                        // Session has already failed, no action needed
+                }
+                TraversalPhase::Connected => {
+                    if !self.is_connection_healthy(&session.peer_id) {
+                        warn!(
+                            "Connection to peer {:?} is no longer healthy",
+                            session.peer_id
+                        );
                     }
+                }
+                TraversalPhase::Failed => {
+                    // Session has already failed, no action needed
                 }
             }
         }
@@ -8289,9 +8295,15 @@ impl NatTraversalEndpoint {
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
         let phase_deadline = self.active_sessions.get(&peer_id).and_then(|entry| {
-            let session = entry.value();
-            let phase_timeout = self.get_phase_timeout(session.phase);
-            (!phase_timeout.is_zero()).then_some(session.started_at + phase_timeout)
+            let phase = entry.value().phase;
+            if matches!(phase, TraversalPhase::Discovery) {
+                drop(entry);
+                self.discovery_manager
+                    .lock()
+                    .phase_timeout_deadline_for_peer(peer_id)
+            } else {
+                self.non_discovery_phase_timeout_deadline(entry.value())
+            }
         });
         let discovery_deadline = self
             .discovery_manager
@@ -8305,22 +8317,46 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Get timeout duration for a specific traversal phase
-    fn get_phase_timeout(&self, phase: TraversalPhase) -> Duration {
-        match phase {
-            // Reduced from 10s to 3s — with early advancement, this is only
-            // the fallback timeout. Candidates typically arrive within 1-2s.
-            TraversalPhase::Discovery => Duration::from_secs(3),
-            TraversalPhase::Coordination => self.config.coordination_timeout,
-            TraversalPhase::Synchronization => Duration::from_secs(3),
-            TraversalPhase::Punching => Duration::from_secs(5),
-            TraversalPhase::Validation => {
-                self.timeout_config
-                    .nat_traversal
-                    .connection_establishment_timeout
+    fn expected_session_rtt(&self, session: &NatTraversalSession) -> Duration {
+        session
+            .session_state
+            .metrics
+            .rtt
+            .unwrap_or_else(|| TransportConfig::default().initial_rtt)
+    }
+
+    fn connectivity_phase_budget(&self, session: &NatTraversalSession) -> Duration {
+        let scaled_rtt = self
+            .expected_session_rtt(session)
+            .checked_mul(6)
+            .unwrap_or(Duration::MAX)
+            .saturating_add(Duration::from_secs(1));
+        let lower = self.config.coordination_timeout.min(
+            self.timeout_config
+                .nat_traversal
+                .connection_establishment_timeout,
+        );
+        let upper = self.config.coordination_timeout.max(
+            self.timeout_config
+                .nat_traversal
+                .connection_establishment_timeout,
+        );
+
+        scaled_rtt.max(lower).min(upper)
+    }
+
+    fn non_discovery_phase_timeout_deadline(
+        &self,
+        session: &NatTraversalSession,
+    ) -> Option<std::time::Instant> {
+        match session.phase {
+            TraversalPhase::Coordination | TraversalPhase::Synchronization => {
+                Some(session.started_at + self.config.coordination_timeout)
             }
-            TraversalPhase::Connected => Duration::from_secs(30), // Keepalive check
-            TraversalPhase::Failed => Duration::ZERO,
+            TraversalPhase::Punching | TraversalPhase::Validation => {
+                Some(session.started_at + self.connectivity_phase_budget(session))
+            }
+            TraversalPhase::Discovery | TraversalPhase::Connected | TraversalPhase::Failed => None,
         }
     }
 
@@ -10252,6 +10288,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_poll_advances_synchronization_without_waiting_for_fixed_timeout() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x61; 32]);
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: std::time::Instant::now(),
+                phase: TraversalPhase::Synchronization,
+                candidates: vec![
+                    CandidateAddress::new(
+                        "127.0.0.1:9001".parse().unwrap(),
+                        100,
+                        CandidateSource::Observed { by_node: None },
+                    )
+                    .expect("candidate"),
+                ],
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: std::time::Instant::now(),
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let events = endpoint
+            .poll(std::time::Instant::now())
+            .expect("poll should succeed");
+
+        assert!(matches!(
+            endpoint
+                .active_sessions
+                .get(&peer_id)
+                .expect("session")
+                .phase,
+            TraversalPhase::Punching
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NatTraversalEvent::HolePunchingStarted { peer_id: event_peer, .. }
+                if *event_peer == peer_id
+        )));
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_connected_phase_has_no_contract_timeout_deadline() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+        let session = NatTraversalSession {
+            peer_id: PeerId([0x62; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: std::time::Instant::now(),
+            phase: TraversalPhase::Connected,
+            candidates: Vec::new(),
+            session_state: SessionState {
+                state: ConnectionState::Connected,
+                last_transition: std::time::Instant::now(),
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        assert!(
+            endpoint
+                .non_discovery_phase_timeout_deadline(&session)
+                .is_none()
+        );
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
     async fn test_next_session_poll_deadline_prefers_discovery_cadence() {
         let config = NatTraversalConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
@@ -10296,9 +10423,14 @@ mod tests {
             deadline <= now + Duration::from_millis(20),
             "discovery cadence should win over the coarse phase timeout"
         );
+        let discovery_contract_deadline = endpoint
+            .discovery_manager
+            .lock()
+            .phase_timeout_deadline_for_peer(peer_id)
+            .expect("discovery contract deadline");
         assert!(
-            deadline < now + endpoint.get_phase_timeout(TraversalPhase::Discovery),
-            "session-specific discovery polling should wake before the phase timeout"
+            deadline < discovery_contract_deadline,
+            "session-specific discovery polling should wake before the discovery contract deadline"
         );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
