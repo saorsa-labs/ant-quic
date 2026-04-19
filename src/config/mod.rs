@@ -31,7 +31,6 @@ mod transport;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 
 pub mod nat_timeouts;
-pub mod timeouts;
 
 // Port configuration module
 pub mod port;
