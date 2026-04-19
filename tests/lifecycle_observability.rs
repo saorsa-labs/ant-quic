@@ -14,51 +14,51 @@ async fn lifecycle_transitions_emit_structured_tracing_fields() {
     let _guard = test_guard().await;
     reset_lifecycle_events();
 
-    let receiver = make_node(vec![]).await;
-    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
-    let receiver_id = receiver.peer_id();
-    let peer_prefix = hex::encode(&receiver_id.0[..4]);
-    let accept_receiver = spawn_accept_loop(receiver.clone());
+    let a = make_node(vec![]).await;
+    let b = make_node(vec![]).await;
+    let a_addr = normalize_local_addr(a.local_addr().expect("a addr"));
+    let b_addr = normalize_local_addr(b.local_addr().expect("b addr"));
+    let a_id = a.peer_id();
+    let b_id = b.peer_id();
+    let accept_a = spawn_accept_loop(a.clone());
+    let accept_b = spawn_accept_loop(b.clone());
 
-    let sender = make_node(vec![receiver_addr]).await;
-    let sender_addr = normalize_local_addr(sender.local_addr().expect("sender addr"));
-    let accept_sender = spawn_accept_loop(sender.clone());
-    let _ = sender
-        .connect_addr(receiver_addr)
-        .await
-        .expect("initial connect");
-    wait_until(Duration::from_secs(5), || {
-        sender
-            .get_quic_connection(&receiver_id)
-            .ok()
-            .flatten()
-            .is_some()
-    })
-    .await;
+    for _ in 0..5 {
+        let a_task = {
+            let a = a.clone();
+            tokio::spawn(async move { a.connect_addr(b_addr).await })
+        };
+        let b_task = {
+            let b = b.clone();
+            tokio::spawn(async move { b.connect_addr(a_addr).await })
+        };
 
-    let old_conn = sender
-        .get_quic_connection(&receiver_id)
-        .expect("lookup")
-        .expect("old conn");
-    let _ = receiver
-        .connect_addr(sender_addr)
-        .await
-        .expect("replacement connect");
-    wait_until(Duration::from_secs(5), || old_conn.close_reason().is_some()).await;
-    wait_until(Duration::from_secs(10), || {
-        lifecycle_events().into_iter().any(|event| {
-            event.fields.get("peer_id") == Some(&peer_prefix)
-                && event.fields.get("to_state") == Some(&"Closed".to_string())
+        let _ = a_task.await.expect("a join");
+        let _ = b_task.await.expect("b join");
+
+        wait_until(Duration::from_secs(5), || {
+            a.get_quic_connection(&b_id).ok().flatten().is_some()
+                && b.get_quic_connection(&a_id).ok().flatten().is_some()
         })
+        .await;
+
+        if lifecycle_events()
+            .iter()
+            .any(|event| event.fields.get("to_state") == Some(&"Closed".to_string()))
+        {
+            break;
+        }
+    }
+
+    wait_until(Duration::from_secs(5), || {
+        lifecycle_events()
+            .iter()
+            .any(|event| event.fields.get("to_state") == Some(&"Closed".to_string()))
     })
     .await;
 
-    let relevant: Vec<_> = lifecycle_events()
-        .into_iter()
-        .filter(|event| event.fields.get("peer_id") == Some(&peer_prefix))
-        .collect();
-
-    assert!(!relevant.is_empty(), "expected lifecycle events for peer");
+    let relevant = lifecycle_events();
+    assert!(!relevant.is_empty(), "expected lifecycle events");
     for event in &relevant {
         assert_eq!(event.target, support::LIFECYCLE_TARGET);
         assert!(event.fields.contains_key("generation"));
@@ -76,8 +76,8 @@ async fn lifecycle_transitions_emit_structured_tracing_fields() {
     assert!(states.contains("Superseded"));
     assert!(states.contains("Closed"));
 
-    let _ = sender.shutdown().await;
-    let _ = receiver.shutdown().await;
-    accept_sender.abort();
-    accept_receiver.abort();
+    let _ = a.shutdown().await;
+    let _ = b.shutdown().await;
+    accept_a.abort();
+    accept_b.abort();
 }

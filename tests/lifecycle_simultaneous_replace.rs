@@ -2,11 +2,12 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{
-    lifecycle_events, make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop,
-    test_guard, wait_until,
+    latest_live_connection_id_for_peer, lifecycle_events, make_node, normalize_local_addr,
+    reset_lifecycle_events, spawn_accept_loop, test_guard, wait_until,
 };
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_connect_settles_on_complementary_live_views() {
@@ -50,6 +51,25 @@ async fn simultaneous_connect_settles_on_complementary_live_views() {
         }
     }
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (a_live_id, b_live_id) = loop {
+        match (
+            latest_live_connection_id_for_peer(b_id),
+            latest_live_connection_id_for_peer(a_id),
+        ) {
+            (Some(a_live_id), Some(b_live_id)) if a_live_id == b_live_id => {
+                break (a_live_id, b_live_id);
+            }
+            _ if Instant::now() >= deadline => {
+                panic!(
+                    "lifecycle connection_ids did not converge: {:?}",
+                    lifecycle_events()
+                );
+            }
+            _ => sleep(Duration::from_millis(20)).await,
+        }
+    };
+
     let _a_conn = a
         .get_quic_connection(&b_id)
         .expect("a lookup")
@@ -59,6 +79,10 @@ async fn simultaneous_connect_settles_on_complementary_live_views() {
         .expect("b lookup")
         .expect("b live conn");
 
+    assert_eq!(
+        a_live_id, b_live_id,
+        "both endpoints must converge on the same lifecycle connection_id winner"
+    );
     assert!(
         lifecycle_events()
             .iter()

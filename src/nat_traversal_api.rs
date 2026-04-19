@@ -233,6 +233,7 @@ struct TrackedConnection {
     connection: InnerConnection,
     generation: u64,
     established_at_unix_ms: u64,
+    connection_family_id: [u8; 32],
     connection_id: [u8; 32],
     state: ConnectionLifecycleState,
 }
@@ -256,7 +257,15 @@ pub(crate) struct ConnectionLifecycleSnapshot {
     pub established_at_unix_ms: u64,
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionCanonicalSortKey {
+    connection_family_id: [u8; 32],
+    connection_id: [u8; 32],
+    generation: u64,
+    established_at_unix_ms: u64,
+    stable_id: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ConnectionRegistrationOutcome {
     Live {
@@ -5760,33 +5769,76 @@ impl NatTraversalEndpoint {
         );
     }
 
-    #[allow(dead_code)]
-    fn candidate_wins(existing: &TrackedConnection, candidate: &TrackedConnection) -> bool {
-        if candidate.connection_id != existing.connection_id {
-            candidate.connection_id > existing.connection_id
-        } else {
-            (
-                candidate.generation,
-                candidate.established_at_unix_ms,
-                candidate.stable_id(),
-            ) > (
-                existing.generation,
-                existing.established_at_unix_ms,
-                existing.stable_id(),
-            )
+    fn canonical_sort_key(
+        connection_family_id: [u8; 32],
+        connection_id: [u8; 32],
+        generation: u64,
+        established_at_unix_ms: u64,
+        stable_id: usize,
+    ) -> ConnectionCanonicalSortKey {
+        ConnectionCanonicalSortKey {
+            connection_family_id,
+            connection_id,
+            generation,
+            established_at_unix_ms,
+            stable_id,
         }
     }
 
-    fn lifecycle_connection_id_for(
+    fn canonical_sort_key_cmp(
+        left: ConnectionCanonicalSortKey,
+        right: ConnectionCanonicalSortKey,
+    ) -> std::cmp::Ordering {
+        if left.connection_family_id != right.connection_family_id {
+            left.connection_id.cmp(&right.connection_id)
+        } else {
+            (
+                left.generation,
+                left.established_at_unix_ms,
+                left.connection_id,
+                left.stable_id,
+            )
+                .cmp(&(
+                    right.generation,
+                    right.established_at_unix_ms,
+                    right.connection_id,
+                    right.stable_id,
+                ))
+        }
+    }
+
+    /// Deterministically rank competing connections for the same peer.
+    ///
+    /// Connections from the same initiator share a `connection_family_id`, so
+    /// reconnects on that family prefer the newer local generation / timestamp.
+    /// Simultaneous opens from opposite initiators compare the shared
+    /// per-connection `connection_id` derived from TLS exporter material, so
+    /// both endpoints choose the same winner without relying on local
+    /// generation counters.
+    fn candidate_wins(existing: &TrackedConnection, candidate: &TrackedConnection) -> bool {
+        Self::canonical_sort_key_cmp(
+            Self::canonical_sort_key(
+                candidate.connection_family_id,
+                candidate.connection_id,
+                candidate.generation,
+                candidate.established_at_unix_ms,
+                candidate.stable_id(),
+            ),
+            Self::canonical_sort_key(
+                existing.connection_family_id,
+                existing.connection_id,
+                existing.generation,
+                existing.established_at_unix_ms,
+                existing.stable_id(),
+            ),
+        ) == std::cmp::Ordering::Greater
+    }
+
+    fn lifecycle_connection_family_id_from_initiator(
         local_peer_id: PeerId,
         peer_id: PeerId,
-        connection: &InnerConnection,
+        initiator: PeerId,
     ) -> [u8; 32] {
-        let initiator = if connection.side().is_client() {
-            local_peer_id
-        } else {
-            peer_id
-        };
         let (left, right) = if local_peer_id.0 <= peer_id.0 {
             (local_peer_id, peer_id)
         } else {
@@ -5794,7 +5846,7 @@ impl NatTraversalEndpoint {
         };
 
         let mut hasher = Blake3Hasher::new();
-        hasher.update(b"ant-quic.lifecycle.v1");
+        hasher.update(b"ant-quic.lifecycle.family.v1");
         hasher.update(&left.0);
         hasher.update(&right.0);
         hasher.update(&initiator.0);
@@ -5802,6 +5854,115 @@ impl NatTraversalEndpoint {
         let mut out = [0u8; 32];
         out.copy_from_slice(hasher.finalize().as_bytes());
         out
+    }
+
+    fn lifecycle_connection_family_id_for(
+        local_peer_id: PeerId,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> [u8; 32] {
+        let derived_peer_id = Self::derive_peer_id_from_connection(connection);
+        debug_assert!(
+            derived_peer_id.is_some(),
+            "lifecycle registration missing authenticated peer id"
+        );
+        let canonical_peer_id = derived_peer_id.unwrap_or(peer_id);
+        let initiator = if connection.side().is_client() {
+            local_peer_id
+        } else {
+            canonical_peer_id
+        };
+        Self::lifecycle_connection_family_id_from_initiator(
+            local_peer_id,
+            canonical_peer_id,
+            initiator,
+        )
+    }
+
+    fn lifecycle_connection_id_for(
+        local_peer_id: PeerId,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> [u8; 32] {
+        let derived_peer_id = Self::derive_peer_id_from_connection(connection);
+        debug_assert!(
+            derived_peer_id.is_some(),
+            "lifecycle registration missing authenticated peer id"
+        );
+        let canonical_peer_id = derived_peer_id.unwrap_or(peer_id);
+        let mut exporter = [0u8; 32];
+        if connection
+            .export_keying_material(
+                &mut exporter,
+                b"ant-quic/lifecycle-connection-id/v1",
+                b"canonical",
+            )
+            .is_ok()
+        {
+            return exporter;
+        }
+
+        let initiator = if connection.side().is_client() {
+            local_peer_id
+        } else {
+            canonical_peer_id
+        };
+        Self::lifecycle_connection_family_id_from_initiator(
+            local_peer_id,
+            canonical_peer_id,
+            initiator,
+        )
+    }
+
+    fn record_rejected_connection(
+        peer_id: &PeerId,
+        entries: &mut Vec<TrackedConnection>,
+        mut tracked: TrackedConnection,
+        winner_generation: u64,
+    ) {
+        let superseded_state = ConnectionLifecycleState::Superseded {
+            replaced_by_generation: winner_generation,
+        };
+        Self::log_lifecycle_transition(
+            peer_id,
+            tracked.generation,
+            &tracked.connection_id,
+            tracked.stable_id(),
+            "Init",
+            superseded_state.name(),
+            ConnectionCloseReason::Superseded,
+        );
+        tracked.state = superseded_state;
+
+        let closing_state = ConnectionLifecycleState::Closing {
+            reason: ConnectionCloseReason::Superseded,
+        };
+        Self::log_lifecycle_transition(
+            peer_id,
+            tracked.generation,
+            &tracked.connection_id,
+            tracked.stable_id(),
+            tracked.state.name(),
+            closing_state.name(),
+            ConnectionCloseReason::Superseded,
+        );
+        tracked.state = closing_state;
+
+        let closed_state = ConnectionLifecycleState::Closed {
+            reason: ConnectionCloseReason::Superseded,
+            closed_at_unix_ms: now_unix_ms(),
+        };
+        Self::log_lifecycle_transition(
+            peer_id,
+            tracked.generation,
+            &tracked.connection_id,
+            tracked.stable_id(),
+            tracked.state.name(),
+            closed_state.name(),
+            ConnectionCloseReason::Superseded,
+        );
+        tracked.state = closed_state;
+        entries.push(tracked);
     }
 
     fn register_connection_lifecycle_parts(
@@ -5818,11 +5979,17 @@ impl NatTraversalEndpoint {
             connection: connection.clone(),
             generation,
             established_at_unix_ms: now_unix_ms(),
+            connection_family_id: Self::lifecycle_connection_family_id_for(
+                local_peer_id,
+                peer_id,
+                &connection,
+            ),
             connection_id: Self::lifecycle_connection_id_for(local_peer_id, peer_id, &connection),
             state: ConnectionLifecycleState::Live,
         };
 
         let mut superseded_generation = None;
+        let mut rejected_connection = None;
 
         {
             let mut lifecycle = connection_lifecycle.write();
@@ -5831,27 +5998,50 @@ impl NatTraversalEndpoint {
                 .iter()
                 .position(|entry| matches!(entry.state, ConnectionLifecycleState::Live))
             {
-                let live = &entries[live_idx];
-                superseded_generation = Some(live.generation);
-                Self::log_lifecycle_transition(
-                    &peer_id,
-                    live.generation,
-                    &live.connection_id,
-                    live.stable_id(),
-                    live.state.name(),
-                    ConnectionLifecycleState::Superseded {
+                let live = entries[live_idx].clone();
+                if Self::candidate_wins(&live, &tracked) {
+                    superseded_generation = Some(live.generation);
+                    Self::log_lifecycle_transition(
+                        &peer_id,
+                        live.generation,
+                        &live.connection_id,
+                        live.stable_id(),
+                        live.state.name(),
+                        ConnectionLifecycleState::Superseded {
+                            replaced_by_generation: generation,
+                        }
+                        .name(),
+                        ConnectionCloseReason::Superseded,
+                    );
+                    entries[live_idx].state = ConnectionLifecycleState::Superseded {
                         replaced_by_generation: generation,
-                    }
-                    .name(),
-                    ConnectionCloseReason::Superseded,
-                );
-                entries[live_idx].state = ConnectionLifecycleState::Superseded {
-                    replaced_by_generation: generation,
-                };
+                    };
+                    Self::log_lifecycle_live(&peer_id, &tracked);
+                    entries.push(tracked.clone());
+                } else {
+                    let winner_generation = live.generation;
+                    Self::record_rejected_connection(
+                        &peer_id,
+                        entries,
+                        tracked.clone(),
+                        winner_generation,
+                    );
+                    rejected_connection = Some((tracked.connection.clone(), winner_generation));
+                }
+            } else {
+                Self::log_lifecycle_live(&peer_id, &tracked);
+                entries.push(tracked.clone());
             }
-            Self::log_lifecycle_live(&peer_id, &tracked);
-            entries.push(tracked.clone());
             Self::prune_closed_lifecycle_entries(entries);
+        }
+
+        if let Some((rejected_connection, winner_generation)) = rejected_connection {
+            if rejected_connection.close_reason().is_none()
+                && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+            {
+                rejected_connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+            }
+            return ConnectionRegistrationOutcome::Rejected { winner_generation };
         }
 
         connections.insert(peer_id, connection);
@@ -8968,6 +9158,64 @@ mod tests {
         assert_eq!(config.max_candidates, 8);
         assert!(config.enable_symmetric_nat);
         assert!(config.enable_relay_fallback);
+    }
+
+    #[test]
+    fn test_lifecycle_connection_family_id_is_symmetric_for_same_initiator() {
+        let a = PeerId([0x11; 32]);
+        let b = PeerId([0x22; 32]);
+
+        let a_initiated_from_a =
+            NatTraversalEndpoint::lifecycle_connection_family_id_from_initiator(a, b, a);
+        let a_initiated_from_b =
+            NatTraversalEndpoint::lifecycle_connection_family_id_from_initiator(b, a, a);
+        let b_initiated =
+            NatTraversalEndpoint::lifecycle_connection_family_id_from_initiator(a, b, b);
+
+        assert_eq!(a_initiated_from_a, a_initiated_from_b);
+        assert_ne!(a_initiated_from_a, b_initiated);
+    }
+
+    #[test]
+    fn test_canonical_sort_key_prefers_connection_id_across_simultaneous_open() {
+        let a_family = [0x11; 32];
+        let b_family = [0x22; 32];
+        let a_connection_id = [0xAA; 32];
+        let b_connection_id = [0xBB; 32];
+
+        let a_key =
+            NatTraversalEndpoint::canonical_sort_key(a_family, a_connection_id, 99, 9_999, 99);
+        let b_key = NatTraversalEndpoint::canonical_sort_key(b_family, b_connection_id, 1, 1, 1);
+
+        assert_eq!(
+            NatTraversalEndpoint::canonical_sort_key_cmp(a_key, b_key),
+            a_connection_id.cmp(&b_connection_id),
+            "shared connection_id must dominate simultaneous-open races across families"
+        );
+    }
+
+    #[test]
+    fn test_canonical_sort_key_prefers_newer_generation_when_connection_family_matches() {
+        let family_id = [0xAB; 32];
+        let older = NatTraversalEndpoint::canonical_sort_key(family_id, [0x01; 32], 1, 200, 1);
+        let newer = NatTraversalEndpoint::canonical_sort_key(family_id, [0x02; 32], 2, 100, 0);
+
+        assert_eq!(
+            NatTraversalEndpoint::canonical_sort_key_cmp(newer, older),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_canonical_sort_key_prefers_newer_established_at_when_generation_matches() {
+        let family_id = [0xCD; 32];
+        let older = NatTraversalEndpoint::canonical_sort_key(family_id, [0x10; 32], 7, 100, 1);
+        let newer = NatTraversalEndpoint::canonical_sort_key(family_id, [0x11; 32], 7, 101, 0);
+
+        assert_eq!(
+            NatTraversalEndpoint::canonical_sort_key_cmp(newer, older),
+            std::cmp::Ordering::Greater
+        );
     }
 
     /// Regression for issue #163.

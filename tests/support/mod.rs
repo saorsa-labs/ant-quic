@@ -187,3 +187,41 @@ pub fn lifecycle_generations_for_peer(peer_id: PeerId) -> Vec<u64> {
         })
         .collect()
 }
+
+pub fn latest_live_connection_id_for_peer(peer_id: PeerId) -> Option<String> {
+    let prefix = hex::encode(&peer_id.0[..4]);
+    lifecycle_events()
+        .into_iter()
+        .filter(|event| event.fields.get("peer_id") == Some(&prefix))
+        .filter(|event| event.fields.get("to_state") == Some(&"Live".to_string()))
+        .filter_map(|event| event.fields.get("connection_id").cloned())
+        .last()
+}
+
+fn lifecycle_connection_id_for_initiator(
+    local_peer_id: PeerId,
+    remote_peer_id: PeerId,
+    initiator: PeerId,
+) -> [u8; 32] {
+    let (left, right) = if local_peer_id.0 <= remote_peer_id.0 {
+        (local_peer_id, remote_peer_id)
+    } else {
+        (remote_peer_id, local_peer_id)
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ant-quic.lifecycle.family.v1");
+    hasher.update(&left.0);
+    hasher.update(&right.0);
+    hasher.update(&initiator.0);
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    out
+}
+
+pub fn preferred_lifecycle_initiator(a: PeerId, b: PeerId) -> PeerId {
+    let a_id = lifecycle_connection_id_for_initiator(a, b, a);
+    let b_id = lifecycle_connection_id_for_initiator(a, b, b);
+    if a_id > b_id { a } else { b }
+}
