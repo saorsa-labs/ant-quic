@@ -1699,6 +1699,7 @@ impl P2pEndpoint {
 
                 // Create transport registry
                 let mut transport_registry = config.transport_registry.clone();
+                crate::transport::register_best_effort_transports(&mut transport_registry).await;
                 transport_registry.register(Arc::new(transport));
 
                 nat_config.transport_registry = Some(Arc::new(transport_registry));
@@ -1775,6 +1776,7 @@ impl P2pEndpoint {
                 );
 
                 let mut transport_registry = config.transport_registry.clone();
+                crate::transport::register_best_effort_transports(&mut transport_registry).await;
                 transport_registry.register(Arc::new(transport));
 
                 nat_config.transport_registry = Some(Arc::new(transport_registry));

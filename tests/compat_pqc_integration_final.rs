@@ -3,6 +3,9 @@
 //! v0.13.0+: PQC is always enabled (100% PQC, no classical crypto).
 //! This test suite verifies that all PQC components are properly integrated
 //! and meet the acceptance criteria for production release.
+//!
+//! This crate exercises the low-level `Endpoint` compatibility layer rather
+//! than the primary symmetric P2P API.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

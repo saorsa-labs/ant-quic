@@ -1,6 +1,9 @@
 //! Minimal smoke tests to prove two local nodes can connect.
 //!
 //! These are intended to be fast and robust on developer machines and CI.
+//!
+//! This crate exercises the low-level `high_level::Endpoint` compatibility layer.
+//! Equivalent symmetric peer-oriented coverage lives in `tests/p2p_smoke_connect.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

@@ -406,6 +406,13 @@ impl TransportRegistry {
             .collect()
     }
 
+    /// Check whether the registry already contains a provider for a transport type.
+    pub fn has_transport_type(&self, transport_type: TransportType) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.transport_type() == transport_type)
+    }
+
     /// Get the first provider that can handle a destination address
     pub fn provider_for_addr(&self, addr: &TransportAddr) -> Option<Arc<dyn TransportProvider>> {
         let target_type = addr.transport_type();

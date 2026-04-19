@@ -2,6 +2,10 @@
 //!
 //! These tests verify that OBSERVED_ADDRESS frames are properly
 //! sent and received during connection establishment.
+//!
+//! This crate exercises the low-level `Endpoint::client/server` compatibility API.
+//! Peer-oriented discovery coverage lives in
+//! `tests/p2p_external_address_discovery.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

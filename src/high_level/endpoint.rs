@@ -127,6 +127,21 @@ impl Endpoint {
         )
     }
 
+    /// Helper to construct an endpoint for use with outgoing connections only
+    /// (fallback without network-discovery feature)
+    #[cfg(all(not(wasm_browser), not(feature = "network-discovery")))]
+    pub fn client(addr: SocketAddr) -> io::Result<Self> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        Self::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            runtime.wrap_udp_socket(socket)?,
+            runtime,
+        )
+    }
+
     /// Returns relevant stats from this Endpoint
     pub fn stats(&self) -> EndpointStats {
         self.inner

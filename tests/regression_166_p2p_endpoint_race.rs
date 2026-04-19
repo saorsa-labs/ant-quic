@@ -6,7 +6,7 @@
 //! Regression repro for saorsa-labs/ant-quic#166 — at the
 //! `P2pEndpoint::send` / `P2pEndpoint::recv` layer.
 //!
-//! The sister test (`regression_166_accept_uni_race.rs`) proved quinn's
+//! The sister test (`compat_regression_166_accept_uni_race.rs`) proved quinn's
 //! `accept_uni()` delivers all concurrent streams correctly. If #166
 //! reproduces at the P2pEndpoint layer, then the bug lives in the
 //! reader-task glue — `spawn_reader_task`,

@@ -9,6 +9,8 @@
 //! 1. Datagrams are properly dropped when the receive buffer is full
 //! 2. Applications are notified about drops via events/logs
 //! 3. The connection remains functional after drops
+//!
+//! This crate exercises the low-level `high_level::Endpoint` compatibility layer.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

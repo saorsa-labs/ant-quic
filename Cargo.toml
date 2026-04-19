@@ -49,16 +49,13 @@ exclude = [
 [features]
 # Keep the Cargo feature surface intentionally small:
 # - runtime/platform: platform-verifier, network-discovery
-# - diagnostics: log, trace, __qlog, arbitrary
+# - diagnostics: trace, __qlog, arbitrary
 # - transport: ble
 # PQC is always enabled and no longer controlled by a feature flag.
 default = ["platform-verifier", "network-discovery"]
 
 # Platform-specific certificate verification
 platform-verifier = ["dep:rustls-platform-verifier"]
-
-# Configure `tracing` to log events via `log` if no `tracing` subscriber exists
-log = ["tracing/log"]
 
 # Enhanced network interface discovery
 network-discovery = ["dep:socket2", "dep:nix"]
@@ -75,7 +72,8 @@ trace = []
 # BLE transport support (Linux and macOS)
 # Enables Bluetooth Low Energy transport for short-range P2P
 # - Linux: Uses BlueZ via bluer crate
-# - macOS: Uses Core Bluetooth via btleplug crate
+# - macOS: Uses Core Bluetooth via btleplug crate; plain CLI/test binaries
+#   require an app bundle that declares `NSBluetoothAlwaysUsageDescription`
 ble = ["dep:btleplug"]
 
 [dependencies]
@@ -294,7 +292,8 @@ name = "property_tests"
 path = "tests/property_tests/main.rs"
 
 [package.metadata.docs.rs]
-features = ["platform-verifier", "log"]
+no-default-features = true
+features = ["platform-verifier", "network-discovery"]
 
 # cargo-machete false positive
 [package.metadata.cargo-machete]

@@ -63,6 +63,7 @@ mod platform_linux {
 
     #[test]
     fn test_linux_socket_options() {
+        use libc::{SO_REUSEADDR, SOL_SOCKET, c_int, c_void, getsockopt, socklen_t};
         use std::net::UdpSocket;
         use std::os::unix::io::AsRawFd;
 
@@ -72,15 +73,15 @@ mod platform_linux {
 
         // Test Linux-specific socket options
         unsafe {
-            let mut value: nix::libc::c_int = 0;
-            let mut len = std::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t;
+            let mut value: c_int = 0;
+            let mut len = std::mem::size_of::<c_int>() as socklen_t;
 
             // Get SO_REUSEADDR
-            let ret = nix::libc::getsockopt(
+            let ret = getsockopt(
                 fd,
-                nix::libc::SOL_SOCKET,
-                nix::libc::SO_REUSEADDR,
-                &mut value as *mut _ as *mut nix::libc::c_void,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                &mut value as *mut _ as *mut c_void,
                 &mut len,
             );
             assert_eq!(ret, 0);

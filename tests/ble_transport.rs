@@ -12,7 +12,8 @@
 //! # Hardware Requirements
 //!
 //! Some tests require BLE hardware and are marked with `#[ignore]`.
-//! Run hardware tests with: `cargo test --features ble -- --ignored`
+//! Default builds include BLE support; stripped builds can run them with:
+//! `cargo test --features ble -- --ignored`
 //!
 //! # Platform Support
 //!

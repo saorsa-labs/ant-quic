@@ -2,6 +2,11 @@
 //!
 //! These tests verify the complete flow of address discovery from
 //! connection establishment through frame exchange to NAT traversal integration.
+//!
+//! This crate exercises the low-level `Endpoint::client/server` compatibility
+//! layer rather than the primary symmetric P2P surface.
+//! Peer-oriented discovery coverage lives in
+//! `tests/p2p_external_address_discovery.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

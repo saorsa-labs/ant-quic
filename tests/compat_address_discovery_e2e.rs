@@ -1,8 +1,12 @@
 //! End-to-end integration tests for QUIC Address Discovery
 //!
 //! These tests verify the complete address discovery flow using
-//! the public APIs available in ant-quic.
+//! the low-level QUIC compatibility APIs available in ant-quic.
+//!
+//! Symmetric peer-oriented discovery coverage lives in
+//! `tests/p2p_external_address_discovery.rs`.
 
+#![cfg(feature = "network-discovery")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

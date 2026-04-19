@@ -120,10 +120,41 @@ pub use ble::{
     ResumeToken, ScanEvent, ScanState, TX_CHARACTERISTIC_UUID,
 };
 
-/// Create a default transport registry with UDP support
+/// Register best-effort default constrained transports.
+///
+/// These transports are optional at runtime: initialization failures are logged
+/// and do not prevent the endpoint from starting with its core UDP transport.
+pub(crate) async fn register_best_effort_transports(registry: &mut TransportRegistry) {
+    register_best_effort_ble(registry).await;
+}
+
+#[cfg(feature = "ble")]
+async fn register_best_effort_ble(registry: &mut TransportRegistry) {
+    use std::sync::Arc;
+
+    if registry.has_transport_type(TransportType::Ble) {
+        return;
+    }
+
+    match BleTransport::new().await {
+        Ok(ble) => {
+            tracing::info!("BLE transport available; registering by default");
+            registry.register(Arc::new(ble));
+        }
+        Err(error) => {
+            tracing::debug!(%error, "BLE transport unavailable; continuing with UDP only");
+        }
+    }
+}
+
+#[cfg(not(feature = "ble"))]
+async fn register_best_effort_ble(_registry: &mut TransportRegistry) {}
+
+/// Create a default transport registry with UDP support plus best-effort
+/// constrained transports such as BLE when available.
 ///
 /// This is the standard starting point for most applications.
-/// Additional transports can be added via feature flags or manual registration.
+/// Additional transports can still be added manually.
 ///
 /// # Example
 ///
@@ -147,6 +178,7 @@ pub async fn default_registry(bind_addr: &str) -> Result<TransportRegistry, std:
     })?)
     .await?;
     registry.register(Arc::new(udp));
+    register_best_effort_transports(&mut registry).await;
 
     Ok(registry)
 }
@@ -170,6 +202,13 @@ mod tests {
         // LoRa address
         let lora_addr = TransportAddr::lora([0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(lora_addr.transport_type(), TransportType::LoRa);
+    }
+
+    #[tokio::test]
+    async fn test_default_registry_registers_udp() {
+        let registry = default_registry("127.0.0.1:0").await.unwrap();
+        assert_eq!(registry.providers_by_type(TransportType::Udp).len(), 1);
+        assert!(registry.has_quic_capable_transport());
     }
 
     #[test]

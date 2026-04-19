@@ -10,6 +10,11 @@
 //! bidirectional stream, and waits for a server-initiated unidirectional stream.
 //! The test verifies that no datagrams are lost when the application actively
 //! drains the buffer and that both directions of reliable streams continue to work.
+//!
+//! This crate exercises the low-level `high_level::Endpoint` compatibility layer.
+//! Symmetric peer-oriented delivery coverage lives in
+//! `tests/p2p_multi_peer_delivery.rs`, while this crate remains because the
+//! stream/datagram interaction it covers is only visible at the low-level QUIC API.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

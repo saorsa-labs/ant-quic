@@ -59,6 +59,8 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+#[cfg(all(feature = "ble", target_os = "macos"))]
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1378,8 +1380,11 @@ impl BleTransport {
     }
 
     /// Create a new BLE transport with custom configuration
-    #[cfg(all(feature = "ble", not(all(test, target_os = "macos"))))]
+    #[cfg(feature = "ble")]
     pub async fn with_config(config: BleConfig) -> Result<Self, TransportError> {
+        #[cfg(target_os = "macos")]
+        Self::ensure_macos_usage_description()?;
+
         // Get adapter and local device ID
         let (adapter, local_device_id) = Self::get_adapter_and_device_id().await?;
 
@@ -1421,20 +1426,64 @@ impl BleTransport {
         Ok(transport)
     }
 
-    /// Create a new BLE transport with custom configuration in macOS test builds
-    #[cfg(all(feature = "ble", test, target_os = "macos"))]
-    pub async fn with_config(_config: BleConfig) -> Result<Self, TransportError> {
-        Err(TransportError::Other {
-            message: "BLE transport tests are disabled on macOS because cargo test binaries do not embed NSBluetoothAlwaysUsageDescription required by CoreBluetooth".to_string(),
-        })
-    }
-
     /// Create a new BLE transport with custom configuration (non-BLE platforms)
     #[cfg(not(feature = "ble"))]
     pub async fn with_config(_config: BleConfig) -> Result<Self, TransportError> {
         Err(TransportError::Other {
             message: "BLE transport requires the 'ble' feature".to_string(),
         })
+    }
+
+    #[cfg(all(feature = "ble", target_os = "macos"))]
+    fn ensure_macos_usage_description() -> Result<(), TransportError> {
+        let current_exe = std::env::current_exe().map_err(|_| TransportError::Other {
+            message:
+                "BLE transport unavailable on macOS because the current executable path could not be determined"
+                    .to_string(),
+        })?;
+
+        if Self::app_bundle_info_plist(&current_exe)
+            .as_deref()
+            .is_some_and(Self::file_declares_macos_bluetooth_usage)
+        {
+            return Ok(());
+        }
+
+        Err(TransportError::Other {
+            message: "BLE transport is compiled in on macOS but inactive for plain CLI/test binaries; run from an app bundle with NSBluetoothAlwaysUsageDescription to enable it".to_string(),
+        })
+    }
+
+    #[cfg(all(feature = "ble", target_os = "macos"))]
+    fn file_declares_macos_bluetooth_usage(path: &std::path::Path) -> bool {
+        const BLUETOOTH_USAGE_KEYS: [&[u8]; 2] = [
+            b"NSBluetoothAlwaysUsageDescription",
+            b"NSBluetoothPeripheralUsageDescription",
+        ];
+
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+
+        BLUETOOTH_USAGE_KEYS
+            .iter()
+            .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
+    }
+
+    #[cfg(all(feature = "ble", target_os = "macos"))]
+    fn app_bundle_info_plist(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+        let macos_dir = executable.parent()?;
+        if macos_dir.file_name() != Some(OsStr::new("MacOS")) {
+            return None;
+        }
+
+        let contents_dir = macos_dir.parent()?;
+        if contents_dir.file_name() != Some(OsStr::new("Contents")) {
+            return None;
+        }
+
+        Some(contents_dir.join("Info.plist"))
     }
 
     /// Get the btleplug adapter and derive a local device ID from it

@@ -46,7 +46,8 @@ use crate::unified_config::load_or_generate_endpoint_keypair;
 /// - `bind_addr`: Defaults to `0.0.0.0:0` (random port)
 /// - `known_peers`: Defaults to empty (node can still accept connections)
 /// - `keypair`: Defaults to fresh generated keypair
-/// - `transport_providers`: Defaults to UDP transport only
+/// - `transport_providers`: Defaults to UDP plus best-effort constrained transports
+///   such as BLE when available
 ///
 /// # Example
 ///
@@ -78,10 +79,11 @@ pub struct NodeConfig {
     /// Provide for persistent identity across restarts.
     pub keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
 
-    /// Additional transport providers beyond the default UDP transport.
+    /// Additional transport providers beyond the default transport set.
     ///
-    /// The UDP transport is always included by default. Use this to add
-    /// additional transports like BLE, LoRa, serial, etc.
+    /// UDP is always included, and constrained transports such as BLE are
+    /// registered automatically when compiled in and available at runtime.
+    /// Use this to add additional transports like LoRa, serial, etc.
     ///
     /// Transport capabilities are propagated to peer advertisements and
     /// used for routing decisions.
@@ -293,7 +295,8 @@ impl NodeConfigBuilder {
     /// Add a transport provider
     ///
     /// Transport providers are used for multi-transport P2P networking.
-    /// The UDP transport is always included by default.
+    /// UDP is always included, and constrained transports such as BLE are
+    /// registered automatically when compiled in and available at runtime.
     ///
     /// # Example
     ///

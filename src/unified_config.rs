@@ -242,8 +242,9 @@ pub struct P2pConfig {
     /// Transport registry for multi-transport support
     ///
     /// Contains all registered transport providers (UDP, BLE, etc.) that this
-    /// endpoint can use for connectivity. If empty, a default UDP transport
-    /// is created automatically.
+    /// endpoint can use for connectivity. If empty, a default transport set is
+    /// created automatically with UDP plus best-effort constrained transports
+    /// such as BLE when compiled in and available at runtime.
     pub transport_registry: TransportRegistry,
 
     /// Capacity of the data channel shared between background reader tasks and `recv()`.

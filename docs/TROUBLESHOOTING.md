@@ -535,7 +535,7 @@ let config = P2pConfig::builder()
 **A**: Use multiple known peers in different networks/regions, let the endpoint connect to them early (`connect_known_peers()`), ensure address discovery is working, and tune timeouts only when necessary. Normal applications should not manually choose direct-vs-relay strategy.
 
 ### Q: Can QUIC bi/uni streams drop data like datagrams?
-**A**: No. Streams are fully reliable and ordered — any missing stream payload is a protocol/library bug. If this happens, grab `ConnectionStats` (for both peers), enable `RUST_LOG=ant_quic=trace`, and file an issue that includes: (1) how many stream messages you sent, (2) which ones failed to arrive, and (3) whether you were concurrently reading datagrams. This helps us reproduce race conditions such as the multi-client `tokio::select!` loops covered by `tests/multi_client_mixed_traffic.rs`.
+**A**: No. Streams are fully reliable and ordered — any missing stream payload is a protocol/library bug. If this happens, grab `ConnectionStats` (for both peers), enable `RUST_LOG=ant_quic=trace`, and file an issue that includes: (1) how many stream messages you sent, (2) which ones failed to arrive, and (3) whether you were concurrently reading datagrams. This helps us reproduce race conditions such as the multi-client `tokio::select!` loops covered by `tests/compat_multi_client_mixed_traffic.rs`.
 
 ## Getting Help
 

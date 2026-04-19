@@ -12,7 +12,7 @@
 //!
 //! - BLE hardware (Bluetooth 4.0+ adapter)
 //! - Platform support: Linux (BlueZ), macOS (Core Bluetooth), Windows (WinRT)
-//! - Feature flag: `--features ble`
+//! - Build with `--features ble`
 //!
 //! # Usage
 //!
@@ -57,8 +57,8 @@
 // Stub main for when BLE feature is disabled
 #[cfg(not(feature = "ble"))]
 fn main() {
-    eprintln!("This example requires the 'ble' feature.");
-    eprintln!("Run with: cargo run --example ble_chat --features ble");
+    eprintln!("This example requires BLE support.");
+    eprintln!("Run it with `--features ble`.");
     std::process::exit(1);
 }
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
         println!("Requirements:");
         println!("  - BLE hardware (Bluetooth 4.0+ adapter)");
-        println!("  - Compile with: cargo run --example ble_chat --features ble");
+        println!("  - Build with: cargo run --example ble_chat --features ble -- --peripheral");
         println!();
         return Ok(());
     };
@@ -130,6 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             eprintln!("Failed to initialize BLE: {e}");
             eprintln!("Make sure you have a Bluetooth adapter and appropriate permissions.");
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "On macOS, BLE is only available from an app bundle with NSBluetoothAlwaysUsageDescription."
+            );
             return Err(e.into());
         }
     };

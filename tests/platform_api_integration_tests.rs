@@ -2,6 +2,7 @@
 //!
 //! These tests verify that platform-specific APIs work correctly on each OS
 
+#![cfg(feature = "network-discovery")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::candidate_discovery::NetworkInterfaceDiscovery;

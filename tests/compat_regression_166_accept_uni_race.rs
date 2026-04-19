@@ -7,6 +7,9 @@
 //! stream goes ACKed on the sender but never surfaces at `accept_uni()`
 //! on the receiver in the live VPS mesh.
 //!
+//! This crate exercises the low-level `Endpoint::client/server` compatibility
+//! layer to isolate transport behavior beneath the symmetric P2P orchestration.
+//!
 //! Suspect mechanism: the receiver's P2pEndpoint reader task uses a
 //! strictly-serial loop — `accept_uni().await` → `read_to_end().await`
 //! → handle → `accept_uni().await` … — so any short stream that arrives

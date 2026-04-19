@@ -1,4 +1,6 @@
 //! Integration tests for NAT traversal with mixed RFC and legacy endpoints
+//!
+//! This crate exercises the low-level `Endpoint::client/server` compatibility API.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
