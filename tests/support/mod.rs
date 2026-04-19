@@ -195,7 +195,7 @@ pub fn latest_live_connection_id_for_peer(peer_id: PeerId) -> Option<String> {
         .filter(|event| event.fields.get("peer_id") == Some(&prefix))
         .filter(|event| event.fields.get("to_state") == Some(&"Live".to_string()))
         .filter_map(|event| event.fields.get("connection_id").cloned())
-        .last()
+        .next_back()
 }
 
 fn lifecycle_connection_id_for_initiator(

@@ -491,21 +491,6 @@ pub enum ReadToEndError {
     TooLong,
 }
 
-/* TODO: Enable when futures-io feature is added
-#[cfg(feature = "futures-io")]
-impl futures_io::AsyncRead for RecvStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut buf = ReadBuf::new(buf);
-        ready!(Self::poll_read_buf(self.get_mut(), cx, &mut buf))?;
-        Poll::Ready(Ok(buf.filled().len()))
-    }
-}
-*/
-
 impl tokio::io::AsyncRead for RecvStream {
     fn poll_read(
         self: Pin<&mut Self>,

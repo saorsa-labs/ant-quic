@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-04-19
+
+### Fixed
+
+- **#173 — `P2pEndpoint::send` no longer waits on `SendStream::stopped()`.** The previous implementation wrapped the final `finish()` in `tokio::time::timeout(Duration::from_secs(5), send_stream.stopped())`, which mis-reported slow-but-alive peers as dead (`Endpoint error: Connection error: send acknowledgement timed out (peer may be dead)`). Quinn's own docs explicitly warn that `stopped()` is not a transport-liveness primitive — it can be arbitrarily delayed by asymmetric loss, peer-side congestion, or slow `accept_uni()` — so the 5 s hard-coded timeout fired while the underlying QUIC connection was still genuinely healthy, blocking cross-continent gossip / DM workloads on the x0x VPS fleet. `send` is now fire-and-forget at the QUIC layer: success means the bytes were queued and `finish()` returned. Callers that need delivery confirmation should use `send_with_receive_ack`; callers that need active liveness should use the new `probe_peer` (below).
+
+### Added
+
+- **`P2pEndpoint::probe_peer(peer_id, timeout)` and `Node::probe_peer(...)`.** Active liveness primitive that sends a dedicated probe envelope over a fresh uni-stream, waits for the remote ant-quic reader to reply with an ACK-v1 control frame, and returns the measured round-trip `Duration`. A successful probe proves both (a) the underlying UDP/QUIC path is live and (b) the remote reader task is running and servicing incoming streams — exactly the signal gossip / pubsub layers need to distinguish zombie half-open connections from genuinely-alive peers. Probe envelopes are invisible to the application receive pipeline: they are never forwarded to `recv()` or emitted as `P2pEvent::DataReceived`. Returns `EndpointError::ProbeTimeout` when no ACK arrives within the caller-supplied deadline.
+- **`EndpointError::ProbeTimeout` variant** distinguishable from the existing `AckTimeout` so applications can branch on probe-specific outcomes.
+
+### Tests
+
+- `tests/b_send_fire_and_forget.rs` — asserts 32 back-to-back `send()` calls complete in well under the old 5 s timeout when the receiver is not draining `recv()`.
+- `tests/b_probe_peer.rs` — happy-path RTT measurement, invisibility assertion (128 probes, zero `DataReceived` events, zero `recv()` payloads, followed by a normal send that still round-trips), and timeout behaviour when the remote is shut down.
+- Adjusted the comment header of `tests/regression_166_mesh_churn.rs` to no longer imply that the old `send acknowledgement timed out` string is part of the asserted behaviour.
+
 ## [0.27.1] - 2026-04-18
 
 ### Added

@@ -213,11 +213,11 @@ assert!(pqc_server.has_pqc_support());
 
 Run tests with:
 ```bash
-# Without PQC feature
+# Default library surface (PQC is always on)
 cargo test --package ant-quic --lib crypto::pqc
 
-# With PQC feature
-cargo test --package ant-quic --lib crypto::pqc --features pqc
+# Exhaustive feature surface
+cargo test --package ant-quic --lib crypto::pqc --all-features
 ```
 
 All tests pass with appropriate error messages indicating that the actual cryptographic operations are not yet available in aws-lc-rs.

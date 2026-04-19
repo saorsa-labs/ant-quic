@@ -32,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    // Check if PQC features are enabled
+    // Disabled example placeholder: PQC no longer requires a feature flag.
     
     {
-        println!("Error: This example requires the 'pqc' feature to be enabled.");
-        println!("Run with: cargo run --example pqc_basic --features pqc -- <server|client>");
+        println!("Error: PQC is always enabled in this repository.");
+        println!("Run with: cargo run --example pqc_basic -- <server|client>");
         std::process::exit(1);
     }
 

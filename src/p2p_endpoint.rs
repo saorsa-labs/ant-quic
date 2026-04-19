@@ -65,7 +65,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::ack_frame::{
     AckControlOutcome, ReceiveRejectReason, decode_ack_control, decode_ack_payload,
-    encode_ack_control, encode_ack_payload,
+    decode_probe_request, encode_ack_control, encode_ack_payload, encode_probe_request,
 };
 use crate::bootstrap_cache::{
     BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
@@ -1034,15 +1034,6 @@ fn endpoint_error_from_write_error(error: crate::high_level::WriteError) -> Endp
     }
 }
 
-fn endpoint_error_from_stopped_error(error: crate::high_level::StoppedError) -> EndpointError {
-    match error {
-        crate::high_level::StoppedError::ConnectionLost(error) => {
-            endpoint_error_from_connection_error(error)
-        }
-        other => EndpointError::Connection(other.to_string()),
-    }
-}
-
 fn close_reason_for_disconnect(reason: &DisconnectReason) -> ConnectionCloseReason {
     match reason {
         DisconnectReason::Normal => ConnectionCloseReason::LifecycleCleanup,
@@ -1093,6 +1084,10 @@ pub enum EndpointError {
     /// Timed out waiting for the remote receive pipeline ACK.
     #[error("Timed out waiting for remote receive acknowledgement")]
     AckTimeout,
+
+    /// Timed out waiting for a peer liveness probe response.
+    #[error("Timed out waiting for peer liveness probe response")]
+    ProbeTimeout,
 
     /// The remote receive pipeline rejected the payload.
     #[error("Remote receive pipeline rejected payload: {reason}")]
@@ -4370,25 +4365,14 @@ impl P2pEndpoint {
                         .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
                 })?;
 
-                // Wait for peer to acknowledge receipt. Without this, finish()
-                // returns immediately (it only queues a FIN) and dead connections
-                // silently eat data. A 5-second timeout is generous — a live
-                // connection ACKs within ~1 RTT.
-                match tokio::time::timeout(Duration::from_secs(5), send_stream.stopped()).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        return Err(endpoint_error_from_stopped_error(e));
-                    }
-                    Err(_) => {
-                        if let Some(reason) = close_reason_from_connection(&connection) {
-                            return Err(EndpointError::ConnectionClosed { reason });
-                        }
-                        return Err(EndpointError::Connection(
-                            "send acknowledgement timed out (peer may be dead)".into(),
-                        ));
-                    }
-                }
-
+                // Fire-and-forget: `finish()` queues the FIN; QUIC transmits and ACKs
+                // it asynchronously. Do NOT wait on `send_stream.stopped()` here —
+                // Quinn's docs explicitly warn it is not a liveness primitive (it
+                // fires when the peer reads-to-completion or stops the stream, which
+                // can be arbitrarily delayed by asymmetric loss or peer congestion).
+                // Callers that need delivery confirmation should use
+                // `send_with_receive_ack`; callers that need active liveness should
+                // use `probe_peer`.
                 debug!("Sent {} bytes to peer {:?} via QUIC", data.len(), peer_id);
             }
             crate::transport::ProtocolEngine::Constrained => {
@@ -4579,6 +4563,156 @@ impl P2pEndpoint {
                     AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
                 );
                 Err(EndpointError::AckTimeout)
+            }
+        }
+    }
+
+    /// Actively probe peer liveness and measure round-trip time.
+    ///
+    /// Sends a minimal probe envelope over a fresh uni-stream and waits for the
+    /// remote ant-quic reader to reply with an ACK control frame. Returns the
+    /// measured round-trip duration on success.
+    ///
+    /// This is the preferred primitive for applications that need to
+    /// distinguish a genuinely-alive peer from a zombie (half-open) connection.
+    /// It exercises the same reader-pipeline path as [`Self::send`], so a
+    /// successful probe implies both (a) the underlying UDP/QUIC path is live
+    /// and (b) the remote reader task is running and can service incoming
+    /// streams — which is exactly the signal gossip/pubsub layers need to
+    /// decide whether to demote a suspect peer.
+    ///
+    /// Probe envelopes are invisible to the application receive pipeline:
+    /// they are never forwarded to `recv()` or emitted as
+    /// [`P2pEvent::DataReceived`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
+    /// - [`EndpointError::PeerNotFound`] if no live QUIC connection exists.
+    /// - [`EndpointError::NotSupported`] if the connection or transport cannot
+    ///   carry ACK-v1 control frames (e.g. constrained transports, or peers
+    ///   that did not negotiate the capability).
+    /// - [`EndpointError::ConnectionClosed`] if the connection is already
+    ///   transitioning out of `Live`.
+    /// - [`EndpointError::ProbeTimeout`] if no ACK arrives within `timeout`.
+    pub async fn probe_peer(
+        &self,
+        peer_id: &PeerId,
+        timeout_duration: Duration,
+    ) -> Result<Duration, EndpointError> {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let transport_addr = {
+            let peer_info = self.connected_peers.read().await;
+            if let Some(conn) = peer_info.get(peer_id) {
+                conn.remote_addr.clone()
+            } else if let Some(connection) = self
+                .inner
+                .get_connection(peer_id)
+                .map_err(EndpointError::NatTraversal)?
+            {
+                TransportAddr::Udp(connection.remote_address())
+            } else {
+                return Err(EndpointError::PeerNotFound(*peer_id));
+            }
+        };
+
+        let engine = {
+            let mut router = self.router.write().await;
+            router.select_engine_for_addr(&transport_addr)
+        };
+        if !matches!(engine, crate::transport::ProtocolEngine::Quic) {
+            return Err(EndpointError::NotSupported);
+        }
+
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+
+        if !connection.supports_ack_receive_v1() {
+            return Err(EndpointError::NotSupported);
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+
+        let stable_id = connection.stable_id();
+        let tag = self.next_ack_request_tag(stable_id);
+        let (tx, rx) = oneshot::channel();
+        let inserted = register_ack_waiter(self.ack_waiters.as_ref(), stable_id, tag, tx);
+        if !inserted {
+            return Err(EndpointError::Connection(
+                "failed to reserve unique probe tag".to_string(),
+            ));
+        }
+
+        let envelope = encode_probe_request(tag);
+        let sent_at = Instant::now();
+        let send_result = async {
+            let mut send_stream = connection
+                .open_uni()
+                .await
+                .map_err(endpoint_error_from_connection_error)?;
+            send_stream
+                .write_all(&envelope)
+                .await
+                .map_err(endpoint_error_from_write_error)?;
+            send_stream.finish().map_err(|e| {
+                close_reason_from_connection(&connection)
+                    .map(|reason| EndpointError::ConnectionClosed { reason })
+                    .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
+            })
+        }
+        .await;
+
+        if let Err(error) = send_result {
+            let _ = resolve_ack_waiter(
+                self.ack_waiters.as_ref(),
+                stable_id,
+                tag,
+                AckWaiterResult::Closed(ConnectionCloseReason::LocallyClosed),
+            );
+            return Err(error);
+        }
+
+        note_peer_activity(
+            &self.connected_peers,
+            &self.peer_activity,
+            *peer_id,
+            PeerActivityKind::Sent,
+            sent_at,
+        )
+        .await;
+
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(AckWaiterResult::Accepted)) => Ok(sent_at.elapsed()),
+            Ok(Ok(AckWaiterResult::Rejected(reason))) => {
+                Err(EndpointError::ReceiveRejected { reason })
+            }
+            Ok(Ok(AckWaiterResult::Closed(reason))) => {
+                Err(EndpointError::ConnectionClosed { reason })
+            }
+            Ok(Err(_)) => {
+                if let Some(reason) = close_reason_from_connection(&connection) {
+                    Err(EndpointError::ConnectionClosed { reason })
+                } else {
+                    Err(EndpointError::Connection(
+                        "probe waiter dropped before completion".to_string(),
+                    ))
+                }
+            }
+            Err(_) => {
+                let _ = resolve_ack_waiter(
+                    self.ack_waiters.as_ref(),
+                    stable_id,
+                    tag,
+                    AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
+                );
+                Err(EndpointError::ProbeTimeout)
             }
         }
     }
@@ -5510,6 +5644,27 @@ impl P2pEndpoint {
                             "received ACK control frame with no matching waiter"
                         );
                     }
+                    continue;
+                }
+
+                // Probe-liveness request: reply with an Accepted ACK control frame
+                // and do NOT forward to data_tx / DataReceived. Probes are invisible
+                // to the application.
+                if let Some(tag) = decode_probe_request(&data) {
+                    note_peer_activity(
+                        &connected_peers,
+                        &peer_activity,
+                        peer_id,
+                        PeerActivityKind::Received,
+                        Instant::now(),
+                    )
+                    .await;
+                    Self::send_ack_control_frame(
+                        connection.clone(),
+                        tag,
+                        AckControlOutcome::Accepted,
+                    )
+                    .await;
                     continue;
                 }
 

@@ -659,6 +659,23 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Actively probe peer liveness and measure round-trip time.
+    ///
+    /// Sends a lightweight probe envelope and waits for the peer's reader task
+    /// to acknowledge it. Returns the measured round-trip duration on success.
+    /// Probe traffic is invisible to [`Self::recv`] — it does not emit
+    /// `DataReceived` events or deliver payloads.
+    pub async fn probe_peer(
+        &self,
+        peer_id: &PeerId,
+        timeout: Duration,
+    ) -> Result<Duration, NodeError> {
+        self.inner
+            .probe_peer(peer_id, timeout)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Receive data from any peer
     pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), NodeError> {
         self.inner.recv().await.map_err(NodeError::Endpoint)

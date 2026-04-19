@@ -56,10 +56,10 @@ warn() {
 echo "1. Code Compilation and Quality"
 echo "==============================="
 
-check "Code compiles without errors" "cargo check --all-targets"
-check "All tests pass" "cargo test --lib"
-check "No clippy warnings" "cargo clippy -- -D warnings"
-check "Code is properly formatted" "cargo fmt -- --check"
+check "Code compiles without errors" "cargo check --all-features --all-targets"
+check "All tests pass" "cargo test --lib --all-features"
+check "No clippy warnings" "cargo clippy --all-features --all-targets -- -D warnings -D clippy::panic -D clippy::unwrap_used -D clippy::expect_used"
+check "Code is properly formatted" "cargo fmt --all -- --check"
 
 echo
 echo "2. PQC Algorithm Implementation"
@@ -67,16 +67,16 @@ echo "==============================="
 
 check "ML-KEM-768 module exists" "test -f src/crypto/pqc/ml_kem.rs"
 check "ML-DSA-65 module exists" "test -f src/crypto/pqc/ml_dsa.rs"
-check "Hybrid key exchange implemented" "test -f src/crypto/pqc/hybrid.rs"
 check "TLS extensions for PQC" "test -f src/crypto/pqc/tls_extensions.rs"
+check "Pure PQC negotiation module exists" "test -f src/crypto/pqc/negotiation.rs"
 
 echo
 echo "3. Security Features"
 echo "===================="
 
 check "Memory pool for secure allocation" "test -f src/crypto/pqc/memory_pool.rs"
-check "Configuration with security defaults" "grep -q 'PqcMode::Hybrid' src/crypto/pqc/config.rs"
-check "Negotiation fallback mechanism" "test -f src/crypto/pqc/negotiation.rs"
+check "Configuration keeps PQC always enabled" "grep -q 'PQC is always enabled' src/crypto/pqc/config.rs"
+check "rustls PQC provider exists" "test -f src/crypto/pqc/rustls_provider.rs"
 warn "Security validation module" "test -f src/crypto/pqc/security_validation.rs"
 
 echo
@@ -112,8 +112,7 @@ echo "6. Documentation"
 echo "================"
 
 check "PQC configuration example" "test -f examples/pqc_config_demo.rs"
-check "Hybrid mode example" "test -f examples/pqc_hybrid_demo.rs"
-warn "API documentation builds" "cargo doc --no-deps --features pqc"
+warn "API documentation builds" "cargo doc --all-features --no-deps"
 
 echo
 echo "7. Integration Status"

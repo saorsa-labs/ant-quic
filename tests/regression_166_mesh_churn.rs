@@ -12,11 +12,12 @@
 //!
 //! David's 3-daemon localhost reproduction showed multiple
 //! `Aborting previous reader task for peer` events per peer within a
-//! single mixed-traffic test run, with paired
-//! `send acknowledgement timed out (peer may be dead)` warnings from the
-//! sending side. The fix (cooperative cancel at the `accept_uni()`
-//! boundary + per-connection reader tracking) preserves ACKed bytes in
-//! flight across the connection replacement.
+//! single mixed-traffic test run, with paired stream-ACK warnings from
+//! the sending side (the old 5 s `SendStream::stopped()` timeout in
+//! `P2pEndpoint::send`; removed as part of the #173 fix). The fix
+//! (cooperative cancel at the `accept_uni()` boundary + per-connection
+//! reader tracking) preserves ACKed bytes in flight across the
+//! connection replacement.
 //!
 //! This test constructs a 3-peer mesh, drives concurrent mutual connects
 //! (to provoke the simultaneous-open path), then every peer pair sends

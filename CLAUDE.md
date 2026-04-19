@@ -158,13 +158,13 @@ cargo run --example dashboard_demo
 
 ### Feature Testing
 ```bash
-# Test different crypto providers
-cargo nextest run --no-default-features --features rustls-ring
-cargo nextest run --no-default-features --features rustls-aws-lc-rs
+# Test the stripped portability surface
+cargo nextest run --no-default-features
 
-# Test with PQC features
-cargo nextest run --features "pqc aws-lc-rs"
-cargo build --features "pqc aws-lc-rs" --all-targets
+# Test the default and exhaustive feature sets
+cargo nextest run
+cargo nextest run --all-features
+cargo build --all-features --all-targets
 ```
 
 **Note:** WASM is not supported. ant-quic uses raw UDP sockets and NAT traversal which are incompatible with the browser sandbox environment.
