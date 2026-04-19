@@ -8040,7 +8040,7 @@ impl NatTraversalEndpoint {
                                 NatTraversalEvent::PathValidated {
                                     peer_id: session.peer_id,
                                     address: successful_path,
-                                    rtt: Duration::from_millis(50), // TODO: Get actual RTT
+                                    rtt: self.path_validation_rtt(session),
                                 },
                             );
                             validation_requests.push((session.peer_id, successful_path));
@@ -8055,7 +8055,7 @@ impl NatTraversalEndpoint {
                     }
                 }
                 TraversalPhase::Validation => {
-                    if self.is_path_validated(&session.peer_id) {
+                    if self.session_path_is_validated(session) {
                         Self::set_session_phase(session, now, TraversalPhase::Connected);
                         self.emit_event(
                             &mut events,
@@ -8318,31 +8318,42 @@ impl NatTraversalEndpoint {
     }
 
     fn expected_session_rtt(&self, session: &NatTraversalSession) -> Duration {
+        // Keep this aligned with TransportConfig::default().initial_rtt without
+        // constructing a full transport config in the poll hot path.
+        const DEFAULT_EXPECTED_SESSION_RTT: Duration = Duration::from_millis(333);
+
         session
             .session_state
             .metrics
             .rtt
-            .unwrap_or_else(|| TransportConfig::default().initial_rtt)
+            .unwrap_or(DEFAULT_EXPECTED_SESSION_RTT)
     }
 
     fn connectivity_phase_budget(&self, session: &NatTraversalSession) -> Duration {
+        const MIN_CONNECTIVITY_PHASE_BUDGET: Duration = Duration::from_secs(1);
+        const CONNECTIVITY_PHASE_RTT_MULTIPLIER: u32 = 6;
+        const CONNECTIVITY_PHASE_BUDGET_SLACK: Duration = Duration::from_millis(500);
+
         let scaled_rtt = self
             .expected_session_rtt(session)
-            .checked_mul(6)
+            .checked_mul(CONNECTIVITY_PHASE_RTT_MULTIPLIER)
             .unwrap_or(Duration::MAX)
-            .saturating_add(Duration::from_secs(1));
-        let lower = self.config.coordination_timeout.min(
-            self.timeout_config
-                .nat_traversal
-                .connection_establishment_timeout,
-        );
-        let upper = self.config.coordination_timeout.max(
-            self.timeout_config
-                .nat_traversal
-                .connection_establishment_timeout,
-        );
+            .saturating_add(CONNECTIVITY_PHASE_BUDGET_SLACK);
+        let upper = self
+            .timeout_config
+            .nat_traversal
+            .connection_establishment_timeout
+            .max(MIN_CONNECTIVITY_PHASE_BUDGET);
 
-        scaled_rtt.max(lower).min(upper)
+        scaled_rtt.max(MIN_CONNECTIVITY_PHASE_BUDGET).min(upper)
+    }
+
+    fn path_validation_rtt(&self, session: &NatTraversalSession) -> Duration {
+        self.connections
+            .get(&session.peer_id)
+            .map(|entry| entry.value().stats().path.rtt)
+            .or(session.session_state.metrics.rtt)
+            .unwrap_or_else(|| self.expected_session_rtt(session))
     }
 
     fn non_discovery_phase_timeout_deadline(
@@ -8809,34 +8820,32 @@ impl NatTraversalEndpoint {
         self.connections.contains_key(peer_id)
     }
 
-    /// Check if path validation succeeded
-    fn is_path_validated(&self, peer_id: &PeerId) -> bool {
-        debug!("Checking path validation for peer {:?}", peer_id);
+    /// Check if path validation succeeded for the in-hand session state.
+    fn session_path_is_validated(&self, session: &NatTraversalSession) -> bool {
+        debug!("Checking path validation for peer {:?}", session.peer_id);
 
-        // Check if we have an active connection
-        if self.has_existing_connection(peer_id) {
-            info!("Path validated: connection exists for peer {:?}", peer_id);
+        if self.has_existing_connection(&session.peer_id) {
+            info!(
+                "Path validated: connection exists for peer {:?}",
+                session.peer_id
+            );
             return true;
         }
 
-        // Check if we have any validated candidates
-        // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
-        if let Some(session) = self.active_sessions.get(peer_id) {
-            let validated = session
-                .candidates
-                .iter()
-                .any(|c| matches!(c.state, CandidateState::Valid));
+        let validated = session
+            .candidates
+            .iter()
+            .any(|c| matches!(c.state, CandidateState::Valid));
 
-            if validated {
-                info!(
-                    "Path validated: found validated candidate for peer {:?}",
-                    peer_id
-                );
-                return true;
-            }
+        if validated {
+            info!(
+                "Path validated: found validated candidate for peer {:?}",
+                session.peer_id
+            );
+            return true;
         }
 
-        warn!("Path not validated for peer {:?}", peer_id);
+        warn!("Path not validated for peer {:?}", session.peer_id);
         false
     }
 
@@ -10341,6 +10350,178 @@ mod tests {
             NatTraversalEvent::HolePunchingStarted { peer_id: event_peer, .. }
                 if *event_peer == peer_id
         )));
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_poll_advances_punching_to_validation_without_waiting_for_fixed_timeout() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x62; 32]);
+        let candidate_addr: SocketAddr = "127.0.0.1:9002".parse().expect("candidate addr");
+        endpoint
+            .successful_candidates
+            .insert(peer_id, candidate_addr);
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: std::time::Instant::now(),
+                phase: TraversalPhase::Punching,
+                candidates: vec![
+                    CandidateAddress::new(
+                        candidate_addr,
+                        100,
+                        CandidateSource::Observed { by_node: None },
+                    )
+                    .expect("candidate"),
+                ],
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: std::time::Instant::now(),
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let events = endpoint
+            .poll(std::time::Instant::now())
+            .expect("poll should succeed");
+
+        let session = endpoint.active_sessions.get(&peer_id).expect("session");
+        assert!(matches!(session.phase, TraversalPhase::Validation));
+        assert!(matches!(
+            session.candidates.first().expect("candidate").state,
+            CandidateState::Validating
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NatTraversalEvent::TraversalFailed { .. })),
+            "successful punch results should advance immediately instead of waiting for a timeout"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_poll_advances_validation_to_connected_without_waiting_for_fixed_timeout() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x63; 32]);
+        let candidate_addr: SocketAddr = "127.0.0.1:9003".parse().expect("candidate addr");
+        let mut candidate = CandidateAddress::new(
+            candidate_addr,
+            100,
+            CandidateSource::Observed { by_node: None },
+        )
+        .expect("candidate");
+        candidate.state = CandidateState::Valid;
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: std::time::Instant::now(),
+                phase: TraversalPhase::Validation,
+                candidates: vec![candidate],
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: std::time::Instant::now(),
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let events = endpoint
+            .poll(std::time::Instant::now())
+            .expect("poll should succeed");
+
+        assert!(matches!(
+            endpoint
+                .active_sessions
+                .get(&peer_id)
+                .expect("session")
+                .phase,
+            TraversalPhase::Connected
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NatTraversalEvent::TraversalSucceeded {
+                peer_id: event_peer,
+                final_address,
+                ..
+            } if *event_peer == peer_id && *final_address == candidate_addr
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_connectivity_phase_budget_uses_small_floor_and_establishment_cap() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(60),
+            timeouts: crate::config::nat_timeouts::TimeoutConfig {
+                nat_traversal: crate::config::nat_timeouts::NatTraversalTimeouts {
+                    connection_establishment_timeout: Duration::from_secs(4),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x64; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: std::time::Instant::now(),
+            phase: TraversalPhase::Punching,
+            candidates: Vec::new(),
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: std::time::Instant::now(),
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        session.session_state.metrics.rtt = Some(Duration::from_micros(20));
+        assert_eq!(
+            endpoint.connectivity_phase_budget(&session),
+            Duration::from_secs(1),
+            "very fast paths should use the small connectivity floor instead of a large coordination-derived floor"
+        );
+
+        session.session_state.metrics.rtt = Some(Duration::from_secs(10));
+        assert_eq!(
+            endpoint.connectivity_phase_budget(&session),
+            Duration::from_secs(4),
+            "connectivity phases should cap at the connection-establishment timeout even if coordination is configured larger"
+        );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
