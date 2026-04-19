@@ -31,8 +31,8 @@ run() {
         --listen "[::]:0" \
         --no-default-bootstrap \
         --mdns \
-        --mdns-mode Both \
-        --mdns-auto-connect Enabled \
+        --mdns-mode both \
+        --mdns-auto-connect enabled \
         --stats --stats-interval 2)
     PIDS+=("$pid_l1")
 
@@ -41,13 +41,13 @@ run() {
     if [ -n "${STUDIO1_TARGET:-}" ]; then
         local pid_l2
         pid_l2=$(ssh_run_log "c1_studio1" "${STUDIO1_TARGET}" \
-            "${ANT_QUIC_BIN_STUDIO:-ant-quic} --listen '[::]:0' --no-default-bootstrap --mdns --mdns-mode Both --mdns-auto-connect Enabled --stats --stats-interval 2")
+            "${ANT_QUIC_BIN_STUDIO:-\$HOME/ant-quic-matrix/bin/ant-quic} --listen '[::]:0' --no-default-bootstrap --mdns --mdns-mode both --mdns-auto-connect enabled --stats --stats-interval 2")
         PIDS+=("$pid_l2")
     fi
     if [ -n "${STUDIO2_TARGET:-}" ]; then
         local pid_l3
         pid_l3=$(ssh_run_log "c1_studio2" "${STUDIO2_TARGET}" \
-            "${ANT_QUIC_BIN_STUDIO:-ant-quic} --listen '[::]:0' --no-default-bootstrap --mdns --mdns-mode Both --mdns-auto-connect Enabled --stats --stats-interval 2")
+            "${ANT_QUIC_BIN_STUDIO:-\$HOME/ant-quic-matrix/bin/ant-quic} --listen '[::]:0' --no-default-bootstrap --mdns --mdns-mode both --mdns-auto-connect enabled --stats --stats-interval 2")
         PIDS+=("$pid_l3")
     fi
 
@@ -66,15 +66,18 @@ verify() {
     log_info "C1: verifying acceptance criteria"
     local fail=0
 
-    # Each LAN node should have observed at least one MdnsPeerDiscovered.
+    # Each LAN node should have observed at least one mDNS peer.
+    # Match on the binary's INFO log "mDNS peer discovered:" (sentence form).
     for label in c1_macbook c1_studio1 c1_studio2; do
         local logfile="${LOG_DIR}/${label}.log"
         [ -f "$logfile" ] || continue
-        if ! grep -q 'MdnsPeerDiscovered' "$logfile"; then
-            log_error "${label}: no MdnsPeerDiscovered observed"
+        if ! grep -qE 'mDNS peer discovered:|MdnsPeerDiscovered' "$logfile"; then
+            log_error "${label}: no mDNS peer discovery observed"
             fail=1
         else
-            log_ok "${label}: mDNS discovery confirmed"
+            local n
+            n=$(grep -cE 'mDNS peer discovered:|MdnsPeerDiscovered' "$logfile")
+            log_ok "${label}: mDNS discovery confirmed (${n} peer(s))"
         fi
     done
 

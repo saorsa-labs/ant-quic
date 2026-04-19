@@ -16,6 +16,18 @@ set -euo pipefail
 
 : "${LOG_DIR:?LOG_DIR must be set by the orchestrator}"
 
+# SSH options. Bash arrays cannot be exported across subshells, so we define
+# them here in the sourced common helper rather than relying on the orchestrator
+# to export. Scenario subshells get the same options for free.
+SSH_OPTS=(
+    -4
+    -o BatchMode=yes
+    -o ConnectTimeout=15
+    -o ControlMaster=no
+    -o ControlPath=none
+    -o StrictHostKeyChecking=accept-new
+)
+
 # Color helpers (safe when stdout is not a TTY).
 _supports_color() { [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; }
 _red()    { _supports_color && printf '\033[31m%s\033[0m\n' "$*" || printf '%s\n' "$*"; }

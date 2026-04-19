@@ -31,18 +31,18 @@ run() {
     pid=$(local_run_log "c2_macbook" \
         "${ANT_QUIC_BIN_LOCAL}" \
         --listen "[::]:0" \
-        --mdns --mdns-mode Both \
+        --mdns --mdns-mode both \
         --stats --stats-interval 2)
     PIDS+=("$pid")
 
     if [ -n "${STUDIO1_TARGET:-}" ]; then
         pid=$(ssh_run_log "c2_studio1" "${STUDIO1_TARGET}" \
-            "${ANT_QUIC_BIN_STUDIO:-ant-quic} --listen '[::]:0' --mdns --mdns-mode Both --stats --stats-interval 2")
+            "${ANT_QUIC_BIN_STUDIO:-\$HOME/ant-quic-matrix/bin/ant-quic} --listen '[::]:0' --mdns --mdns-mode both --stats --stats-interval 2")
         PIDS+=("$pid")
     fi
     if [ -n "${STUDIO2_TARGET:-}" ]; then
         pid=$(ssh_run_log "c2_studio2" "${STUDIO2_TARGET}" \
-            "${ANT_QUIC_BIN_STUDIO:-ant-quic} --listen '[::]:0' --mdns --mdns-mode Both --stats --stats-interval 2")
+            "${ANT_QUIC_BIN_STUDIO:-\$HOME/ant-quic-matrix/bin/ant-quic} --listen '[::]:0' --mdns --mdns-mode both --stats --stats-interval 2")
         PIDS+=("$pid")
     fi
 
@@ -62,16 +62,19 @@ verify() {
         local logfile="${LOG_DIR}/${label}.log"
         [ -f "$logfile" ] || continue
 
-        # At least one ConnectionEstablished overall.
-        if ! grep -q 'ConnectionEstablished' "$logfile"; then
-            log_error "${label}: zero ConnectionEstablished events"
+        # At least one successful connection overall. The binary's `--stats`
+        # output emits "Successful connections: <N>" each interval; we match
+        # any non-zero N. Also accept ConnectionEstablished P2pEvent strings
+        # for forward compatibility with newer binaries that log them directly.
+        if ! grep -qE 'Successful connections: [1-9][0-9]*|ConnectionEstablished' "$logfile"; then
+            log_error "${label}: zero successful connections"
             fail=1
             continue
         fi
 
-        # mDNS for the other 2 LAN nodes.
-        if ! grep -q 'MdnsPeerDiscovered' "$logfile"; then
-            log_warn "${label}: no MdnsPeerDiscovered (LAN sibling unreachable?)"
+        # mDNS for the other LAN nodes (info if absent, not fatal).
+        if ! grep -qE 'mDNS peer discovered:|MdnsPeerDiscovered' "$logfile"; then
+            log_warn "${label}: no mDNS discovery (LAN sibling unreachable?)"
         fi
 
         log_ok "${label}: at least one connection observed"

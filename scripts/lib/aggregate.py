@@ -26,7 +26,10 @@ import sys
 SILENT_DROP_RE = re.compile(r"target=ant_quic::silent_drop\b.*?kind=(\S+)")
 SEND_ERROR_RE = re.compile(r"target=ant_quic::send_error\b")
 PEER_ID_RE = re.compile(r"Peer ID:\s*([0-9a-f]{64})")
-CONN_EST_RE = re.compile(r"ConnectionEstablished")
+# Match either the P2pEvent name OR the --stats summary line "Successful
+# connections: N" with N >= 1. Either is a positive signal a connection was
+# made by the node.
+CONN_EST_RE = re.compile(r"ConnectionEstablished|Successful connections:\s*[1-9]")
 DIRECT_PATH_RE = re.compile(r"DirectPathStatus\s*\{[^}]*?status:\s*(\w+)")
 NAT_PROGRESS_RE = re.compile(r"NatTraversalProgress")
 RELAY_BYTES_RE = re.compile(r"bytes_relayed[=:]\s*(\d+)")
@@ -50,9 +53,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def collect_logs(log_dir: pathlib.Path) -> dict[str, list[str]]:
-    """Read every *.log in log_dir, returning {node_label: [lines]}."""
+    """Read every node *.log in log_dir, returning {node_label: [lines]}.
+
+    Excludes orchestrator.log — the harness's own output is not a node log
+    and would false-positive on log lines that mention `ConnectionEstablished`
+    in scenario titles or summary messages.
+    """
     logs: dict[str, list[str]] = {}
     for path in sorted(log_dir.glob("*.log")):
+        if path.stem == "orchestrator":
+            continue
         try:
             logs[path.stem] = path.read_text(errors="replace").splitlines()
         except OSError as e:
@@ -156,11 +166,15 @@ def write_summary(out_path: pathlib.Path, logs: dict[str, list[str]]) -> int:
 
     lines.append("## Verdicts\n")
     lines.append(f"- silent_drop events: **{drop_total}** (target 0)")
-    lines.append(f"- send_error events: **{send_total}**")
-    lines.append(f"- nodes with ≥1 ConnectionEstablished: **{nodes_with_conns}/{len(logs)}**")
+    lines.append(f"- send_error events: **{send_total}** (target 0)")
+    lines.append(f"- nodes with ≥1 connection: **{nodes_with_conns}/{len(logs)}** (informational)")
     lines.append(f"- stale-reaper triggers: **{stale_total}** (target 0)\n")
 
-    fail = drop_total > 0 or stale_total > 0 or nodes_with_conns < len(logs)
+    # Aggregator FAILs on silent failures only. Connection count is informational
+    # — per-scenario verify() functions own the connection assertions because
+    # different scenarios have different expectations (e.g. C1 LAN-only doesn't
+    # need full QUIC handshakes within its 25s window, just mDNS discovery).
+    fail = drop_total > 0 or stale_total > 0 or send_total > 0
     if fail:
         lines.append("**Result: FAIL** — see breakdowns below.\n")
     else:
