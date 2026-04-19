@@ -8332,6 +8332,8 @@ impl NatTraversalEndpoint {
     fn connectivity_phase_budget(&self, session: &NatTraversalSession) -> Duration {
         const MIN_CONNECTIVITY_PHASE_BUDGET: Duration = Duration::from_secs(1);
         const CONNECTIVITY_PHASE_RTT_MULTIPLIER: u32 = 6;
+        // Keep a modest fixed cushion for punch / validation bookkeeping without
+        // drifting back toward the old multi-second transition gates.
         const CONNECTIVITY_PHASE_BUDGET_SLACK: Duration = Duration::from_millis(500);
 
         let scaled_rtt = self
@@ -8339,6 +8341,9 @@ impl NatTraversalEndpoint {
             .checked_mul(CONNECTIVITY_PHASE_RTT_MULTIPLIER)
             .unwrap_or(Duration::MAX)
             .saturating_add(CONNECTIVITY_PHASE_BUDGET_SLACK);
+        // Enforce a 1s safety floor even if the configured establishment timeout
+        // is tighter; NAT punch/validation needs at least one real scheduling
+        // window to observe I/O progress before declaring absence.
         let upper = self
             .timeout_config
             .nat_traversal
@@ -8348,12 +8353,25 @@ impl NatTraversalEndpoint {
         scaled_rtt.max(MIN_CONNECTIVITY_PHASE_BUDGET).min(upper)
     }
 
+    fn resolve_path_validation_rtt(
+        connection_rtt: Option<Duration>,
+        session_rtt: Option<Duration>,
+        expected_rtt: Duration,
+    ) -> Duration {
+        connection_rtt
+            .filter(|rtt| !rtt.is_zero())
+            .or(session_rtt)
+            .unwrap_or(expected_rtt)
+    }
+
     fn path_validation_rtt(&self, session: &NatTraversalSession) -> Duration {
-        self.connections
-            .get(&session.peer_id)
-            .map(|entry| entry.value().stats().path.rtt)
-            .or(session.session_state.metrics.rtt)
-            .unwrap_or_else(|| self.expected_session_rtt(session))
+        Self::resolve_path_validation_rtt(
+            self.connections
+                .get(&session.peer_id)
+                .map(|entry| entry.value().stats().path.rtt),
+            session.session_state.metrics.rtt,
+            self.expected_session_rtt(session),
+        )
     }
 
     fn non_discovery_phase_timeout_deadline(
@@ -10473,6 +10491,31 @@ mod tests {
                 ..
             } if *event_peer == peer_id && *final_address == candidate_addr
         )));
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[test]
+    fn test_resolve_path_validation_rtt_ignores_zero_connection_sample() {
+        assert_eq!(
+            NatTraversalEndpoint::resolve_path_validation_rtt(
+                Some(Duration::ZERO),
+                Some(Duration::from_millis(42)),
+                Duration::from_millis(333),
+            ),
+            Duration::from_millis(42),
+            "unsampled zero-RTT connection stats should fall through to the session RTT"
+        );
+
+        assert_eq!(
+            NatTraversalEndpoint::resolve_path_validation_rtt(
+                Some(Duration::from_millis(7)),
+                Some(Duration::from_millis(42)),
+                Duration::from_millis(333),
+            ),
+            Duration::from_millis(7),
+            "real connection RTT samples should still win when present"
+        );
     }
 
     #[tokio::test]
@@ -10514,6 +10557,13 @@ mod tests {
             endpoint.connectivity_phase_budget(&session),
             Duration::from_secs(1),
             "very fast paths should use the small connectivity floor instead of a large coordination-derived floor"
+        );
+
+        session.session_state.metrics.rtt = Some(Duration::from_millis(100));
+        assert_eq!(
+            endpoint.connectivity_phase_budget(&session),
+            Duration::from_millis(1100),
+            "mid-range RTTs should use the scaled path budget rather than only the floor or cap"
         );
 
         session.session_state.metrics.rtt = Some(Duration::from_secs(10));
