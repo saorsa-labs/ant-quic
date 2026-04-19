@@ -152,16 +152,16 @@ pub enum ConnectionStage {
     },
 }
 
-/// Configuration for connection strategy timeouts and behavior
+/// Configuration for connection-strategy stage budgets and behavior.
 #[derive(Debug, Clone)]
 pub struct StrategyConfig {
-    /// Timeout for direct IPv4 connection attempts
+    /// Budget for the direct Happy-Eyeballs stage.
     pub ipv4_timeout: Duration,
-    /// Timeout for direct IPv6 connection attempts
+    /// Budget for the direct Happy-Eyeballs stage.
     pub ipv6_timeout: Duration,
-    /// Timeout for each hole-punch round
+    /// Budget for each hole-punch round.
     pub holepunch_timeout: Duration,
-    /// Timeout for relay connection
+    /// Budget for relay connection attempts.
     pub relay_timeout: Duration,
     /// Maximum number of hole-punch rounds before falling back to relay
     pub max_holepunch_rounds: u32,
@@ -177,24 +177,77 @@ pub struct StrategyConfig {
 
 impl Default for StrategyConfig {
     fn default() -> Self {
-        Self {
-            ipv4_timeout: Duration::from_secs(5),
-            ipv6_timeout: Duration::from_secs(5),
-            holepunch_timeout: Duration::from_secs(15),
-            relay_timeout: Duration::from_secs(30),
+        let timeouts = crate::config::nat_timeouts::TimeoutConfig::default();
+        let mut config = Self {
+            ipv4_timeout: Duration::ZERO,
+            ipv6_timeout: Duration::ZERO,
+            holepunch_timeout: Duration::ZERO,
+            relay_timeout: Duration::ZERO,
             max_holepunch_rounds: 3,
             ipv6_enabled: true,
             relay_enabled: true,
             coordinator: None,
             relay_addrs: Vec::new(),
-        }
+        };
+        config.apply_adaptive_timeouts(
+            timeouts.nat_traversal.connection_establishment_timeout,
+            timeouts.nat_traversal.coordination_timeout,
+            Some(default_expected_rtt()),
+        );
+        config
     }
 }
 
 impl StrategyConfig {
-    /// Create a new strategy config with default values
+    /// Create a new strategy config with adaptive default stage budgets.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Derive stage budgets from authoritative timeout owners plus an optional RTT hint.
+    pub fn with_adaptive_timeouts(
+        mut self,
+        connection_establishment_timeout: Duration,
+        coordination_timeout: Duration,
+        observed_rtt: Option<Duration>,
+    ) -> Self {
+        self.apply_adaptive_timeouts(
+            connection_establishment_timeout,
+            coordination_timeout,
+            observed_rtt,
+        );
+        self
+    }
+
+    /// Mutate the strategy budgets using authoritative timeout owners plus an optional RTT hint.
+    pub fn apply_adaptive_timeouts(
+        &mut self,
+        connection_establishment_timeout: Duration,
+        coordination_timeout: Duration,
+        observed_rtt: Option<Duration>,
+    ) {
+        let rtt = observed_rtt.unwrap_or_else(default_expected_rtt);
+        let direct_ceiling = connection_establishment_timeout.max(Duration::from_millis(1));
+        let direct_floor = Duration::from_secs(1).min(direct_ceiling);
+        let multi_hop_ceiling = connection_establishment_timeout.max(coordination_timeout);
+        let multi_hop_floor = coordination_timeout.min(multi_hop_ceiling);
+
+        self.ipv4_timeout = clamp_duration(
+            scale_duration(rtt, 4).saturating_add(Duration::from_millis(750)),
+            direct_floor,
+            direct_ceiling,
+        );
+        self.ipv6_timeout = self.ipv4_timeout;
+        self.holepunch_timeout = clamp_duration(
+            scale_duration(rtt, 6).saturating_add(Duration::from_millis(1500)),
+            multi_hop_floor,
+            multi_hop_ceiling,
+        );
+        self.relay_timeout = clamp_duration(
+            scale_duration(rtt, 10).saturating_add(Duration::from_secs(2)),
+            multi_hop_floor,
+            multi_hop_ceiling,
+        );
     }
 
     /// Set the IPv4 timeout
@@ -256,6 +309,19 @@ impl StrategyConfig {
         self.relay_addrs = addrs;
         self
     }
+}
+
+fn default_expected_rtt() -> Duration {
+    crate::TransportConfig::default().initial_rtt
+}
+
+fn scale_duration(duration: Duration, multiplier: u32) -> Duration {
+    duration.checked_mul(multiplier).unwrap_or(Duration::MAX)
+}
+
+fn clamp_duration(value: Duration, floor: Duration, ceiling: Duration) -> Duration {
+    let ceiling = ceiling.max(floor);
+    value.max(floor).min(ceiling)
 }
 
 /// Connection strategy state machine
@@ -482,15 +548,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
+    fn test_default_config_uses_adaptive_stage_budgets() {
         let config = StrategyConfig::default();
-        assert_eq!(config.ipv4_timeout, Duration::from_secs(5));
-        assert_eq!(config.ipv6_timeout, Duration::from_secs(5));
-        assert_eq!(config.holepunch_timeout, Duration::from_secs(15));
-        assert_eq!(config.relay_timeout, Duration::from_secs(30));
+        let timeouts = crate::config::nat_timeouts::TimeoutConfig::default();
+
+        assert!(config.ipv4_timeout > Duration::ZERO);
+        assert_eq!(config.ipv4_timeout, config.ipv6_timeout);
+        assert!(
+            config.ipv4_timeout <= timeouts.nat_traversal.connection_establishment_timeout,
+            "direct stage must stay within the handshake budget"
+        );
+        assert_eq!(
+            config.holepunch_timeout, timeouts.nat_traversal.coordination_timeout,
+            "default hole-punch budget should align with authoritative coordination timeout"
+        );
+        assert_eq!(
+            config.relay_timeout, timeouts.nat_traversal.coordination_timeout,
+            "default relay budget should align with authoritative coordination timeout"
+        );
         assert_eq!(config.max_holepunch_rounds, 3);
         assert!(config.ipv6_enabled);
         assert!(config.relay_enabled);
+    }
+
+    #[test]
+    fn test_adaptive_timeouts_expand_for_high_rtt_and_respect_caps() {
+        let config = StrategyConfig::default().with_adaptive_timeouts(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Some(Duration::from_secs(3)),
+        );
+
+        assert!(config.ipv4_timeout > Duration::from_secs(10));
+        assert_eq!(config.ipv4_timeout, config.ipv6_timeout);
+        assert!(config.holepunch_timeout >= Duration::from_secs(19));
+        assert_eq!(
+            config.relay_timeout,
+            Duration::from_secs(30),
+            "relay budget must cap at the authoritative handshake timeout"
+        );
     }
 
     #[test]

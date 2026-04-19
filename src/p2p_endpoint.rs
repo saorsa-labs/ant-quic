@@ -233,6 +233,37 @@ fn extend_unique_socket_addrs(
     }
 }
 
+fn cached_peer_avg_rtt(peer: &CachedPeer) -> Option<Duration> {
+    (peer.stats.avg_rtt_ms > 0).then(|| Duration::from_millis(u64::from(peer.stats.avg_rtt_ms)))
+}
+
+fn cached_peer_matches_strategy_addr(peer: &CachedPeer, addr: SocketAddr) -> bool {
+    peer.addresses.contains(&addr)
+        || peer.preferred_addresses().contains(&addr)
+        || peer.capabilities.external_addresses.contains(&addr)
+        || peer
+            .capabilities
+            .reachable_addresses
+            .iter()
+            .any(|record| record.address == addr)
+}
+
+fn strategy_rtt_hint_from_cached_peers(
+    peers: &[CachedPeer],
+    addrs: &[SocketAddr],
+) -> Option<Duration> {
+    peers
+        .iter()
+        .filter(|peer| {
+            addrs
+                .iter()
+                .copied()
+                .any(|addr| cached_peer_matches_strategy_addr(peer, addr))
+        })
+        .filter_map(cached_peer_avg_rtt)
+        .max()
+}
+
 fn select_preferred_relay_target_addr(
     listener_addrs: &[SocketAddr],
     reachable_addrs: &[SocketAddr],
@@ -3140,6 +3171,41 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
+    async fn connection_strategy_rtt_hint(
+        &self,
+        peer_id: Option<PeerId>,
+        target_ipv4: Option<SocketAddr>,
+        target_ipv6: Option<SocketAddr>,
+        coordinator: Option<SocketAddr>,
+        relay_addrs: &[SocketAddr],
+    ) -> Option<Duration> {
+        let mut hints = Vec::new();
+
+        if let Some(peer_id) = peer_id
+            && let Some(cached_peer) = self.bootstrap_cache.get_peer(&peer_id).await
+            && let Some(rtt) = cached_peer_avg_rtt(&cached_peer)
+        {
+            hints.push(rtt);
+        }
+
+        let mut candidate_addrs = Vec::new();
+        extend_unique_socket_addrs(
+            &mut candidate_addrs,
+            [target_ipv4, target_ipv6].into_iter().flatten(),
+        );
+        extend_unique_socket_addrs(&mut candidate_addrs, coordinator);
+        extend_unique_socket_addrs(&mut candidate_addrs, relay_addrs.iter().copied());
+
+        if !candidate_addrs.is_empty() {
+            let peers = self.bootstrap_cache.all_peers().await;
+            if let Some(rtt) = strategy_rtt_hint_from_cached_peers(&peers, &candidate_addrs) {
+                hints.push(rtt);
+            }
+        }
+
+        hints.into_iter().max()
+    }
+
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
     pub async fn connect_with_fallback(
         &self,
@@ -3152,7 +3218,10 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Build strategy config with coordinator and relay from our config
+        // Build strategy config with coordinator and relay from our config.
+        // If the caller did not supply a custom strategy, derive stage budgets
+        // from authoritative timeout owners plus any RTT hints we have cached.
+        let custom_strategy_supplied = strategy_config.is_some();
         let mut config = strategy_config.unwrap_or_default();
         if config.coordinator.is_none() {
             config.coordinator = self.coordinator_candidates().await.into_iter().next();
@@ -3238,6 +3307,30 @@ impl P2pEndpoint {
                     config.relay_addrs.push(relay_addr);
                 }
             }
+        }
+
+        if !custom_strategy_supplied {
+            let rtt_hint = self
+                .connection_strategy_rtt_hint(
+                    peer_id,
+                    target_ipv4,
+                    target_ipv6,
+                    config.coordinator,
+                    &config.relay_addrs,
+                )
+                .await;
+            config.apply_adaptive_timeouts(
+                self.config
+                    .timeouts
+                    .nat_traversal
+                    .connection_establishment_timeout,
+                self.config.timeouts.nat_traversal.coordination_timeout,
+                rtt_hint,
+            );
+            debug!(
+                "Adaptive connection strategy budgets: direct={:?}, holepunch={:?}, relay={:?}, rtt_hint={:?}",
+                config.ipv4_timeout, config.holepunch_timeout, config.relay_timeout, rtt_hint
+            );
         }
 
         let mut strategy = ConnectionStrategy::new(config);
@@ -3426,9 +3519,17 @@ impl P2pEndpoint {
                     let target_peer_id =
                         peer_id.unwrap_or_else(|| peer_id_from_socket_addr(target));
 
+                    let holepunch_timeout = strategy.holepunch_timeout();
+                    let holepunch_deadline = tokio::time::Instant::now() + holepunch_timeout;
+
                     match timeout(
-                        strategy.holepunch_timeout(),
-                        self.try_hole_punch(target, coordinator, target_peer_id),
+                        holepunch_timeout,
+                        self.try_hole_punch(
+                            target,
+                            coordinator,
+                            target_peer_id,
+                            holepunch_deadline,
+                        ),
                     )
                     .await
                     {
@@ -3638,6 +3739,7 @@ impl P2pEndpoint {
         target: SocketAddr,
         coordinator: SocketAddr,
         peer_id: PeerId,
+        deadline: tokio::time::Instant,
     ) -> Result<PeerConnection, EndpointError> {
         // First ensure we're connected to the coordinator
         if !self.is_connected_to_addr(coordinator).await {
@@ -3650,9 +3752,7 @@ impl P2pEndpoint {
             .initiate_nat_traversal(peer_id, coordinator)
             .map_err(EndpointError::NatTraversal)?;
 
-        // Poll for completion with event-driven notification instead of sleep loop
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-
+        // Poll for completion with event-driven notification instead of sleep loops.
         loop {
             if self.shutdown.is_cancelled() {
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
@@ -6390,6 +6490,70 @@ mod tests {
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
     ) -> Vec<P2pEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn test_strategy_rtt_hint_from_cached_peers_prefers_slowest_matching_path() {
+        let direct_addr: SocketAddr = "203.0.113.10:9000".parse().expect("direct addr");
+        let relay_addr: SocketAddr = "198.51.100.20:9443".parse().expect("relay addr");
+        let now = std::time::SystemTime::UNIX_EPOCH;
+
+        let direct_peer = CachedPeer {
+            peer_id: PeerId([0x11; 32]),
+            addresses: vec![direct_addr],
+            capabilities: PeerCapabilities::default(),
+            first_seen: now,
+            last_seen: now,
+            last_attempt: None,
+            stats: crate::bootstrap_cache::ConnectionStats {
+                avg_rtt_ms: 120,
+                ..Default::default()
+            },
+            quality_score: 0.5,
+            source: PeerSource::Seed,
+            relay_paths: Vec::new(),
+            token: None,
+        };
+        let relay_peer = CachedPeer {
+            peer_id: PeerId([0x22; 32]),
+            addresses: vec![relay_addr],
+            capabilities: PeerCapabilities::default(),
+            first_seen: now,
+            last_seen: now,
+            last_attempt: None,
+            stats: crate::bootstrap_cache::ConnectionStats {
+                avg_rtt_ms: 480,
+                ..Default::default()
+            },
+            quality_score: 0.5,
+            source: PeerSource::Seed,
+            relay_paths: Vec::new(),
+            token: None,
+        };
+        let unrelated_peer = CachedPeer {
+            peer_id: PeerId([0x33; 32]),
+            addresses: vec!["192.0.2.99:9999".parse().expect("other addr")],
+            capabilities: PeerCapabilities::default(),
+            first_seen: now,
+            last_seen: now,
+            last_attempt: None,
+            stats: crate::bootstrap_cache::ConnectionStats {
+                avg_rtt_ms: 900,
+                ..Default::default()
+            },
+            quality_score: 0.5,
+            source: PeerSource::Seed,
+            relay_paths: Vec::new(),
+            token: None,
+        };
+
+        let hint = strategy_rtt_hint_from_cached_peers(
+            &[direct_peer, relay_peer, unrelated_peer],
+            &[direct_addr, relay_addr],
+        )
+        .expect("matching peers should yield an RTT hint");
+
+        assert_eq!(hint, Duration::from_millis(480));
     }
 
     #[test]
