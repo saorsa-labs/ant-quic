@@ -778,17 +778,21 @@ impl MasqueRelayServer {
                                 let err_str = e.to_string();
                                 if err_str.contains("too large") || err_str.contains("TooLarge") {
                                     // Skip oversized datagrams (e.g., jumbo UDP from scanners)
-                                    tracing::trace!(
+                                    tracing::warn!(
+                                        target: "ant_quic::silent_drop",
+                                        kind = "relay_oversized_datagram",
                                         session_id,
                                         len,
-                                        "Skipping oversized datagram for relay"
+                                        "skipping oversized datagram for relay"
                                     );
                                     continue;
                                 } else {
-                                    tracing::debug!(
+                                    tracing::warn!(
+                                        target: "ant_quic::silent_drop",
+                                        kind = "relay_send_datagram_fatal",
                                         session_id,
                                         error = %e,
-                                        "Fatal datagram send error, stopping UDP→QUIC"
+                                        "fatal datagram send error, stopping UDP→QUIC"
                                     );
                                     break;
                                 }

@@ -2454,11 +2454,21 @@ impl NatTraversalEndpoint {
                                     generation,
                                 });
                                 if let Some(ref tx) = relay_event_tx {
-                                    let _ = tx.send(NatTraversalEvent::ConnectionEstablished {
-                                        peer_id,
-                                        remote_address: remote,
-                                        side: Side::Server,
-                                    });
+                                    if let Err(e) =
+                                        tx.send(NatTraversalEvent::ConnectionEstablished {
+                                            peer_id,
+                                            remote_address: remote,
+                                            side: Side::Server,
+                                        })
+                                    {
+                                        tracing::warn!(
+                                            target: "ant_quic::silent_drop",
+                                            kind = "event_tx_relay_accept_established",
+                                            peer_id = ?peer_id,
+                                            error = %e,
+                                            "silent drop"
+                                        );
+                                    }
                                     traversal_event_notify.notify_waiters();
                                 }
                                 incoming_notify.notify_waiters();
@@ -5149,7 +5159,15 @@ impl NatTraversalEndpoint {
             .close_reason()
             .map(|reason| format!("Connection closed: {reason}"))
             .unwrap_or_else(|| "Connection closed".to_string());
-        let _ = event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason });
+        if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason }) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_connection_lost",
+                peer_id = ?peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
         traversal_event_notify.notify_waiters();
     }
 
@@ -5159,7 +5177,14 @@ impl NatTraversalEndpoint {
         traversal_event_notify: &Arc<tokio::sync::Notify>,
         event: NatTraversalEvent,
     ) {
-        let _ = event_tx.send(event.clone());
+        if let Err(e) = event_tx.send(event.clone()) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_emit_event",
+                error = %e,
+                "silent drop"
+            );
+        }
         if let Some(callback) = event_callback {
             callback(event);
         }
@@ -5247,11 +5272,20 @@ impl NatTraversalEndpoint {
                     .map(normalize_socket_addr)
                 {
                     if seen.insert(address) {
-                        let _ = observed_address_tx.send(ObservedAddressReport {
+                        if let Err(e) = observed_address_tx.send(ObservedAddressReport {
                             reporter_peer_id: peer_id,
                             reported_by,
                             address,
-                        });
+                        }) {
+                            tracing::warn!(
+                                target: "ant_quic::silent_drop",
+                                kind = "observed_address_tx",
+                                peer_id = ?peer_id,
+                                addr = ?address,
+                                error = %e,
+                                "silent drop"
+                            );
+                        }
                     }
                 }
 
@@ -5307,11 +5341,19 @@ impl NatTraversalEndpoint {
 
         // Send event notification (we initiated = Client side)
         if let Some(ref event_tx) = self.event_tx {
-            let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
+            if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 peer_id,
                 remote_address: remote_addr,
                 side: Side::Client,
-            });
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_connection_established_client",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
             self.incoming_notify.notify_one();
             self.traversal_event_notify.notify_waiters();
         }
@@ -6675,11 +6717,19 @@ impl NatTraversalEndpoint {
         let should_emit = self.emitted_established_events.insert(peer_id);
 
         if should_emit {
-            let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
+            if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 peer_id,
                 remote_address,
                 side,
-            });
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_connection_established_inner",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
             self.incoming_notify.notify_one();
             self.traversal_event_notify.notify_waiters();
         }
@@ -9225,7 +9275,15 @@ impl NatTraversalEndpoint {
                 remote_address: candidate_address,
                 side: Side::Client,
             };
-            let _ = event_tx.send(event.clone());
+            if let Err(e) = event_tx.send(event.clone()) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_emit_event_after_relay",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
             if let Some(callback) = event_callback {
                 callback(event);
             }

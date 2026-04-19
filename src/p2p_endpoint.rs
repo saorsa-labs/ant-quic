@@ -399,7 +399,15 @@ fn publish_direct_path_status(
     };
 
     if should_emit {
-        let _ = event_tx.send(P2pEvent::DirectPathStatus { peer_id, status });
+        if let Err(e) = event_tx.send(P2pEvent::DirectPathStatus { peer_id, status }) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_direct_path_status",
+                peer_id = ?peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
     }
 }
 
@@ -1370,12 +1378,20 @@ async fn record_connection_established(
     }
 
     if should_emit {
-        let _ = event_tx.send(P2pEvent::PeerConnected {
+        if let Err(e) = event_tx.send(P2pEvent::PeerConnected {
             peer_id: peer_conn.peer_id,
             addr: peer_conn.remote_addr.clone(),
             side: peer_conn.side,
             traversal_method: peer_conn.traversal_method,
-        });
+        }) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_peer_connected",
+                peer_id = ?peer_conn.peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
     }
 }
 
@@ -1398,10 +1414,18 @@ async fn remove_connected_peer(
             }
         }
 
-        let _ = event_tx.send(P2pEvent::PeerDisconnected {
+        if let Err(e) = event_tx.send(P2pEvent::PeerDisconnected {
             peer_id: *peer_id,
             reason,
-        });
+        }) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_peer_disconnected",
+                peer_id = ?peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
         true
     } else {
         false
@@ -1461,9 +1485,25 @@ fn emit_peer_lifecycle_event(
     peer_id: PeerId,
     event: PeerLifecycleEvent,
 ) {
-    let _ = peer_event_tx.send((peer_id, event.clone()));
+    if let Err(e) = peer_event_tx.send((peer_id, event.clone())) {
+        tracing::warn!(
+            target: "ant_quic::silent_drop",
+            kind = "peer_event_tx_lifecycle",
+            peer_id = ?peer_id,
+            error = %e,
+            "silent drop"
+        );
+    }
     if let Some(sender) = peer_event_channels.read().get(&peer_id).cloned() {
-        let _ = sender.send(event);
+        if let Err(e) = sender.send(event) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "per_peer_lifecycle_broadcast",
+                peer_id = ?peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
     }
 }
 
@@ -1499,7 +1539,14 @@ fn resolve_ack_waiter(
         sender
     };
     if let Some(tx) = tx {
-        let _ = tx.send(result);
+        if let Err(_dropped) = tx.send(result) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "ack_waiter_oneshot",
+                stable_id = stable_id,
+                "silent drop"
+            );
+        }
         true
     } else {
         false
@@ -1514,7 +1561,14 @@ fn fail_ack_waiters_for_connection(
     let waiters = ack_waiters.write().remove(&stable_id);
     if let Some(waiters) = waiters {
         for (_, tx) in waiters {
-            let _ = tx.send(AckWaiterResult::Closed(reason));
+            if let Err(_dropped) = tx.send(AckWaiterResult::Closed(reason)) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "ack_waiter_close_oneshot",
+                    stable_id = stable_id,
+                    "silent drop"
+                );
+            }
         }
     }
 }
@@ -1564,10 +1618,18 @@ async fn bridge_nat_traversal_event(
                 }
             };
             publish_direct_path_status(direct_path_statuses, event_tx, peer_id, status);
-            let _ = event_tx.send(P2pEvent::NatTraversalProgress {
+            if let Err(e) = event_tx.send(P2pEvent::NatTraversalProgress {
                 peer_id,
                 phase: TraversalPhase::Failed,
-            });
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_nat_progress_failed",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
         }
         NatTraversalEvent::PhaseTransition {
             peer_id, to_phase, ..
@@ -1580,16 +1642,32 @@ async fn bridge_nat_traversal_event(
                     DirectPathStatus::Pending,
                 );
             }
-            let _ = event_tx.send(P2pEvent::NatTraversalProgress {
+            if let Err(e) = event_tx.send(P2pEvent::NatTraversalProgress {
                 peer_id,
                 phase: to_phase,
-            });
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_nat_progress_phase",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
         }
         NatTraversalEvent::ExternalAddressDiscovered { address, .. } => {
             info!("External address discovered: {}", address);
-            let _ = event_tx.send(P2pEvent::ExternalAddressDiscovered {
+            if let Err(e) = event_tx.send(P2pEvent::ExternalAddressDiscovered {
                 addr: TransportAddr::Udp(address),
-            });
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_external_addr",
+                    addr = ?address,
+                    error = %e,
+                    "silent drop"
+                );
+            }
         }
         _ => {}
     }
@@ -2249,7 +2327,15 @@ impl P2pEndpoint {
 
     async fn refresh_runtime_known_peer_connections(&self) {
         for addr in self.runtime_known_peer_udp_addrs() {
-            let _ = self.connect_direct_addr(addr).await;
+            if let Err(e) = self.connect_direct_addr(addr).await {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "connect_direct_addr_drop",
+                    addr = ?addr,
+                    error = ?e,
+                    "silent drop"
+                );
+            }
         }
     }
 
@@ -2981,10 +3067,18 @@ impl P2pEndpoint {
         );
 
         // Broadcast progress
-        let _ = self.event_tx.send(P2pEvent::NatTraversalProgress {
+        if let Err(e) = self.event_tx.send(P2pEvent::NatTraversalProgress {
             peer_id,
             phase: TraversalPhase::Discovery,
-        });
+        }) {
+            tracing::warn!(
+                target: "ant_quic::silent_drop",
+                kind = "event_tx_nat_progress_discovery",
+                peer_id = ?peer_id,
+                error = %e,
+                "silent drop"
+            );
+        }
 
         // Initiate NAT traversal
         if let Err(e) = self.inner.initiate_nat_traversal(peer_id, coord_addr) {
@@ -4525,135 +4619,148 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, peer_id: &PeerId, data: &[u8]) -> Result<(), EndpointError> {
-        if self.shutdown.is_cancelled() {
-            return Err(EndpointError::ShuttingDown);
-        }
-
-        // Get peer's transport address to determine which engine/transport to use.
-        // Fall back to the canonical live QUIC connection if `connected_peers`
-        // lagged a lifecycle transition.
-        let transport_addr = {
-            let peer_info = self.connected_peers.read().await;
-            if let Some(conn) = peer_info.get(peer_id) {
-                conn.remote_addr.clone()
-            } else if let Some(connection) = self
-                .inner
-                .get_connection(peer_id)
-                .map_err(EndpointError::NatTraversal)?
-            {
-                TransportAddr::Udp(connection.remote_address())
-            } else {
-                return Err(EndpointError::PeerNotFound(*peer_id));
+        let peer_id_for_log = *peer_id;
+        let result: Result<(), EndpointError> = async {
+            if self.shutdown.is_cancelled() {
+                return Err(EndpointError::ShuttingDown);
             }
-        };
 
-        // Select protocol engine based on transport address
-        let engine = {
-            let mut router = self.router.write().await;
-            router.select_engine_for_addr(&transport_addr)
-        };
-
-        match engine {
-            crate::transport::ProtocolEngine::Quic => {
-                // Use existing QUIC connection (UDP transport)
-                let connection = self
+            // Get peer's transport address to determine which engine/transport to use.
+            // Fall back to the canonical live QUIC connection if `connected_peers`
+            // lagged a lifecycle transition.
+            let transport_addr = {
+                let peer_info = self.connected_peers.read().await;
+                if let Some(conn) = peer_info.get(peer_id) {
+                    conn.remote_addr.clone()
+                } else if let Some(connection) = self
                     .inner
                     .get_connection(peer_id)
                     .map_err(EndpointError::NatTraversal)?
-                    .ok_or(EndpointError::PeerNotFound(*peer_id))?;
-
-                if let Some(reason) = close_reason_from_connection(&connection) {
-                    return Err(EndpointError::ConnectionClosed { reason });
+                {
+                    TransportAddr::Udp(connection.remote_address())
+                } else {
+                    return Err(EndpointError::PeerNotFound(*peer_id));
                 }
+            };
 
-                let mut send_stream = connection
-                    .open_uni()
-                    .await
-                    .map_err(endpoint_error_from_connection_error)?;
+            // Select protocol engine based on transport address
+            let engine = {
+                let mut router = self.router.write().await;
+                router.select_engine_for_addr(&transport_addr)
+            };
 
-                send_stream
-                    .write_all(data)
-                    .await
-                    .map_err(endpoint_error_from_write_error)?;
+            match engine {
+                crate::transport::ProtocolEngine::Quic => {
+                    // Use existing QUIC connection (UDP transport)
+                    let connection = self
+                        .inner
+                        .get_connection(peer_id)
+                        .map_err(EndpointError::NatTraversal)?
+                        .ok_or(EndpointError::PeerNotFound(*peer_id))?;
 
-                send_stream.finish().map_err(|e| {
-                    close_reason_from_connection(&connection)
-                        .map(|reason| EndpointError::ConnectionClosed { reason })
-                        .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
-                })?;
-
-                // Fire-and-forget: `finish()` queues the FIN; QUIC transmits and ACKs
-                // it asynchronously. Do NOT wait on `send_stream.stopped()` here —
-                // Quinn's docs explicitly warn it is not a liveness primitive (it
-                // fires when the peer reads-to-completion or stops the stream, which
-                // can be arbitrarily delayed by asymmetric loss or peer congestion).
-                // Callers that need delivery confirmation should use
-                // `send_with_receive_ack`; callers that need active liveness should
-                // use `probe_peer`.
-                debug!("Sent {} bytes to peer {:?} via QUIC", data.len(), peer_id);
-            }
-            crate::transport::ProtocolEngine::Constrained => {
-                // Check if we have an established constrained connection for this peer
-                let maybe_conn_id = self
-                    .constrained_connections
-                    .read()
-                    .await
-                    .get(peer_id)
-                    .copied();
-
-                if let Some(conn_id) = maybe_conn_id {
-                    // Use ConstrainedEngine for reliable delivery
-                    let engine = self.inner.constrained_engine();
-                    let responses = {
-                        let mut engine = engine.lock();
-                        engine
-                            .send(conn_id, data)
-                            .map_err(|e| EndpointError::Connection(e.to_string()))?
-                    };
-
-                    // Send any packets generated by the constrained engine
-                    for (_dest_addr, packet_data) in responses {
-                        self.transport_registry
-                            .send(&packet_data, &transport_addr)
-                            .await
-                            .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                    if let Some(reason) = close_reason_from_connection(&connection) {
+                        return Err(EndpointError::ConnectionClosed { reason });
                     }
 
-                    debug!(
-                        "Sent {} bytes to peer {:?} via constrained engine ({})",
-                        data.len(),
-                        peer_id,
-                        transport_addr.transport_type()
-                    );
-                } else {
-                    // No established connection - send directly via transport
-                    // This path is used for initial connection or connectionless messages
-                    self.transport_registry
-                        .send(data, &transport_addr)
+                    let mut send_stream = connection
+                        .open_uni()
                         .await
-                        .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                        .map_err(endpoint_error_from_connection_error)?;
 
-                    debug!(
-                        "Sent {} bytes to peer {:?} via constrained transport (direct, {})",
-                        data.len(),
-                        peer_id,
-                        transport_addr.transport_type()
-                    );
+                    send_stream
+                        .write_all(data)
+                        .await
+                        .map_err(endpoint_error_from_write_error)?;
+
+                    send_stream.finish().map_err(|e| {
+                        close_reason_from_connection(&connection)
+                            .map(|reason| EndpointError::ConnectionClosed { reason })
+                            .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
+                    })?;
+
+                    // Fire-and-forget: `finish()` queues the FIN; QUIC transmits and ACKs
+                    // it asynchronously. Do NOT wait on `send_stream.stopped()` here —
+                    // Quinn's docs explicitly warn it is not a liveness primitive (it
+                    // fires when the peer reads-to-completion or stops the stream, which
+                    // can be arbitrarily delayed by asymmetric loss or peer congestion).
+                    // Callers that need delivery confirmation should use
+                    // `send_with_receive_ack`; callers that need active liveness should
+                    // use `probe_peer`.
+                    debug!("Sent {} bytes to peer {:?} via QUIC", data.len(), peer_id);
+                }
+                crate::transport::ProtocolEngine::Constrained => {
+                    // Check if we have an established constrained connection for this peer
+                    let maybe_conn_id = self
+                        .constrained_connections
+                        .read()
+                        .await
+                        .get(peer_id)
+                        .copied();
+
+                    if let Some(conn_id) = maybe_conn_id {
+                        // Use ConstrainedEngine for reliable delivery
+                        let engine = self.inner.constrained_engine();
+                        let responses = {
+                            let mut engine = engine.lock();
+                            engine
+                                .send(conn_id, data)
+                                .map_err(|e| EndpointError::Connection(e.to_string()))?
+                        };
+
+                        // Send any packets generated by the constrained engine
+                        for (_dest_addr, packet_data) in responses {
+                            self.transport_registry
+                                .send(&packet_data, &transport_addr)
+                                .await
+                                .map_err(|e| EndpointError::Connection(e.to_string()))?;
+                        }
+
+                        debug!(
+                            "Sent {} bytes to peer {:?} via constrained engine ({})",
+                            data.len(),
+                            peer_id,
+                            transport_addr.transport_type()
+                        );
+                    } else {
+                        // No established connection - send directly via transport
+                        // This path is used for initial connection or connectionless messages
+                        self.transport_registry
+                            .send(data, &transport_addr)
+                            .await
+                            .map_err(|e| EndpointError::Connection(e.to_string()))?;
+
+                        debug!(
+                            "Sent {} bytes to peer {:?} via constrained transport (direct, {})",
+                            data.len(),
+                            peer_id,
+                            transport_addr.transport_type()
+                        );
+                    }
                 }
             }
+
+            let now = Instant::now();
+            note_peer_activity(
+                &self.connected_peers,
+                &self.peer_activity,
+                *peer_id,
+                PeerActivityKind::Sent,
+                now,
+            )
+            .await;
+
+            Ok(())
         }
-
-        let now = Instant::now();
-        note_peer_activity(
-            &self.connected_peers,
-            &self.peer_activity,
-            *peer_id,
-            PeerActivityKind::Sent,
-            now,
-        )
         .await;
-
-        Ok(())
+        if let Err(ref e) = result {
+            tracing::warn!(
+                target: "ant_quic::send_error",
+                peer_id = ?peer_id_for_log,
+                error = %e,
+                "send failed"
+            );
+        }
+        result
     }
 
     /// Send data and wait until the remote ant-quic receive pipeline accepts it.
@@ -4737,12 +4844,19 @@ impl P2pEndpoint {
         .await;
 
         if let Err(error) = send_result {
-            let _ = resolve_ack_waiter(
+            if !resolve_ack_waiter(
                 self.ack_waiters.as_ref(),
                 stable_id,
                 tag,
                 AckWaiterResult::Closed(ConnectionCloseReason::LocallyClosed),
-            );
+            ) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "resolve_ack_waiter_miss",
+                    stable_id = stable_id,
+                    "no waiter for tag"
+                );
+            }
             return Err(error);
         }
 
@@ -4773,12 +4887,19 @@ impl P2pEndpoint {
                 }
             }
             Err(_) => {
-                let _ = resolve_ack_waiter(
+                if !resolve_ack_waiter(
                     self.ack_waiters.as_ref(),
                     stable_id,
                     tag,
                     AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
-                );
+                ) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "resolve_ack_waiter_miss",
+                        stable_id = stable_id,
+                        "no waiter for tag"
+                    );
+                }
                 Err(EndpointError::AckTimeout)
             }
         }
@@ -4887,12 +5008,19 @@ impl P2pEndpoint {
         .await;
 
         if let Err(error) = send_result {
-            let _ = resolve_ack_waiter(
+            if !resolve_ack_waiter(
                 self.ack_waiters.as_ref(),
                 stable_id,
                 tag,
                 AckWaiterResult::Closed(ConnectionCloseReason::LocallyClosed),
-            );
+            ) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "resolve_ack_waiter_miss",
+                    stable_id = stable_id,
+                    "no waiter for tag"
+                );
+            }
             return Err(error);
         }
 
@@ -4923,12 +5051,19 @@ impl P2pEndpoint {
                 }
             }
             Err(_) => {
-                let _ = resolve_ack_waiter(
+                if !resolve_ack_waiter(
                     self.ack_waiters.as_ref(),
                     stable_id,
                     tag,
                     AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
-                );
+                ) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "resolve_ack_waiter_miss",
+                        stable_id = stable_id,
+                        "no waiter for tag"
+                    );
+                }
                 Err(EndpointError::ProbeTimeout)
             }
         }
@@ -4971,11 +5106,20 @@ impl P2pEndpoint {
                 )
                 .await;
 
-                // Emit DataReceived event
-                let _ = self.event_tx.send(P2pEvent::DataReceived {
+                // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+                if let Err(e) = self.event_tx.send(P2pEvent::DataReceived {
                     peer_id,
                     bytes: data_len,
-                });
+                }) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "event_tx_data_received",
+                        peer_id = ?peer_id,
+                        bytes = data_len,
+                        error = %e,
+                        "HIGH: silent drop"
+                    );
+                }
 
                 return Ok((peer_id, data));
             }
@@ -5222,19 +5366,23 @@ impl P2pEndpoint {
                 .unwrap_or(AutoConnectPolicy::Disabled);
             if !mdns_policy.allows_automatic_dial() {
                 if mdns_policy.requires_approval() {
-                    let _ = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
+                    if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
                         peer: peer.clone(),
                         reason: "approval required by discovery policy".to_string(),
-                    });
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_approval_required", error = %e, "silent drop");
+                    }
                 }
                 continue;
             }
 
             if let Err(reason) = self.discovered_peer_allowed(peer.claimed_peer_id) {
-                let _ = self.event_tx.send(P2pEvent::MdnsPeerIneligible {
+                if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerIneligible {
                     peer: peer.clone(),
                     reason,
-                });
+                }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_ineligible", error = %e, "silent drop");
+                }
                 continue;
             }
 
@@ -5556,23 +5704,31 @@ impl P2pEndpoint {
                     snapshot.namespace = namespace.clone();
                     snapshot.advertised_instance_fullname = Some(instance_fullname.clone());
                 }
-                let _ = self.event_tx.send(P2pEvent::MdnsServiceAdvertised {
+                if let Err(e) = self.event_tx.send(P2pEvent::MdnsServiceAdvertised {
                     service,
                     namespace,
                     instance_fullname,
-                });
+                }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_service_advertised", error = %e, "silent drop");
+                }
             }
             MdnsRuntimeEvent::PeerDiscovered(peer) => {
                 self.upsert_mdns_peer(&peer);
-                let _ = self.event_tx.send(P2pEvent::MdnsPeerDiscovered { peer });
+                if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerDiscovered { peer }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_peer_discovered", error = %e, "silent drop");
+                }
             }
             MdnsRuntimeEvent::PeerUpdated(peer) => {
                 self.upsert_mdns_peer(&peer);
-                let _ = self.event_tx.send(P2pEvent::MdnsPeerUpdated { peer });
+                if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerUpdated { peer }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_peer_updated", error = %e, "silent drop");
+                }
             }
             MdnsRuntimeEvent::PeerRemoved(peer) => {
                 self.remove_mdns_peer(&peer.fullname);
-                let _ = self.event_tx.send(P2pEvent::MdnsPeerRemoved { peer });
+                if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerRemoved { peer }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_peer_removed", error = %e, "silent drop");
+                }
             }
             MdnsRuntimeEvent::PeerEligible(peer) => {
                 self.upsert_mdns_peer(&peer);
@@ -5587,10 +5743,12 @@ impl P2pEndpoint {
                     .map(|mdns| mdns.auto_connect)
                     .unwrap_or(AutoConnectPolicy::Disabled);
                 if mdns_policy.requires_approval() {
-                    let _ = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
+                    if let Err(e) = self.event_tx.send(P2pEvent::MdnsPeerApprovalRequired {
                         peer,
                         reason: "approval required by discovery policy".to_string(),
-                    });
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_approval_required", error = %e, "silent drop");
+                    }
                 } else if self.mdns_auto_connect_enabled() {
                     self.schedule_mdns_auto_connect(peer);
                 }
@@ -5656,25 +5814,31 @@ impl P2pEndpoint {
                 .await
                 .is_none()
             {
-                let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectAttempted {
+                if let Err(e) = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectAttempted {
                     peer: peer.clone(),
                     addresses: addresses.clone(),
-                });
+                }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_auto_connect_attempted", error = %e, "silent drop");
+                }
 
                 match endpoint.connect_orchestrated(None, addresses.clone()).await {
                     Ok(connection) => {
-                        let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectSucceeded {
+                        if let Err(e) = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectSucceeded {
                             peer,
                             authenticated_peer_id: connection.peer_id,
                             remote_addr: connection.remote_addr,
-                        });
+                        }) {
+                            tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_auto_connect_succeeded", error = %e, "silent drop");
+                        }
                     }
                     Err(error) => {
-                        let _ = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectFailed {
+                        if let Err(e) = endpoint.event_tx.send(P2pEvent::MdnsAutoConnectFailed {
                             peer,
                             addresses,
                             error: error.to_string(),
-                        });
+                        }) {
+                            tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_mdns_auto_connect_failed", error = %e, "silent drop");
+                        }
                     }
                 }
             }
@@ -5691,33 +5855,46 @@ impl P2pEndpoint {
             PortMappingEvent::Established { snapshot } => {
                 self.apply_port_mapping_snapshot(snapshot);
                 if let Some(mapped_addr) = snapshot.external_addr {
-                    let _ = self.event_tx.send(P2pEvent::PortMappingEstablished {
+                    if let Err(e) = self.event_tx.send(P2pEvent::PortMappingEstablished {
                         external_addr: mapped_addr,
-                    });
-                    let _ = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_port_mapping_established", error = %e, "silent drop");
+                    }
+                    if let Err(e) = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
                         addr: TransportAddr::Udp(mapped_addr),
-                    });
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_external_addr", error = %e, "silent drop");
+                    }
                 }
             }
             PortMappingEvent::Renewed { snapshot } => {
                 self.apply_port_mapping_snapshot(snapshot);
                 if let Some(mapped_addr) = snapshot.external_addr {
-                    let _ = self.event_tx.send(P2pEvent::PortMappingRenewed {
+                    if let Err(e) = self.event_tx.send(P2pEvent::PortMappingRenewed {
                         external_addr: mapped_addr,
-                    });
-                    let _ = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_port_mapping_renewed", error = %e, "silent drop");
+                    }
+                    if let Err(e) = self.event_tx.send(P2pEvent::ExternalAddressDiscovered {
                         addr: TransportAddr::Udp(mapped_addr),
-                    });
+                    }) {
+                        tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_external_addr", error = %e, "silent drop");
+                    }
                 }
             }
             PortMappingEvent::Failed { error } => {
-                let _ = self.event_tx.send(P2pEvent::PortMappingFailed { error });
+                if let Err(e) = self.event_tx.send(P2pEvent::PortMappingFailed { error }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_port_mapping_failed", error = %e, "silent drop");
+                }
             }
             PortMappingEvent::Removed { external_addr } => {
                 self.apply_port_mapping_snapshot(PortMappingSnapshot::default());
-                let _ = self
+                if let Err(e) = self
                     .event_tx
-                    .send(P2pEvent::PortMappingRemoved { external_addr });
+                    .send(P2pEvent::PortMappingRemoved { external_addr })
+                {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_port_mapping_removed", error = %e, "silent drop");
+                }
             }
         }
     }
@@ -5738,10 +5915,12 @@ impl P2pEndpoint {
         {
             let _ = self.inner.remove_local_external_candidate(previous_addr);
             if let Some(mapped_addr) = snapshot.external_addr {
-                let _ = self.event_tx.send(P2pEvent::PortMappingAddressChanged {
+                if let Err(e) = self.event_tx.send(P2pEvent::PortMappingAddressChanged {
                     previous_addr,
                     external_addr: mapped_addr,
-                });
+                }) {
+                    tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_port_mapping_addr_changed", error = %e, "silent drop");
+                }
             }
         }
 
@@ -5950,11 +6129,20 @@ impl P2pEndpoint {
                 )
                 .await;
 
-                // Emit DataReceived event
-                let _ = event_tx.send(P2pEvent::DataReceived {
+                // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
                     peer_id,
                     bytes: payload_len,
-                });
+                }) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "event_tx_data_received_reader",
+                        peer_id = ?peer_id,
+                        bytes = payload_len,
+                        error = %e,
+                        "HIGH: silent drop"
+                    );
+                }
 
                 // Send through channel; if the receiver is dropped, exit
                 if data_tx.send((peer_id, payload)).await.is_err() {
@@ -6039,10 +6227,12 @@ impl P2pEndpoint {
             );
         }
 
-        let _ = event_tx.send(P2pEvent::PeerAddressUpdated {
+        if let Err(e) = event_tx.send(P2pEvent::PeerAddressUpdated {
             peer_addr,
             advertised_addr,
-        });
+        }) {
+            tracing::warn!(target: "ant_quic::silent_drop", kind = "event_tx_peer_addr_updated", error = %e, "silent drop");
+        }
     }
 
     fn spawn_peer_address_update_poller(&self) {
@@ -6180,10 +6370,19 @@ impl P2pEndpoint {
                             now,
                         )
                         .await;
-                        let _ = event_tx.send(P2pEvent::DataReceived {
+                        if let Err(e) = event_tx.send(P2pEvent::DataReceived {
                             peer_id,
                             bytes: data_len,
-                        });
+                        }) {
+                            tracing::warn!(
+                                target: "ant_quic::silent_drop",
+                                kind = "event_tx_data_received_reader",
+                                peer_id = ?peer_id,
+                                bytes = data_len,
+                                error = %e,
+                                "HIGH: silent drop"
+                            );
+                        }
 
                         if data_tx.send((peer_id, data)).await.is_err() {
                             debug!("Constrained poller: channel closed, exiting");
