@@ -85,7 +85,7 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
-    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
+    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId, TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effort_port_mapping};
@@ -1231,6 +1231,43 @@ pub enum EndpointError {
     /// No target address provided
     #[error("No target address provided")]
     NoAddress,
+}
+
+#[derive(Debug)]
+enum HolePunchAwaitError {
+    TraversalFailure(TraversalFailureReason),
+    Endpoint(EndpointError),
+}
+
+impl HolePunchAwaitError {
+    fn retry_reason(&self) -> Option<&TraversalFailureReason> {
+        match self {
+            Self::TraversalFailure(reason) => Some(reason),
+            Self::Endpoint(_) => None,
+        }
+    }
+
+    fn from_nat_traversal_error(error: NatTraversalError) -> Self {
+        match P2pEndpoint::traversal_failure_reason_from_nat_error(&error) {
+            Some(reason) => Self::TraversalFailure(reason),
+            None => Self::Endpoint(EndpointError::NatTraversal(error)),
+        }
+    }
+}
+
+impl std::fmt::Display for HolePunchAwaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TraversalFailure(reason) => {
+                write!(
+                    f,
+                    "{}",
+                    P2pEndpoint::endpoint_error_from_traversal_failure(reason.clone())
+                )
+            }
+            Self::Endpoint(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 /// Shared cleanup logic for removing a peer from all tracking structures.
@@ -3509,6 +3546,12 @@ impl P2pEndpoint {
         }
 
         let mut strategy = ConnectionStrategy::new(config);
+        let overall_deadline = tokio::time::Instant::now()
+            + self
+                .config
+                .timeouts
+                .nat_traversal
+                .connection_establishment_timeout;
 
         info!(
             "Starting fallback connection: IPv4={:?}, IPv6={:?} (PeerId: {:?})",
@@ -3694,42 +3737,57 @@ impl P2pEndpoint {
                     let target_peer_id =
                         peer_id.unwrap_or_else(|| peer_id_from_socket_addr(target));
 
-                    let holepunch_timeout = strategy.holepunch_timeout();
-                    let holepunch_deadline = tokio::time::Instant::now() + holepunch_timeout;
-
-                    match timeout(
-                        holepunch_timeout,
-                        self.try_hole_punch(
-                            target,
-                            coordinator,
-                            target_peer_id,
-                            holepunch_deadline,
-                        ),
-                    )
-                    .await
+                    match self
+                        .start_hole_punch_session(target, coordinator, target_peer_id)
+                        .await
                     {
-                        Ok(Ok(conn)) => {
-                            info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
-                            return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
-                        }
-                        Ok(Err(e)) => {
-                            strategy.record_holepunch_error(round, e.to_string());
-                            if strategy.should_retry_holepunch() {
-                                debug!("Hole-punch round {} failed, retrying", round);
-                                strategy.increment_round();
-                            } else {
-                                debug!("Hole-punch failed after {} rounds", round);
-                                strategy.transition_to_relay(e.to_string());
+                        Ok(()) => match self
+                            .await_hole_punch_outcome(target, target_peer_id, overall_deadline)
+                            .await
+                        {
+                            Ok(conn) => {
+                                info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
+                                return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                             }
-                        }
-                        Err(_) => {
-                            strategy.record_holepunch_error(round, "Timeout".to_string());
-                            if strategy.should_retry_holepunch() {
-                                debug!("Hole-punch round {} timed out, retrying", round);
+                            Err(error) => {
+                                let retryable = strategy.should_retry_holepunch()
+                                    && error
+                                        .retry_reason()
+                                        .is_some_and(Self::should_retry_hole_punch_reason);
+                                let error_text = error.to_string();
+
+                                strategy.record_holepunch_error(round, error_text.clone());
+                                if retryable {
+                                    debug!(
+                                        "Hole-punch round {} failed with retryable reason, retrying",
+                                        round
+                                    );
+                                    strategy.increment_round();
+                                } else {
+                                    debug!("Hole-punch failed after {} rounds", round);
+                                    strategy.transition_to_relay(error_text);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            let retryable = strategy.should_retry_holepunch()
+                                && match &e {
+                                    EndpointError::NatTraversal(error) => {
+                                        Self::traversal_failure_reason_from_nat_error(error)
+                                            .as_ref()
+                                            .is_some_and(Self::should_retry_hole_punch_reason)
+                                    }
+                                    _ => false,
+                                };
+                            let error_text = e.to_string();
+
+                            strategy.record_holepunch_error(round, error_text.clone());
+                            if retryable {
+                                debug!("Hole-punch round {} failed to start, retrying", round);
                                 strategy.increment_round();
                             } else {
-                                debug!("Hole-punch timed out after {} rounds", round);
-                                strategy.transition_to_relay("Timeout");
+                                debug!("Hole-punch failed to start after {} rounds", round);
+                                strategy.transition_to_relay(error_text);
                             }
                         }
                     }
@@ -3908,51 +3966,57 @@ impl P2pEndpoint {
         Ok(peer_conn)
     }
 
-    /// Internal helper for hole-punch attempt
-    async fn try_hole_punch(
+    async fn start_hole_punch_session(
         &self,
-        target: SocketAddr,
+        _target: SocketAddr,
         coordinator: SocketAddr,
         peer_id: PeerId,
-        deadline: tokio::time::Instant,
-    ) -> Result<PeerConnection, EndpointError> {
-        // First ensure we're connected to the coordinator
+    ) -> Result<(), EndpointError> {
         if !self.is_connected_to_addr(coordinator).await {
             debug!("Connecting to coordinator {} first", coordinator);
             self.connect_direct_addr(coordinator).await?;
         }
 
-        // Initiate NAT traversal
         self.inner
             .initiate_nat_traversal(peer_id, coordinator)
-            .map_err(EndpointError::NatTraversal)?;
+            .map_err(EndpointError::NatTraversal)
+    }
 
-        // Poll for completion with event-driven notification instead of sleep loops.
+    async fn await_hole_punch_outcome(
+        &self,
+        target: SocketAddr,
+        peer_id: PeerId,
+        overall_deadline: tokio::time::Instant,
+    ) -> Result<PeerConnection, HolePunchAwaitError> {
         loop {
             if self.shutdown.is_cancelled() {
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
-                return Err(EndpointError::ShuttingDown);
+                return Err(HolePunchAwaitError::Endpoint(EndpointError::ShuttingDown));
+            }
+
+            if tokio::time::Instant::now() >= overall_deadline {
+                let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                return Err(HolePunchAwaitError::Endpoint(EndpointError::Timeout));
             }
 
             let events = self
                 .inner
                 .poll(Instant::now())
-                .map_err(EndpointError::NatTraversal)?;
+                .map_err(HolePunchAwaitError::from_nat_traversal_error)?;
 
             if let Some(rejection) = take_live_rejection(self.inner.local_peer_id(), peer_id) {
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
-                return Err(EndpointError::NatTraversal(
-                    NatTraversalError::CoordinationFailed(format!(
-                        "coordination rejected: {:?}",
-                        rejection.reason
-                    )),
+                return Err(HolePunchAwaitError::TraversalFailure(
+                    TraversalFailureReason::CoordinationRejected {
+                        reason: rejection.reason,
+                    },
                 ));
             }
 
             let had_events = !events.is_empty();
             for event in events {
                 info!(
-                    "try_hole_punch polled event for target {:?}: {:?}",
+                    "await_hole_punch_outcome polled event for target {:?}: {:?}",
                     peer_id, event
                 );
                 match event {
@@ -3962,11 +4026,6 @@ impl P2pEndpoint {
                         side,
                         ..
                     } if evt_peer == peer_id || remote_address == target => {
-                        // Register peer ID at the low-level endpoint so local
-                        // hole-punch session handling can map authenticated
-                        // connections back to peer identity. This is local routing
-                        // context, not a guarantee that RFC PUNCH_ME_NOW preserves
-                        // peer ID end-to-end on the wire.
                         self.inner
                             .register_connection_peer_id(remote_address, evt_peer);
 
@@ -3980,8 +4039,6 @@ impl P2pEndpoint {
                             last_activity: Instant::now(),
                         };
 
-                        // Spawn background reader task BEFORE storing in connected_peers
-                        // to prevent race where recv() misses early data
                         if let Some(conn) = self
                             .inner
                             .get_connection_by_authenticated_peer(evt_peer)
@@ -4000,13 +4057,66 @@ impl P2pEndpoint {
                         let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
                         return Ok(peer_conn);
                     }
+                    NatTraversalEvent::TraversalSucceeded {
+                        peer_id: evt_peer, ..
+                    } if evt_peer == peer_id => {
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(peer_id)
+                            .await
+                            .or_else(|| self.inner.session_connection(peer_id))
+                        {
+                            let remote_address = conn.remote_address();
+                            let side = conn.side();
+                            self.inner
+                                .register_connection_peer_id(remote_address, peer_id);
+
+                            let peer_conn = PeerConnection {
+                                peer_id,
+                                remote_addr: TransportAddr::Udp(remote_address),
+                                traversal_method: TraversalMethod::HolePunch,
+                                side,
+                                authenticated: true,
+                                connected_at: Instant::now(),
+                                last_activity: Instant::now(),
+                            };
+
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(peer_id, conn).await;
+                            });
+
+                            self.observe_peer_reachability(&peer_conn);
+                            self.register_connected_peer(peer_conn.clone()).await;
+                            let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                            return Ok(peer_conn);
+                        }
+                    }
+                    NatTraversalEvent::TraversalTerminated {
+                        peer_id: evt_peer,
+                        reason,
+                        ..
+                    } if evt_peer == peer_id => {
+                        let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                        return Err(HolePunchAwaitError::TraversalFailure(reason));
+                    }
+                    NatTraversalEvent::CoordinationRejected {
+                        peer_id: evt_peer,
+                        reason,
+                        ..
+                    } if evt_peer == peer_id => {
+                        let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
+                        return Err(HolePunchAwaitError::TraversalFailure(
+                            TraversalFailureReason::CoordinationRejected { reason },
+                        ));
+                    }
                     NatTraversalEvent::TraversalFailed {
                         peer_id: evt_peer,
                         error,
                         ..
                     } if evt_peer == peer_id => {
                         let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
-                        return Err(EndpointError::NatTraversal(error));
+                        return Err(HolePunchAwaitError::from_nat_traversal_error(error));
                     }
                     _ => {}
                 }
@@ -4019,7 +4129,7 @@ impl P2pEndpoint {
                 .or_else(|| self.inner.session_connection(peer_id))
             {
                 info!(
-                    "try_hole_punch observed existing inner connection for peer {:?}; finalizing",
+                    "await_hole_punch_outcome observed existing inner connection for peer {:?}; finalizing",
                     peer_id
                 );
                 let remote_address = conn.remote_address();
@@ -4054,15 +4164,14 @@ impl P2pEndpoint {
                 continue;
             }
 
-            match self.wait_for_traversal_progress(peer_id, deadline).await {
+            match self
+                .wait_for_traversal_progress(peer_id, overall_deadline)
+                .await
+            {
                 Ok(()) => {}
-                Err(error @ EndpointError::ShuttingDown) | Err(error @ EndpointError::Timeout) => {
-                    let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
-                    return Err(error);
-                }
                 Err(error) => {
                     let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
-                    return Err(error);
+                    return Err(HolePunchAwaitError::Endpoint(error));
                 }
             }
         }
@@ -4093,6 +4202,94 @@ impl P2pEndpoint {
                 }
             }
             _ = self.shutdown.cancelled() => Err(EndpointError::ShuttingDown),
+        }
+    }
+
+    fn should_retry_hole_punch_reason(reason: &TraversalFailureReason) -> bool {
+        match reason {
+            TraversalFailureReason::CoordinatorUnavailable
+            | TraversalFailureReason::CoordinationExpired
+            | TraversalFailureReason::PunchWindowMissed
+            | TraversalFailureReason::ValidationTimedOut
+            | TraversalFailureReason::NetworkError(_) => true,
+            TraversalFailureReason::DiscoveryExhausted
+            | TraversalFailureReason::CoordinationRejected { .. }
+            | TraversalFailureReason::SynchronizationExpired
+            | TraversalFailureReason::ValidationFailed
+            | TraversalFailureReason::ConnectionFailed
+            | TraversalFailureReason::ProtocolViolation(_)
+            | TraversalFailureReason::ShuttingDown => false,
+        }
+    }
+
+    fn traversal_failure_reason_from_nat_error(
+        error: &NatTraversalError,
+    ) -> Option<TraversalFailureReason> {
+        match error {
+            NatTraversalError::NoBootstrapNodes => {
+                Some(TraversalFailureReason::CoordinatorUnavailable)
+            }
+            NatTraversalError::NoCandidatesFound
+            | NatTraversalError::CandidateDiscoveryFailed(_) => {
+                Some(TraversalFailureReason::DiscoveryExhausted)
+            }
+            NatTraversalError::CoordinationFailed(message) => {
+                Some(TraversalFailureReason::NetworkError(message.clone()))
+            }
+            NatTraversalError::HolePunchingFailed | NatTraversalError::PunchingFailed(_) => {
+                Some(TraversalFailureReason::PunchWindowMissed)
+            }
+            NatTraversalError::ValidationTimeout => {
+                Some(TraversalFailureReason::ValidationTimedOut)
+            }
+            NatTraversalError::ValidationFailed(_) => {
+                Some(TraversalFailureReason::ValidationFailed)
+            }
+            NatTraversalError::Timeout => Some(TraversalFailureReason::NetworkError(
+                "overall hole-punch deadline expired".to_string(),
+            )),
+            NatTraversalError::ConnectionFailed(_) | NatTraversalError::PeerNotConnected => {
+                Some(TraversalFailureReason::ConnectionFailed)
+            }
+            NatTraversalError::ProtocolError(message)
+            | NatTraversalError::ConfigError(message)
+            | NatTraversalError::TraversalFailed(message) => {
+                Some(TraversalFailureReason::ProtocolViolation(message.clone()))
+            }
+            NatTraversalError::NetworkError(message) => {
+                Some(TraversalFailureReason::NetworkError(message.clone()))
+            }
+        }
+    }
+
+    fn endpoint_error_from_traversal_failure(reason: TraversalFailureReason) -> EndpointError {
+        match reason {
+            TraversalFailureReason::CoordinatorUnavailable => {
+                EndpointError::NatTraversal(NatTraversalError::NoBootstrapNodes)
+            }
+            TraversalFailureReason::DiscoveryExhausted => {
+                EndpointError::NatTraversal(NatTraversalError::NoCandidatesFound)
+            }
+            TraversalFailureReason::CoordinationRejected { reason } => EndpointError::NatTraversal(
+                NatTraversalError::CoordinationFailed(format!("coordination rejected: {reason:?}")),
+            ),
+            TraversalFailureReason::CoordinationExpired
+            | TraversalFailureReason::SynchronizationExpired
+            | TraversalFailureReason::PunchWindowMissed
+            | TraversalFailureReason::ValidationTimedOut => EndpointError::Timeout,
+            TraversalFailureReason::ValidationFailed => EndpointError::NatTraversal(
+                NatTraversalError::ValidationFailed("traversal validation failed".to_string()),
+            ),
+            TraversalFailureReason::ConnectionFailed => EndpointError::NatTraversal(
+                NatTraversalError::ConnectionFailed("hole-punch connection failed".to_string()),
+            ),
+            TraversalFailureReason::ProtocolViolation(message) => {
+                EndpointError::NatTraversal(NatTraversalError::ProtocolError(message))
+            }
+            TraversalFailureReason::NetworkError(message) => {
+                EndpointError::NatTraversal(NatTraversalError::NetworkError(message))
+            }
+            TraversalFailureReason::ShuttingDown => EndpointError::ShuttingDown,
         }
     }
 
@@ -6765,6 +6962,7 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator_control::RejectionReason;
 
     fn collect_broadcast_events(
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
@@ -7160,6 +7358,100 @@ mod tests {
             }
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_should_retry_hole_punch_reason_distinguishes_retryable_and_terminal_reasons() {
+        assert!(P2pEndpoint::should_retry_hole_punch_reason(
+            &TraversalFailureReason::CoordinatorUnavailable
+        ));
+        assert!(P2pEndpoint::should_retry_hole_punch_reason(
+            &TraversalFailureReason::NetworkError("transient".to_string())
+        ));
+        assert!(!P2pEndpoint::should_retry_hole_punch_reason(
+            &TraversalFailureReason::CoordinationRejected {
+                reason: RejectionReason::RateLimited,
+            }
+        ));
+        assert!(!P2pEndpoint::should_retry_hole_punch_reason(
+            &TraversalFailureReason::ProtocolViolation("bad state".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_traversal_failure_reason_from_nat_error_maps_representative_hole_punch_failures() {
+        assert!(matches!(
+            P2pEndpoint::traversal_failure_reason_from_nat_error(
+                &NatTraversalError::NoBootstrapNodes
+            ),
+            Some(TraversalFailureReason::CoordinatorUnavailable)
+        ));
+        assert!(matches!(
+            P2pEndpoint::traversal_failure_reason_from_nat_error(
+                &NatTraversalError::HolePunchingFailed
+            ),
+            Some(TraversalFailureReason::PunchWindowMissed)
+        ));
+        assert!(matches!(
+            P2pEndpoint::traversal_failure_reason_from_nat_error(&NatTraversalError::ProtocolError(
+                "malformed".to_string()
+            )),
+            Some(TraversalFailureReason::ProtocolViolation(message)) if message == "malformed"
+        ));
+    }
+
+    #[test]
+    fn test_endpoint_error_from_traversal_failure_maps_typed_terminal_outcome() {
+        let error = P2pEndpoint::endpoint_error_from_traversal_failure(
+            TraversalFailureReason::CoordinationRejected {
+                reason: RejectionReason::Expired,
+            },
+        );
+
+        assert!(matches!(
+            error,
+            EndpointError::NatTraversal(NatTraversalError::CoordinationFailed(message))
+                if message.contains("Expired")
+        ));
+    }
+
+    #[test]
+    fn test_hole_punch_await_error_preserves_typed_retry_classification() {
+        let rejected =
+            HolePunchAwaitError::TraversalFailure(TraversalFailureReason::CoordinationRejected {
+                reason: RejectionReason::RateLimited,
+            });
+        assert!(matches!(
+            rejected.retry_reason(),
+            Some(TraversalFailureReason::CoordinationRejected {
+                reason: RejectionReason::RateLimited,
+            })
+        ));
+        assert!(
+            !rejected
+                .retry_reason()
+                .is_some_and(P2pEndpoint::should_retry_hole_punch_reason)
+        );
+
+        let sync_expired =
+            HolePunchAwaitError::TraversalFailure(TraversalFailureReason::SynchronizationExpired);
+        assert!(matches!(
+            sync_expired.retry_reason(),
+            Some(TraversalFailureReason::SynchronizationExpired)
+        ));
+        assert!(
+            !sync_expired
+                .retry_reason()
+                .is_some_and(P2pEndpoint::should_retry_hole_punch_reason)
+        );
+
+        let punch_missed =
+            HolePunchAwaitError::TraversalFailure(TraversalFailureReason::PunchWindowMissed);
+        assert!(
+            punch_missed
+                .retry_reason()
+                .is_some_and(P2pEndpoint::should_retry_hole_punch_reason)
+        );
     }
 
     #[tokio::test]
