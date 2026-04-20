@@ -1176,6 +1176,37 @@ pub enum NatTraversalEvent {
         /// Whether fallback mechanisms are available
         fallback_available: bool,
     },
+    /// Typed traversal progress event emitted alongside legacy phase transitions.
+    TraversalProgress {
+        peer_id: PeerId,
+        phase: TraversalPhase,
+        deadline: Option<std::time::Instant>,
+    },
+    /// Typed coordinator rejection event emitted alongside existing rejection handling.
+    CoordinationRejected {
+        peer_id: PeerId,
+        coordinator: SocketAddr,
+        reason: crate::coordinator_control::RejectionReason,
+    },
+    /// Retry was scheduled for a classified traversal failure.
+    RetryScheduled {
+        peer_id: PeerId,
+        attempt: u32,
+        retry_at: std::time::Instant,
+        reason: TraversalFailureReason,
+    },
+    /// Traversal stalled waiting for progress before a deadline expired.
+    TraversalStalled {
+        peer_id: PeerId,
+        phase: TraversalPhase,
+        deadline_kind: TraversalDeadlineKind,
+    },
+    /// Typed terminal traversal outcome emitted alongside legacy TraversalFailed.
+    TraversalTerminated {
+        peer_id: PeerId,
+        reason: TraversalFailureReason,
+        fallback_available: bool,
+    },
     /// Connection lost
     ConnectionLost {
         /// The peer this event relates to
@@ -4001,8 +4032,39 @@ impl NatTraversalEndpoint {
                         Some(from_peer_id),
                         *reason,
                     );
+                    let coordinator = live
+                        .expected_coordinator
+                        .and_then(|peer_id| {
+                            self.connections
+                                .get(&peer_id)
+                                .map(|entry| entry.remote_address())
+                        })
+                        .unwrap_or_else(|| {
+                            self.connections
+                                .get(&from_peer_id)
+                                .map(|entry| entry.remote_address())
+                                .unwrap_or_else(create_random_port_bind_addr)
+                        });
+                    if let Some(event_tx) = self.event_tx.as_ref() {
+                        NatTraversalEndpoint::emit_runtime_event_parts(
+                            event_tx,
+                            self.event_callback.as_ref(),
+                            &self.traversal_event_notify,
+                            NatTraversalEvent::CoordinationRejected {
+                                peer_id: *target,
+                                coordinator,
+                                reason: *reason,
+                            },
+                        );
+                    } else if let Some(ref callback) = self.event_callback {
+                        callback(NatTraversalEvent::CoordinationRejected {
+                            peer_id: *target,
+                            coordinator,
+                            reason: *reason,
+                        });
+                        self.traversal_event_notify.notify_waiters();
+                    }
                     self.incoming_notify.notify_waiters();
-                    self.traversal_event_notify.notify_waiters();
                     info!(
                         "coordinator control rejected handled request_id={} from_peer={:?} initiator={:?} target={:?} round={} reason={:?}",
                         envelope.request_id, from_peer_id, initiator, target, round, reason
@@ -8164,6 +8226,16 @@ impl NatTraversalEndpoint {
                         Self::set_session_phase(session, now, TraversalPhase::Punching);
                         self.emit_event(
                             &mut events,
+                            NatTraversalEvent::TraversalProgress {
+                                peer_id: session.peer_id,
+                                phase: TraversalPhase::Punching,
+                                deadline: self
+                                    .recompute_session_deadline(session, now)
+                                    .map(|deadline| deadline.at),
+                            },
+                        );
+                        self.emit_event(
+                            &mut events,
                             NatTraversalEvent::HolePunchingStarted {
                                 peer_id: session.peer_id,
                                 targets: session.candidates.iter().map(|c| c.address).collect(),
@@ -8182,6 +8254,16 @@ impl NatTraversalEndpoint {
                 TraversalPhase::Punching => {
                     if let Some(successful_path) = self.check_punch_results_for_session(session) {
                         Self::set_session_phase(session, now, TraversalPhase::Validation);
+                        self.emit_event(
+                            &mut events,
+                            NatTraversalEvent::TraversalProgress {
+                                peer_id: session.peer_id,
+                                phase: TraversalPhase::Validation,
+                                deadline: self
+                                    .recompute_session_deadline(session, now)
+                                    .map(|deadline| deadline.at),
+                            },
+                        );
                         if let Some(candidate) = session.candidates.iter_mut().find(|candidate| {
                             normalize_socket_addr(candidate.address)
                                 == normalize_socket_addr(successful_path)
@@ -8212,6 +8294,16 @@ impl NatTraversalEndpoint {
                 TraversalPhase::Validation => {
                     if self.session_path_is_validated(session) {
                         Self::set_session_phase(session, now, TraversalPhase::Connected);
+                        self.emit_event(
+                            &mut events,
+                            NatTraversalEvent::TraversalProgress {
+                                peer_id: session.peer_id,
+                                phase: TraversalPhase::Connected,
+                                deadline: self
+                                    .recompute_session_deadline(session, now)
+                                    .map(|deadline| deadline.at),
+                            },
+                        );
                         self.emit_event(
                             &mut events,
                             NatTraversalEvent::TraversalSucceeded {
@@ -8276,6 +8368,18 @@ impl NatTraversalEndpoint {
                         to_phase: TraversalPhase::Coordination,
                     },
                 );
+                self.emit_event(
+                    &mut events,
+                    NatTraversalEvent::TraversalProgress {
+                        peer_id,
+                        phase: TraversalPhase::Coordination,
+                        deadline: self
+                            .active_sessions
+                            .get(&peer_id)
+                            .and_then(|entry| self.recompute_session_deadline(entry.value(), now))
+                            .map(|deadline| deadline.at),
+                    },
+                );
                 info!(
                     "Peer {:?} early-advanced from Discovery to Coordination ({:.1}s before timeout)",
                     peer_id,
@@ -8301,6 +8405,16 @@ impl NatTraversalEndpoint {
                             peer_id: session.peer_id,
                             from_phase: TraversalPhase::Discovery,
                             to_phase: TraversalPhase::Coordination,
+                        },
+                    );
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::TraversalProgress {
+                            peer_id: session.peer_id,
+                            phase: TraversalPhase::Coordination,
+                            deadline: self
+                                .recompute_session_deadline(session, now)
+                                .map(|deadline| deadline.at),
                         },
                     );
                     info!(
@@ -8643,13 +8757,58 @@ impl NatTraversalEndpoint {
         error: NatTraversalError,
     ) {
         let reason = self.classify_failure_reason(session, &error);
+        let deadline_kind = session
+            .next_deadline
+            .as_ref()
+            .map(|deadline| deadline.kind)
+            .or({
+                match session.phase {
+                    TraversalPhase::Coordination => {
+                        Some(TraversalDeadlineKind::CoordinationResponse)
+                    }
+                    TraversalPhase::Synchronization => {
+                        Some(TraversalDeadlineKind::SynchronizationProgress)
+                    }
+                    TraversalPhase::Punching => Some(TraversalDeadlineKind::PunchProgress),
+                    TraversalPhase::Validation => Some(TraversalDeadlineKind::ValidationProgress),
+                    TraversalPhase::Discovery => Some(TraversalDeadlineKind::DiscoveryProgress),
+                    TraversalPhase::Connected | TraversalPhase::Failed => None,
+                }
+            });
         session.last_failure = Some(reason.clone());
+
+        if matches!(
+            reason,
+            TraversalFailureReason::CoordinationExpired
+                | TraversalFailureReason::SynchronizationExpired
+                | TraversalFailureReason::PunchWindowMissed
+                | TraversalFailureReason::ValidationTimedOut
+                | TraversalFailureReason::DiscoveryExhausted
+        ) && let Some(deadline_kind) = deadline_kind
+        {
+            self.emit_event(
+                events,
+                NatTraversalEvent::TraversalStalled {
+                    peer_id: session.peer_id,
+                    phase: session.phase,
+                    deadline_kind,
+                },
+            );
+        }
 
         match self.retry_disposition(&reason, session.attempt, now) {
             RetryDisposition::Never => {
                 session.retry_at = None;
                 session.next_deadline = None;
                 session.phase = TraversalPhase::Failed;
+                self.emit_event(
+                    events,
+                    NatTraversalEvent::TraversalTerminated {
+                        peer_id: session.peer_id,
+                        reason: reason.clone(),
+                        fallback_available: true,
+                    },
+                );
                 self.emit_event(
                     events,
                     NatTraversalEvent::TraversalFailed {
@@ -8672,6 +8831,15 @@ impl NatTraversalEndpoint {
                     kind: TraversalDeadlineKind::RetryBackoff,
                     at: retry_at,
                 });
+                self.emit_event(
+                    events,
+                    NatTraversalEvent::RetryScheduled {
+                        peer_id: session.peer_id,
+                        attempt: session.attempt,
+                        retry_at,
+                        reason: reason.clone(),
+                    },
+                );
                 warn!(
                     "Phase {:?} failed for peer {:?}: {:?}, retrying (attempt {}) at {:?}",
                     session.phase, session.peer_id, reason, session.attempt, retry_at
@@ -10662,6 +10830,14 @@ mod tests {
         ));
         assert!(events.iter().any(|event| matches!(
             event,
+            NatTraversalEvent::TraversalProgress {
+                peer_id: event_peer,
+                phase: TraversalPhase::Punching,
+                ..
+            } if *event_peer == peer_id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
             NatTraversalEvent::HolePunchingStarted { peer_id: event_peer, .. }
                 if *event_peer == peer_id
         )));
@@ -11145,10 +11321,15 @@ mod tests {
                 at,
             }) if at == retry_at
         ));
-        assert!(
-            events.is_empty(),
-            "retryable failures should not emit terminal events"
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [NatTraversalEvent::RetryScheduled {
+                peer_id,
+                attempt,
+                retry_at: scheduled_retry_at,
+                reason: TraversalFailureReason::CoordinatorUnavailable,
+            }] if *peer_id == session.peer_id && *attempt == session.attempt && *scheduled_retry_at == retry_at
+        ));
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
@@ -11203,10 +11384,22 @@ mod tests {
                 ..
             })
         ));
-        assert!(
-            events.is_empty(),
-            "retryable synchronization expiration should not emit terminal failure"
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                NatTraversalEvent::TraversalStalled {
+                    peer_id,
+                    phase: TraversalPhase::Synchronization,
+                    deadline_kind: TraversalDeadlineKind::SynchronizationProgress,
+                },
+                NatTraversalEvent::RetryScheduled {
+                    peer_id: retry_peer_id,
+                    attempt,
+                    retry_at: _,
+                    reason: TraversalFailureReason::SynchronizationExpired,
+                }
+            ] if *peer_id == session.peer_id && *retry_peer_id == session.peer_id && *attempt == session.attempt
+        ));
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
@@ -11265,10 +11458,22 @@ mod tests {
                 ..
             })
         ));
-        assert!(
-            events.is_empty(),
-            "retryable discovery exhaustion should not emit terminal failure"
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                NatTraversalEvent::TraversalStalled {
+                    peer_id,
+                    phase: TraversalPhase::Discovery,
+                    deadline_kind: TraversalDeadlineKind::DiscoveryProgress,
+                },
+                NatTraversalEvent::RetryScheduled {
+                    peer_id: retry_peer_id,
+                    attempt,
+                    retry_at: _,
+                    reason: TraversalFailureReason::DiscoveryExhausted,
+                }
+            ] if *peer_id == session.peer_id && *retry_peer_id == session.peer_id && *attempt == session.attempt
+        ));
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
@@ -11330,11 +11535,21 @@ mod tests {
         assert!(matches!(session.phase, TraversalPhase::Failed));
         assert!(matches!(
             events.as_slice(),
-            [NatTraversalEvent::TraversalFailed {
-                peer_id,
-                error: NatTraversalError::ProtocolError(message),
-                fallback_available: true,
-            }] if *peer_id == session.peer_id && message == "malformed control message"
+            [
+                NatTraversalEvent::TraversalTerminated {
+                    peer_id,
+                    reason: TraversalFailureReason::ProtocolViolation(message),
+                    fallback_available: true,
+                },
+                NatTraversalEvent::TraversalFailed {
+                    peer_id: failed_peer_id,
+                    error: NatTraversalError::ProtocolError(failed_message),
+                    fallback_available: true,
+                }
+            ] if *peer_id == session.peer_id
+                && *failed_peer_id == session.peer_id
+                && message == "malformed control message"
+                && failed_message == "malformed control message"
         ));
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
@@ -11515,7 +11730,7 @@ mod tests {
             .expect("poll at retry deadline should succeed");
         assert!(
             events_after.is_empty(),
-            "consuming retry state should not itself emit terminal events"
+            "consuming retry state should not itself emit terminal events or stale discovery output"
         );
         {
             let session = endpoint
@@ -11541,6 +11756,49 @@ mod tests {
         }
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_rejected_runtime_event_uses_normal_event_path() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let captured_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_events_for_callback = Arc::clone(&captured_events);
+        let traversal_event_notify = Arc::new(tokio::sync::Notify::new());
+        let callback: Arc<dyn Fn(NatTraversalEvent) + Send + Sync> = Arc::new(move |event| {
+            captured_events_for_callback.lock().unwrap().push(event);
+        });
+
+        NatTraversalEndpoint::emit_runtime_event_parts(
+            &event_tx,
+            Some(&callback),
+            &traversal_event_notify,
+            NatTraversalEvent::CoordinationRejected {
+                peer_id: PeerId([0x7B; 32]),
+                coordinator: "127.0.0.1:9009".parse().unwrap(),
+                reason: RejectionReason::RateLimited,
+            },
+        );
+
+        let runtime_event = event_rx
+            .try_recv()
+            .expect("runtime event should be enqueued");
+        assert!(matches!(
+            runtime_event,
+            NatTraversalEvent::CoordinationRejected {
+                peer_id,
+                coordinator,
+                reason: RejectionReason::RateLimited,
+            } if peer_id == PeerId([0x7B; 32]) && coordinator == "127.0.0.1:9009".parse().unwrap()
+        ));
+        let callback_events = captured_events.lock().unwrap();
+        assert!(callback_events.iter().any(|event| matches!(
+            event,
+            NatTraversalEvent::CoordinationRejected {
+                peer_id,
+                reason: RejectionReason::RateLimited,
+                ..
+            } if *peer_id == PeerId([0x7B; 32])
+        )));
     }
 
     #[tokio::test]
