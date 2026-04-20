@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# Top-level orchestrator for the cross-environment ant-quic test.
+# Top-level orchestrator for the comprehensive cross-environment ant-quic
+# test matrix.
 #
-# Runs one or more scenarios under scripts/lib/scenarios/ against a mixed
-# topology (this MacBook + 2 Mac Studios on the local LAN, plus the
-# saorsa-N.saorsalabs.com VPS fleet). Aggregates per-node logs into
-# SUMMARY.md via scripts/lib/aggregate.py.
+# Topology comes from scripts/lib/topology.sh — 3 LAN Macs + 6 x0x bootstrap
+# VPS, all on port 10000. Registry is dropped.
 #
 # Usage:
-#   scripts/run-cross-env-matrix.sh                       # run all scenarios
-#   scripts/run-cross-env-matrix.sh --scenario c1-lan-mdns
-#   scripts/run-cross-env-matrix.sh --list                # list scenarios
-#   scripts/run-cross-env-matrix.sh --no-deploy           # skip VPS deploy step
+#   scripts/run-cross-env-matrix.sh                        # all scenarios
+#   scripts/run-cross-env-matrix.sh --scenario c1-mesh-up
+#   scripts/run-cross-env-matrix.sh --list
+#   scripts/run-cross-env-matrix.sh --no-preflight
 #
 # Env knobs:
-#   ANT_QUIC_BIN_LOCAL    macOS ant-quic binary (default: target/release/ant-quic)
-#   STUDIO1_TARGET        SSH target for studio 1 (e.g. studio1@studio1.local)
-#   STUDIO2_TARGET        SSH target for studio 2
-#   REGISTRY_HEALTH_URL   Default https://saorsa-1.saorsalabs.com/health
-#   LOG_DIR               Override default log dir
+#   ANT_QUIC_BIN_LOCAL   macOS binary on this MacBook (default target/debug/ant-quic)
+#   ANT_QUIC_PORT        test mesh port (default 10000)
+#   LOG_DIR              override default log directory
+#   STUDIO1_TARGET / STUDIO2_TARGET   override SSH targets for L2/L3
 #
-# Exits non-zero if any scenario's verify() fails OR aggregate.py reports FAIL.
+# Exits non-zero if any scenario verify() fails OR aggregate.py reports FAIL.
 
 set -euo pipefail
 
@@ -29,25 +27,27 @@ LIB_DIR="${SCRIPT_DIR}/lib"
 SCENARIOS_DIR="${LIB_DIR}/scenarios"
 
 export LOG_DIR="${LOG_DIR:-${REPO_DIR}/target/cross-env/$(date +%Y%m%d-%H%M%S)}"
-export ANT_QUIC_BIN_LOCAL="${ANT_QUIC_BIN_LOCAL:-${REPO_DIR}/target/release/ant-quic}"
-export REGISTRY_HEALTH_URL="${REGISTRY_HEALTH_URL:-https://saorsa-1.saorsalabs.com/health}"
-# Reuse the SSH options shape from run-connectivity-matrix.sh.
-export SSH_OPTS=(
-    -4
-    -o BatchMode=yes
-    -o ConnectTimeout=15
-    -o ControlMaster=no
-    -o ControlPath=none
-    -o StrictHostKeyChecking=accept-new
-)
-
-# shellcheck disable=SC1091
-source "${LIB_DIR}/cross-env-common.sh"
+export ANT_QUIC_BIN_LOCAL="${ANT_QUIC_BIN_LOCAL:-${REPO_DIR}/target/debug/ant-quic}"
+export ANT_QUIC_PORT="${ANT_QUIC_PORT:-10000}"
 
 mkdir -p "${LOG_DIR}"
 
+# shellcheck disable=SC1091
+source "${LIB_DIR}/cross-env-common.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/topology.sh"
+
+# Apply env-var overrides for studio targets so users can swap hostnames
+# without editing topology.sh.
+[ -n "${STUDIO1_TARGET:-}" ] && NODE_SSH[L2]="${STUDIO1_TARGET}"
+[ -n "${STUDIO2_TARGET:-}" ] && NODE_SSH[L3]="${STUDIO2_TARGET}"
+
+# Subset of nodes to actually use this run. preflight() prunes unreachable
+# ones. Default = ALL_NODES.
+REACHABLE_NODES=("${ALL_NODES[@]}")
+
 print_help() {
-    sed -n '2,25p' "$0"
+    sed -n '2,18p' "$0"
 }
 
 list_scenarios() {
@@ -58,6 +58,8 @@ list_scenarios() {
     done
 }
 
+# Probe each node's port; remove unreachable ones from REACHABLE_NODES
+# and record them in skipped.txt for the aggregator.
 preflight() {
     log_info "preflight: ant-quic local binary"
     if [ ! -x "${ANT_QUIC_BIN_LOCAL}" ]; then
@@ -66,22 +68,35 @@ preflight() {
         return 1
     fi
 
-    log_info "preflight: registry health"
-    if ! curl -fsSm 5 "${REGISTRY_HEALTH_URL}" >/dev/null 2>&1; then
-        log_warn "registry health probe failed (${REGISTRY_HEALTH_URL}); LAN-only scenarios will still run"
-    else
-        log_ok "registry healthy"
-    fi
-
-    log_info "preflight: studio reachability"
-    for target in "${STUDIO1_TARGET:-}" "${STUDIO2_TARGET:-}"; do
-        [ -n "$target" ] || continue
-        if ! ssh "${SSH_OPTS[@]}" "$target" true 2>/dev/null; then
-            log_warn "studio ${target} unreachable; scenarios needing it will skip"
+    log_info "preflight: probing ${#ALL_NODES[@]} nodes on port ${ANT_QUIC_PORT}"
+    local kept=()
+    : > "${LOG_DIR}/skipped.txt"
+    for label in "${ALL_NODES[@]}"; do
+        local host="${NODE_HOST[$label]}"
+        if [ "$label" = "L1" ]; then
+            kept+=("$label")
+            continue
+        fi
+        # For non-L1 nodes, probe SSH reachability. (Node may not have a
+        # process listening on ${ANT_QUIC_PORT} until C1 starts it; SSH is
+        # the only reliable pre-startup probe.)
+        local target="${NODE_SSH[$label]}"
+        if ssh "${SSH_OPTS[@]}" "${target}" true 2>/dev/null; then
+            log_ok "  ${label}: reachable via ssh ${target}"
+            kept+=("$label")
         else
-            log_ok "studio ${target} reachable"
+            log_warn "  ${label}: ssh ${target} failed — SKIPPED"
+            printf '%s\t%s\n' "$label" "ssh-unreachable" >> "${LOG_DIR}/skipped.txt"
         fi
     done
+    REACHABLE_NODES=("${kept[@]}")
+    export REACHABLE_NODES_STR="${kept[*]}"
+
+    if [ "${#REACHABLE_NODES[@]}" -lt 2 ]; then
+        log_error "fewer than 2 reachable nodes; cannot form a mesh"
+        return 1
+    fi
+    log_ok "preflight: ${#REACHABLE_NODES[@]} reachable nodes (${REACHABLE_NODES[*]})"
 }
 
 run_scenario() {
@@ -129,6 +144,7 @@ main() {
     fi
 
     log_info "Log dir: ${LOG_DIR}"
+    log_info "Topology port: ${ANT_QUIC_PORT}"
     [ "$skip_preflight" -eq 0 ] && preflight
 
     local fail=0

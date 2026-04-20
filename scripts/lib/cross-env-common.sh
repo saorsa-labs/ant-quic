@@ -132,3 +132,34 @@ register_cleanup() {
     local cleanup_fn="$1"
     trap "${cleanup_fn}" EXIT INT TERM
 }
+
+# Extract a node's 64-char hex peer ID from its startup log.
+# Looks for the binary's "Peer ID:" line. Caller must have waited for
+# startup; otherwise this returns empty.
+extract_peer_id_from_log() {
+    local label="$1"
+    local logfile="${LOG_DIR}/${label}.log"
+    [ -f "$logfile" ] || return 1
+    grep -m1 -oE 'Peer ID:[[:space:]]*[0-9a-f]{16}' "$logfile" 2>/dev/null \
+        | awk '{print $NF}'
+}
+
+# Install a pfctl rule on this MacBook that drops UDP between localhost and
+# the given remote IP/port pair. Used by the forced-relay scenario to
+# guarantee the direct path fails so the relay path engages.
+#
+# Requires sudo. Anchor name "com.saorsa/cross-env" so we can flush cleanly.
+block_direct_path_pfctl() {
+    local remote_ip="$1"
+    local remote_port="${2:-${ANT_QUIC_PORT:-10000}}"
+    log_warn "installing pfctl block: udp ↔ ${remote_ip}:${remote_port} (sudo)"
+    sudo pfctl -a com.saorsa/cross-env -f - <<EOF
+block drop quick proto udp from any to ${remote_ip} port ${remote_port}
+block drop quick proto udp from ${remote_ip} to any port ${remote_port}
+EOF
+}
+
+unblock_direct_path_pfctl() {
+    log_info "flushing pfctl anchor com.saorsa/cross-env (sudo)"
+    sudo pfctl -a com.saorsa/cross-env -F all 2>/dev/null || true
+}

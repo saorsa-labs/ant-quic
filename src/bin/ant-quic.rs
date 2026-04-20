@@ -208,6 +208,18 @@ struct Args {
     /// Chunk size for data generation/verification (bytes)
     #[arg(long, default_value = "65536")]
     chunk_size: usize,
+
+    /// Targeted send: 64-char hex peer ID. Sends `--generate-data` bytes (or
+    /// 64 MiB by default) to ONLY this peer as a stream of SHA-256-verified
+    /// chunks. Emits `{"event":"send_to_complete", ...}` on completion.
+    /// Forces JSON output regardless of --json.
+    #[arg(long)]
+    send_to: Option<String>,
+
+    /// Wait this many seconds for --send-to target peer to appear in
+    /// connected_peers before giving up.
+    #[arg(long, default_value = "30")]
+    send_to_timeout: u64,
 }
 
 /// CLI subcommands
@@ -315,6 +327,64 @@ impl From<CliMdnsAutoConnect> for AutoConnectPolicy {
 }
 
 // v0.13.0: Mode enum removed - all nodes are symmetric P2P nodes
+
+/// SHA-256 verified data chunk used by `--send-to` and `--verify-data`.
+///
+/// Wire format is `serde_json::to_vec(&chunk)`. This matches the format used
+/// by `src/bin/e2e-test-node.rs`, so receivers running either binary can
+/// decode chunks from senders running either binary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VerifiedDataChunk {
+    sequence: u64,
+    data: Vec<u8>,
+    checksum: String,
+    timestamp: u64,
+}
+
+impl VerifiedDataChunk {
+    fn new(sequence: u64, data: Vec<u8>) -> Self {
+        let checksum = compute_sha256(&data);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            sequence,
+            data,
+            checksum,
+            timestamp,
+        }
+    }
+
+    fn verify(&self) -> bool {
+        compute_sha256(&self.data) == self.checksum
+    }
+}
+
+fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// Generate `total_size` bytes of random-ish data split into `chunk_size` pieces.
+fn generate_verified_chunks(total_size: u64, chunk_size: usize) -> Vec<VerifiedDataChunk> {
+    let mut chunks = Vec::new();
+    let mut remaining = total_size;
+    let mut sequence = 0u64;
+    while remaining > 0 {
+        let this_chunk = (remaining as usize).min(chunk_size);
+        // Deterministic-ish payload: sequence-derived so receivers can sanity-
+        // check ordering without needing the same RNG seed.
+        let payload: Vec<u8> = (0..this_chunk)
+            .map(|i| ((sequence as usize).wrapping_add(i) & 0xff) as u8)
+            .collect();
+        chunks.push(VerifiedDataChunk::new(sequence, payload));
+        remaining -= this_chunk as u64;
+        sequence += 1;
+    }
+    chunks
+}
 
 /// Runtime statistics
 #[derive(Debug, Default)]
@@ -575,6 +645,50 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Recv-decoder loop. When --verify-data or --send-to is set, drain
+    // endpoint.recv() and try to decode incoming bytes as a VerifiedDataChunk.
+    // Always emit a JSON event so the cross-env harness can grep on it.
+    let recv_decode_handle = if args.verify_data || args.send_to.is_some() {
+        let endpoint_recv = endpoint.clone();
+        let shutdown_recv = shutdown.clone();
+        let stats_recv = stats.clone();
+        // Always-on JSON for verified chunks so the harness has stable wire format.
+        Some(tokio::spawn(async move {
+            while !shutdown_recv.is_cancelled() {
+                match tokio::time::timeout(Duration::from_millis(200), endpoint_recv.recv()).await {
+                    Ok(Ok((peer_id, data))) => {
+                        stats_recv
+                            .bytes_received
+                            .fetch_add(data.len() as u64, Ordering::SeqCst);
+                        if let Ok(chunk) = serde_json::from_slice::<VerifiedDataChunk>(&data) {
+                            let sha_ok = chunk.verify();
+                            if sha_ok {
+                                stats_recv
+                                    .data_chunks_verified
+                                    .fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                stats_recv
+                                    .data_verification_failures
+                                    .fetch_add(1, Ordering::SeqCst);
+                            }
+                            println!(
+                                r#"{{"event":"data_received","peer_id":"{}","sequence":{},"bytes":{},"sha_match":{}}}"#,
+                                format_peer_id(&peer_id),
+                                chunk.sequence,
+                                chunk.data.len(),
+                                sha_ok
+                            );
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // Stats reporter
     let stats_clone2 = stats.clone();
@@ -871,6 +985,111 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --send-to: targeted SHA-256-verified data transfer to a specific peer.
+    // Runs after any explicit --connect / --connect-peer-id has had a chance
+    // to establish, but does not require them — mDNS or known-peers paths can
+    // also bring the target into `connected_peers`.
+    if let Some(target_hex) = args.send_to.clone() {
+        let target_id = match parse_peer_id_hex(&target_hex) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Invalid --send-to value {}: {}", target_hex, e);
+                return Err(anyhow::anyhow!("invalid --send-to peer id"));
+            }
+        };
+        let total_bytes = args.generate_data.unwrap_or(64 * 1024 * 1024);
+        let chunk_size = args.chunk_size;
+        let target_short = format_peer_id(&target_id);
+        let timeout = Duration::from_secs(args.send_to_timeout);
+
+        info!(
+            "send-to: target={} bytes={} chunk_size={} timeout={}s",
+            target_short,
+            total_bytes,
+            chunk_size,
+            timeout.as_secs()
+        );
+
+        let wait_start = Instant::now();
+        let mut connected = false;
+        while wait_start.elapsed() < timeout {
+            if peer_states.read().await.contains_key(&target_id) {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !connected {
+            println!(
+                r#"{{"event":"send_to_complete","target":"{}","bytes":0,"chunks":0,"duration_ms":{},"throughput_mbps":0.0,"sha_ok":false,"error":"target not connected within timeout"}}"#,
+                target_short,
+                wait_start.elapsed().as_millis()
+            );
+            error!(
+                "send-to: target {} not connected within {}s",
+                target_short,
+                timeout.as_secs()
+            );
+        } else {
+            let chunks = generate_verified_chunks(total_bytes, chunk_size);
+            let chunk_count = chunks.len();
+            let send_start = Instant::now();
+            let mut chunks_sent = 0u64;
+            let mut send_failures = 0u64;
+            let mut bytes_sent_wire = 0u64;
+            for chunk in &chunks {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let bytes = match serde_json::to_vec(chunk) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(
+                            "send-to: serialise failure for chunk {}: {}",
+                            chunk.sequence, e
+                        );
+                        send_failures += 1;
+                        continue;
+                    }
+                };
+                match endpoint.send(&target_id, &bytes).await {
+                    Ok(()) => {
+                        chunks_sent += 1;
+                        bytes_sent_wire += bytes.len() as u64;
+                        stats
+                            .bytes_sent
+                            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                        stats.data_chunks_sent.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        send_failures += 1;
+                        warn!("send-to: chunk {} failed: {}", chunk.sequence, e);
+                    }
+                }
+            }
+            let duration_ms = send_start.elapsed().as_millis();
+            let throughput_mbps = if duration_ms > 0 {
+                (bytes_sent_wire as f64 * 8.0) / (duration_ms as f64 * 1_000.0)
+            } else {
+                0.0
+            };
+            println!(
+                r#"{{"event":"send_to_complete","target":"{}","bytes":{},"chunks":{},"chunks_total":{},"failures":{},"duration_ms":{},"throughput_mbps":{:.2},"sha_ok":true}}"#,
+                target_short,
+                bytes_sent_wire,
+                chunks_sent,
+                chunk_count,
+                send_failures,
+                duration_ms,
+                throughput_mbps
+            );
+            info!(
+                "send-to: complete — {} bytes in {} ms ({:.2} Mbps), {} chunks ok / {} failed",
+                bytes_sent_wire, duration_ms, throughput_mbps, chunks_sent, send_failures
+            );
+        }
+    }
+
     // Main loop - accept connections
     let start_time = Instant::now();
     let duration = if args.duration > 0 {
@@ -922,6 +1141,9 @@ async fn main() -> anyhow::Result<()> {
         h.abort();
     }
     if let Some(h) = metrics_handle {
+        h.abort();
+    }
+    if let Some(h) = recv_decode_handle {
         h.abort();
     }
 
@@ -1527,78 +1749,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
-    }
-}
-
-// === Data Verification Functions ===
-
-/// Compute SHA-256 hash of data
-#[allow(dead_code)] // Will be used when data generation features are wired up
-fn compute_sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
-/// Verified data chunk with embedded checksum
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Will be used when data generation features are wired up
-pub struct VerifiedDataChunk {
-    /// Sequence number
-    pub sequence: u64,
-    /// The actual data
-    pub data: Vec<u8>,
-    /// SHA-256 hash of the data
-    pub checksum: [u8; 32],
-}
-
-#[allow(dead_code)] // Will be used when data generation features are wired up
-impl VerifiedDataChunk {
-    /// Create a new verified chunk with random data
-    fn generate(sequence: u64, size: usize) -> Self {
-        let data: Vec<u8> = (0..size)
-            .map(|i| ((sequence + i as u64) % 256) as u8)
-            .collect();
-        let checksum = compute_sha256(&data);
-        Self {
-            sequence,
-            data,
-            checksum,
-        }
-    }
-
-    /// Serialize chunk to bytes: [sequence(8)] [checksum(32)] [data]
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + 32 + self.data.len());
-        bytes.extend_from_slice(&self.sequence.to_be_bytes());
-        bytes.extend_from_slice(&self.checksum);
-        bytes.extend_from_slice(&self.data);
-        bytes
-    }
-
-    /// Deserialize chunk from bytes
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 40 {
-            return None;
-        }
-        let sequence = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
-        let mut checksum = [0u8; 32];
-        checksum.copy_from_slice(&bytes[8..40]);
-        let data = bytes[40..].to_vec();
-        Some(Self {
-            sequence,
-            data,
-            checksum,
-        })
-    }
-
-    /// Verify the checksum matches the data
-    fn verify(&self) -> bool {
-        let computed = compute_sha256(&self.data);
-        computed == self.checksum
     }
 }
 

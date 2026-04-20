@@ -1,227 +1,373 @@
 #!/usr/bin/env python3
-"""Aggregate per-node ant-quic logs into a single SUMMARY.md.
+"""Aggregate the cross-env matrix run into a single SUMMARY.md.
 
-Given a directory of *.log files (one per node), this script:
+Reads:
+  - ``LOG_DIR/c1_<label>.log`` for each long-lived c1 node.
+  - ``LOG_DIR/c3_send_<sender>_to_<recipient>.log`` for transfer attempts.
+  - ``LOG_DIR/c4_stream_<sender>_to_<recipient>.log`` for stream attempts.
+  - ``LOG_DIR/c5_send_<sender>_to_<recipient>_relay.log`` for forced-relay.
+  - ``LOG_DIR/peer_ids.tsv`` for label -> 16-char short peer id.
+  - ``LOG_DIR/skipped.txt`` for nodes preflight marked unreachable.
 
-  * Builds a per-pair connection-type matrix from `ConnectionEstablished`
-    and `DirectPathStatus` log lines.
-  * Counts every `target=ant_quic::silent_drop` line by `kind=`.
-  * Counts every `target=ant_quic::send_error` line by peer.
-  * Surfaces unexpected timeouts, ack-timeout, and stale-reaper triggers.
-  * Writes SUMMARY.md alongside the input logs.
+Writes ``LOG_DIR/SUMMARY.md`` and exits 0/1 by verdict.
 
-Pure stdlib; no external deps. Designed to work even with partial
-instrumentation: missing kinds simply don't appear in the breakdown.
+PASS iff zero silent_drop, zero send_error, zero stale-reaper triggers,
+every reachable directed pair connected, every C3 transfer SHA-OK, and
+forced-relay (if it ran) succeeded.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import json
 import pathlib
 import re
 import sys
+from typing import Optional
 
 
-SILENT_DROP_RE = re.compile(r"target=ant_quic::silent_drop\b.*?kind=(\S+)")
-SEND_ERROR_RE = re.compile(r"target=ant_quic::send_error\b")
-PEER_ID_RE = re.compile(r"Peer ID:\s*([0-9a-f]{64})")
-# Match either the P2pEvent name OR the --stats summary line "Successful
-# connections: N" with N >= 1. Either is a positive signal a connection was
-# made by the node.
-CONN_EST_RE = re.compile(r"ConnectionEstablished|Successful connections:\s*[1-9]")
-DIRECT_PATH_RE = re.compile(r"DirectPathStatus\s*\{[^}]*?status:\s*(\w+)")
-NAT_PROGRESS_RE = re.compile(r"NatTraversalProgress")
-RELAY_BYTES_RE = re.compile(r"bytes_relayed[=:]\s*(\d+)")
-STALE_REAPER_RE = re.compile(r"stale.connection.reaper", re.IGNORECASE)
+# Stable patterns the harness emits.
+RE_PEER_ID = re.compile(r"Peer ID:\s*([0-9a-f]{16})")
+RE_PEER_CONNECTED = re.compile(
+    r'"event":"peer_connected".*?"peer_id":"([0-9a-f]+)".*?"connection_type":"([^"]+)"'
+)
+RE_DIRECT_PATH = re.compile(
+    r'"event":"direct_path_status".*?"peer_id":"([0-9a-f]+)".*?"status":"([^"]+)"'
+)
+RE_SEND_TO_COMPLETE = re.compile(
+    r'"event":"send_to_complete".*?"target":"([0-9a-f]+)".*?"bytes":(\d+).*?"chunks":(\d+).*?"duration_ms":(\d+).*?"throughput_mbps":([0-9.]+).*?"sha_ok":(true|false)'
+)
+RE_DATA_RECEIVED = re.compile(
+    r'"event":"data_received".*?"peer_id":"([0-9a-f]+)".*?"sha_match":(true|false)'
+)
+RE_COUNTER_SENT = re.compile(r'"event":"counter_sent"')
+RE_RELAY_TRAFFIC = re.compile(
+    r'target=ant_quic::relay_traffic.*?bytes_forwarded=(\d+).*?datagrams=(\d+)'
+)
+RE_SILENT_DROP = re.compile(r"target=ant_quic::silent_drop\b.*?kind=(\S+)")
+RE_SEND_ERROR = re.compile(r"target=ant_quic::send_error\b")
+RE_STALE_REAPER = re.compile(r"stale.connection.reaper", re.IGNORECASE)
+RE_SHUTDOWN = re.compile(r"Shutting down P2P endpoint")
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "log_dir",
-        type=pathlib.Path,
-        help="Directory containing per-node *.log files",
-    )
-    p.add_argument(
-        "--output",
-        type=pathlib.Path,
-        default=None,
-        help="Output SUMMARY.md path (default: <log_dir>/SUMMARY.md)",
-    )
-    return p.parse_args()
-
-
-def collect_logs(log_dir: pathlib.Path) -> dict[str, list[str]]:
-    """Read every node *.log in log_dir, returning {node_label: [lines]}.
-
-    Excludes orchestrator.log — the harness's own output is not a node log
-    and would false-positive on log lines that mention `ConnectionEstablished`
-    in scenario titles or summary messages.
-    """
-    logs: dict[str, list[str]] = {}
-    for path in sorted(log_dir.glob("*.log")):
-        if path.stem == "orchestrator":
+def load_peer_ids(log_dir: pathlib.Path) -> dict[str, str]:
+    """label -> 16-char short peer id."""
+    out: dict[str, str] = {}
+    p = log_dir / "peer_ids.tsv"
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        if "\t" not in line:
             continue
-        try:
-            logs[path.stem] = path.read_text(errors="replace").splitlines()
-        except OSError as e:
-            print(f"warn: could not read {path}: {e}", file=sys.stderr)
-    return logs
+        label, pid = line.split("\t", 1)
+        out[label.strip()] = pid.strip()
+    return out
 
 
-def per_node_peer_id(lines: list[str]) -> str | None:
-    for line in lines:
-        m = PEER_ID_RE.search(line)
-        if m:
-            return m.group(1)
-    return None
+def load_skipped(log_dir: pathlib.Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    p = log_dir / "skipped.txt"
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        if "\t" not in line:
+            continue
+        label, reason = line.split("\t", 1)
+        out[label.strip()] = reason.strip()
+    return out
 
 
-def silent_drop_breakdown(logs: dict[str, list[str]]) -> dict[str, dict[str, int]]:
-    """{node_label: {kind: count}}"""
+def read_log(path: pathlib.Path) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def build_connectivity(
+    log_dir: pathlib.Path, labels: list[str], peer_ids: dict[str, str]
+) -> dict[tuple[str, str], str]:
+    """(sender_label, recipient_label) -> connection_type or '' if no event."""
+    by_short = {pid: lab for lab, pid in peer_ids.items()}
+    matrix: dict[tuple[str, str], str] = {}
+    for sender in labels:
+        f = log_dir / f"c1_{sender}.log"
+        if not f.exists():
+            continue
+        for line in read_log(f):
+            m = RE_PEER_CONNECTED.search(line)
+            if not m:
+                continue
+            recipient_short, ctype = m.group(1), m.group(2)
+            recipient_label = by_short.get(recipient_short)
+            if recipient_label is None:
+                continue
+            # Last writer wins — connection_type may upgrade as path improves.
+            matrix[(sender, recipient_label)] = ctype
+    return matrix
+
+
+def build_path_types(
+    log_dir: pathlib.Path, labels: list[str], peer_ids: dict[str, str]
+) -> dict[tuple[str, str], str]:
+    by_short = {pid: lab for lab, pid in peer_ids.items()}
+    matrix: dict[tuple[str, str], str] = {}
+    for sender in labels:
+        f = log_dir / f"c1_{sender}.log"
+        if not f.exists():
+            continue
+        for line in read_log(f):
+            m = RE_DIRECT_PATH.search(line)
+            if not m:
+                continue
+            recipient_short, status = m.group(1), m.group(2)
+            recipient_label = by_short.get(recipient_short)
+            if recipient_label is None:
+                continue
+            matrix[(sender, recipient_label)] = status
+    return matrix
+
+
+def build_transfers(log_dir: pathlib.Path, labels: list[str]) -> dict[tuple[str, str], dict]:
+    """Read c3_send_*.log for the sender's send_to_complete event, then
+    cross-check the recipient's c1_*.log for a matching sha_match=true.
+    """
+    out: dict[tuple[str, str], dict] = {}
+    for sender in labels:
+        for recipient in labels:
+            if sender == recipient:
+                continue
+            sender_log = log_dir / f"c3_send_{sender}_to_{recipient}.log"
+            if not sender_log.exists():
+                continue
+            cell: dict = {"sent_bytes": 0, "throughput_mbps": 0.0, "sha_ok": False}
+            for line in read_log(sender_log):
+                m = RE_SEND_TO_COMPLETE.search(line)
+                if m:
+                    cell["sent_bytes"] = int(m.group(2))
+                    cell["chunks"] = int(m.group(3))
+                    cell["duration_ms"] = int(m.group(4))
+                    cell["throughput_mbps"] = float(m.group(5))
+                    cell["sha_ok"] = m.group(6) == "true"
+            # Cross-check recipient
+            recip_log = log_dir / f"c1_{recipient}.log"
+            if recip_log.exists():
+                received_chunks = 0
+                for line in read_log(recip_log):
+                    m = RE_DATA_RECEIVED.search(line)
+                    if m and m.group(2) == "true":
+                        received_chunks += 1
+                cell["received_chunks"] = received_chunks
+            out[(sender, recipient)] = cell
+    return out
+
+
+def build_streams(log_dir: pathlib.Path, labels: list[str]) -> dict[tuple[str, str], int]:
+    out: dict[tuple[str, str], int] = {}
+    for sender in labels:
+        for recipient in labels:
+            if sender == recipient:
+                continue
+            f = log_dir / f"c4_stream_{sender}_to_{recipient}.log"
+            if not f.exists():
+                continue
+            n = sum(1 for line in read_log(f) if RE_COUNTER_SENT.search(line))
+            out[(sender, recipient)] = n
+    return out
+
+
+def build_silent_drops(log_dir: pathlib.Path) -> dict[str, dict[str, int]]:
     out: dict[str, dict[str, int]] = {}
-    for node, lines in logs.items():
-        kinds: collections.Counter[str] = collections.Counter()
-        for line in lines:
-            m = SILENT_DROP_RE.search(line)
+    for f in sorted(log_dir.glob("*.log")):
+        if f.stem in ("orchestrator", "SUMMARY"):
+            continue
+        kinds = collections.Counter()
+        for line in read_log(f):
+            m = RE_SILENT_DROP.search(line)
             if m:
                 kinds[m.group(1)] += 1
         if kinds:
-            out[node] = dict(kinds)
+            out[f.stem] = dict(kinds)
     return out
 
 
-def send_error_count(logs: dict[str, list[str]]) -> dict[str, int]:
-    return {node: sum(1 for line in lines if SEND_ERROR_RE.search(line))
-            for node, lines in logs.items()}
+def total_send_errors(log_dir: pathlib.Path) -> int:
+    n = 0
+    for f in sorted(log_dir.glob("*.log")):
+        if f.stem in ("orchestrator", "SUMMARY"):
+            continue
+        for line in read_log(f):
+            if RE_SEND_ERROR.search(line):
+                n += 1
+    return n
 
 
-def connection_pairs(logs: dict[str, list[str]]) -> dict[str, int]:
-    """{node_label: number of ConnectionEstablished events observed}"""
-    return {node: sum(1 for line in lines if CONN_EST_RE.search(line))
-            for node, lines in logs.items()}
+def total_stale_reaper(log_dir: pathlib.Path) -> int:
+    n = 0
+    for f in sorted(log_dir.glob("*.log")):
+        if f.stem in ("orchestrator", "SUMMARY"):
+            continue
+        for line in read_log(f):
+            if RE_STALE_REAPER.search(line):
+                n += 1
+    return n
 
 
-def direct_path_statuses(logs: dict[str, list[str]]) -> dict[str, dict[str, int]]:
-    """{node_label: {status_variant: count}}"""
-    out: dict[str, dict[str, int]] = {}
-    for node, lines in logs.items():
-        statuses: collections.Counter[str] = collections.Counter()
-        for line in lines:
-            m = DIRECT_PATH_RE.search(line)
-            if m:
-                statuses[m.group(1)] += 1
-        if statuses:
-            out[node] = dict(statuses)
-    return out
+def find_relay_evidence(log_dir: pathlib.Path, labels: list[str]) -> Optional[dict]:
+    """Look across all c1_*.log for relay_traffic warns; return the max
+    bytes_forwarded observed plus the node label that emitted it.
+    """
+    best: Optional[dict] = None
+    for label in labels:
+        f = log_dir / f"c1_{label}.log"
+        if not f.exists():
+            continue
+        for line in read_log(f):
+            m = RE_RELAY_TRAFFIC.search(line)
+            if not m:
+                continue
+            bytes_forwarded = int(m.group(1))
+            datagrams = int(m.group(2))
+            if best is None or bytes_forwarded > best["bytes_forwarded"]:
+                best = {
+                    "node": label,
+                    "bytes_forwarded": bytes_forwarded,
+                    "datagrams": datagrams,
+                }
+    return best
 
 
-def relay_bytes_seen(logs: dict[str, list[str]]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for node, lines in logs.items():
-        last = 0
-        for line in lines:
-            m = RELAY_BYTES_RE.search(line)
-            if m:
-                last = max(last, int(m.group(1)))
-        if last:
-            out[node] = last
-    return out
-
-
-def stale_reaper_hits(logs: dict[str, list[str]]) -> dict[str, int]:
-    return {node: sum(1 for line in lines if STALE_REAPER_RE.search(line))
-            for node, lines in logs.items()}
-
-
-def md_table(headers: list[str], rows: list[list[str]]) -> str:
-    if not rows:
-        return "_(no data)_\n"
-    out = ["| " + " | ".join(headers) + " |",
-           "| " + " | ".join("---" for _ in headers) + " |"]
-    for row in rows:
+def matrix_to_md(
+    title: str, labels: list[str], get: callable, none_repr: str = "·"
+) -> str:
+    out = [f"### {title}\n"]
+    out.append("| | " + " | ".join(labels) + " |")
+    out.append("|---|" + "|".join(["---"] * len(labels)) + "|")
+    for s in labels:
+        row = [s]
+        for r in labels:
+            if s == r:
+                row.append("—")
+            else:
+                row.append(get(s, r) or none_repr)
         out.append("| " + " | ".join(row) + " |")
     return "\n".join(out) + "\n"
 
 
-def write_summary(out_path: pathlib.Path, logs: dict[str, list[str]]) -> int:
-    """Write SUMMARY.md. Returns 0 if all checks passed, 1 otherwise."""
-    drops = silent_drop_breakdown(logs)
-    send_errs = send_error_count(logs)
-    conns = connection_pairs(logs)
-    paths = direct_path_statuses(logs)
-    relay = relay_bytes_seen(logs)
-    stale = stale_reaper_hits(logs)
+def write_summary(log_dir: pathlib.Path, out_path: pathlib.Path) -> int:
+    peer_ids = load_peer_ids(log_dir)
+    skipped = load_skipped(log_dir)
+    labels = sorted(peer_ids.keys())  # only reachable nodes that produced a peer id
 
-    drop_total = sum(sum(v.values()) for v in drops.values())
-    send_total = sum(send_errs.values())
-    stale_total = sum(stale.values())
-    nodes_with_conns = sum(1 for n, c in conns.items() if c > 0)
+    connectivity = build_connectivity(log_dir, labels, peer_ids)
+    path_types = build_path_types(log_dir, labels, peer_ids)
+    transfers = build_transfers(log_dir, labels)
+    streams = build_streams(log_dir, labels)
+    silent_drops = build_silent_drops(log_dir)
+    send_err_total = total_send_errors(log_dir)
+    stale_total = total_stale_reaper(log_dir)
+    relay = find_relay_evidence(log_dir, labels)
+
+    drop_total = sum(sum(v.values()) for v in silent_drops.values())
+
+    expected_pairs = len(labels) * (len(labels) - 1)
+    connected_pairs = sum(1 for c in connectivity.values() if c)
+    transfer_ok = sum(1 for c in transfers.values() if c.get("sha_ok"))
+    transfer_total = sum(1 for c in transfers.values())
+
+    fail = (
+        drop_total > 0
+        or send_err_total > 0
+        or stale_total > 0
+        or (expected_pairs > 0 and connected_pairs < expected_pairs)
+        or (transfer_total > 0 and transfer_ok < transfer_total)
+        or (relay is not None and relay.get("bytes_forwarded", 0) == 0)
+    )
 
     lines: list[str] = []
     lines.append("# Cross-env ant-quic test SUMMARY\n")
-    lines.append(f"Run directory: `{out_path.parent}`\n")
-    lines.append(f"Nodes inspected: **{len(logs)}**\n")
+    lines.append(f"Run directory: `{log_dir}`")
+    lines.append(f"Reachable nodes: **{len(labels)}**")
+    if skipped:
+        skip_str = ", ".join(f"{k} ({v})" for k, v in skipped.items())
+        lines.append(f"Skipped: {skip_str}")
+    lines.append("")
 
-    lines.append("## Verdicts\n")
-    lines.append(f"- silent_drop events: **{drop_total}** (target 0)")
-    lines.append(f"- send_error events: **{send_total}** (target 0)")
-    lines.append(f"- nodes with ≥1 connection: **{nodes_with_conns}/{len(logs)}** (informational)")
-    lines.append(f"- stale-reaper triggers: **{stale_total}** (target 0)\n")
-
-    # Aggregator FAILs on silent failures only. Connection count is informational
-    # — per-scenario verify() functions own the connection assertions because
-    # different scenarios have different expectations (e.g. C1 LAN-only doesn't
-    # need full QUIC handshakes within its 25s window, just mDNS discovery).
-    fail = drop_total > 0 or stale_total > 0 or send_total > 0
-    if fail:
-        lines.append("**Result: FAIL** — see breakdowns below.\n")
-    else:
-        lines.append("**Result: PASS**\n")
+    lines.append("## Verdict")
+    lines.append(f"- silent_drop: **{drop_total}** (target 0)")
+    lines.append(f"- send_error: **{send_err_total}** (target 0)")
+    lines.append(f"- stale_reaper: **{stale_total}** (target 0)")
+    lines.append(
+        f"- mesh formation: **{connected_pairs}/{expected_pairs}** directed pairs connected"
+    )
+    if transfer_total:
+        lines.append(
+            f"- pairwise transfer: **{transfer_ok}/{transfer_total}** SHA-verified"
+        )
+    if relay is not None:
+        lines.append(
+            f"- forced-relay: bytes_forwarded={relay['bytes_forwarded']:,} via {relay['node']}"
+        )
+    lines.append("")
+    lines.append(f"**Result: {'FAIL' if fail else 'PASS'}**\n")
 
     lines.append("## Per-node peer identity\n")
-    rows = []
-    for node, ll in logs.items():
-        pid = per_node_peer_id(ll) or "_(not seen)_"
-        rows.append([node, pid[:16] + ("…" if len(pid) > 16 and pid != "_(not seen)_" else "")])
-    lines.append(md_table(["node", "peer id (first 16)"], rows))
+    lines.append("| label | peer id (16) |")
+    lines.append("|---|---|")
+    for lab in labels:
+        lines.append(f"| {lab} | `{peer_ids[lab]}` |")
+    lines.append("")
 
-    lines.append("## Connections\n")
-    rows = [[node, str(conns.get(node, 0))] for node in sorted(logs)]
-    lines.append(md_table(["node", "ConnectionEstablished count"], rows))
+    lines.append("## Connectivity matrix (sender → recipient)\n")
+    lines.append(matrix_to_md(
+        "connection_type",
+        labels,
+        lambda s, r: connectivity.get((s, r), ""),
+    ))
 
-    lines.append("## DirectPathStatus distribution\n")
-    rows = []
-    for node in sorted(logs):
-        node_paths = paths.get(node, {})
-        if not node_paths:
-            continue
-        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(node_paths.items()))
-        rows.append([node, breakdown])
-    lines.append(md_table(["node", "statuses"], rows))
+    lines.append("## Path-type matrix (last direct_path_status per pair)\n")
+    lines.append(matrix_to_md(
+        "direct_path_status",
+        labels,
+        lambda s, r: path_types.get((s, r), ""),
+    ))
 
-    lines.append("## Silent drops by kind\n")
-    if drop_total == 0:
-        lines.append("_None — instrumentation reports zero silent drops._\n")
-    else:
-        rows = []
-        for node in sorted(drops):
-            for kind, n in sorted(drops[node].items(), key=lambda kv: -kv[1]):
-                rows.append([node, kind, str(n)])
-        lines.append(md_table(["node", "kind", "count"], rows))
+    if transfers:
+        lines.append("## Transfer matrix (C3 — 64 MiB SHA-verified)\n")
 
-    lines.append("## Send-path errors\n")
-    rows = [[node, str(send_errs[node])] for node in sorted(send_errs) if send_errs[node]]
-    lines.append(md_table(["node", "send_error count"], rows) if rows else "_None._\n")
+        def cell(s: str, r: str) -> str:
+            c = transfers.get((s, r))
+            if c is None:
+                return ""
+            mark = "✓" if c.get("sha_ok") else "✗"
+            return f"{mark} {c.get('throughput_mbps', 0):.1f} Mbps"
 
-    lines.append("## Relay bytes observed (max per node)\n")
-    rows = [[node, f"{relay[node]:,}"] for node in sorted(relay)]
-    lines.append(md_table(["node", "max bytes_relayed"], rows) if rows else "_No relay activity observed._\n")
+        lines.append(matrix_to_md("transfer", labels, cell))
 
-    lines.append("## Stale-reaper triggers\n")
-    rows = [[node, str(stale[node])] for node in sorted(stale) if stale[node]]
-    lines.append(md_table(["node", "trigger count"], rows) if rows else "_None — clean shutdowns._\n")
+    if streams:
+        lines.append("## Stream matrix (C4 — counter_sent per pair)\n")
+        lines.append(matrix_to_md(
+            "counters",
+            labels,
+            lambda s, r: str(streams.get((s, r), "")) if (s, r) in streams else "",
+        ))
+
+    if relay is not None:
+        lines.append("## Forced-relay evidence (C5)\n")
+        lines.append(f"- relay node: **{relay['node']}**")
+        lines.append(f"- bytes forwarded: **{relay['bytes_forwarded']:,}**")
+        lines.append(f"- datagrams: {relay['datagrams']:,}")
+        lines.append("")
+
+    if silent_drops:
+        lines.append("## Silent drops by kind\n")
+        lines.append("| node | kind | count |")
+        lines.append("|---|---|---|")
+        for node in sorted(silent_drops):
+            for kind, n in sorted(silent_drops[node].items(), key=lambda kv: -kv[1]):
+                lines.append(f"| {node} | `{kind}` | {n} |")
+        lines.append("")
 
     out_path.write_text("\n".join(lines))
     print(f"wrote {out_path}")
@@ -229,16 +375,16 @@ def write_summary(out_path: pathlib.Path, logs: dict[str, list[str]]) -> int:
 
 
 def main() -> int:
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("log_dir", type=pathlib.Path)
+    ap.add_argument("--output", type=pathlib.Path, default=None)
+    args = ap.parse_args()
     log_dir = args.log_dir.resolve()
     if not log_dir.is_dir():
         print(f"error: {log_dir} is not a directory", file=sys.stderr)
         return 2
-    logs = collect_logs(log_dir)
-    if not logs:
-        print(f"warn: no *.log files found in {log_dir}", file=sys.stderr)
-    out_path = args.output or (log_dir / "SUMMARY.md")
-    return write_summary(out_path, logs)
+    out = args.output or (log_dir / "SUMMARY.md")
+    return write_summary(log_dir, out)
 
 
 if __name__ == "__main__":

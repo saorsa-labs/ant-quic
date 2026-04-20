@@ -742,10 +742,14 @@ impl MasqueRelayServer {
 
         let server = Arc::clone(self);
         let server2 = Arc::clone(self);
+        let server3 = Arc::clone(self);
         let socket2 = Arc::clone(&socket);
         let conn2 = connection.clone();
 
         // Run both directions concurrently; exit when either side finishes.
+        // Third arm: periodic relay-traffic heartbeat so external test harnesses
+        // can grep `target=ant_quic::relay_traffic` to see how many bytes have
+        // been forwarded by this session.
         tokio::select! {
             // Direction 1: UDP → QUIC (target responses → relay → client)
             _ = async {
@@ -893,6 +897,26 @@ impl MasqueRelayServer {
                             break;
                         }
                     }
+                }
+            } => {},
+
+            // Periodic relay-traffic heartbeat. Emits one warn-level line per
+            // tick with the cumulative bytes forwarded by THIS server (not just
+            // this session — stats are server-wide). The cross-env test harness
+            // greps `target=ant_quic::relay_traffic` to confirm bytes actually
+            // moved through the relay during forced-relay scenarios.
+            _ = async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tick.tick().await; // skip immediate fire
+                loop {
+                    tick.tick().await;
+                    tracing::warn!(
+                        target: "ant_quic::relay_traffic",
+                        session_id,
+                        bytes_forwarded = server3.stats.total_bytes_relayed(),
+                        datagrams = server3.stats.datagrams_forwarded.load(Ordering::Relaxed),
+                        "relay session traffic"
+                    );
                 }
             } => {},
         }
