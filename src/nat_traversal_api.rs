@@ -687,6 +687,46 @@ pub enum CandidatePairState {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalDeadlineKind {
+    DiscoveryProgress,
+    CoordinationResponse,
+    SynchronizationProgress,
+    PunchProgress,
+    ValidationProgress,
+    RetryBackoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDeadline {
+    kind: TraversalDeadlineKind,
+    at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraversalFailureReason {
+    DiscoveryExhausted,
+    CoordinatorUnavailable,
+    CoordinationRejected {
+        reason: crate::coordinator_control::RejectionReason,
+    },
+    CoordinationExpired,
+    SynchronizationExpired,
+    PunchWindowMissed,
+    ValidationTimedOut,
+    ValidationFailed,
+    ConnectionFailed,
+    ProtocolViolation(String),
+    NetworkError(String),
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDisposition {
+    Never,
+    After(std::time::Instant),
+}
+
 /// Active NAT traversal session state
 #[derive(Debug)]
 struct NatTraversalSession {
@@ -703,6 +743,14 @@ struct NatTraversalSession {
     phase: TraversalPhase,
     /// Discovered candidate addresses
     candidates: Vec<CandidateAddress>,
+    /// Last traversal progress timestamp
+    last_progress_at: std::time::Instant,
+    /// Authoritative next protocol deadline for this session
+    next_deadline: Option<SessionDeadline>,
+    /// Stored retry schedule, if any
+    retry_at: Option<std::time::Instant>,
+    /// Last classified failure for this session
+    last_failure: Option<TraversalFailureReason>,
     /// Session state machine
     session_state: SessionState,
 }
@@ -2821,16 +2869,21 @@ impl NatTraversalEndpoint {
         );
 
         // Create new session
+        let now = std::time::Instant::now();
         let session = NatTraversalSession {
             peer_id,
             coordinator,
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at: now,
             phase: TraversalPhase::Discovery,
             candidates: Vec::new(),
+            last_progress_at: now,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connecting,
-                last_transition: std::time::Instant::now(),
+                last_transition: now,
 
                 connection: None,
                 active_attempts: Vec::new(),
@@ -4084,7 +4137,7 @@ impl NatTraversalEndpoint {
 
         let request_id = next_request_id();
         let round = 1u32;
-        let expires_at_unix_ms = now_unix_ms().saturating_add(10_000);
+        let expires_at_unix_ms = self.coordinator_request_expires_at_unix_ms(peer_id);
         let local_peer_id = self.local_peer_id();
         let envelope = CoordinatorControlEnvelope {
             request_id,
@@ -4386,6 +4439,31 @@ impl NatTraversalEndpoint {
 
     fn coordination_connect_timeout(config: &NatTraversalConfig) -> Duration {
         config.coordination_timeout
+    }
+
+    fn coordinator_request_expiry_duration(&self, peer_id: PeerId) -> Duration {
+        const MIN_COORDINATOR_REQUEST_EXPIRY: Duration = Duration::from_millis(250);
+
+        let now = std::time::Instant::now();
+        let upper_bound = self.config.coordination_timeout;
+        let session_budget = self
+            .active_sessions
+            .get(&peer_id)
+            .and_then(|entry| self.recompute_session_deadline(entry.value(), now))
+            .map(|deadline| deadline.at.saturating_duration_since(now));
+
+        // Keep a small floor so requests are not emitted already-expiring under
+        // scheduler jitter; smarter health-aware tuning can follow in later work.
+        session_budget
+            .unwrap_or(upper_bound)
+            .max(MIN_COORDINATOR_REQUEST_EXPIRY)
+            .min(upper_bound)
+    }
+
+    fn coordinator_request_expires_at_unix_ms(&self, peer_id: PeerId) -> u64 {
+        let expiry_duration = self.coordinator_request_expiry_duration(peer_id);
+        let expiry_ms = expiry_duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        now_unix_ms().saturating_add(expiry_ms)
     }
 
     /// Create a QUIC endpoint with NAT traversal configured (async version)
@@ -7802,6 +7880,9 @@ impl NatTraversalEndpoint {
         if session.phase != phase {
             session.phase = phase;
             session.started_at = now;
+            session.last_progress_at = now;
+            session.retry_at = None;
+            session.next_deadline = None;
             session.session_state.last_transition = now;
         }
     }
@@ -7961,8 +8042,13 @@ impl NatTraversalEndpoint {
     fn poll_discovery_manager(&self, now: std::time::Instant, events: &mut Vec<NatTraversalEvent>) {
         let mut discovery = self.discovery_manager.lock();
         let discovery_events = discovery.poll(now);
+        drop(discovery);
 
         for discovery_event in discovery_events {
+            let current_peer_id = self.get_current_discovery_peer_id();
+            if self.discovery_retry_backoff_active(current_peer_id, now) {
+                continue;
+            }
             if let Some(nat_event) = self.convert_discovery_event(discovery_event) {
                 self.emit_event(events, nat_event);
             }
@@ -8016,19 +8102,38 @@ impl NatTraversalEndpoint {
         // Phase 1: Collect work and update session states (brief DashMap access)
         for mut entry in self.active_sessions.iter_mut() {
             let session = entry.value_mut();
+            session.next_deadline = self.recompute_session_deadline(session, now);
             let elapsed = now.duration_since(session.started_at);
             let timed_out = match session.phase {
                 TraversalPhase::Discovery => discovery_phase_deadlines
                     .get(&session.peer_id)
                     .copied()
                     .is_some_and(|deadline| now >= deadline),
-                _ => self
-                    .non_discovery_phase_timeout_deadline(session)
+                _ => session
+                    .next_deadline
+                    .as_ref()
+                    .map(|deadline| deadline.at)
                     .is_some_and(|deadline| now >= deadline),
             };
 
             match session.phase {
                 TraversalPhase::Discovery => {
+                    if let Some(SessionDeadline {
+                        kind: TraversalDeadlineKind::RetryBackoff,
+                        at,
+                    }) = session.next_deadline.as_ref()
+                    {
+                        if now < *at {
+                            continue;
+                        }
+
+                        session.retry_at = None;
+                        session.next_deadline = None;
+                        session.last_progress_at = now;
+                        session.started_at = now;
+                        continue;
+                    }
+
                     if timed_out {
                         timeout_discovery_peers.push(session.peer_id);
                     } else if let Some(deadline) =
@@ -8070,7 +8175,7 @@ impl NatTraversalEndpoint {
                             session,
                             now,
                             &mut events,
-                            NatTraversalError::ProtocolError("Synchronization timeout".to_string()),
+                            NatTraversalError::Timeout,
                         );
                     }
                 }
@@ -8205,29 +8310,12 @@ impl NatTraversalEndpoint {
                 }
             } else if let Some(mut entry) = self.active_sessions.get_mut(&peer_id) {
                 let session = entry.value_mut();
-                if session.attempt < self.config.max_concurrent_attempts as u32 {
-                    session.attempt += 1;
-                    session.started_at = now;
-                    let backoff_duration = self.calculate_backoff(session.attempt);
-                    warn!(
-                        "Discovery timeout for peer {:?}, retrying (attempt {}), backoff: {:?}",
-                        peer_id, session.attempt, backoff_duration
-                    );
-                } else {
-                    session.phase = TraversalPhase::Failed;
-                    self.emit_event(
-                        &mut events,
-                        NatTraversalEvent::TraversalFailed {
-                            peer_id,
-                            error: NatTraversalError::NoCandidatesFound,
-                            fallback_available: true,
-                        },
-                    );
-                    error!(
-                        "NAT traversal failed for peer {:?}: no candidates found after {} attempts",
-                        peer_id, session.attempt
-                    );
-                }
+                self.handle_phase_failure(
+                    session,
+                    now,
+                    &mut events,
+                    NatTraversalError::NoCandidatesFound,
+                );
             }
         }
 
@@ -8344,23 +8432,21 @@ impl NatTraversalEndpoint {
         peer_id: PeerId,
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
-        let phase_deadline = self.active_sessions.get(&peer_id).and_then(|entry| {
-            let phase = entry.value().phase;
-            if matches!(phase, TraversalPhase::Discovery) {
-                drop(entry);
-                self.discovery_manager
-                    .lock()
-                    .phase_timeout_deadline_for_peer(peer_id)
-            } else {
-                self.non_discovery_phase_timeout_deadline(entry.value())
-            }
+        let session_deadline = self.active_sessions.get(&peer_id).and_then(|entry| {
+            let session = entry.value();
+            let authoritative = session
+                .next_deadline
+                .as_ref()
+                .cloned()
+                .or_else(|| self.recompute_session_deadline(session, now));
+            authoritative.map(|deadline| deadline.at.max(now))
         });
         let discovery_deadline = self
             .discovery_manager
             .lock()
             .next_poll_deadline_for_peer(peer_id, now);
 
-        match (phase_deadline, discovery_deadline) {
+        match (session_deadline, discovery_deadline) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
             (None, None) => None,
@@ -8424,18 +8510,44 @@ impl NatTraversalEndpoint {
         )
     }
 
-    fn non_discovery_phase_timeout_deadline(
+    fn recompute_session_deadline(
         &self,
         session: &NatTraversalSession,
-    ) -> Option<std::time::Instant> {
+        now: std::time::Instant,
+    ) -> Option<SessionDeadline> {
+        if let Some(retry_at) = session.retry_at {
+            return Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                at: retry_at.max(now),
+            });
+        }
+
         match session.phase {
-            TraversalPhase::Coordination | TraversalPhase::Synchronization => {
-                Some(session.started_at + self.config.coordination_timeout)
-            }
-            TraversalPhase::Punching | TraversalPhase::Validation => {
-                Some(session.started_at + self.connectivity_phase_budget(session))
-            }
-            TraversalPhase::Discovery | TraversalPhase::Connected | TraversalPhase::Failed => None,
+            TraversalPhase::Discovery => self
+                .discovery_manager
+                .lock()
+                .phase_timeout_deadline_for_peer(session.peer_id)
+                .map(|at| SessionDeadline {
+                    kind: TraversalDeadlineKind::DiscoveryProgress,
+                    at,
+                }),
+            TraversalPhase::Coordination => Some(SessionDeadline {
+                kind: TraversalDeadlineKind::CoordinationResponse,
+                at: session.last_progress_at + self.config.coordination_timeout,
+            }),
+            TraversalPhase::Synchronization => Some(SessionDeadline {
+                kind: TraversalDeadlineKind::SynchronizationProgress,
+                at: session.last_progress_at + self.config.coordination_timeout,
+            }),
+            TraversalPhase::Punching => Some(SessionDeadline {
+                kind: TraversalDeadlineKind::PunchProgress,
+                at: session.last_progress_at + self.connectivity_phase_budget(session),
+            }),
+            TraversalPhase::Validation => Some(SessionDeadline {
+                kind: TraversalDeadlineKind::ValidationProgress,
+                at: session.last_progress_at + self.connectivity_phase_budget(session),
+            }),
+            TraversalPhase::Connected | TraversalPhase::Failed => None,
         }
     }
 
@@ -8448,6 +8560,80 @@ impl NatTraversalEndpoint {
         backoff.min(max) + jitter
     }
 
+    fn classify_failure_reason(
+        &self,
+        session: &NatTraversalSession,
+        error: &NatTraversalError,
+    ) -> TraversalFailureReason {
+        match error {
+            NatTraversalError::NoCandidatesFound
+            | NatTraversalError::CandidateDiscoveryFailed(_) => {
+                TraversalFailureReason::DiscoveryExhausted
+            }
+            NatTraversalError::NoBootstrapNodes => TraversalFailureReason::CoordinatorUnavailable,
+            NatTraversalError::CoordinationFailed(message) => {
+                TraversalFailureReason::NetworkError(message.clone())
+            }
+            NatTraversalError::HolePunchingFailed | NatTraversalError::PunchingFailed(_) => {
+                TraversalFailureReason::PunchWindowMissed
+            }
+            NatTraversalError::ValidationTimeout => TraversalFailureReason::ValidationTimedOut,
+            NatTraversalError::ValidationFailed(_) => TraversalFailureReason::ValidationFailed,
+            NatTraversalError::Timeout => match session.phase {
+                TraversalPhase::Coordination => TraversalFailureReason::CoordinationExpired,
+                TraversalPhase::Synchronization => TraversalFailureReason::SynchronizationExpired,
+                TraversalPhase::Punching => TraversalFailureReason::PunchWindowMissed,
+                TraversalPhase::Validation => TraversalFailureReason::ValidationTimedOut,
+                _ => TraversalFailureReason::NetworkError("Traversal timed out".to_string()),
+            },
+            NatTraversalError::ConnectionFailed(_) | NatTraversalError::PeerNotConnected => {
+                TraversalFailureReason::ConnectionFailed
+            }
+            NatTraversalError::ProtocolError(message) => {
+                TraversalFailureReason::ProtocolViolation(message.clone())
+            }
+            NatTraversalError::NetworkError(message) => {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    TraversalFailureReason::ShuttingDown
+                } else {
+                    TraversalFailureReason::NetworkError(message.clone())
+                }
+            }
+            NatTraversalError::ConfigError(message)
+            | NatTraversalError::TraversalFailed(message) => {
+                TraversalFailureReason::ProtocolViolation(message.clone())
+            }
+        }
+    }
+
+    fn retry_disposition(
+        &self,
+        reason: &TraversalFailureReason,
+        attempt: u32,
+        now: std::time::Instant,
+    ) -> RetryDisposition {
+        if attempt >= self.config.max_concurrent_attempts as u32 {
+            return RetryDisposition::Never;
+        }
+
+        match reason {
+            TraversalFailureReason::ShuttingDown
+            | TraversalFailureReason::ProtocolViolation(_)
+            | TraversalFailureReason::CoordinationRejected { .. } => RetryDisposition::Never,
+            TraversalFailureReason::CoordinatorUnavailable
+            | TraversalFailureReason::DiscoveryExhausted
+            | TraversalFailureReason::CoordinationExpired
+            | TraversalFailureReason::SynchronizationExpired
+            | TraversalFailureReason::PunchWindowMissed
+            | TraversalFailureReason::ValidationTimedOut
+            | TraversalFailureReason::ValidationFailed
+            | TraversalFailureReason::ConnectionFailed
+            | TraversalFailureReason::NetworkError(_) => {
+                RetryDisposition::After(now + self.calculate_backoff(attempt + 1))
+            }
+        }
+    }
+
     /// Handle phase failure with retry logic
     fn handle_phase_failure(
         &self,
@@ -8456,30 +8642,41 @@ impl NatTraversalEndpoint {
         events: &mut Vec<NatTraversalEvent>,
         error: NatTraversalError,
     ) {
-        if session.attempt < self.config.max_concurrent_attempts as u32 {
-            // Retry with backoff
-            session.attempt += 1;
-            session.started_at = now;
-            let backoff = self.calculate_backoff(session.attempt);
-            warn!(
-                "Phase {:?} failed for peer {:?}: {:?}, retrying (attempt {}) after {:?}",
-                session.phase, session.peer_id, error, session.attempt, backoff
-            );
-        } else {
-            // Max attempts reached
-            session.phase = TraversalPhase::Failed;
-            self.emit_event(
-                events,
-                NatTraversalEvent::TraversalFailed {
-                    peer_id: session.peer_id,
-                    error,
-                    fallback_available: true,
-                },
-            );
-            error!(
-                "NAT traversal failed for peer {:?} after {} attempts",
-                session.peer_id, session.attempt
-            );
+        let reason = self.classify_failure_reason(session, &error);
+        session.last_failure = Some(reason.clone());
+
+        match self.retry_disposition(&reason, session.attempt, now) {
+            RetryDisposition::Never => {
+                session.retry_at = None;
+                session.next_deadline = None;
+                session.phase = TraversalPhase::Failed;
+                self.emit_event(
+                    events,
+                    NatTraversalEvent::TraversalFailed {
+                        peer_id: session.peer_id,
+                        error,
+                        fallback_available: true,
+                    },
+                );
+                error!(
+                    "NAT traversal failed for peer {:?} after {} attempts",
+                    session.peer_id, session.attempt
+                );
+            }
+            RetryDisposition::After(retry_at) => {
+                session.attempt += 1;
+                session.started_at = now;
+                session.last_progress_at = now;
+                session.retry_at = Some(retry_at);
+                session.next_deadline = Some(SessionDeadline {
+                    kind: TraversalDeadlineKind::RetryBackoff,
+                    at: retry_at,
+                });
+                warn!(
+                    "Phase {:?} failed for peer {:?}: {:?}, retrying (attempt {}) at {:?}",
+                    session.phase, session.peer_id, reason, session.attempt, retry_at
+                );
+            }
         }
     }
 
@@ -8545,7 +8742,7 @@ impl NatTraversalEndpoint {
 
         let request_id = next_request_id();
         let round = 1u32;
-        let expires_at_unix_ms = now_unix_ms().saturating_add(10_000);
+        let expires_at_unix_ms = self.coordinator_request_expires_at_unix_ms(peer_id);
         let local_peer_id = self.local_peer_id();
         let _envelope = CoordinatorControlEnvelope {
             request_id,
@@ -8928,6 +9125,21 @@ impl NatTraversalEndpoint {
             return true; // Assume healthy if connection exists in map
         }
         true
+    }
+
+    fn discovery_retry_backoff_active(&self, peer_id: PeerId, _now: std::time::Instant) -> bool {
+        self.active_sessions.get(&peer_id).is_some_and(|entry| {
+            let session = entry.value();
+            matches!(session.phase, TraversalPhase::Discovery)
+                && matches!(
+                    session.next_deadline.as_ref(),
+                    Some(SessionDeadline {
+                        kind: TraversalDeadlineKind::RetryBackoff,
+                        ..
+                    })
+                )
+                && session.retry_at.is_some()
+        })
     }
 
     /// Convert discovery events to NAT traversal events with proper peer ID resolution
@@ -10107,16 +10319,21 @@ mod tests {
 
     #[test]
     fn test_session_is_synchronized_requires_candidates() {
+        let started_at = std::time::Instant::now();
         let session = NatTraversalSession {
             peer_id: PeerId([7; 32]),
             coordinator: "127.0.0.1:9000".parse().unwrap(),
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at,
             phase: TraversalPhase::Synchronization,
             candidates: Vec::new(),
+            last_progress_at: started_at,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connecting,
-                last_transition: std::time::Instant::now(),
+                last_transition: started_at,
                 connection: None,
                 active_attempts: Vec::new(),
                 metrics: ConnectionMetrics::default(),
@@ -10140,11 +10357,12 @@ mod tests {
             .expect("Endpoint creation should succeed");
 
         let peer_id = PeerId([9; 32]);
+        let now = std::time::Instant::now();
         let session = NatTraversalSession {
             peer_id,
             coordinator: "127.0.0.1:9000".parse().unwrap(),
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at: now,
             phase: TraversalPhase::Punching,
             candidates: vec![
                 CandidateAddress::new(
@@ -10154,9 +10372,13 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            last_progress_at: now,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connecting,
-                last_transition: std::time::Instant::now(),
+                last_transition: now,
                 connection: None,
                 active_attempts: Vec::new(),
                 metrics: ConnectionMetrics::default(),
@@ -10184,18 +10406,23 @@ mod tests {
             .successful_candidates
             .insert(peer_id, candidate_addr);
 
+        let now = std::time::Instant::now();
         let session = NatTraversalSession {
             peer_id,
             coordinator: "127.0.0.1:9000".parse().unwrap(),
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at: now,
             phase: TraversalPhase::Punching,
             candidates: vec![
                 CandidateAddress::new(candidate_addr, 100, CandidateSource::Peer).unwrap(),
             ],
+            last_progress_at: now,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connecting,
-                last_transition: std::time::Instant::now(),
+                last_transition: now,
                 connection: None,
                 active_attempts: Vec::new(),
                 metrics: ConnectionMetrics::default(),
@@ -10300,6 +10527,10 @@ mod tests {
                 started_at: now,
                 phase: TraversalPhase::Discovery,
                 candidates: Vec::new(),
+                last_progress_at: now,
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Connecting,
                     last_transition: connecting_deadline
@@ -10322,6 +10553,10 @@ mod tests {
                 started_at: now,
                 phase: TraversalPhase::Failed,
                 candidates: Vec::new(),
+                last_progress_at: now,
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Closed,
                     last_transition: closed_deadline
@@ -10399,6 +10634,10 @@ mod tests {
                     )
                     .expect("candidate"),
                 ],
+                last_progress_at: std::time::Instant::now(),
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Connecting,
                     last_transition: std::time::Instant::now(),
@@ -10461,6 +10700,10 @@ mod tests {
                     )
                     .expect("candidate"),
                 ],
+                last_progress_at: std::time::Instant::now(),
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Connecting,
                     last_transition: std::time::Instant::now(),
@@ -10519,6 +10762,10 @@ mod tests {
                 started_at: std::time::Instant::now(),
                 phase: TraversalPhase::Validation,
                 candidates: vec![candidate],
+                last_progress_at: std::time::Instant::now(),
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Connecting,
                     last_transition: std::time::Instant::now(),
@@ -10594,16 +10841,21 @@ mod tests {
             .await
             .expect("Endpoint creation should succeed");
 
+        let started_at = std::time::Instant::now();
         let mut session = NatTraversalSession {
             peer_id: PeerId([0x64; 32]),
             coordinator: "127.0.0.1:9000".parse().unwrap(),
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at,
             phase: TraversalPhase::Punching,
             candidates: Vec::new(),
+            last_progress_at: started_at,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connecting,
-                last_transition: std::time::Instant::now(),
+                last_transition: started_at,
                 connection: None,
                 active_attempts: Vec::new(),
                 metrics: ConnectionMetrics::default(),
@@ -10643,16 +10895,21 @@ mod tests {
         let endpoint = NatTraversalEndpoint::new(config, None, None)
             .await
             .expect("Endpoint creation should succeed");
+        let started_at = std::time::Instant::now();
         let session = NatTraversalSession {
             peer_id: PeerId([0x62; 32]),
             coordinator: "127.0.0.1:9000".parse().unwrap(),
             attempt: 1,
-            started_at: std::time::Instant::now(),
+            started_at,
             phase: TraversalPhase::Connected,
             candidates: Vec::new(),
+            last_progress_at: started_at,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
             session_state: SessionState {
                 state: ConnectionState::Connected,
-                last_transition: std::time::Instant::now(),
+                last_transition: started_at,
                 connection: None,
                 active_attempts: Vec::new(),
                 metrics: ConnectionMetrics::default(),
@@ -10661,9 +10918,628 @@ mod tests {
 
         assert!(
             endpoint
-                .non_discovery_phase_timeout_deadline(&session)
+                .recompute_session_deadline(&session, started_at)
                 .is_none()
         );
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_recompute_session_deadline_prefers_retry_backoff() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let retry_at = now + Duration::from_millis(250);
+        let session = NatTraversalSession {
+            peer_id: PeerId([0x71; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now,
+            phase: TraversalPhase::Synchronization,
+            candidates: Vec::new(),
+            last_progress_at: now - Duration::from_secs(2),
+            next_deadline: None,
+            retry_at: Some(retry_at),
+            last_failure: Some(TraversalFailureReason::NetworkError(
+                "temporary".to_string(),
+            )),
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        let deadline = endpoint
+            .recompute_session_deadline(&session, now)
+            .expect("retry deadline");
+        assert_eq!(deadline.kind, TraversalDeadlineKind::RetryBackoff);
+        assert_eq!(deadline.at, retry_at);
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_recompute_session_deadline_uses_session_owned_non_discovery_budget() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let coordination_timeout = config.coordination_timeout;
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let last_progress_at = now - Duration::from_millis(400);
+        let session = NatTraversalSession {
+            peer_id: PeerId([0x72; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now - Duration::from_secs(10),
+            phase: TraversalPhase::Synchronization,
+            candidates: vec![
+                CandidateAddress::new(
+                    "127.0.0.1:9001".parse().unwrap(),
+                    100,
+                    CandidateSource::Observed { by_node: None },
+                )
+                .expect("candidate"),
+            ],
+            last_progress_at,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        let deadline = endpoint
+            .recompute_session_deadline(&session, now)
+            .expect("phase deadline");
+        assert_eq!(
+            deadline.kind,
+            TraversalDeadlineKind::SynchronizationProgress
+        );
+        assert_eq!(deadline.at, last_progress_at + coordination_timeout);
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[test]
+    fn test_set_session_phase_clears_stale_retry_state_and_resets_progress_timestamp() {
+        let original_now = std::time::Instant::now();
+        let transition_now = original_now + Duration::from_secs(2);
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x76; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 2,
+            started_at: original_now,
+            phase: TraversalPhase::Coordination,
+            candidates: Vec::new(),
+            last_progress_at: original_now,
+            next_deadline: Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                at: original_now + Duration::from_secs(1),
+            }),
+            retry_at: Some(original_now + Duration::from_secs(1)),
+            last_failure: Some(TraversalFailureReason::CoordinatorUnavailable),
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: original_now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        NatTraversalEndpoint::set_session_phase(
+            &mut session,
+            transition_now,
+            TraversalPhase::Synchronization,
+        );
+
+        assert!(matches!(session.phase, TraversalPhase::Synchronization));
+        assert_eq!(session.started_at, transition_now);
+        assert_eq!(session.last_progress_at, transition_now);
+        assert!(
+            session.retry_at.is_none(),
+            "phase progress should clear stale retry scheduling"
+        );
+        assert!(
+            session.next_deadline.is_none(),
+            "phase progress should clear stale retry deadline ownership"
+        );
+        assert_eq!(session.session_state.last_transition, transition_now);
+    }
+
+    #[tokio::test]
+    async fn test_retry_disposition_distinguishes_retryable_vs_terminal_reasons() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let retryable =
+            endpoint.retry_disposition(&TraversalFailureReason::CoordinatorUnavailable, 1, now);
+        let terminal = endpoint.retry_disposition(
+            &TraversalFailureReason::ProtocolViolation("bad frame".to_string()),
+            1,
+            now,
+        );
+
+        assert!(matches!(retryable, RetryDisposition::After(at) if at > now));
+        assert!(matches!(terminal, RetryDisposition::Never));
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_handle_phase_failure_stores_retry_state_for_retryable_failures() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x73; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now - Duration::from_secs(1),
+            phase: TraversalPhase::Coordination,
+            candidates: Vec::new(),
+            last_progress_at: now - Duration::from_secs(1),
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+        let mut events = Vec::new();
+
+        endpoint.handle_phase_failure(
+            &mut session,
+            now,
+            &mut events,
+            NatTraversalError::NoBootstrapNodes,
+        );
+
+        assert!(matches!(
+            session.last_failure,
+            Some(TraversalFailureReason::CoordinatorUnavailable)
+        ));
+        let retry_at = session.retry_at.expect("retry scheduled");
+        assert!(retry_at > now);
+        assert!(matches!(
+            session.next_deadline,
+            Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                at,
+            }) if at == retry_at
+        ));
+        assert!(
+            events.is_empty(),
+            "retryable failures should not emit terminal events"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_handle_phase_failure_classifies_synchronization_timeout_as_retryable_expiration()
+    {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x77; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now - Duration::from_secs(1),
+            phase: TraversalPhase::Synchronization,
+            candidates: Vec::new(),
+            last_progress_at: now - Duration::from_secs(1),
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+        let mut events = Vec::new();
+
+        endpoint.handle_phase_failure(&mut session, now, &mut events, NatTraversalError::Timeout);
+
+        assert!(matches!(
+            session.last_failure,
+            Some(TraversalFailureReason::SynchronizationExpired)
+        ));
+        assert!(
+            session.retry_at.is_some(),
+            "synchronization timeout should be retryable"
+        );
+        assert!(matches!(
+            session.next_deadline,
+            Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                ..
+            })
+        ));
+        assert!(
+            events.is_empty(),
+            "retryable synchronization expiration should not emit terminal failure"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_handle_phase_failure_stores_retry_schedule_for_discovery_exhaustion() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x78; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now - Duration::from_secs(1),
+            phase: TraversalPhase::Discovery,
+            candidates: Vec::new(),
+            last_progress_at: now - Duration::from_secs(1),
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+        let mut events = Vec::new();
+
+        endpoint.handle_phase_failure(
+            &mut session,
+            now,
+            &mut events,
+            NatTraversalError::NoCandidatesFound,
+        );
+
+        assert!(matches!(
+            session.last_failure,
+            Some(TraversalFailureReason::DiscoveryExhausted)
+        ));
+        assert!(
+            session.retry_at.is_some(),
+            "discovery exhaustion should persist retry scheduling"
+        );
+        assert!(matches!(
+            session.next_deadline,
+            Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                ..
+            })
+        ));
+        assert!(
+            events.is_empty(),
+            "retryable discovery exhaustion should not emit terminal failure"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_handle_phase_failure_emits_terminal_event_and_clears_retry_state() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let mut session = NatTraversalSession {
+            peer_id: PeerId([0x74; 32]),
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now,
+            phase: TraversalPhase::Synchronization,
+            candidates: Vec::new(),
+            last_progress_at: now,
+            next_deadline: Some(SessionDeadline {
+                kind: TraversalDeadlineKind::RetryBackoff,
+                at: now + Duration::from_secs(1),
+            }),
+            retry_at: Some(now + Duration::from_secs(1)),
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+        let mut events = Vec::new();
+
+        endpoint.handle_phase_failure(
+            &mut session,
+            now,
+            &mut events,
+            NatTraversalError::ProtocolError("malformed control message".to_string()),
+        );
+
+        assert!(matches!(
+            session.last_failure,
+            Some(TraversalFailureReason::ProtocolViolation(_))
+        ));
+        assert!(
+            session.retry_at.is_none(),
+            "terminal failures clear retry_at"
+        );
+        assert!(
+            session.next_deadline.is_none(),
+            "terminal failures clear next_deadline"
+        );
+        assert!(matches!(session.phase, TraversalPhase::Failed));
+        assert!(matches!(
+            events.as_slice(),
+            [NatTraversalEvent::TraversalFailed {
+                peer_id,
+                error: NatTraversalError::ProtocolError(message),
+                fallback_available: true,
+            }] if *peer_id == session.peer_id && message == "malformed control message"
+        ));
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_request_expiry_helper_is_bounded_by_session_budget_and_timeout() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let coordination_timeout = config.coordination_timeout;
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x75; 32]);
+        let now = std::time::Instant::now();
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: now - Duration::from_secs(10),
+                phase: TraversalPhase::Synchronization,
+                candidates: Vec::new(),
+                last_progress_at: now - Duration::from_secs(1),
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: now,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let expiry_duration = endpoint.coordinator_request_expiry_duration(peer_id);
+        assert!(
+            expiry_duration <= coordination_timeout,
+            "expiry must stay within configured coordination timeout"
+        );
+        assert!(
+            expiry_duration <= Duration::from_secs(4),
+            "expiry should clamp to remaining session-owned budget"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_request_expiry_helper_applies_minimum_floor() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x79; 32]);
+        let now = std::time::Instant::now();
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: now - Duration::from_secs(1),
+                phase: TraversalPhase::Synchronization,
+                candidates: Vec::new(),
+                last_progress_at: now - Duration::from_secs(5),
+                next_deadline: Some(SessionDeadline {
+                    kind: TraversalDeadlineKind::SynchronizationProgress,
+                    at: now,
+                }),
+                retry_at: None,
+                last_failure: None,
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: now,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let expiry_duration = endpoint.coordinator_request_expiry_duration(peer_id);
+        assert!(
+            expiry_duration >= Duration::from_millis(250),
+            "expiry should honor the minimum floor when session budget is exhausted"
+        );
+        assert!(
+            expiry_duration <= Duration::from_secs(5),
+            "expiry floor must still respect the configured upper bound"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_discovery_retry_backoff_is_preserved_until_due_and_then_consumed() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x7A; 32]);
+        endpoint
+            .discovery_manager
+            .lock()
+            .start_discovery(peer_id, Vec::new())
+            .expect("discovery should start");
+
+        let base_now = std::time::Instant::now();
+        let retry_at = base_now + Duration::from_secs(30);
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: base_now - Duration::from_secs(10),
+                phase: TraversalPhase::Discovery,
+                candidates: Vec::new(),
+                last_progress_at: base_now - Duration::from_secs(10),
+                next_deadline: Some(SessionDeadline {
+                    kind: TraversalDeadlineKind::RetryBackoff,
+                    at: retry_at,
+                }),
+                retry_at: Some(retry_at),
+                last_failure: Some(TraversalFailureReason::DiscoveryExhausted),
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: base_now,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let events_before = endpoint
+            .poll(base_now)
+            .expect("poll before retry deadline should succeed");
+        assert!(
+            events_before.is_empty(),
+            "inert retry wait should not emit events"
+        );
+        {
+            let session = endpoint
+                .active_sessions
+                .get(&peer_id)
+                .expect("session before due");
+            assert_eq!(session.retry_at, Some(retry_at));
+            assert!(matches!(
+                session.next_deadline,
+                Some(SessionDeadline {
+                    kind: TraversalDeadlineKind::RetryBackoff,
+                    at,
+                }) if at == retry_at
+            ));
+        }
+
+        let events_after = endpoint
+            .poll(retry_at)
+            .expect("poll at retry deadline should succeed");
+        assert!(
+            events_after.is_empty(),
+            "consuming retry state should not itself emit terminal events"
+        );
+        {
+            let session = endpoint
+                .active_sessions
+                .get(&peer_id)
+                .expect("session after due");
+            assert!(
+                session.retry_at.is_none(),
+                "retry state should be consumed once due"
+            );
+            assert!(
+                !matches!(
+                    session.next_deadline,
+                    Some(SessionDeadline {
+                        kind: TraversalDeadlineKind::RetryBackoff,
+                        ..
+                    })
+                ),
+                "retry backoff should no longer remain authoritative after consumption"
+            );
+            assert_eq!(session.last_progress_at, retry_at);
+            assert_eq!(session.started_at, retry_at);
+        }
+
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
 
@@ -10692,6 +11568,10 @@ mod tests {
                 started_at: std::time::Instant::now(),
                 phase: TraversalPhase::Discovery,
                 candidates: Vec::new(),
+                last_progress_at: std::time::Instant::now(),
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
                 session_state: SessionState {
                     state: ConnectionState::Connecting,
                     last_transition: std::time::Instant::now(),
