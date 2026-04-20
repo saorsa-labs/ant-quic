@@ -1160,6 +1160,8 @@ impl CandidateDiscoveryManager {
                     if Self::should_delay_completion(&self.config, session, now) {
                         Some(session.started_at + self.config.min_discovery_time)
                     } else {
+                        // Wake immediately so the next poll tick can consume the
+                        // completed session without inventing another timer floor.
                         Some(now)
                     }
                 } else {

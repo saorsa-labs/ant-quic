@@ -382,6 +382,47 @@ fn normalize_direct_path_unavailable_reason(
     }
 }
 
+fn normalize_direct_path_unavailable_reason_from_traversal_reason(
+    reason: &TraversalFailureReason,
+) -> DirectPathUnavailableReason {
+    match reason {
+        TraversalFailureReason::DiscoveryExhausted => DirectPathUnavailableReason::NoCandidates,
+        TraversalFailureReason::CoordinatorUnavailable
+        | TraversalFailureReason::CoordinationRejected { .. }
+        | TraversalFailureReason::CoordinationExpired
+        | TraversalFailureReason::SynchronizationExpired
+        | TraversalFailureReason::PunchWindowMissed
+        | TraversalFailureReason::ValidationTimedOut
+        | TraversalFailureReason::ValidationFailed
+        | TraversalFailureReason::ConnectionFailed
+        | TraversalFailureReason::NetworkError(_)
+        | TraversalFailureReason::ShuttingDown => DirectPathUnavailableReason::NatUnreachable,
+        TraversalFailureReason::ProtocolViolation(_) => DirectPathUnavailableReason::Unknown,
+    }
+}
+
+fn is_terminal_direct_path_status(status: &DirectPathStatus) -> bool {
+    matches!(
+        status,
+        DirectPathStatus::BestEffortUnavailable { .. } | DirectPathStatus::Failed { .. }
+    )
+}
+
+fn terminal_direct_path_status_from_failure(
+    reason: &TraversalFailureReason,
+    fallback_available: bool,
+) -> DirectPathStatus {
+    if fallback_available {
+        DirectPathStatus::BestEffortUnavailable {
+            reason: normalize_direct_path_unavailable_reason_from_traversal_reason(reason),
+        }
+    } else {
+        DirectPathStatus::Failed {
+            error: reason.to_string(),
+        }
+    }
+}
+
 fn publish_direct_path_status(
     statuses: &ParkingRwLock<HashMap<PeerId, DirectPathStatus>>,
     event_tx: &broadcast::Sender<P2pEvent>,
@@ -1248,7 +1289,7 @@ impl HolePunchAwaitError {
     }
 
     fn from_nat_traversal_error(error: NatTraversalError) -> Self {
-        match P2pEndpoint::traversal_failure_reason_from_nat_error(&error) {
+        match TraversalFailureReason::from_public_operation_error(&error) {
             Some(reason) => Self::TraversalFailure(reason),
             None => Self::Endpoint(EndpointError::NatTraversal(error)),
         }
@@ -1258,13 +1299,7 @@ impl HolePunchAwaitError {
 impl std::fmt::Display for HolePunchAwaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TraversalFailure(reason) => {
-                write!(
-                    f,
-                    "{}",
-                    P2pEndpoint::endpoint_error_from_traversal_failure(reason.clone())
-                )
-            }
+            Self::TraversalFailure(reason) => write!(f, "{reason}"),
             Self::Endpoint(error) => write!(f, "{error}"),
         }
     }
@@ -1639,11 +1674,40 @@ async fn bridge_nat_traversal_event(
                 },
             );
         }
+        NatTraversalEvent::TraversalTerminated {
+            peer_id,
+            reason,
+            fallback_available,
+        } => {
+            stats.write().await.failed_connections += 1;
+            let status = terminal_direct_path_status_from_failure(&reason, fallback_available);
+            publish_direct_path_status(direct_path_statuses, event_tx, peer_id, status);
+            if let Err(e) = event_tx.send(P2pEvent::NatTraversalProgress {
+                peer_id,
+                phase: TraversalPhase::Failed,
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_nat_progress_failed",
+                    peer_id = ?peer_id,
+                    error = %e,
+                    "silent drop"
+                );
+            }
+        }
         NatTraversalEvent::TraversalFailed {
             peer_id,
             error,
             fallback_available,
         } => {
+            let already_terminal = direct_path_statuses
+                .read()
+                .get(&peer_id)
+                .is_some_and(is_terminal_direct_path_status);
+            if already_terminal {
+                return;
+            }
+
             stats.write().await.failed_connections += 1;
             let status = if fallback_available {
                 DirectPathStatus::BestEffortUnavailable {
@@ -3738,7 +3802,7 @@ impl P2pEndpoint {
                         peer_id.unwrap_or_else(|| peer_id_from_socket_addr(target));
 
                     match self
-                        .start_hole_punch_session(target, coordinator, target_peer_id)
+                        .start_hole_punch_session(coordinator, target_peer_id)
                         .await
                     {
                         Ok(()) => match self
@@ -3773,7 +3837,7 @@ impl P2pEndpoint {
                             let retryable = strategy.should_retry_holepunch()
                                 && match &e {
                                     EndpointError::NatTraversal(error) => {
-                                        Self::traversal_failure_reason_from_nat_error(error)
+                                        TraversalFailureReason::from_public_operation_error(error)
                                             .as_ref()
                                             .is_some_and(Self::should_retry_hole_punch_reason)
                                     }
@@ -3968,7 +4032,6 @@ impl P2pEndpoint {
 
     async fn start_hole_punch_session(
         &self,
-        _target: SocketAddr,
         coordinator: SocketAddr,
         peer_id: PeerId,
     ) -> Result<(), EndpointError> {
@@ -4229,46 +4292,7 @@ impl P2pEndpoint {
         }
     }
 
-    fn traversal_failure_reason_from_nat_error(
-        error: &NatTraversalError,
-    ) -> Option<TraversalFailureReason> {
-        match error {
-            NatTraversalError::NoBootstrapNodes => {
-                Some(TraversalFailureReason::CoordinatorUnavailable)
-            }
-            NatTraversalError::NoCandidatesFound
-            | NatTraversalError::CandidateDiscoveryFailed(_) => {
-                Some(TraversalFailureReason::DiscoveryExhausted)
-            }
-            NatTraversalError::CoordinationFailed(message) => {
-                Some(TraversalFailureReason::NetworkError(message.clone()))
-            }
-            NatTraversalError::HolePunchingFailed | NatTraversalError::PunchingFailed(_) => {
-                Some(TraversalFailureReason::PunchWindowMissed)
-            }
-            NatTraversalError::ValidationTimeout => {
-                Some(TraversalFailureReason::ValidationTimedOut)
-            }
-            NatTraversalError::ValidationFailed(_) => {
-                Some(TraversalFailureReason::ValidationFailed)
-            }
-            NatTraversalError::Timeout => Some(TraversalFailureReason::NetworkError(
-                "overall hole-punch deadline expired".to_string(),
-            )),
-            NatTraversalError::ConnectionFailed(_) | NatTraversalError::PeerNotConnected => {
-                Some(TraversalFailureReason::ConnectionFailed)
-            }
-            NatTraversalError::ProtocolError(message)
-            | NatTraversalError::ConfigError(message)
-            | NatTraversalError::TraversalFailed(message) => {
-                Some(TraversalFailureReason::ProtocolViolation(message.clone()))
-            }
-            NatTraversalError::NetworkError(message) => {
-                Some(TraversalFailureReason::NetworkError(message.clone()))
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn endpoint_error_from_traversal_failure(reason: TraversalFailureReason) -> EndpointError {
         match reason {
             TraversalFailureReason::CoordinatorUnavailable => {
@@ -4278,7 +4302,7 @@ impl P2pEndpoint {
                 EndpointError::NatTraversal(NatTraversalError::NoCandidatesFound)
             }
             TraversalFailureReason::CoordinationRejected { reason } => EndpointError::NatTraversal(
-                NatTraversalError::CoordinationFailed(format!("coordination rejected: {reason:?}")),
+                NatTraversalError::CoordinationFailed(format!("coordination rejected: {reason}")),
             ),
             TraversalFailureReason::CoordinationExpired
             | TraversalFailureReason::SynchronizationExpired
@@ -7388,19 +7412,19 @@ mod tests {
     #[test]
     fn test_traversal_failure_reason_from_nat_error_maps_representative_hole_punch_failures() {
         assert!(matches!(
-            P2pEndpoint::traversal_failure_reason_from_nat_error(
+            TraversalFailureReason::from_public_operation_error(
                 &NatTraversalError::NoBootstrapNodes
             ),
             Some(TraversalFailureReason::CoordinatorUnavailable)
         ));
         assert!(matches!(
-            P2pEndpoint::traversal_failure_reason_from_nat_error(
+            TraversalFailureReason::from_public_operation_error(
                 &NatTraversalError::HolePunchingFailed
             ),
             Some(TraversalFailureReason::PunchWindowMissed)
         ));
         assert!(matches!(
-            P2pEndpoint::traversal_failure_reason_from_nat_error(&NatTraversalError::ProtocolError(
+            TraversalFailureReason::from_public_operation_error(&NatTraversalError::ProtocolError(
                 "malformed".to_string()
             )),
             Some(TraversalFailureReason::ProtocolViolation(message)) if message == "malformed"
@@ -7418,8 +7442,17 @@ mod tests {
         assert!(matches!(
             error,
             EndpointError::NatTraversal(NatTraversalError::CoordinationFailed(message))
-                if message.contains("Expired")
+                if message.contains("request expired")
         ));
+    }
+
+    #[test]
+    fn test_hole_punch_await_error_display_uses_typed_reason() {
+        let error =
+            HolePunchAwaitError::TraversalFailure(TraversalFailureReason::CoordinationRejected {
+                reason: RejectionReason::Expired,
+            });
+        assert_eq!(error.to_string(), "coordination rejected: request expired");
     }
 
     #[test]
@@ -7593,6 +7626,71 @@ mod tests {
             Some(&DirectPathStatus::BestEffortUnavailable {
                 reason: DirectPathUnavailableReason::NatUnreachable,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_nat_traversal_terminated_is_authoritative_over_legacy_failed() {
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let direct_path_statuses = ParkingRwLock::new(HashMap::new());
+        let peer_id = PeerId([0x35; 32]);
+
+        bridge_nat_traversal_event(
+            &stats,
+            &event_tx,
+            &direct_path_statuses,
+            NatTraversalEvent::TraversalTerminated {
+                peer_id,
+                reason: TraversalFailureReason::PunchWindowMissed,
+                fallback_available: true,
+            },
+        )
+        .await;
+        bridge_nat_traversal_event(
+            &stats,
+            &event_tx,
+            &direct_path_statuses,
+            NatTraversalEvent::TraversalFailed {
+                peer_id,
+                error: NatTraversalError::HolePunchingFailed,
+                fallback_available: true,
+            },
+        )
+        .await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.failed_connections, 1);
+        drop(stats);
+
+        let collected = collect_broadcast_events(&mut event_rx);
+        assert_eq!(
+            collected
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    P2pEvent::NatTraversalProgress {
+                        peer_id: observed_peer_id,
+                        phase: TraversalPhase::Failed,
+                    } if *observed_peer_id == peer_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            collected
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    P2pEvent::DirectPathStatus {
+                        peer_id: observed_peer_id,
+                        status: DirectPathStatus::BestEffortUnavailable {
+                            reason: DirectPathUnavailableReason::NatUnreachable,
+                        },
+                    } if *observed_peer_id == peer_id
+                ))
+                .count(),
+            1
         );
     }
 

@@ -78,6 +78,19 @@ pub enum RejectionReason {
     InternalError,
 }
 
+impl std::fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfTarget => write!(f, "self-target request"),
+            Self::UnknownTarget => write!(f, "unknown target"),
+            Self::Expired => write!(f, "request expired"),
+            Self::RateLimited => write!(f, "rate limited"),
+            Self::Unauthenticated => write!(f, "unauthenticated requester"),
+            Self::InternalError => write!(f, "internal coordinator error"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingRequest {
     pub initiator: PeerId,
@@ -167,6 +180,8 @@ fn scavenge_expired_state(now_ms: u64) {
     inbound_offers().retain(|_, offer| offer.local_expires_at > now);
     live_requests().retain(|_, live| live.local_expires_at > now);
     rejections().retain(|key, recorded| {
+        // This cross-map lookup stays safe because `rejections` and
+        // `live_requests` are distinct DashMaps with independent shard locks.
         live_requests().get(key).is_some_and(|live| {
             live.local_expires_at > now
                 && live.request_id == recorded.request_id
