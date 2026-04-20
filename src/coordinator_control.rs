@@ -6,7 +6,7 @@ use std::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
@@ -85,6 +85,7 @@ pub(crate) struct PendingRequest {
     pub round: u32,
     pub initiator_addrs: Vec<SocketAddr>,
     pub expires_at_unix_ms: u64,
+    pub local_expires_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub(crate) struct LiveRequest {
     pub request_id: u64,
     pub round: u32,
     pub expires_at_unix_ms: u64,
+    pub local_expires_at: Instant,
     pub expected_coordinator: Option<PeerId>,
 }
 
@@ -112,6 +114,7 @@ pub(crate) struct InboundOffer {
     pub round: u32,
     pub initiator_addrs: Vec<SocketAddr>,
     pub expires_at_unix_ms: u64,
+    pub local_expires_at: Instant,
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -159,12 +162,15 @@ fn maybe_scavenge_expired_state(now_ms: u64) {
 }
 
 fn scavenge_expired_state(now_ms: u64) {
-    pending_requests().retain(|_, pending| pending.expires_at_unix_ms > now_ms);
-    inbound_offers().retain(|_, offer| offer.expires_at_unix_ms > now_ms);
-    live_requests().retain(|_, live| live.expires_at_unix_ms > now_ms);
+    let now = Instant::now();
+    pending_requests().retain(|_, pending| pending.local_expires_at > now);
+    inbound_offers().retain(|_, offer| offer.local_expires_at > now);
+    live_requests().retain(|_, live| live.local_expires_at > now);
     rejections().retain(|key, recorded| {
         live_requests().get(key).is_some_and(|live| {
-            live.request_id == recorded.request_id && live.round == recorded.round
+            live.local_expires_at > now
+                && live.request_id == recorded.request_id
+                && live.round == recorded.round
         })
     });
 
@@ -212,9 +218,14 @@ pub(crate) fn remember_pending_request(request_id: u64, pending: PendingRequest)
 
 pub(crate) fn get_pending_request(request_id: u64) -> Option<PendingRequest> {
     maybe_scavenge_expired_state(now_unix_ms());
-    pending_requests()
+    let pending = pending_requests()
         .get(&request_id)
-        .map(|entry| entry.value().clone())
+        .map(|entry| entry.value().clone())?;
+    if pending.local_expires_at <= Instant::now() {
+        let _ = pending_requests().remove(&request_id);
+        return None;
+    }
+    Some(pending)
 }
 
 pub(crate) fn remove_pending_request(request_id: u64) -> Option<PendingRequest> {
@@ -235,9 +246,14 @@ pub(crate) fn remember_inbound_offer(
 
 pub(crate) fn inbound_offer(local_target_peer: PeerId, request_id: u64) -> Option<InboundOffer> {
     maybe_scavenge_expired_state(now_unix_ms());
-    inbound_offers()
+    let offer = inbound_offers()
         .get(&(local_target_peer.0, request_id))
-        .map(|entry| entry.value().clone())
+        .map(|entry| entry.value().clone())?;
+    if offer.local_expires_at <= Instant::now() {
+        let _ = inbound_offers().remove(&(local_target_peer.0, request_id));
+        return None;
+    }
+    Some(offer)
 }
 
 pub(crate) fn remove_inbound_offer(
@@ -274,9 +290,14 @@ pub(crate) fn remember_live_request(local_peer: PeerId, target_peer: PeerId, liv
 
 pub(crate) fn live_request(local_peer: PeerId, target_peer: PeerId) -> Option<LiveRequest> {
     maybe_scavenge_expired_state(now_unix_ms());
-    live_requests()
+    let live = live_requests()
         .get(&(local_peer.0, target_peer.0))
-        .map(|entry| entry.value().clone())
+        .map(|entry| entry.value().clone())?;
+    if live.local_expires_at <= Instant::now() {
+        let _ = live_requests().remove(&(local_peer.0, target_peer.0));
+        return None;
+    }
+    Some(live)
 }
 
 pub(crate) fn clear_live_request(local_peer: PeerId, target_peer: PeerId) -> Option<LiveRequest> {
@@ -312,9 +333,7 @@ pub(crate) fn take_live_rejection(
 ) -> Option<RecordedRejection> {
     maybe_scavenge_expired_state(now_unix_ms());
     let key = (local_peer.0, target_peer.0);
-    let live = live_requests()
-        .get(&key)
-        .map(|entry| entry.value().clone())?;
+    let live = live_request(local_peer, target_peer)?;
     let recorded = rejections().get(&key).map(|entry| entry.value().clone())?;
 
     if recorded.request_id != live.request_id || recorded.round != live.round {
@@ -322,6 +341,19 @@ pub(crate) fn take_live_rejection(
     }
 
     rejections().remove(&key).map(|(_, rejection)| rejection)
+}
+
+pub(crate) fn monotonic_deadline_from_unix_ms(expires_at_unix_ms: u64) -> Instant {
+    let remaining_ms = expires_at_unix_ms.saturating_sub(now_unix_ms());
+    Instant::now() + Duration::from_millis(remaining_ms)
+}
+
+pub(crate) fn wire_and_monotonic_expiry_after(duration: Duration) -> (u64, Instant) {
+    let expiry_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    (
+        now_unix_ms().saturating_add(expiry_ms),
+        Instant::now() + duration,
+    )
 }
 
 pub(crate) fn now_unix_ms() -> u64 {
@@ -445,6 +477,7 @@ mod tests {
         let local_b = peer(0x02);
         let target = peer(0x33);
         let now_ms = now_unix_ms();
+        let fresh_deadline = Instant::now() + Duration::from_secs(60);
 
         let _ = clear_live_request(local_a, target);
         let _ = clear_live_request(local_b, target);
@@ -458,6 +491,7 @@ mod tests {
                 request_id: 100,
                 round: 1,
                 expires_at_unix_ms: now_ms + 60_000,
+                local_expires_at: fresh_deadline,
                 expected_coordinator: None,
             },
         );
@@ -468,6 +502,7 @@ mod tests {
                 request_id: 200,
                 round: 1,
                 expires_at_unix_ms: now_ms + 61_000,
+                local_expires_at: fresh_deadline,
                 expected_coordinator: None,
             },
         );
@@ -517,6 +552,7 @@ mod tests {
                 request_id: 301,
                 round: 2,
                 expires_at_unix_ms: now_ms + 62_000,
+                local_expires_at: fresh_deadline,
                 expected_coordinator: None,
             },
         );
@@ -565,6 +601,8 @@ mod tests {
     #[test]
     fn scavenger_removes_expired_abandoned_state() {
         let now_ms = now_unix_ms();
+        let expired_deadline = Instant::now();
+        let fresh_deadline = Instant::now() + Duration::from_secs(10);
         let expired_request_id = 9_101;
         let fresh_request_id = 9_102;
         let expired_target = peer(0x71);
@@ -593,6 +631,7 @@ mod tests {
                 round: 1,
                 initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms - 1,
+                local_expires_at: expired_deadline,
             },
         );
         remember_pending_request(
@@ -603,6 +642,7 @@ mod tests {
                 round: 2,
                 initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms + 10_000,
+                local_expires_at: fresh_deadline,
             },
         );
 
@@ -617,6 +657,7 @@ mod tests {
                 round: 1,
                 initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms - 1,
+                local_expires_at: expired_deadline,
             },
         );
         remember_inbound_offer(
@@ -630,6 +671,7 @@ mod tests {
                 round: 2,
                 initiator_addrs: Vec::new(),
                 expires_at_unix_ms: now_ms + 10_000,
+                local_expires_at: fresh_deadline,
             },
         );
 
@@ -640,6 +682,7 @@ mod tests {
                 request_id: expired_request_id,
                 round: 1,
                 expires_at_unix_ms: now_ms - 1,
+                local_expires_at: expired_deadline,
                 expected_coordinator: None,
             },
         );
@@ -650,6 +693,7 @@ mod tests {
                 request_id: fresh_request_id,
                 round: 2,
                 expires_at_unix_ms: now_ms + 10_000,
+                local_expires_at: fresh_deadline,
                 expected_coordinator: None,
             },
         );
@@ -697,5 +741,59 @@ mod tests {
         let _ = clear_live_request(fresh_local, fresh_target);
         let _ = take_live_rejection(fresh_local, fresh_target);
         rate_limits().remove(&(fresh_local.0, fresh_requester.0));
+    }
+
+    #[test]
+    fn getters_prefer_monotonic_deadlines_over_future_wire_expiry() {
+        let now_ms = now_unix_ms();
+        let request_id = 9_201;
+        let local_peer = peer(0x81);
+        let target_peer = peer(0x82);
+        let expired_deadline = Instant::now();
+
+        let _ = remove_pending_request(request_id);
+        let _ = remove_inbound_offer(target_peer, request_id);
+        let _ = clear_live_request(local_peer, target_peer);
+
+        remember_pending_request(
+            request_id,
+            PendingRequest {
+                initiator: local_peer,
+                target: target_peer,
+                round: 1,
+                initiator_addrs: Vec::new(),
+                expires_at_unix_ms: now_ms + 60_000,
+                local_expires_at: expired_deadline,
+            },
+        );
+        remember_inbound_offer(
+            target_peer,
+            request_id,
+            InboundOffer {
+                coordinator: peer(0x83),
+                initiator: local_peer,
+                target: target_peer,
+                request_id,
+                round: 1,
+                initiator_addrs: Vec::new(),
+                expires_at_unix_ms: now_ms + 60_000,
+                local_expires_at: expired_deadline,
+            },
+        );
+        remember_live_request(
+            local_peer,
+            target_peer,
+            LiveRequest {
+                request_id,
+                round: 1,
+                expires_at_unix_ms: now_ms + 60_000,
+                local_expires_at: expired_deadline,
+                expected_coordinator: None,
+            },
+        );
+
+        assert!(get_pending_request(request_id).is_none());
+        assert!(inbound_offer(target_peer, request_id).is_none());
+        assert!(live_request(local_peer, target_peer).is_none());
     }
 }

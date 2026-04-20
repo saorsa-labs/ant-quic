@@ -16,10 +16,11 @@
 use crate::coordinator_control::{
     CoordinatorControlEnvelope, CoordinatorControlMessage, InboundOffer, LiveRequest,
     PendingRequest, RejectionReason, clear_live_request, decode_coordinator_control,
-    encode_coordinator_control, get_pending_request, inbound_offer, live_request, next_request_id,
-    note_rate_limit_and_check, now_unix_ms, record_rejection, remember_inbound_offer,
-    remember_live_request, remember_pending_request, remove_inbound_offer, remove_pending_request,
-    take_live_rejection,
+    encode_coordinator_control, get_pending_request, inbound_offer, live_request,
+    monotonic_deadline_from_unix_ms, next_request_id, note_rate_limit_and_check, now_unix_ms,
+    record_rejection, remember_inbound_offer, remember_live_request, remember_pending_request,
+    remove_inbound_offer, remove_pending_request, take_live_rejection,
+    wire_and_monotonic_expiry_after,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -3503,6 +3504,9 @@ impl NatTraversalEndpoint {
                         round: *round,
                         initiator_addrs: initiator_addrs.clone(),
                         expires_at_unix_ms: envelope.expires_at_unix_ms,
+                        local_expires_at: monotonic_deadline_from_unix_ms(
+                            envelope.expires_at_unix_ms,
+                        ),
                     },
                 );
 
@@ -3589,6 +3593,9 @@ impl NatTraversalEndpoint {
                         round: *round,
                         initiator_addrs: initiator_addrs.clone(),
                         expires_at_unix_ms: envelope.expires_at_unix_ms,
+                        local_expires_at: monotonic_deadline_from_unix_ms(
+                            envelope.expires_at_unix_ms,
+                        ),
                     },
                 );
 
@@ -3667,10 +3674,6 @@ impl NatTraversalEndpoint {
                     return Ok(true);
                 }
                 if *round != pending.round {
-                    let _ = remove_pending_request(envelope.request_id);
-                    return Ok(true);
-                }
-                if pending.expires_at_unix_ms < now_unix_ms() {
                     let _ = remove_pending_request(envelope.request_id);
                     return Ok(true);
                 }
@@ -3779,9 +3782,6 @@ impl NatTraversalEndpoint {
                         return Ok(true);
                     }
                     if live.round != *round {
-                        return Ok(true);
-                    }
-                    if live.expires_at_unix_ms < now_unix_ms() {
                         return Ok(true);
                     }
                     if let Some(expected) = live.expected_coordinator
@@ -3912,9 +3912,6 @@ impl NatTraversalEndpoint {
                         if offer.round != *round {
                             return Ok(true);
                         }
-                        if offer.expires_at_unix_ms < now_unix_ms() {
-                            return Ok(true);
-                        }
                         if offer.coordinator != from_peer_id {
                             return Ok(true);
                         }
@@ -4022,9 +4019,6 @@ impl NatTraversalEndpoint {
                     if live.round != *round {
                         return Ok(true);
                     }
-                    if live.expires_at_unix_ms < now_unix_ms() {
-                        return Ok(true);
-                    }
                     if let Some(expected) = live.expected_coordinator
                         && expected != from_peer_id
                     {
@@ -4089,9 +4083,6 @@ impl NatTraversalEndpoint {
                         return Ok(true);
                     }
                     if offer.round != *round {
-                        return Ok(true);
-                    }
-                    if offer.expires_at_unix_ms < now_unix_ms() {
                         return Ok(true);
                     }
                     if offer.coordinator != from_peer_id {
@@ -4206,7 +4197,9 @@ impl NatTraversalEndpoint {
 
         let request_id = next_request_id();
         let round = 1u32;
-        let expires_at_unix_ms = self.coordinator_request_expires_at_unix_ms(peer_id);
+        let expiry_duration = self.coordinator_request_expiry_duration(peer_id);
+        let (expires_at_unix_ms, local_expires_at) =
+            wire_and_monotonic_expiry_after(expiry_duration);
         let local_peer_id = self.local_peer_id();
         let envelope = CoordinatorControlEnvelope {
             request_id,
@@ -4232,6 +4225,7 @@ impl NatTraversalEndpoint {
                         request_id,
                         round,
                         expires_at_unix_ms,
+                        local_expires_at,
                         expected_coordinator: Some(coordinator_peer_id),
                     },
                 );
@@ -4276,6 +4270,7 @@ impl NatTraversalEndpoint {
                             request_id,
                             round,
                             expires_at_unix_ms,
+                            local_expires_at,
                             expected_coordinator: None,
                         },
                     );
@@ -4328,6 +4323,7 @@ impl NatTraversalEndpoint {
                                         request_id,
                                         round,
                                         expires_at_unix_ms,
+                                        local_expires_at,
                                         expected_coordinator: Some(coordinator_peer_id),
                                     },
                                 );
