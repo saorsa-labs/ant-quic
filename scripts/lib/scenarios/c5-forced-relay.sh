@@ -71,7 +71,7 @@ run() {
 
     log_info "C5: ${s} -> ${r}: ${TRANSFER_BYTES} bytes via relay"
     local kp; kp=$(known_peers_csv)
-    timeout "${TRANSFER_TIMEOUT}" "${NODE_BIN[$s]}" \
+    portable_timeout "${TRANSFER_TIMEOUT}" "${NODE_BIN[$s]}" \
         --listen "[::]:0" \
         --no-default-bootstrap \
         --known-peers "${kp}" \

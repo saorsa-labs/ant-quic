@@ -25,7 +25,7 @@ source "${LIB_DIR}/topology.sh"
 : "${LOG_DIR:?must be set}"
 : "${ANT_QUIC_PORT:?must be set}"
 TRANSFER_BYTES="${TRANSFER_BYTES:-67108864}"     # 64 MiB
-TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-90}"
+TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-180}"      # binary needs ~30s startup + 30s peer-wait + transfer time
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 
 read -r -a NODES <<< "${REACHABLE_NODES_STR:-${ALL_NODES[*]}}"
@@ -58,7 +58,7 @@ send_one() {
     local cmd
     if [ "$sender" = "L1" ]; then
         # shellcheck disable=SC2086
-        timeout "${TRANSFER_TIMEOUT}" "${NODE_BIN[$sender]}" \
+        portable_timeout "${TRANSFER_TIMEOUT}" "${NODE_BIN[$sender]}" \
             --listen "[::]:0" \
             --no-default-bootstrap \
             --known-peers "${KNOWN_CSV}" \

@@ -62,12 +62,20 @@ done
 # Will be filled in after C1 mesh-up parses each node's startup log.
 declare -A NODE_PEER_ID
 
-# Comma-separated --known-peers list of all VPS IPv4 addresses on the test
-# port. Every node passes this to ant-quic so cross-LAN discovery works
-# without the registry.
+# Comma-separated --known-peers list of VPS IPv4 addresses on the test
+# port. By default returns ALL VPS, but if REACHABLE_NODES_STR is set
+# (preflight populates it) the unreachable ones are excluded — otherwise
+# every short-lived sender process pays the SSH-timeout cost trying to
+# connect to dead nodes.
 known_peers_csv() {
+    local reachable="${REACHABLE_NODES_STR:-${ALL_NODES[*]}}"
     local out=""
     for v in "${VPS_NODES[@]}"; do
+        # Include only if this VPS is in the reachable list.
+        case " ${reachable} " in
+            *" ${v} "*) : ;;
+            *) continue ;;
+        esac
         [ -n "$out" ] && out+=","
         out+="${NODE_HOST[$v]}:${ANT_QUIC_PORT}"
     done

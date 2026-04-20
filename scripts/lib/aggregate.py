@@ -88,8 +88,12 @@ def read_log(path: pathlib.Path) -> list[str]:
 def build_connectivity(
     log_dir: pathlib.Path, labels: list[str], peer_ids: dict[str, str]
 ) -> dict[tuple[str, str], str]:
-    """(sender_label, recipient_label) -> connection_type or '' if no event."""
-    by_short = {pid: lab for lab, pid in peer_ids.items()}
+    """(sender_label, recipient_label) -> connection_type or '' if no event.
+
+    peer_ids holds full 64-char ids, but peer_connected JSON events print
+    only the 16-char display form. Index by the first 16 chars.
+    """
+    by_short = {pid[:16]: lab for lab, pid in peer_ids.items()}
     matrix: dict[tuple[str, str], str] = {}
     for sender in labels:
         f = log_dir / f"c1_{sender}.log"
@@ -111,7 +115,7 @@ def build_connectivity(
 def build_path_types(
     log_dir: pathlib.Path, labels: list[str], peer_ids: dict[str, str]
 ) -> dict[tuple[str, str], str]:
-    by_short = {pid: lab for lab, pid in peer_ids.items()}
+    by_short = {pid[:16]: lab for lab, pid in peer_ids.items()}
     matrix: dict[tuple[str, str], str] = {}
     for sender in labels:
         f = log_dir / f"c1_{sender}.log"

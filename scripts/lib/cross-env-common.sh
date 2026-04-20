@@ -133,15 +133,44 @@ register_cleanup() {
     trap "${cleanup_fn}" EXIT INT TERM
 }
 
-# Extract a node's 64-char hex peer ID from its startup log.
-# Looks for the binary's "Peer ID:" line. Caller must have waited for
-# startup; otherwise this returns empty.
+# Extract a node's full 64-char hex peer ID from its startup log.
+# Reads the `{"event":"local_identity","peer_id":"..."}` JSON line which
+# contains the full 32-byte (64-hex-char) peer id needed by --send-to and
+# --connect-peer-id. The plain "Peer ID:" INFO line shows only the first
+# 16 chars and is NOT what we want.
+#
+# `label` is the c1_<node> prefix (e.g. "c1_L1"); the function strips the
+# leading "c1_" if present so callers can pass either form.
 extract_peer_id_from_log() {
     local label="$1"
     local logfile="${LOG_DIR}/${label}.log"
     [ -f "$logfile" ] || return 1
-    grep -m1 -oE 'Peer ID:[[:space:]]*[0-9a-f]{16}' "$logfile" 2>/dev/null \
-        | awk '{print $NF}'
+    grep -m1 '"event":"local_identity"' "$logfile" 2>/dev/null \
+        | sed -E 's/.*"peer_id":"([0-9a-f]{64})".*/\1/'
+}
+
+# Run a command with a wall-clock timeout, portable across BSD (macOS)
+# and GNU. macOS has no `timeout` binary by default; this helper picks
+# `gtimeout` if available, else falls back to a backgrounded watchdog.
+# Usage: portable_timeout <secs> <cmd> [args...]
+portable_timeout() {
+    local secs="$1"; shift
+    local bin
+    bin=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || true)
+    if [ -n "$bin" ]; then
+        "$bin" "$secs" "$@"
+        return $?
+    fi
+    # Watchdog fallback. Keep PID isolated so we don't kill the parent.
+    "$@" &
+    local cmd_pid=$!
+    ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 2; kill -KILL "$cmd_pid" 2>/dev/null ) &
+    local wd_pid=$!
+    wait "$cmd_pid" 2>/dev/null
+    local rc=$?
+    kill "$wd_pid" 2>/dev/null
+    wait "$wd_pid" 2>/dev/null
+    return $rc
 }
 
 # Install a pfctl rule on this MacBook that drops UDP between localhost and

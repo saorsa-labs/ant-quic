@@ -41,7 +41,7 @@ stream_one() {
     log_info "  ${sender} -> ${recipient}: ${STREAM_DURATION}s @ ${COUNTER_INTERVAL_MS}ms"
 
     if [ "$sender" = "L1" ]; then
-        timeout $((STREAM_DURATION + 10)) "${NODE_BIN[$sender]}" \
+        portable_timeout $((STREAM_DURATION + 10)) "${NODE_BIN[$sender]}" \
             --listen "[::]:0" \
             --no-default-bootstrap \
             --known-peers "${KNOWN_CSV}" \

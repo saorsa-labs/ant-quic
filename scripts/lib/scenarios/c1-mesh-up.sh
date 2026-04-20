@@ -78,11 +78,11 @@ run() {
     for label in "${NODES[@]}"; do
         local pid
         pid=$(extract_peer_id_from_log "c1_${label}" || true)
-        if [ -n "${pid:-}" ]; then
+        if [ -n "${pid:-}" ] && [ "${#pid}" -eq 64 ]; then
             printf '%s\t%s\n' "$label" "$pid" >> "${LOG_DIR}/peer_ids.tsv"
-            log_ok "  ${label}: ${pid}"
+            log_ok "  ${label}: ${pid:0:16}…"
         else
-            log_warn "  ${label}: could not extract peer id"
+            log_warn "  ${label}: could not extract full peer id (got '${pid:0:64}')"
         fi
     done
 }
@@ -104,12 +104,14 @@ verify() {
             if [ -z "$rid" ]; then
                 continue
             fi
-            # Match the binary's JSON peer_connected event referencing the
-            # recipient's short id (first 16 hex chars).
-            if grep -q "\"event\":\"peer_connected\".*\"peer_id\":\"${rid}\"" "$logfile" 2>/dev/null; then
+            # peer_ids.tsv has full 64-char ids but the binary's
+            # peer_connected JSON event prints only the 16-char display form
+            # (first 8 bytes via format_peer_id). Truncate to match.
+            local rid_short="${rid:0:16}"
+            if grep -q "\"event\":\"peer_connected\".*\"peer_id\":\"${rid_short}\"" "$logfile" 2>/dev/null; then
                 : # ok
             else
-                log_warn "  ${sender} -> ${recipient}: no peer_connected for ${rid}"
+                log_warn "  ${sender} -> ${recipient}: no peer_connected for ${rid_short}"
                 fail=1
             fi
         done
