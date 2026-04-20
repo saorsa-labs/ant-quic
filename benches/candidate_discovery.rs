@@ -199,7 +199,7 @@ fn bench_candidate_pairing(c: &mut Criterion) {
                         }
 
                         // Sort pairs by priority
-                        pairs.sort_by(|a, b| b.2.cmp(&a.2));
+                        pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
                         pairs
                     });
                 },
@@ -243,7 +243,7 @@ fn bench_candidate_sorting(c: &mut Criterion) {
 
                 b.iter(|| {
                     let mut sorted_candidates = candidates.clone();
-                    sorted_candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+                    sorted_candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
                     black_box(sorted_candidates);
                 });
             },
