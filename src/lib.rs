@@ -331,13 +331,15 @@ pub use connection::{
     Datagrams, Event, FinishError, ReadError, ReadableError, RecvStream, SendDatagramError,
     SendStream, StreamEvent, Streams, WriteError, Written,
 };
+pub use coordinator_control::RejectionReason;
 pub use endpoint::{
     AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint as LowLevelEndpoint,
     Incoming,
 };
 pub use nat_traversal_api::{
     BootstrapNode, CandidateAddress, NatTraversalConfig, NatTraversalEndpoint, NatTraversalError,
-    NatTraversalEvent, NatTraversalStatistics, PeerId,
+    NatTraversalEvent, NatTraversalStatistics, PeerId, TraversalDeadlineKind,
+    TraversalFailureReason,
 };
 pub use reachability::{ReachabilityScope, TraversalMethod};
 

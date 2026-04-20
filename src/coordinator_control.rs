@@ -61,13 +61,20 @@ pub(crate) enum CoordinatorControlMessage {
     },
 }
 
+/// Coordinator-side reason for rejecting a traversal coordination request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum RejectionReason {
+pub enum RejectionReason {
+    /// The initiator attempted to coordinate a traversal to itself.
     SelfTarget,
+    /// The requested target peer is unknown or currently unavailable.
     UnknownTarget,
+    /// The request or offer expired before it could be coordinated.
     Expired,
+    /// The coordinator refused the request due to rate limiting.
     RateLimited,
+    /// The initiating peer was not sufficiently authenticated for coordination.
     Unauthenticated,
+    /// The coordinator hit an internal error while processing the request.
     InternalError,
 }
 

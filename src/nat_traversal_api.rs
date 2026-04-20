@@ -687,13 +687,20 @@ pub enum CandidatePairState {
     Cancelled,
 }
 
+/// The specific protocol progress condition currently bounding traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TraversalDeadlineKind {
+pub enum TraversalDeadlineKind {
+    /// Discovery failed to produce enough evidence before its contract deadline.
     DiscoveryProgress,
+    /// Coordination did not receive the expected response in time.
     CoordinationResponse,
+    /// Synchronization did not make progress before its deadline.
     SynchronizationProgress,
+    /// Hole punching did not produce a viable path before the punch window closed.
     PunchProgress,
+    /// Path validation did not complete before its deadline.
     ValidationProgress,
+    /// Session-owned retry backoff has not expired yet.
     RetryBackoff,
 }
 
@@ -8142,7 +8149,7 @@ impl NatTraversalEndpoint {
         let mut validation_requests: Vec<(PeerId, SocketAddr)> = Vec::new();
         // Collect Discovery-phase peers for deferred discovery_manager access
         // to avoid locking discovery_manager while iter_mut() holds all shard guards
-        let mut early_discovery_peers: Vec<(PeerId, Duration)> = Vec::new();
+        let mut early_discovery_peers: Vec<PeerId> = Vec::new();
         let mut timeout_discovery_peers: Vec<PeerId> = Vec::new();
         let active_session_ids: Vec<PeerId> = self
             .active_sessions
@@ -8198,11 +8205,8 @@ impl NatTraversalEndpoint {
 
                     if timed_out {
                         timeout_discovery_peers.push(session.peer_id);
-                    } else if let Some(deadline) =
-                        discovery_phase_deadlines.get(&session.peer_id).copied()
-                    {
-                        early_discovery_peers
-                            .push((session.peer_id, deadline.saturating_duration_since(now)));
+                    } else {
+                        early_discovery_peers.push(session.peer_id);
                     }
                 }
                 TraversalPhase::Coordination => {
@@ -8348,7 +8352,7 @@ impl NatTraversalEndpoint {
 
         // Phase 1b: Process deferred discovery_manager checks
         // Each get_mut() locks only one shard, safe to lock discovery_manager
-        for (peer_id, time_remaining) in early_discovery_peers {
+        for peer_id in early_discovery_peers {
             let discovered_candidates = self
                 .discovery_manager
                 .lock()
@@ -8380,11 +8384,22 @@ impl NatTraversalEndpoint {
                             .map(|deadline| deadline.at),
                     },
                 );
-                info!(
-                    "Peer {:?} early-advanced from Discovery to Coordination ({:.1}s before timeout)",
-                    peer_id,
-                    time_remaining.as_secs_f64()
-                );
+                let time_remaining = discovery_phase_deadlines
+                    .get(&peer_id)
+                    .copied()
+                    .map(|deadline| deadline.saturating_duration_since(now));
+                if let Some(time_remaining) = time_remaining {
+                    info!(
+                        "Peer {:?} early-advanced from Discovery to Coordination ({:.1}s before timeout)",
+                        peer_id,
+                        time_remaining.as_secs_f64()
+                    );
+                } else {
+                    info!(
+                        "Peer {:?} early-advanced from Discovery to Coordination on evidence",
+                        peer_id,
+                    );
+                }
             }
         }
 
@@ -8546,19 +8561,29 @@ impl NatTraversalEndpoint {
         peer_id: PeerId,
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
-        let session_deadline = self.active_sessions.get(&peer_id).and_then(|entry| {
-            let session = entry.value();
-            let authoritative = session
-                .next_deadline
-                .as_ref()
-                .cloned()
-                .or_else(|| self.recompute_session_deadline(session, now));
-            authoritative.map(|deadline| deadline.at.max(now))
-        });
-        let discovery_deadline = self
-            .discovery_manager
-            .lock()
-            .next_poll_deadline_for_peer(peer_id, now);
+        let (session_deadline, include_discovery_deadline) = self
+            .active_sessions
+            .get(&peer_id)
+            .map(|entry| {
+                let session = entry.value();
+                let authoritative = session
+                    .next_deadline
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| self.recompute_session_deadline(session, now));
+                (
+                    authoritative.map(|deadline| deadline.at.max(now)),
+                    matches!(session.phase, TraversalPhase::Discovery),
+                )
+            })
+            .unwrap_or((None, false));
+        let discovery_deadline = include_discovery_deadline
+            .then(|| {
+                self.discovery_manager
+                    .lock()
+                    .next_poll_deadline_for_peer(peer_id, now)
+            })
+            .flatten();
 
         match (session_deadline, discovery_deadline) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -8720,6 +8745,12 @@ impl NatTraversalEndpoint {
         }
     }
 
+    /// Session-level retry policy for the current traversal negotiation.
+    ///
+    /// This answers whether the active NAT traversal session should back off and
+    /// retry internally. It is intentionally distinct from
+    /// `P2pEndpoint::should_retry_hole_punch_reason`, which decides whether to
+    /// start a fresh outer hole-punch session after this one terminates.
     fn retry_disposition(
         &self,
         reason: &TraversalFailureReason,
@@ -11859,6 +11890,63 @@ mod tests {
             deadline < discovery_contract_deadline,
             "session-specific discovery polling should wake before the discovery contract deadline"
         );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_next_session_poll_deadline_ignores_discovery_cadence_after_phase_progress() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            coordination_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let coordination_timeout = config.coordination_timeout;
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let peer_id = PeerId([0x45; 32]);
+        endpoint
+            .discovery_manager
+            .lock()
+            .start_discovery(peer_id, Vec::new())
+            .expect("discovery should start");
+
+        let now = std::time::Instant::now();
+        endpoint.active_sessions.insert(
+            peer_id,
+            NatTraversalSession {
+                peer_id,
+                coordinator: "127.0.0.1:9000".parse().unwrap(),
+                attempt: 1,
+                started_at: now,
+                phase: TraversalPhase::Coordination,
+                candidates: vec![CandidateAddress {
+                    address: "127.0.0.1:9001".parse().unwrap(),
+                    priority: 1,
+                    source: CandidateSource::Local,
+                    state: CandidateState::New,
+                }],
+                last_progress_at: now,
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: now,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+
+        let deadline = endpoint
+            .next_session_poll_deadline(peer_id, now)
+            .expect("coordination session should schedule a wakeup");
+
+        assert_eq!(deadline, now + coordination_timeout);
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }

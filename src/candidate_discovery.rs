@@ -178,6 +178,9 @@ pub struct DiscoverySession {
     current_phase: DiscoveryPhase,
     /// Session start time
     started_at: Instant,
+    /// When local interface scanning finished and discovery is only waiting for
+    /// bounded additional evidence (for example an OBSERVED_ADDRESS report).
+    local_scan_completed_at: Option<Instant>,
     /// Discovered candidates for this peer
     discovered_candidates: Vec<DiscoveryCandidate>,
     /// Discovery statistics
@@ -648,6 +651,7 @@ impl DiscoverySession {
         Self {
             current_phase: DiscoveryPhase::Idle,
             started_at: Instant::now(),
+            local_scan_completed_at: None,
             discovered_candidates: Vec::new(),
             statistics: DiscoveryStatistics::default(),
         }
@@ -667,6 +671,45 @@ impl CandidateDiscoveryManager {
             active_sessions: HashMap::new(),
             cached_local_candidates: None,
             additional_bound_addresses: Vec::new(),
+        }
+    }
+
+    fn has_server_reflexive_candidate(session: &DiscoverySession) -> bool {
+        session
+            .discovered_candidates
+            .iter()
+            .any(|candidate| matches!(candidate.source, DiscoverySourceType::ServerReflexive))
+    }
+
+    fn should_delay_completion(
+        config: &DiscoveryConfig,
+        session: &DiscoverySession,
+        now: Instant,
+    ) -> bool {
+        !config.min_discovery_time.is_zero()
+            && !session.discovered_candidates.is_empty()
+            && !Self::has_server_reflexive_candidate(session)
+            && now < session.started_at + config.min_discovery_time
+    }
+
+    fn complete_discovery_session(session: &mut DiscoverySession, now: Instant) -> DiscoveryEvent {
+        let final_candidates: Vec<ValidatedCandidate> = session
+            .discovered_candidates
+            .iter()
+            .map(|dc| ValidatedCandidate::from_discovery(dc, 1.0))
+            .collect();
+
+        let candidate_count = final_candidates.len();
+        session.current_phase = DiscoveryPhase::Completed {
+            final_candidates,
+            completion_time: now,
+        };
+        session.local_scan_completed_at = None;
+
+        DiscoveryEvent::DiscoveryCompleted {
+            candidate_count,
+            total_duration: now.duration_since(session.started_at),
+            success_rate: if candidate_count > 0 { 1.0 } else { 0.0 },
         }
     }
 
@@ -797,14 +840,42 @@ impl CandidateDiscoveryManager {
 
         for peer_id in peer_ids {
             // Get the current phase by cloning the needed data
-            let phase_info = self
-                .active_sessions
-                .get(&peer_id)
-                .map(|s| (s.current_phase.clone(), s.started_at));
+            let phase_info = self.active_sessions.get(&peer_id).map(|s| {
+                (
+                    s.current_phase.clone(),
+                    s.started_at,
+                    s.local_scan_completed_at,
+                )
+            });
 
-            if let Some((DiscoveryPhase::LocalInterfaceScanning { started_at }, session_start)) =
-                phase_info
+            if let Some((
+                DiscoveryPhase::LocalInterfaceScanning { started_at },
+                session_start,
+                local_scan_completed_at,
+            )) = phase_info
             {
+                if local_scan_completed_at.is_some() {
+                    if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                        if Self::should_delay_completion(&self.config, session, now) {
+                            debug!(
+                                "Waiting for additional discovery evidence for peer {:?}: elapsed {:?} < min {:?}",
+                                peer_id,
+                                now.duration_since(session_start),
+                                self.config.min_discovery_time
+                            );
+                        } else {
+                            let candidate_count = session.discovered_candidates.len();
+                            let completion = Self::complete_discovery_session(session, now);
+                            info!(
+                                "Discovery completed for peer {:?}: {} candidates found",
+                                peer_id, candidate_count
+                            );
+                            all_events.push(completion);
+                        }
+                    }
+                    continue;
+                }
+
                 let bound_candidate = self.config.bound_address.and_then(|addr| {
                     if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
                         Some(addr)
@@ -978,45 +1049,24 @@ impl CandidateDiscoveryManager {
                         duration: started_at.elapsed(),
                     });
 
-                    // Step 4: Check if we should complete discovery
-                    // Wait for min_discovery_time to allow OBSERVED_ADDRESS frames
-                    let elapsed = now.duration_since(session_start);
-                    let has_external = self
-                        .active_sessions
-                        .get(&peer_id)
-                        .is_some_and(|s| s.statistics.server_reflexive_candidates_found > 0);
-
-                    if elapsed >= self.config.min_discovery_time || has_external {
-                        // Complete discovery
-                        if let Some(session) = self.active_sessions.get_mut(&peer_id) {
-                            let final_candidates: Vec<ValidatedCandidate> = session
-                                .discovered_candidates
-                                .iter()
-                                .map(|dc| ValidatedCandidate::from_discovery(dc, 1.0))
-                                .collect();
-
-                            let candidate_count = final_candidates.len();
-                            session.current_phase = DiscoveryPhase::Completed {
-                                final_candidates,
-                                completion_time: now,
-                            };
-
+                    if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                        session.local_scan_completed_at = Some(now);
+                        if Self::should_delay_completion(&self.config, session, now) {
+                            debug!(
+                                "Delaying discovery completion for peer {:?}: elapsed {:?} < min {:?}",
+                                peer_id,
+                                now.duration_since(session_start),
+                                self.config.min_discovery_time
+                            );
+                        } else {
+                            let candidate_count = session.discovered_candidates.len();
+                            let completion = Self::complete_discovery_session(session, now);
                             info!(
                                 "Discovery completed for peer {:?}: {} candidates found",
                                 peer_id, candidate_count
                             );
-
-                            all_events.push(DiscoveryEvent::DiscoveryCompleted {
-                                candidate_count,
-                                total_duration: elapsed,
-                                success_rate: if candidate_count > 0 { 1.0 } else { 0.0 },
-                            });
+                            all_events.push(completion);
                         }
-                    } else {
-                        debug!(
-                            "Delaying discovery completion for peer {:?}: elapsed {:?} < min {:?}",
-                            peer_id, elapsed, self.config.min_discovery_time
-                        );
                     }
                 } else if started_at.elapsed() > self.config.local_scan_timeout {
                     // Timeout - complete with whatever we have
@@ -1060,29 +1110,16 @@ impl CandidateDiscoveryManager {
                             }
                         }
 
-                        let final_candidates: Vec<ValidatedCandidate> = session
-                            .discovered_candidates
-                            .iter()
-                            .map(|dc| ValidatedCandidate::from_discovery(dc, 1.0))
-                            .collect();
-
-                        let candidate_count = final_candidates.len();
+                        session.local_scan_completed_at = Some(now);
+                        let candidate_count = session.discovered_candidates.len();
 
                         all_events.push(DiscoveryEvent::LocalScanningCompleted {
                             candidate_count,
                             duration: started_at.elapsed(),
                         });
 
-                        session.current_phase = DiscoveryPhase::Completed {
-                            final_candidates,
-                            completion_time: now,
-                        };
-
-                        all_events.push(DiscoveryEvent::DiscoveryCompleted {
-                            candidate_count,
-                            total_duration: now.duration_since(session.started_at),
-                            success_rate: if candidate_count > 0 { 1.0 } else { 0.0 },
-                        });
+                        let completion = Self::complete_discovery_session(session, now);
+                        all_events.push(completion);
 
                         info!(
                             "Discovery completed (timeout) for peer {:?}: {} candidates",
@@ -1119,19 +1156,23 @@ impl CandidateDiscoveryManager {
             | DiscoveryPhase::Completed { .. }
             | DiscoveryPhase::Failed { .. } => None,
             DiscoveryPhase::LocalInterfaceScanning { started_at } => {
-                let scan_timeout_deadline = *started_at + self.config.local_scan_timeout;
-                let scan_kickoff_deadline = *started_at + Duration::from_millis(50);
-                let discovery_floor_deadline = session.started_at + self.config.min_discovery_time;
-                let next_scan_check = now + Duration::from_millis(10);
+                if session.local_scan_completed_at.is_some() {
+                    if Self::should_delay_completion(&self.config, session, now) {
+                        Some(session.started_at + self.config.min_discovery_time)
+                    } else {
+                        Some(now)
+                    }
+                } else {
+                    let scan_timeout_deadline = *started_at + self.config.local_scan_timeout;
+                    let scan_kickoff_deadline = *started_at + Duration::from_millis(50);
+                    let next_scan_check = now + Duration::from_millis(10);
 
-                let mut deadline = scan_timeout_deadline.min(next_scan_check);
-                if now < scan_kickoff_deadline {
-                    deadline = deadline.min(scan_kickoff_deadline);
+                    let mut deadline = scan_timeout_deadline.min(next_scan_check);
+                    if now < scan_kickoff_deadline {
+                        deadline = deadline.min(scan_kickoff_deadline);
+                    }
+                    Some(deadline)
                 }
-                if !self.config.min_discovery_time.is_zero() {
-                    deadline = deadline.min(discovery_floor_deadline);
-                }
-                Some(deadline)
             }
             DiscoveryPhase::ServerReflexiveQuerying { started_at, .. } => {
                 Some(*started_at + self.config.bootstrap_query_timeout)
@@ -1150,10 +1191,9 @@ impl CandidateDiscoveryManager {
             DiscoveryPhase::Idle
             | DiscoveryPhase::Completed { .. }
             | DiscoveryPhase::Failed { .. } => None,
-            DiscoveryPhase::LocalInterfaceScanning { started_at } => Some(
-                (*started_at + self.config.local_scan_timeout)
-                    .max(session.started_at + self.config.min_discovery_time),
-            ),
+            DiscoveryPhase::LocalInterfaceScanning { started_at } => {
+                Some(*started_at + self.config.local_scan_timeout)
+            }
             DiscoveryPhase::ServerReflexiveQuerying { .. }
             | DiscoveryPhase::CandidateValidation { .. } => {
                 Some(session.started_at + self.config.total_timeout)
@@ -2592,6 +2632,7 @@ mod tests {
             DiscoverySession {
                 current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
                 started_at,
+                local_scan_completed_at: None,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
             },
@@ -2611,9 +2652,42 @@ mod tests {
     }
 
     #[test]
+    fn next_poll_deadline_waits_for_bounded_external_evidence_only_after_scan_completion() {
+        let mut manager = create_test_manager();
+        manager.config.min_discovery_time = Duration::from_secs(10);
+
+        let peer_id = PeerId([8; 32]);
+        let started_at = Instant::now();
+        manager.active_sessions.insert(
+            peer_id,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
+                started_at,
+                local_scan_completed_at: Some(started_at + Duration::from_millis(20)),
+                discovered_candidates: vec![DiscoveryCandidate {
+                    address: "127.0.0.1:9000".parse().expect("valid loopback candidate"),
+                    priority: 60000,
+                    source: DiscoverySourceType::Local,
+                    state: CandidateState::New,
+                }],
+                statistics: DiscoveryStatistics {
+                    local_candidates_found: 1,
+                    ..DiscoveryStatistics::default()
+                },
+            },
+        );
+
+        let now = started_at + Duration::from_secs(1);
+        assert_eq!(
+            manager.next_poll_deadline_for_peer(peer_id, now),
+            Some(started_at + Duration::from_secs(10))
+        );
+    }
+
+    #[test]
     fn next_poll_deadline_is_none_for_completed_session() {
         let manager = create_test_manager();
-        let peer_id = PeerId([8; 32]);
+        let peer_id = PeerId([9; 32]);
         let started_at = Instant::now();
 
         let mut manager = manager;
@@ -2625,6 +2699,7 @@ mod tests {
                     completion_time: started_at,
                 },
                 started_at,
+                local_scan_completed_at: None,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
             },
@@ -2638,18 +2713,19 @@ mod tests {
     }
 
     #[test]
-    fn phase_timeout_deadline_for_local_scan_respects_min_discovery_time_floor() {
+    fn phase_timeout_deadline_for_local_scan_ignores_min_discovery_time_floor() {
         let mut manager = create_test_manager();
         manager.config.local_scan_timeout = Duration::from_secs(2);
         manager.config.min_discovery_time = Duration::from_secs(10);
 
-        let peer_id = PeerId([9; 32]);
+        let peer_id = PeerId([10; 32]);
         let started_at = Instant::now();
         manager.active_sessions.insert(
             peer_id,
             DiscoverySession {
                 current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
                 started_at,
+                local_scan_completed_at: None,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
             },
@@ -2657,22 +2733,59 @@ mod tests {
 
         assert_eq!(
             manager.phase_timeout_deadline_for_peer(peer_id),
-            Some(started_at + Duration::from_secs(10))
+            Some(started_at + Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn poll_completes_after_scan_without_waiting_for_floor_when_no_candidates() {
+        let mut manager = create_test_manager();
+        manager.config.min_discovery_time = Duration::from_secs(10);
+
+        let peer_id = PeerId([11; 32]);
+        let started_at = Instant::now();
+        manager.active_sessions.insert(
+            peer_id,
+            DiscoverySession {
+                current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at },
+                started_at,
+                local_scan_completed_at: Some(started_at + Duration::from_millis(25)),
+                discovered_candidates: Vec::new(),
+                statistics: DiscoveryStatistics::default(),
+            },
+        );
+
+        let events = manager.poll(started_at + Duration::from_secs(1));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiscoveryEvent::DiscoveryCompleted {
+                candidate_count: 0,
+                ..
+            }
+        )));
+        assert!(matches!(
+            manager
+                .active_sessions
+                .get(&peer_id)
+                .expect("session should remain accessible")
+                .current_phase,
+            DiscoveryPhase::Completed { .. }
+        ));
     }
 
     #[test]
     fn next_global_poll_deadline_uses_earliest_active_session() {
         let mut manager = create_test_manager();
         let now = Instant::now();
-        let first_peer = PeerId([9; 32]);
-        let second_peer = PeerId([10; 32]);
+        let first_peer = PeerId([12; 32]);
+        let second_peer = PeerId([13; 32]);
 
         manager.active_sessions.insert(
             first_peer,
             DiscoverySession {
                 current_phase: DiscoveryPhase::LocalInterfaceScanning { started_at: now },
                 started_at: now,
+                local_scan_completed_at: None,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
             },
@@ -2684,6 +2797,7 @@ mod tests {
                     started_at: now + Duration::from_millis(30),
                 },
                 started_at: now + Duration::from_millis(30),
+                local_scan_completed_at: None,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
             },

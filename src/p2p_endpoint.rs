@@ -4184,6 +4184,7 @@ impl P2pEndpoint {
     ) -> Result<(), EndpointError> {
         let traversal_notified = self.inner.traversal_event_notify().notified();
         tokio::pin!(traversal_notified);
+        traversal_notified.as_mut().enable();
 
         let wake_at = self
             .inner
@@ -4205,6 +4206,12 @@ impl P2pEndpoint {
         }
     }
 
+    /// Endpoint-level retry policy after a traversal session has terminated.
+    ///
+    /// This answers whether the connection strategy should start a fresh
+    /// hole-punch session. It is intentionally distinct from
+    /// `NatTraversalEndpoint::retry_disposition`, which only governs retries
+    /// within the current traversal negotiation.
     fn should_retry_hole_punch_reason(reason: &TraversalFailureReason) -> bool {
         match reason {
             TraversalFailureReason::CoordinatorUnavailable
