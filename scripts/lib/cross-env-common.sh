@@ -182,7 +182,9 @@ block_direct_path_pfctl() {
     local remote_ip="$1"
     local remote_port="${2:-${ANT_QUIC_PORT:-10000}}"
     log_warn "installing pfctl block: udp ↔ ${remote_ip}:${remote_port} (sudo)"
-    sudo pfctl -a com.saorsa/cross-env -f - <<EOF
+    local sudo_flag=""
+    [ -n "${SUDO_ASKPASS:-}" ] && sudo_flag="-A"
+    sudo $sudo_flag pfctl -a com.saorsa/cross-env -f - <<EOF
 block drop quick proto udp from any to ${remote_ip} port ${remote_port}
 block drop quick proto udp from ${remote_ip} to any port ${remote_port}
 EOF
@@ -190,5 +192,7 @@ EOF
 
 unblock_direct_path_pfctl() {
     log_info "flushing pfctl anchor com.saorsa/cross-env (sudo)"
-    sudo pfctl -a com.saorsa/cross-env -F all 2>/dev/null || true
+    local sudo_flag=""
+    [ -n "${SUDO_ASKPASS:-}" ] && sudo_flag="-A"
+    sudo $sudo_flag pfctl -a com.saorsa/cross-env -F all 2>/dev/null || true
 }
