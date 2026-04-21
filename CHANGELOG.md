@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.3] - 2026-04-20
+
+### Changed
+
+- **NAT traversal timeout ownership is now session-driven end to end.** Traversal phase deadlines, retry state, typed terminal outcomes, coordinator-control monotonic expiry, and evidence-driven discovery completion now live behind the `NatTraversalEndpoint` state machine instead of being split across cache TTLs, ad-hoc timer floors, and outer hole-punch wrappers.
+- **Traversal outcome telemetry is richer and more stable.** Successful traversal events now carry best-effort winning-pair metadata, attempt counts, and full-session elapsed time; terminal failure classification is shared across NAT and P2P layers; legacy `TraversalFailed` remains as an explicit compatibility event while `TraversalTerminated` is authoritative.
+- **Coordinator expiry heuristics now respect observed RTT hints.** Coordinator-control requests still stay within the configured coordination budget, but they now use monotonic local deadlines and RTT-informed expiry floors so coordination windows better match real network conditions.
+
+### Added
+
+- **Cross-environment NAT traversal validation tooling.** Added a comprehensive cross-environment harness and follow-up fixes from live 9-node runs so the new traversal deadline model can be exercised and debugged under real multi-host conditions.
+- **Additional silent-drop / send-error observability.** Instrumented more silent-drop and send-error sites so traversal regressions are easier to diagnose during live and CI runs.
+
 ## [0.27.2] - 2026-04-19
 
 ### Fixed
