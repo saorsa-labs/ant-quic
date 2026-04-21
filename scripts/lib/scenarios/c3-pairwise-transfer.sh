@@ -78,7 +78,10 @@ send_one() {
             --send-to-timeout 30 \
             --generate-data ${TRANSFER_BYTES} \
             --chunk-size ${CHUNK_SIZE}"
-        ssh "${SSH_OPTS[@]}" "${NODE_SSH[$sender]}" "timeout ${TRANSFER_TIMEOUT} ${cmd}" \
+        # Prefer `gtimeout` (coreutils on macOS) or `timeout` (GNU on Linux);
+        # fall back to a shell watchdog so Darwin studios without either still work.
+        local remote_wrap="if command -v gtimeout >/dev/null 2>&1; then gtimeout ${TRANSFER_TIMEOUT} ${cmd}; elif command -v timeout >/dev/null 2>&1; then timeout ${TRANSFER_TIMEOUT} ${cmd}; else ${cmd} & pid=\$!; (sleep ${TRANSFER_TIMEOUT}; kill -TERM \$pid 2>/dev/null; sleep 2; kill -KILL \$pid 2>/dev/null) & wd=\$!; wait \$pid 2>/dev/null; rc=\$?; kill \$wd 2>/dev/null; exit \$rc; fi"
+        ssh "${SSH_OPTS[@]}" "${NODE_SSH[$sender]}" "$remote_wrap" \
             > "${LOG_DIR}/${logfile_label}.log" 2>&1 || true
     fi
 }

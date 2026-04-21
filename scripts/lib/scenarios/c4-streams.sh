@@ -57,7 +57,11 @@ stream_one() {
             --json --duration ${STREAM_DURATION} \
             --connect-peer-id '${rid}' \
             --counter-test --counter-interval ${COUNTER_INTERVAL_MS}"
-        ssh "${SSH_OPTS[@]}" "${NODE_SSH[$sender]}" "timeout $((STREAM_DURATION + 10)) ${cmd}" \
+        local wall=$((STREAM_DURATION + 10))
+        # Prefer `gtimeout` (coreutils on macOS) or `timeout` (GNU on Linux);
+        # fall back to a shell watchdog so Darwin studios without either still work.
+        local remote_wrap="if command -v gtimeout >/dev/null 2>&1; then gtimeout ${wall} ${cmd}; elif command -v timeout >/dev/null 2>&1; then timeout ${wall} ${cmd}; else ${cmd} & pid=\$!; (sleep ${wall}; kill -TERM \$pid 2>/dev/null; sleep 2; kill -KILL \$pid 2>/dev/null) & wd=\$!; wait \$pid 2>/dev/null; rc=\$?; kill \$wd 2>/dev/null; exit \$rc; fi"
+        ssh "${SSH_OPTS[@]}" "${NODE_SSH[$sender]}" "$remote_wrap" \
             > "${LOG_DIR}/${logfile_label}.log" 2>&1 || true
     fi
 }
