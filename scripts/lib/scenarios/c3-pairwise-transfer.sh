@@ -25,8 +25,10 @@ source "${LIB_DIR}/topology.sh"
 : "${LOG_DIR:?must be set}"
 : "${ANT_QUIC_PORT:?must be set}"
 TRANSFER_BYTES="${TRANSFER_BYTES:-67108864}"     # 64 MiB
-TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-180}"      # binary needs ~30s startup + 30s peer-wait + transfer time
+TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-90}"       # wall timeout per pair (tight; send-to-timeout=30 means fail-fast at 30s)
+SEND_TO_TIMEOUT="${SEND_TO_TIMEOUT:-30}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
+PAR_SENDERS="${PAR_SENDERS:-1}"                  # if 1, run sender rows concurrently; 0 keeps legacy serial behavior
 
 read -r -a NODES <<< "${REACHABLE_NODES_STR:-${ALL_NODES[*]}}"
 KNOWN_CSV=$(known_peers_csv)
@@ -64,7 +66,7 @@ send_one() {
             --known-peers "${KNOWN_CSV}" \
             --json --duration $((TRANSFER_TIMEOUT - 5)) \
             --send-to "${rid}" \
-            --send-to-timeout 30 \
+            --send-to-timeout "${SEND_TO_TIMEOUT}" \
             --generate-data "${TRANSFER_BYTES}" \
             --chunk-size "${CHUNK_SIZE}" \
             > "${LOG_DIR}/${logfile_label}.log" 2>&1 || true
@@ -75,7 +77,7 @@ send_one() {
             --known-peers '${KNOWN_CSV}' \
             --json --duration $((TRANSFER_TIMEOUT - 5)) \
             --send-to '${rid}' \
-            --send-to-timeout 30 \
+            --send-to-timeout ${SEND_TO_TIMEOUT} \
             --generate-data ${TRANSFER_BYTES} \
             --chunk-size ${CHUNK_SIZE}"
         # Prefer `gtimeout` (coreutils on macOS) or `timeout` (GNU on Linux);
@@ -86,17 +88,30 @@ send_one() {
     fi
 }
 
+send_row() {
+    local s="$1"
+    for r in "${NODES[@]}"; do
+        [ "$s" = "$r" ] && continue
+        send_one "$s" "$r"
+    done
+}
+
 run() {
     load_peer_ids
-    log_info "C3: starting pairwise transfers (${#NODES[@]} nodes, ${TRANSFER_BYTES} B each)"
-    local count=0
-    for s in "${NODES[@]}"; do
-        for r in "${NODES[@]}"; do
-            [ "$s" = "$r" ] && continue
-            send_one "$s" "$r"
-            count=$((count+1))
+    log_info "C3: starting pairwise transfers (${#NODES[@]} nodes, ${TRANSFER_BYTES} B each, PAR_SENDERS=${PAR_SENDERS})"
+    local count=$(( ${#NODES[@]} * (${#NODES[@]} - 1) ))
+    if [ "${PAR_SENDERS}" = "1" ]; then
+        local pids=()
+        for s in "${NODES[@]}"; do
+            send_row "$s" &
+            pids+=($!)
         done
-    done
+        wait "${pids[@]}"
+    else
+        for s in "${NODES[@]}"; do
+            send_row "$s"
+        done
+    fi
     log_ok "C3: ${count} pairwise transfers attempted"
 }
 

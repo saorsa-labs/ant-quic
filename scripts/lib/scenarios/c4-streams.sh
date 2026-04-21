@@ -21,6 +21,7 @@ source "${LIB_DIR}/topology.sh"
 : "${LOG_DIR:?must be set}"
 STREAM_DURATION="${STREAM_DURATION:-30}"
 COUNTER_INTERVAL_MS="${COUNTER_INTERVAL_MS:-100}"
+PAR_SENDERS="${PAR_SENDERS:-1}"                  # if 1, run sender rows concurrently
 
 read -r -a NODES <<< "${REACHABLE_NODES_STR:-${ALL_NODES[*]}}"
 KNOWN_CSV=$(known_peers_csv)
@@ -66,17 +67,30 @@ stream_one() {
     fi
 }
 
+stream_row() {
+    local s="$1"
+    for r in "${NODES[@]}"; do
+        [ "$s" = "$r" ] && continue
+        stream_one "$s" "$r"
+    done
+}
+
 run() {
     load_peer_ids
-    log_info "C4: stream tests across ${#NODES[@]} nodes"
-    local count=0
-    for s in "${NODES[@]}"; do
-        for r in "${NODES[@]}"; do
-            [ "$s" = "$r" ] && continue
-            stream_one "$s" "$r"
-            count=$((count+1))
+    log_info "C4: stream tests across ${#NODES[@]} nodes (PAR_SENDERS=${PAR_SENDERS})"
+    local count=$(( ${#NODES[@]} * (${#NODES[@]} - 1) ))
+    if [ "${PAR_SENDERS}" = "1" ]; then
+        local pids=()
+        for s in "${NODES[@]}"; do
+            stream_row "$s" &
+            pids+=($!)
         done
-    done
+        wait "${pids[@]}"
+    else
+        for s in "${NODES[@]}"; do
+            stream_row "$s"
+        done
+    fi
     log_ok "C4: ${count} stream tests attempted"
 }
 
