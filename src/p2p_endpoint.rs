@@ -1360,10 +1360,10 @@ async fn do_cleanup_connection(
             },
         );
         fail_ack_waiters_for_connection(ack_waiters, snapshot.stable_id, close_reason);
-        let mut generations = peer_event_generations.write();
-        if generations.get(peer_id) == Some(&snapshot.generation) {
-            generations.remove(peer_id);
-        }
+        // Keep the generation recorded in `peer_event_generations` so the next
+        // registration emits Replaced{old,new} when a replacement races the close.
+        // The entry will be overwritten when a new connection registers.
+        let _ = peer_event_generations;
     }
 
     // Tear down all background readers for this peer. Cooperative cancel first
@@ -4632,6 +4632,10 @@ impl P2pEndpoint {
                                 generation: previous_generation,
                                 reason: ConnectionCloseReason::Superseded,
                             },
+                            PeerLifecycleEvent::Closed {
+                                generation: previous_generation,
+                                reason: ConnectionCloseReason::Superseded,
+                            },
                         ]
                     }
                     Some(_) => Vec::new(),
@@ -6831,12 +6835,10 @@ impl P2pEndpoint {
                             conn_stable_id,
                             close_reason,
                         );
-                        {
-                            let mut generations = peer_event_generations.write();
-                            if generations.get(&peer_id) == Some(&generation) {
-                                generations.remove(&peer_id);
-                            }
-                        }
+                        // Retain the generation in `peer_event_generations` so a
+                        // replacement connection racing this close still sees the
+                        // prior generation and emits Replaced{old,new}. The next
+                        // register_connected_peer overwrites the entry.
 
                         if !last_reader {
                             debug!(
