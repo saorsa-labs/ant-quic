@@ -99,17 +99,23 @@ impl DualStackSocket {
 
     /// Select the appropriate socket for a destination address.
     ///
+    /// Returns `(socket, socket_is_v6)` so that hot-path callers do not
+    /// need to call `local_addr()` (a `getsockname` syscall) on every
+    /// packet just to check the socket's address family.
+    ///
     /// IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are routed to the IPv4 socket.
-    fn select_socket(&self, dest: &SocketAddr) -> Option<&Arc<tokio::net::UdpSocket>> {
+    fn select_socket(&self, dest: &SocketAddr) -> Option<(&Arc<tokio::net::UdpSocket>, bool)> {
+        let v4 = self.v4.as_ref().map(|s| (s, false));
+        let v6 = self.v6.as_ref().map(|s| (s, true));
         match dest {
-            SocketAddr::V4(_) => self.v4.as_ref().or(self.v6.as_ref()),
-            SocketAddr::V6(v6) => {
-                if let Some(_v4) = v6.ip().to_ipv4_mapped() {
+            SocketAddr::V4(_) => v4.or(v6),
+            SocketAddr::V6(addr) => {
+                if addr.ip().to_ipv4_mapped().is_some() {
                     // IPv4-mapped address: prefer the IPv4 socket
-                    self.v4.as_ref().or(self.v6.as_ref())
+                    v4.or(v6)
                 } else {
                     // Native IPv6 address
-                    self.v6.as_ref().or(self.v4.as_ref())
+                    v6.or(v4)
                 }
             }
         }
@@ -119,9 +125,11 @@ impl DualStackSocket {
     ///
     /// If sending an IPv4-mapped IPv6 address through the IPv4 socket, unwrap to native IPv4.
     /// If sending an IPv4 address through the IPv6 socket, wrap as IPv4-mapped IPv6.
-    fn convert_dest(dest: SocketAddr, socket: &tokio::net::UdpSocket) -> io::Result<SocketAddr> {
-        let socket_is_v6 = socket.local_addr()?.is_ipv6();
-
+    ///
+    /// `socket_is_v6` must match the selected socket's bound family — it is
+    /// derived from [`select_socket`] rather than re-discovered via
+    /// `local_addr()` so that this function is free of syscalls.
+    fn convert_dest(dest: SocketAddr, socket_is_v6: bool) -> io::Result<SocketAddr> {
         match dest {
             SocketAddr::V4(v4) if socket_is_v6 => {
                 // Sending IPv4 through IPv6 socket: map to IPv4-mapped
@@ -213,14 +221,15 @@ impl AsyncUdpSocket for DualStackSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let socket = self.select_socket(&transmit.destination).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no socket available for destination address family",
-            )
-        })?;
+        let (socket, socket_is_v6) =
+            self.select_socket(&transmit.destination).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "no socket available for destination address family",
+                )
+            })?;
 
-        let dest = Self::convert_dest(transmit.destination, socket)?;
+        let dest = Self::convert_dest(transmit.destination, socket_is_v6)?;
         socket.try_send_to(transmit.contents, dest)?;
         Ok(())
     }
