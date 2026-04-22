@@ -43,6 +43,13 @@ use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller};
 pub struct DualStackSocket {
     v4: Option<Arc<tokio::net::UdpSocket>>,
     v6: Option<Arc<tokio::net::UdpSocket>>,
+    /// Cached IPv4 `local_addr()` captured at construction so hot paths
+    /// (quinn's `ConnectionDriver::poll` calls `AsyncUdpSocket::local_addr`
+    /// on every iteration) avoid a `getsockname(2)` syscall per poll.
+    /// Sockets do not rebind after construction, so this stays valid for
+    /// the lifetime of the wrapper.
+    v4_addr: Option<SocketAddr>,
+    v6_addr: Option<SocketAddr>,
     /// Alternates which socket is polled first for fairness
     poll_v4_first: AtomicBool,
 }
@@ -50,8 +57,8 @@ pub struct DualStackSocket {
 impl fmt::Debug for DualStackSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DualStackSocket")
-            .field("v4", &self.v4.as_ref().and_then(|s| s.local_addr().ok()))
-            .field("v6", &self.v6.as_ref().and_then(|s| s.local_addr().ok()))
+            .field("v4", &self.v4_addr)
+            .field("v6", &self.v6_addr)
             .finish()
     }
 }
@@ -70,26 +77,30 @@ impl DualStackSocket {
                 "at least one socket (IPv4 or IPv6) must be provided",
             ));
         }
+        let v4_addr = v4.as_ref().and_then(|s| s.local_addr().ok());
+        let v6_addr = v6.as_ref().and_then(|s| s.local_addr().ok());
         Ok(Self {
             v4: v4.map(Arc::new),
             v6: v6.map(Arc::new),
+            v4_addr,
+            v6_addr,
             poll_v4_first: AtomicBool::new(false),
         })
     }
 
     /// Get the IPv4 local address, if available.
     pub fn local_addr_v4(&self) -> Option<SocketAddr> {
-        self.v4.as_ref().and_then(|s| s.local_addr().ok())
+        self.v4_addr
     }
 
     /// Get the IPv6 local address, if available.
     pub fn local_addr_v6(&self) -> Option<SocketAddr> {
-        self.v6.as_ref().and_then(|s| s.local_addr().ok())
+        self.v6_addr
     }
 
     /// Get both local addresses: (IPv4, IPv6).
     pub fn local_addrs(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
-        (self.local_addr_v4(), self.local_addr_v6())
+        (self.v4_addr, self.v6_addr)
     }
 
     /// Whether this socket has both address families.
@@ -284,11 +295,15 @@ impl AsyncUdpSocket for DualStackSocket {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         // Prefer IPv6 so that endpoint.ipv6 = true, which triggers ensure_ipv6()
         // for all outgoing connections, sending IPv4-mapped addresses to try_send().
-        if let Some(ref s) = self.v6 {
-            return s.local_addr();
+        //
+        // Uses the cached value captured in [`DualStackSocket::new`] — quinn's
+        // `ConnectionDriver::poll` invokes this on every poll iteration, so a
+        // `getsockname(2)` per-poll pegs a CPU under high packet rates.
+        if let Some(addr) = self.v6_addr {
+            return Ok(addr);
         }
-        if let Some(ref s) = self.v4 {
-            return s.local_addr();
+        if let Some(addr) = self.v4_addr {
+            return Ok(addr);
         }
         Err(io::Error::new(
             io::ErrorKind::NotConnected,
