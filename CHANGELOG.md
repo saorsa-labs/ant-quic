@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.4] - 2026-04-23
+
+### Fixed
+
+- **Dual-stack send path no longer CPU-spins under sustained outbound load.**
+  `DualStackSocket::create_io_poller` awaited writability via `tokio::select!`
+  (OR-combine v4/v6), but `try_send` routes each datagram to one specific
+  socket by destination family. When the non-target family's POLLOUT fired
+  while the target's kernel send buffer was full, `try_send_to` cleared
+  readiness on the target only; the non-target's stale `Ready` then satisfied
+  the OR-combination on the next `poll_writable`, and `drive_transmit` spun
+  its `WouldBlock` retry branch at 100% CPU in pure userspace. Switched the
+  poller to `tokio::join!` (AND-combine) so it only resolves when every
+  present socket is writable. Reproduced on a 6-continent mesh (2-of-6
+  nodes rotated into 100% CPU within 4-7 min pre-fix); post-fix watch over
+  90 min showed all tokio-rt-workers in State S with <2% mean CPU.
+- **Connection-supersede race now surfaces `Replaced` + `Closed{Superseded}`
+  lifecycle events.** The NAT path previously dropped these transitions
+  silently when a fresh connection replaced an existing session, leaving
+  downstream observers (`/peers/events` in saorsa-gossip, gossip caches)
+  unable to distinguish superseded sessions from genuine failures.
+
+### Changed
+
+- **Dual-stack socket layer no longer issues a `getsockname(2)` per packet.**
+  `DualStackSocket::try_send` now carries the pre-computed `is_v6` selector
+  from `select_socket`, eliminating the per-datagram `socket.local_addr()?
+  .is_ipv6()` probe in `convert_dest`. Paired with caching `v4_addr` /
+  `v6_addr` at construction, quinn's `ConnectionDriver::poll`
+  (`AsyncUdpSocket::local_addr` every iteration) is now syscall-free on the
+  hot path.
+- **Coordinator control deadlines, send-error observability, and testing
+  harness resilience.** NAT traversal outcome / expiry heuristics now use
+  monotonic deadlines (carried over from 0.27.3 into this release with live
+  mesh validation); test helpers use portable timeout wrappers, honour
+  `SUDO_ASKPASS` for pfctl, and parallelise sender paths for C3/C4.
+
 ## [0.27.3] - 2026-04-20
 
 ### Changed
