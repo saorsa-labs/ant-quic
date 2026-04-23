@@ -206,27 +206,33 @@ impl AsyncUdpSocket for DualStackSocket {
         Box::pin(UdpPollHelper::new(move || {
             let socket = self.clone();
             async move {
-                // Wait until either socket is writable
+                // Wait until EVERY present socket is writable.
+                //
+                // `try_send` routes each datagram to exactly one of v4/v6 by
+                // destination family. If we returned Ready when *either* side
+                // was writable (as the prior OR-via-`tokio::select!` did), and
+                // the selected target's buffer was full, `drive_transmit` would
+                // spin: `try_send_to` clears readiness on the target socket,
+                // but the other socket's stale Ready keeps `poll_writable`
+                // returning Ready immediately on the next iteration. With an
+                // AND-combination the poller waits for a real POLLOUT on both
+                // families, guaranteeing forward progress without CPU spin.
                 let v4_fut = async {
                     if let Some(ref s) = socket.v4 {
                         s.writable().await
                     } else {
-                        // Never resolves if no v4 socket
-                        std::future::pending().await
+                        Ok(())
                     }
                 };
                 let v6_fut = async {
                     if let Some(ref s) = socket.v6 {
                         s.writable().await
                     } else {
-                        std::future::pending().await
+                        Ok(())
                     }
                 };
-
-                tokio::select! {
-                    result = v4_fut => result,
-                    result = v6_fut => result,
-                }
+                let (r4, r6) = tokio::join!(v4_fut, v6_fut);
+                r4.and(r6)
             }
         }))
     }
