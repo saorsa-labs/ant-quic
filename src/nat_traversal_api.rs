@@ -1491,6 +1491,22 @@ impl NatTraversalEndpoint {
 
         config
     }
+
+    fn create_symmetric_relay_server(
+        local_addr: SocketAddr,
+        relay_config: MasqueRelayConfig,
+    ) -> Arc<MasqueRelayServer> {
+        let server = MasqueRelayServer::new(relay_config, local_addr);
+        let server_arc = Arc::new(server);
+        // Sessions expire after MasqueRelayConfig::session_timeout (5 min
+        // default) of inactivity. Without this background reaper, expired
+        // sessions accumulate forever — each retaining its outbound queues
+        // and per-target HashMap, growing process RSS without bound on nodes
+        // that act as a NAT-traversal relay.
+        MasqueRelayServer::spawn_cleanup_task(&server_arc);
+        server_arc
+    }
+
     /// Create a new NAT traversal endpoint with proper UDP socket sharing
     ///
     /// This is the recommended constructor for most use cases. It:
@@ -1664,12 +1680,12 @@ impl NatTraversalEndpoint {
                 ..MasqueRelayConfig::default()
             };
             // Use the local address as the public address (will be updated when external address is discovered)
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let server_arc = Self::create_symmetric_relay_server(local_addr, relay_config);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
             );
-            Some(Arc::new(server))
+            Some(server_arc)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -2171,12 +2187,12 @@ impl NatTraversalEndpoint {
                 ..MasqueRelayConfig::default()
             };
             // Use the local address as the public address (will be updated when external address is discovered)
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let server_arc = Self::create_symmetric_relay_server(local_addr, relay_config);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
             );
-            Some(Arc::new(server))
+            Some(server_arc)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -10327,6 +10343,40 @@ mod tests {
         endpoint.reconcile_relay_server_public_addresses(Some(refreshed_addr));
 
         assert_eq!(endpoint.relay_server_public_address(), Some(refreshed_addr));
+    }
+
+    #[tokio::test]
+    async fn test_symmetric_relay_server_helper_spawns_cleanup_task() {
+        let relay_config = MasqueRelayConfig {
+            cleanup_interval: Duration::from_millis(50),
+            session_config: crate::masque::RelaySessionConfig {
+                session_timeout: Duration::from_millis(10),
+                ..Default::default()
+            },
+            max_sessions: 100,
+            require_authentication: true,
+            ..Default::default()
+        };
+        let server = NatTraversalEndpoint::create_symmetric_relay_server(
+            "127.0.0.1:0".parse().expect("valid addr"),
+            relay_config,
+        );
+        let request = ConnectUdpRequest::bind_any();
+        let response = server
+            .handle_connect_request(&request, "127.0.0.1:44001".parse().expect("valid addr"))
+            .await
+            .expect("connect request should succeed");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(server.session_count().await, 1);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(
+            server.session_count().await,
+            0,
+            "production relay-server creation helper must wire the expiry reaper"
+        );
     }
 
     #[test]
