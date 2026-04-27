@@ -1412,6 +1412,21 @@ async fn record_connection_established(
         }
 
         if previous.is_none_or(|prev| prev.traversal_method != peer_conn.traversal_method) {
+            // Decrement the previous traversal method's live counter when an
+            // established connection transitions methods (e.g. Relay → Direct
+            // after hole-punch upgrade). Without this, both counters tick up
+            // and the steady-state mesh shows direct + relayed > active peers.
+            if let Some(prev) = previous {
+                match prev.traversal_method {
+                    TraversalMethod::Direct => {
+                        s.direct_connections = s.direct_connections.saturating_sub(1);
+                    }
+                    TraversalMethod::Relay => {
+                        s.relayed_connections = s.relayed_connections.saturating_sub(1);
+                    }
+                    TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+                }
+            }
             match peer_conn.traversal_method {
                 TraversalMethod::Direct => {
                     s.direct_connections += 1;
@@ -1480,6 +1495,17 @@ async fn remove_connected_peer(
         {
             let mut s = stats.write().await;
             s.active_connections = s.active_connections.saturating_sub(1);
+            // Keep direct_connections / relayed_connections as live counts so
+            // they stay consistent with connected_peers across disconnects.
+            match peer_conn.traversal_method {
+                TraversalMethod::Direct => {
+                    s.direct_connections = s.direct_connections.saturating_sub(1);
+                }
+                TraversalMethod::Relay => {
+                    s.relayed_connections = s.relayed_connections.saturating_sub(1);
+                }
+                TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+            }
             if peer_conn.traversal_method.is_direct() && peer_conn.side.is_server() {
                 s.active_direct_incoming_connections =
                     s.active_direct_incoming_connections.saturating_sub(1);
@@ -7730,7 +7756,8 @@ mod tests {
         assert_eq!(stats.active_connections, 1);
         assert_eq!(stats.successful_connections, 1);
         assert_eq!(stats.direct_connections, 1);
-        assert_eq!(stats.relayed_connections, 1);
+        // Relay → Direct transition decrements the previous method's live counter.
+        assert_eq!(stats.relayed_connections, 0);
         assert_eq!(stats.active_direct_incoming_connections, 1);
         drop(stats);
 
@@ -7788,6 +7815,205 @@ mod tests {
             event_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_record_connection_established_direct_to_relay_decrements_direct() {
+        let stats = RwLock::new(EndpointStats {
+            active_connections: 1,
+            successful_connections: 1,
+            direct_connections: 1,
+            active_direct_incoming_connections: 1,
+            ..EndpointStats::default()
+        });
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let previous = PeerConnection {
+            peer_id: PeerId([0x60; 32]),
+            remote_addr: TransportAddr::Udp("127.0.0.1:9601".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Server,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        let replacement = PeerConnection {
+            peer_id: previous.peer_id,
+            remote_addr: TransportAddr::Udp("203.0.113.30:9601".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        record_connection_established(&stats, &event_tx, &replacement, Some(&previous)).await;
+
+        let stats = stats.read().await;
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.direct_connections, 0);
+        assert_eq!(stats.relayed_connections, 1);
+        // The previous direct-incoming connection has been replaced by a
+        // Relay client-side connection, so the incoming-direct counter drops.
+        assert_eq!(stats.active_direct_incoming_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_connected_peer_decrements_direct_connections() {
+        let connected_peers = RwLock::new(HashMap::new());
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let peer_id = PeerId([0x70; 32]);
+
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp("127.0.0.1:9701".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Server,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        connected_peers
+            .write()
+            .await
+            .insert(peer_id, peer_conn.clone());
+        record_connection_established(&stats, &event_tx, &peer_conn, None).await;
+
+        {
+            let s = stats.read().await;
+            assert_eq!(s.direct_connections, 1);
+            assert_eq!(s.active_connections, 1);
+            assert_eq!(s.active_direct_incoming_connections, 1);
+        }
+
+        let removed = remove_connected_peer(
+            &connected_peers,
+            &stats,
+            &event_tx,
+            &peer_id,
+            DisconnectReason::ConnectionLost,
+        )
+        .await;
+        assert!(removed);
+
+        let s = stats.read().await;
+        assert_eq!(s.direct_connections, 0);
+        assert_eq!(s.active_connections, 0);
+        assert_eq!(s.active_direct_incoming_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_connected_peer_decrements_relayed_connections() {
+        let connected_peers = RwLock::new(HashMap::new());
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let peer_id = PeerId([0x71; 32]);
+
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp("203.0.113.40:9702".parse().expect("valid addr")),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        connected_peers
+            .write()
+            .await
+            .insert(peer_id, peer_conn.clone());
+        record_connection_established(&stats, &event_tx, &peer_conn, None).await;
+
+        {
+            let s = stats.read().await;
+            assert_eq!(s.relayed_connections, 1);
+            assert_eq!(s.active_connections, 1);
+        }
+
+        let removed = remove_connected_peer(
+            &connected_peers,
+            &stats,
+            &event_tx,
+            &peer_id,
+            DisconnectReason::ConnectionLost,
+        )
+        .await;
+        assert!(removed);
+
+        let s = stats.read().await;
+        assert_eq!(s.relayed_connections, 0);
+        assert_eq!(s.active_connections, 0);
+    }
+
+    /// Issue #178: in a steady-state mesh, the live-count invariant
+    /// `direct_connections + relayed_connections == active_connections`
+    /// must hold across connect → method-transition → disconnect churn.
+    #[tokio::test]
+    async fn test_direct_plus_relayed_equals_active_connections_under_churn() {
+        let connected_peers = RwLock::new(HashMap::new());
+        let stats = RwLock::new(EndpointStats::default());
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
+
+        let mk_conn = |id: u8, method: TraversalMethod, side: Side| PeerConnection {
+            peer_id: PeerId([id; 32]),
+            remote_addr: TransportAddr::Udp(
+                format!("127.0.0.1:{}", 10_000 + id as u16)
+                    .parse()
+                    .expect("valid addr"),
+            ),
+            traversal_method: method,
+            side,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        // Establish 4 Direct peers (server-side incoming, like a mesh node).
+        for id in 1..=4u8 {
+            let conn = mk_conn(id, TraversalMethod::Direct, Side::Server);
+            connected_peers
+                .write()
+                .await
+                .insert(conn.peer_id, conn.clone());
+            record_connection_established(&stats, &event_tx, &conn, None).await;
+        }
+
+        // Transition peer 2 from Direct → Relay (e.g. NAT-traversal regression).
+        let prev2 = connected_peers
+            .read()
+            .await
+            .get(&PeerId([2; 32]))
+            .cloned()
+            .expect("peer 2 present");
+        let relayed2 = mk_conn(2, TraversalMethod::Relay, Side::Client);
+        connected_peers
+            .write()
+            .await
+            .insert(relayed2.peer_id, relayed2.clone());
+        record_connection_established(&stats, &event_tx, &relayed2, Some(&prev2)).await;
+
+        // Disconnect peer 4.
+        let removed = remove_connected_peer(
+            &connected_peers,
+            &stats,
+            &event_tx,
+            &PeerId([4; 32]),
+            DisconnectReason::ConnectionLost,
+        )
+        .await;
+        assert!(removed);
+
+        // Invariants: live counts agree with the connected_peers map.
+        let s = stats.read().await;
+        let peers_len = connected_peers.read().await.len();
+        assert_eq!(peers_len, 3, "3 peers remain after disconnecting peer 4");
+        assert_eq!(s.active_connections, peers_len);
+        assert_eq!(s.direct_connections, 2, "peers 1 and 3 are Direct");
+        assert_eq!(s.relayed_connections, 1, "peer 2 is Relay");
+        assert_eq!(
+            (s.direct_connections + s.relayed_connections) as usize,
+            peers_len
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.6] - 2026-04-27
+
+### Fixed
+
+- **`direct_connections` and `relayed_connections` are now live counts, not
+  monotonic lifetime counters.** Issue #178: x0x's 5-daemon localhost proofs
+  reported `connected_peers=4` alongside `direct_connections=6` for the same
+  steady-state node. Root cause: `record_connection_established` incremented
+  `direct_connections` / `relayed_connections` on every new connection AND on
+  every traversal-method change, but `remove_connected_peer` only decremented
+  `active_connections` / `active_direct_incoming_connections` — it never
+  touched `direct_connections` or `relayed_connections`. A `Relay → Direct`
+  hole-punch upgrade also incremented `direct_connections` without
+  decrementing `relayed_connections`, so both ticked up on every transition.
+  Fixed by decrementing the previous method's live counter on transitions and
+  by decrementing the appropriate counter on disconnect; the steady-state
+  invariant `direct_connections + relayed_connections == active_connections
+  == connected_peers.len()` now holds. Affects observability only — the QUIC
+  transport itself was always tracking the right peers.
+
+## [0.27.5] - 2026-04-26
+
+### Fixed
+
+- **MASQUE relay session reaper now wired into production.** Idle relay
+  sessions previously accumulated unboundedly in long-lived nodes; the reaper
+  is now started alongside the rest of the relay machinery so stale sessions
+  are evicted on the configured cadence.
+
 ## [0.27.4] - 2026-04-23
 
 ### Fixed
