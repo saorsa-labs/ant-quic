@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.7] - 2026-05-06
+
+X0X-0032 fix: bounded admission for `send_with_receive_ack` so receiver-side
+mpsc head-of-line blocking no longer cascades into mesh-wide ACK timeouts.
+
+### Fixed
+
+- **Reader task ACK emission no longer blocks indefinitely on
+  `data_tx.send().await`.** Previous behaviour gated the Accepted ACK on the
+  consumer pipeline draining; when the consumer was backed up (e.g., burst of
+  concurrent inbound messages), reader tasks blocked, ACKs didn't go back to
+  senders, and senders' `send_with_receive_ack` calls timed out at the caller's
+  budget. The cascade was visible in x0x's 6-VPS bootstrap mesh as Phase A
+  catastrophic failures (5/30 sent, 9/30 received) under the raw-QUIC test
+  harness.
+
+  Reader task now waits up to 100ms for `data_tx.reserve()` before deciding:
+  - **Admitted**: payload enqueued, `Accepted` ACK emitted (existing behaviour).
+  - **Closed**: emits `Rejected(ConsumerGone)`, exits reader loop.
+  - **Backpressured**: emits `Rejected(Backpressured)` and drops the payload —
+    new behaviour. Caller learns the receiver couldn't admit the bytes within
+    100ms and can choose fallback (gossip path, retry, surface to user).
+
+### Added
+
+- **`ReceiveRejectReason::Backpressured`** variant in `ack_frame.rs`.
+- **Regression tests** in `tests/b_send_with_receive_ack.rs`:
+  - `send_with_receive_ack_returns_after_remote_pipeline_accepts`
+  - `send_with_receive_ack_rejects_when_remote_pipeline_is_backpressured`
+
+### Verified
+
+- 2/2 new regression tests pass.
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt` clean.
+
 ## [0.27.6] - 2026-04-27
 
 ### Fixed

@@ -13,6 +13,8 @@ pub enum ReceiveRejectReason {
     InvalidEnvelope,
     /// The request is not supported on this connection.
     NotSupported,
+    /// The local receive queue did not admit the payload within the ACK budget.
+    Backpressured,
     /// The payload was rejected for an unspecified reason.
     Unknown,
 }
@@ -23,6 +25,7 @@ impl std::fmt::Display for ReceiveRejectReason {
             Self::ConsumerGone => "ConsumerGone",
             Self::InvalidEnvelope => "InvalidEnvelope",
             Self::NotSupported => "NotSupported",
+            Self::Backpressured => "Backpressured",
             Self::Unknown => "Unknown",
         };
         f.write_str(value)
@@ -69,6 +72,7 @@ pub(crate) fn encode_ack_control(tag: [u8; 16], outcome: AckControlOutcome) -> V
                 ReceiveRejectReason::ConsumerGone => 1,
                 ReceiveRejectReason::InvalidEnvelope => 2,
                 ReceiveRejectReason::NotSupported => 3,
+                ReceiveRejectReason::Backpressured => 4,
                 ReceiveRejectReason::Unknown => 255,
             });
         }
@@ -110,6 +114,7 @@ pub(crate) fn decode_ack_control(bytes: &[u8]) -> Option<([u8; 16], AckControlOu
             1 => ReceiveRejectReason::ConsumerGone,
             2 => ReceiveRejectReason::InvalidEnvelope,
             3 => ReceiveRejectReason::NotSupported,
+            4 => ReceiveRejectReason::Backpressured,
             _ => ReceiveRejectReason::Unknown,
         }),
         2 => AckControlOutcome::Closed(match value {

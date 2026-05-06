@@ -98,6 +98,14 @@ use crate::{ConnectionCloseReason, Side};
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Peer lifecycle event channel capacity.
 const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Maximum time an ACK-requested payload may wait for receiver queue admission.
+///
+/// The ACK-v1 contract is "decoded and admitted into the `recv()` pipeline".
+/// Waiting without bound here couples sender-visible ACK latency to application
+/// drain speed and can cascade into mesh-wide send timeouts. A bounded wait
+/// preserves the accepted-delivery meaning while returning structured
+/// backpressure to callers.
+const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -4632,6 +4640,21 @@ impl P2pEndpoint {
         }
     }
 
+    async fn admit_ack_requested_payload(
+        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        peer_id: PeerId,
+        payload: Vec<u8>,
+    ) -> Result<(), ReceiveRejectReason> {
+        match timeout(ACK_RECEIVE_ADMISSION_TIMEOUT, data_tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send((peer_id, payload));
+                Ok(())
+            }
+            Ok(Err(_closed)) => Err(ReceiveRejectReason::ConsumerGone),
+            Err(_elapsed) => Err(ReceiveRejectReason::Backpressured),
+        }
+    }
+
     async fn register_connected_peer(&self, peer_conn: PeerConnection) {
         store_connected_peer(
             self.connected_peers.as_ref(),
@@ -6387,45 +6410,83 @@ impl P2pEndpoint {
                 )
                 .await;
 
-                // Emit DataReceived event — HIGH priority: upper layer missed inbound data
-                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
-                    peer_id,
-                    bytes: payload_len,
-                }) {
-                    tracing::warn!(
-                        target: "ant_quic::silent_drop",
-                        kind = "event_tx_data_received_reader",
-                        peer_id = ?peer_id,
-                        bytes = payload_len,
-                        error = %e,
-                        "HIGH: silent drop"
-                    );
-                }
-
-                // Send through channel; if the receiver is dropped, exit
-                if data_tx.send((peer_id, payload)).await.is_err() {
-                    if let Some(tag) = ack_tag {
-                        Self::send_ack_control_frame(
-                            connection.clone(),
-                            tag,
-                            AckControlOutcome::Rejected(ReceiveRejectReason::ConsumerGone),
-                        )
-                        .await;
-                    }
-                    debug!(
-                        "Reader task for peer {:?}: channel closed, exiting",
-                        peer_id
-                    );
-                    break;
-                }
-
                 if let Some(tag) = ack_tag {
-                    Self::send_ack_control_frame(
-                        connection.clone(),
-                        tag,
-                        AckControlOutcome::Accepted,
-                    )
-                    .await;
+                    match Self::admit_ack_requested_payload(&data_tx, peer_id, payload).await {
+                        Ok(()) => {
+                            // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+                            if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                                peer_id,
+                                bytes: payload_len,
+                            }) {
+                                tracing::warn!(
+                                    target: "ant_quic::silent_drop",
+                                    kind = "event_tx_data_received_reader",
+                                    peer_id = ?peer_id,
+                                    bytes = payload_len,
+                                    error = %e,
+                                    "HIGH: silent drop"
+                                );
+                            }
+
+                            Self::send_ack_control_frame(
+                                connection.clone(),
+                                tag,
+                                AckControlOutcome::Accepted,
+                            )
+                            .await;
+                        }
+                        Err(reason) => {
+                            if reason == ReceiveRejectReason::Backpressured {
+                                tracing::warn!(
+                                    peer_id = ?peer_id,
+                                    bytes = payload_len,
+                                    admission_timeout_ms =
+                                        ACK_RECEIVE_ADMISSION_TIMEOUT.as_millis() as u64,
+                                    "receive pipeline backpressured; rejecting ACK-requested payload"
+                                );
+                            }
+
+                            Self::send_ack_control_frame(
+                                connection.clone(),
+                                tag,
+                                AckControlOutcome::Rejected(reason),
+                            )
+                            .await;
+
+                            if reason == ReceiveRejectReason::ConsumerGone {
+                                debug!(
+                                    "Reader task for peer {:?}: channel closed, exiting",
+                                    peer_id
+                                );
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Fire-and-forget sends keep the existing backpressure policy:
+                    // wait for capacity rather than dropping silently.
+                    if data_tx.send((peer_id, payload)).await.is_err() {
+                        debug!(
+                            "Reader task for peer {:?}: channel closed, exiting",
+                            peer_id
+                        );
+                        break;
+                    }
+
+                    // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+                    if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                        peer_id,
+                        bytes: payload_len,
+                    }) {
+                        tracing::warn!(
+                            target: "ant_quic::silent_drop",
+                            kind = "event_tx_data_received_reader",
+                            peer_id = ?peer_id,
+                            bytes = payload_len,
+                            error = %e,
+                            "HIGH: silent drop"
+                        );
+                    }
                 }
             }
 
