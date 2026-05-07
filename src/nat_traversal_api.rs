@@ -27,7 +27,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
@@ -653,6 +653,7 @@ pub(crate) struct IncomingAckBidiStream {
     pub(crate) send: InnerSendStream,
     pub(crate) recv: InnerRecvStream,
     pub(crate) prefix: Vec<u8>,
+    pub(crate) accepted_at: Instant,
 }
 
 /// Information about a bootstrap/coordinator node
@@ -5429,6 +5430,7 @@ impl NatTraversalEndpoint {
                     let addr = client_addr;
                     let conn_stable_id = connection.stable_id();
                     let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
+                    let accepted_at = Instant::now();
 
                     tokio::spawn(async move {
                         let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
@@ -5444,6 +5446,7 @@ impl NatTraversalEndpoint {
                                 send: send_stream,
                                 recv: recv_stream,
                                 prefix,
+                                accepted_at,
                             };
                             if let Err(stream) =
                                 Self::dispatch_ack_bidi_stream(&ack_bidi_stream_tx, stream)

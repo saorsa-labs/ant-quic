@@ -2,12 +2,31 @@
 
 mod support;
 
-use ant_quic::{EndpointError, P2pEndpoint, ReceiveRejectReason};
+use ant_quic::{
+    AckDiagnosticsSnapshot, AckPeerDiagnosticsSnapshot, EndpointError, P2pEndpoint, PeerId,
+    ReceiveRejectReason,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard, test_node_config};
 use tokio::time::{sleep, timeout};
+
+fn ack_bucket(
+    diagnostics: &AckDiagnosticsSnapshot,
+    peer_id: PeerId,
+) -> &AckPeerDiagnosticsSnapshot {
+    let expected_peer_id = peer_id.to_hex();
+    diagnostics
+        .peers
+        .iter()
+        .find(|bucket| bucket.peer_id == expected_peer_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing ACK diagnostics bucket for {expected_peer_id}; snapshot={diagnostics:?}"
+            )
+        })
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
@@ -39,6 +58,21 @@ async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
         .expect("recv result");
     assert_eq!(peer_id, sender_id);
     assert_eq!(payload, b"ack-v2 payload");
+
+    let sender_diagnostics = sender.ack_diagnostics();
+    let sender_bucket = ack_bucket(&sender_diagnostics, receiver_id);
+    assert!(sender_bucket.stages.sender_open_bi.count >= 1);
+    assert!(sender_bucket.stages.sender_request_write.count >= 1);
+    assert!(sender_bucket.stages.sender_request_finish.count >= 1);
+    assert!(sender_bucket.stages.sender_response_read.count >= 1);
+    assert!(sender_bucket.outcomes.sender_accepted >= 1);
+
+    let receiver_diagnostics = receiver.ack_diagnostics();
+    let receiver_bucket = ack_bucket(&receiver_diagnostics, sender_id);
+    assert!(receiver_bucket.stages.receiver_demux.count >= 1);
+    assert!(receiver_bucket.stages.receiver_admission.count >= 1);
+    assert!(receiver_bucket.stages.receiver_response_write_finish.count >= 1);
+    assert!(receiver_bucket.outcomes.receiver_accepted >= 1);
 
     sender.shutdown().await;
     receiver.shutdown().await;

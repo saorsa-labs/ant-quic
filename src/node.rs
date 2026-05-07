@@ -59,7 +59,8 @@ use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
 use crate::p2p_endpoint::{
-    ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent,
+    AckDiagnosticsSnapshot, ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection,
+    PeerLifecycleEvent,
 };
 use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
@@ -674,6 +675,11 @@ impl Node {
             .probe_peer(peer_id, timeout)
             .await
             .map_err(NodeError::Endpoint)
+    }
+
+    /// Snapshot stage-by-stage ACK-v2 latency and outcome diagnostics.
+    pub fn ack_diagnostics(&self) -> AckDiagnosticsSnapshot {
+        self.inner.ack_diagnostics()
     }
 
     /// Receive data from any peer

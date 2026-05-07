@@ -54,10 +54,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock as ParkingRwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use rand::RngCore;
+use serde::Serialize;
 use tokio::sync::{Mutex as TokioMutex, Notify, RwLock, Semaphore, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -108,6 +109,17 @@ const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// preserves the accepted-delivery meaning while returning structured
 /// backpressure to callers.
 const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Maximum receiver-side time spent writing the ACK-v2 response stream.
+///
+/// Sender-side ACK timeout remains the end-to-end contract; this shorter
+/// receiver budget exposes response-write starvation directly instead of
+/// burying it inside an opaque sender timeout.
+const ACK_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+/// ACK-v2 request/response stream priority.
+const ACK_STREAM_PRIORITY: i32 = 16;
+/// Probe request/response stream priority. Probes are diagnostic traffic and
+/// must yield to data-plane DM/ACK-v2 streams under load.
+const PROBE_STREAM_PRIORITY: i32 = -16;
 /// Grace period for superseded reader tasks to drain in-flight request/ACK
 /// streams before cooperative cancellation at the next accept boundary.
 const SUPERSEDED_READER_DRAIN_GRACE: Duration = Duration::from_secs(5);
@@ -125,6 +137,11 @@ const PROBE_GLOBAL_CONCURRENCY: usize = 4;
 /// Probe budget acquisition is deliberately short: probes are lower priority
 /// than application sends and ACK-v2 response handling.
 const PROBE_BUDGET_WAIT: Duration = Duration::from_millis(50);
+/// Retain ACK diagnostics for recent minute buckets only.
+const ACK_DIAGNOSTICS_RETENTION_MINUTES: u64 = 15;
+/// Per peer/stable-id/minute/stage sample cap. The soak path needs tail
+/// percentiles, not unbounded per-message history.
+const ACK_DIAGNOSTICS_MAX_STAGE_SAMPLES: usize = 2048;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -609,6 +626,9 @@ pub struct P2pEndpoint {
     /// Pending probe waiters keyed by live connection stable id + request tag.
     ack_waiters: Arc<ParkingRwLock<HashMap<usize, AckWaiterMap>>>,
 
+    /// Stage-by-stage ACK-v2 latency and outcome diagnostics.
+    ack_diagnostics: Arc<AckDiagnostics>,
+
     /// Probe single-flight/cache state keyed by peer.
     probe_flights: Arc<TokioMutex<HashMap<ProbeFlightKey, ProbeFlightState>>>,
 
@@ -834,6 +854,317 @@ enum AckWaiterResult {
 }
 
 type AckWaiterMap = HashMap<[u8; 16], oneshot::Sender<AckWaiterResult>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AckDiagnosticsKey {
+    peer_id: PeerId,
+    stable_id: usize,
+    minute_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AckLatencyStage {
+    SenderOpenBi,
+    SenderRequestWrite,
+    SenderRequestFinish,
+    SenderResponseRead,
+    ReceiverDemux,
+    ReceiverAdmission,
+    ReceiverResponseWriteFinish,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AckOutcome {
+    SenderAccepted,
+    SenderRejected,
+    SenderInvalidResponse,
+    SenderAckTimeout,
+    SenderConnectionClosed,
+    ReceiverAccepted,
+    ReceiverRejected,
+    ReceiverResponseWriteFailed,
+    ReceiverResponseFinishFailed,
+    ReceiverResponseTimedOut,
+}
+
+#[derive(Debug, Default)]
+struct AckStageSamples {
+    values_ms: Vec<u64>,
+}
+
+impl AckStageSamples {
+    fn record(&mut self, duration: Duration) {
+        if self.values_ms.len() >= ACK_DIAGNOSTICS_MAX_STAGE_SAMPLES {
+            self.values_ms.remove(0);
+        }
+        self.values_ms.push(duration_millis_saturating(duration));
+    }
+
+    fn snapshot(&self) -> AckStageLatencySnapshot {
+        AckStageLatencySnapshot::from_samples(&self.values_ms)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AckMinuteDiagnostics {
+    sender_open_bi: AckStageSamples,
+    sender_request_write: AckStageSamples,
+    sender_request_finish: AckStageSamples,
+    sender_response_read: AckStageSamples,
+    receiver_demux: AckStageSamples,
+    receiver_admission: AckStageSamples,
+    receiver_response_write_finish: AckStageSamples,
+    outcomes: AckOutcomeCounters,
+}
+
+impl AckMinuteDiagnostics {
+    fn stage_mut(&mut self, stage: AckLatencyStage) -> &mut AckStageSamples {
+        match stage {
+            AckLatencyStage::SenderOpenBi => &mut self.sender_open_bi,
+            AckLatencyStage::SenderRequestWrite => &mut self.sender_request_write,
+            AckLatencyStage::SenderRequestFinish => &mut self.sender_request_finish,
+            AckLatencyStage::SenderResponseRead => &mut self.sender_response_read,
+            AckLatencyStage::ReceiverDemux => &mut self.receiver_demux,
+            AckLatencyStage::ReceiverAdmission => &mut self.receiver_admission,
+            AckLatencyStage::ReceiverResponseWriteFinish => {
+                &mut self.receiver_response_write_finish
+            }
+        }
+    }
+}
+
+/// Latency percentiles for one ACK-v2 protocol stage.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AckStageLatencySnapshot {
+    /// Number of samples retained for the stage.
+    pub count: usize,
+    /// Median latency in milliseconds.
+    pub p50_ms: Option<u64>,
+    /// 95th percentile latency in milliseconds.
+    pub p95_ms: Option<u64>,
+    /// 99th percentile latency in milliseconds.
+    pub p99_ms: Option<u64>,
+    /// 99.9th percentile latency in milliseconds.
+    pub p999_ms: Option<u64>,
+    /// Maximum retained latency in milliseconds.
+    pub max_ms: Option<u64>,
+}
+
+impl AckStageLatencySnapshot {
+    fn from_samples(samples: &[u64]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+
+        Self {
+            count: sorted.len(),
+            p50_ms: percentile(&sorted, 50, 100),
+            p95_ms: percentile(&sorted, 95, 100),
+            p99_ms: percentile(&sorted, 99, 100),
+            p999_ms: percentile(&sorted, 999, 1000),
+            max_ms: sorted.last().copied(),
+        }
+    }
+}
+
+/// Per-stage ACK-v2 latency diagnostics for one peer/connection/minute bucket.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AckStageDiagnosticsSnapshot {
+    /// Time spent opening the sender-side bidirectional stream.
+    pub sender_open_bi: AckStageLatencySnapshot,
+    /// Time spent writing the ACK-v2 request payload.
+    pub sender_request_write: AckStageLatencySnapshot,
+    /// Time spent finishing the ACK-v2 request stream.
+    pub sender_request_finish: AckStageLatencySnapshot,
+    /// Time spent reading the receiver's ACK-v2 response.
+    pub sender_response_read: AckStageLatencySnapshot,
+    /// Time from inbound stream acceptance to ACK-v2 demux.
+    pub receiver_demux: AckStageLatencySnapshot,
+    /// Time spent in receiver admission and payload enqueue.
+    pub receiver_admission: AckStageLatencySnapshot,
+    /// Time spent writing and finishing the receiver ACK-v2 response.
+    pub receiver_response_write_finish: AckStageLatencySnapshot,
+}
+
+/// ACK-v2 outcome counters for one peer/connection/minute bucket.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AckOutcomeCounters {
+    /// Sender observed an accepted ACK response.
+    pub sender_accepted: u64,
+    /// Sender observed a rejected ACK response.
+    pub sender_rejected: u64,
+    /// Sender received an invalid ACK response envelope.
+    pub sender_invalid_response: u64,
+    /// Sender timed out waiting for an ACK response.
+    pub sender_ack_timeout: u64,
+    /// Sender observed the response side close before an ACK response arrived.
+    pub sender_connection_closed: u64,
+    /// Receiver admitted the payload and sent an accepted ACK response.
+    pub receiver_accepted: u64,
+    /// Receiver rejected the payload before sending the ACK response.
+    pub receiver_rejected: u64,
+    /// Receiver failed while writing the ACK response.
+    pub receiver_response_write_failed: u64,
+    /// Receiver failed while finishing the ACK response stream.
+    pub receiver_response_finish_failed: u64,
+    /// Receiver timed out while writing or finishing the ACK response.
+    pub receiver_response_timed_out: u64,
+}
+
+impl AckOutcomeCounters {
+    fn record(&mut self, outcome: AckOutcome) {
+        match outcome {
+            AckOutcome::SenderAccepted => self.sender_accepted += 1,
+            AckOutcome::SenderRejected => self.sender_rejected += 1,
+            AckOutcome::SenderInvalidResponse => self.sender_invalid_response += 1,
+            AckOutcome::SenderAckTimeout => self.sender_ack_timeout += 1,
+            AckOutcome::SenderConnectionClosed => self.sender_connection_closed += 1,
+            AckOutcome::ReceiverAccepted => self.receiver_accepted += 1,
+            AckOutcome::ReceiverRejected => self.receiver_rejected += 1,
+            AckOutcome::ReceiverResponseWriteFailed => self.receiver_response_write_failed += 1,
+            AckOutcome::ReceiverResponseFinishFailed => self.receiver_response_finish_failed += 1,
+            AckOutcome::ReceiverResponseTimedOut => self.receiver_response_timed_out += 1,
+        }
+    }
+}
+
+/// ACK-v2 diagnostics for one peer/connection/minute bucket.
+#[derive(Debug, Clone, Serialize)]
+pub struct AckPeerDiagnosticsSnapshot {
+    /// Hex-encoded remote peer id.
+    pub peer_id: String,
+    /// Stable ant-quic connection id observed for this bucket.
+    pub stable_id: usize,
+    /// Unix minute for the retained diagnostic bucket.
+    pub minute_unix: u64,
+    /// Latency samples grouped by protocol stage.
+    pub stages: AckStageDiagnosticsSnapshot,
+    /// Outcome counters for this bucket.
+    pub outcomes: AckOutcomeCounters,
+}
+
+/// Snapshot of retained ACK-v2 diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct AckDiagnosticsSnapshot {
+    /// Snapshot generation time in Unix milliseconds.
+    pub generated_at_unix_ms: u64,
+    /// Number of minutes retained in the rolling diagnostics window.
+    pub retention_minutes: u64,
+    /// Per-peer, per-connection, per-minute ACK diagnostics.
+    pub peers: Vec<AckPeerDiagnosticsSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct AckDiagnostics {
+    buckets: ParkingMutex<HashMap<AckDiagnosticsKey, AckMinuteDiagnostics>>,
+}
+
+impl AckDiagnostics {
+    fn record_stage(
+        &self,
+        peer_id: PeerId,
+        stable_id: usize,
+        stage: AckLatencyStage,
+        duration: Duration,
+    ) {
+        let mut buckets = self.buckets.lock();
+        self.prune_locked(&mut buckets);
+        let key = AckDiagnosticsKey {
+            peer_id,
+            stable_id,
+            minute_unix: current_unix_minute(),
+        };
+        buckets
+            .entry(key)
+            .or_default()
+            .stage_mut(stage)
+            .record(duration);
+    }
+
+    fn record_outcome(&self, peer_id: PeerId, stable_id: usize, outcome: AckOutcome) {
+        let mut buckets = self.buckets.lock();
+        self.prune_locked(&mut buckets);
+        let key = AckDiagnosticsKey {
+            peer_id,
+            stable_id,
+            minute_unix: current_unix_minute(),
+        };
+        buckets.entry(key).or_default().outcomes.record(outcome);
+    }
+
+    fn snapshot(&self) -> AckDiagnosticsSnapshot {
+        let mut buckets = self.buckets.lock();
+        self.prune_locked(&mut buckets);
+
+        let mut peers: Vec<_> = buckets
+            .iter()
+            .map(|(key, value)| AckPeerDiagnosticsSnapshot {
+                peer_id: hex::encode(key.peer_id.0),
+                stable_id: key.stable_id,
+                minute_unix: key.minute_unix,
+                stages: AckStageDiagnosticsSnapshot {
+                    sender_open_bi: value.sender_open_bi.snapshot(),
+                    sender_request_write: value.sender_request_write.snapshot(),
+                    sender_request_finish: value.sender_request_finish.snapshot(),
+                    sender_response_read: value.sender_response_read.snapshot(),
+                    receiver_demux: value.receiver_demux.snapshot(),
+                    receiver_admission: value.receiver_admission.snapshot(),
+                    receiver_response_write_finish: value.receiver_response_write_finish.snapshot(),
+                },
+                outcomes: value.outcomes.clone(),
+            })
+            .collect();
+        peers.sort_by(|a, b| {
+            a.peer_id
+                .cmp(&b.peer_id)
+                .then(a.stable_id.cmp(&b.stable_id))
+                .then(a.minute_unix.cmp(&b.minute_unix))
+        });
+
+        AckDiagnosticsSnapshot {
+            generated_at_unix_ms: current_unix_ms(),
+            retention_minutes: ACK_DIAGNOSTICS_RETENTION_MINUTES,
+            peers,
+        }
+    }
+
+    fn prune_locked(&self, buckets: &mut HashMap<AckDiagnosticsKey, AckMinuteDiagnostics>) {
+        let now = current_unix_minute();
+        buckets.retain(|key, _| {
+            now.saturating_sub(key.minute_unix) <= ACK_DIAGNOSTICS_RETENTION_MINUTES
+        });
+    }
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn current_unix_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn current_unix_minute() -> u64 {
+    current_unix_ms() / 60_000
+}
+
+fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> Option<u64> {
+    if sorted.is_empty() || denominator == 0 {
+        return None;
+    }
+    let last = sorted.len().saturating_sub(1);
+    let idx = (last
+        .saturating_mul(numerator)
+        .saturating_add(denominator - 1))
+        / denominator;
+    sorted.get(idx.min(last)).copied()
+}
 
 /// Best-effort runtime assist snapshot for higher-level status surfaces.
 #[derive(Debug, Clone, Default)]
@@ -2172,6 +2503,7 @@ impl P2pEndpoint {
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
         let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
+        let ack_diagnostics = Arc::new(AckDiagnostics::default());
         let probe_flights = Arc::new(TokioMutex::new(HashMap::new()));
         let probe_semaphore = Arc::new(Semaphore::new(PROBE_GLOBAL_CONCURRENCY));
         let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
@@ -2207,6 +2539,7 @@ impl P2pEndpoint {
             reader_handles,
             peer_activity,
             ack_waiters,
+            ack_diagnostics,
             probe_flights,
             probe_semaphore,
             peer_event_tx,
@@ -2220,6 +2553,7 @@ impl P2pEndpoint {
         {
             let connected_peers = Arc::clone(&endpoint.connected_peers);
             let peer_activity = Arc::clone(&endpoint.peer_activity);
+            let ack_diagnostics = Arc::clone(&endpoint.ack_diagnostics);
             let data_tx = endpoint.data_tx.clone();
             let event_tx = endpoint.event_tx.clone();
             let shutdown = endpoint.shutdown.clone();
@@ -2235,10 +2569,12 @@ impl P2pEndpoint {
                                 send,
                                 recv,
                                 prefix,
+                                accepted_at,
                             }) = stream else {
                                 break;
                             };
                             if !Self::handle_ack_bidi_stream(
+                                ack_diagnostics.as_ref(),
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
@@ -2248,6 +2584,7 @@ impl P2pEndpoint {
                                 send,
                                 recv,
                                 prefix,
+                                accepted_at,
                                 max_read_bytes,
                             )
                             .await
@@ -4813,14 +5150,42 @@ impl P2pEndpoint {
         }
     }
 
+    fn set_stream_priority(
+        stream: &crate::high_level::SendStream,
+        priority: i32,
+        peer_id: PeerId,
+        conn_stable_id: usize,
+        stream_kind: &'static str,
+    ) {
+        if let Err(error) = stream.set_priority(priority) {
+            debug!(
+                peer_id = ?peer_id,
+                conn_stable_id,
+                stream_kind,
+                priority,
+                error = ?error,
+                "failed to set QUIC stream priority"
+            );
+        }
+    }
+
     async fn send_ack_control_frame(
         connection: crate::high_level::Connection,
+        peer_id: PeerId,
+        conn_stable_id: usize,
         tag: [u8; 16],
         outcome: AckControlOutcome,
     ) {
         let bytes = encode_ack_control(tag, outcome);
         match connection.open_uni().await {
             Ok(mut stream) => {
+                Self::set_stream_priority(
+                    &stream,
+                    PROBE_STREAM_PRIORITY,
+                    peer_id,
+                    conn_stable_id,
+                    "probe_ack_control",
+                );
                 if let Err(error) = stream.write_all(&bytes).await {
                     warn!(error = %error, "failed to send ACK control frame");
                     return;
@@ -4836,20 +5201,82 @@ impl P2pEndpoint {
     }
 
     async fn send_ack_bidi_response(
+        ack_diagnostics: &AckDiagnostics,
+        peer_id: PeerId,
+        conn_stable_id: usize,
         mut stream: crate::high_level::SendStream,
         outcome: AckControlOutcome,
     ) {
+        Self::set_stream_priority(
+            &stream,
+            ACK_STREAM_PRIORITY,
+            peer_id,
+            conn_stable_id,
+            "ack_v2_response",
+        );
         let bytes = encode_ack_bidi_response(outcome);
-        if let Err(error) = stream.write_all(&bytes).await {
-            warn!(error = %error, "failed to send ACK-v2 response");
-            return;
-        }
-        if let Err(error) = stream.finish() {
-            warn!(error = %error, "failed to finish ACK-v2 response stream");
+        let started = Instant::now();
+        let result = timeout(ACK_RESPONSE_WRITE_TIMEOUT, async {
+            if let Err(error) = stream.write_all(&bytes).await {
+                return Err(("write", error.to_string()));
+            }
+            if let Err(error) = stream.finish() {
+                return Err(("finish", format!("{error:?}")));
+            }
+            Ok(())
+        })
+        .await;
+        ack_diagnostics.record_stage(
+            peer_id,
+            conn_stable_id,
+            AckLatencyStage::ReceiverResponseWriteFinish,
+            started.elapsed(),
+        );
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(("write", error))) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverResponseWriteFailed,
+                );
+                warn!(peer_id = ?peer_id, conn_stable_id, error = %error, "failed to send ACK-v2 response");
+            }
+            Ok(Err(("finish", error))) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverResponseFinishFailed,
+                );
+                warn!(peer_id = ?peer_id, conn_stable_id, error = %error, "failed to finish ACK-v2 response stream");
+            }
+            Ok(Err((stage, error))) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverResponseWriteFailed,
+                );
+                warn!(peer_id = ?peer_id, conn_stable_id, stage, error = %error, "failed to send ACK-v2 response");
+            }
+            Err(_elapsed) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverResponseTimedOut,
+                );
+                warn!(
+                    peer_id = ?peer_id,
+                    conn_stable_id,
+                    timeout_ms = ACK_RESPONSE_WRITE_TIMEOUT.as_millis() as u64,
+                    "timed out writing ACK-v2 response"
+                );
+            }
         }
     }
 
     async fn handle_ack_bidi_stream(
+        ack_diagnostics: &AckDiagnostics,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
         peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
         data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
@@ -4859,10 +5286,20 @@ impl P2pEndpoint {
         send: crate::high_level::SendStream,
         mut recv: crate::high_level::RecvStream,
         prefix: Vec<u8>,
+        accepted_at: Instant,
         max_read_bytes: usize,
     ) -> bool {
+        ack_diagnostics.record_stage(
+            peer_id,
+            conn_stable_id,
+            AckLatencyStage::ReceiverDemux,
+            accepted_at.elapsed(),
+        );
         if prefix.as_slice() != &ACK_BIDI_REQUEST_MAGIC[..] {
             Self::send_ack_bidi_response(
+                ack_diagnostics,
+                peer_id,
+                conn_stable_id,
                 send,
                 AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
             )
@@ -4878,6 +5315,9 @@ impl P2pEndpoint {
                     peer_id, conn_stable_id, e
                 );
                 Self::send_ack_bidi_response(
+                    ack_diagnostics,
+                    peer_id,
+                    conn_stable_id,
                     send,
                     AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
                 )
@@ -4890,6 +5330,9 @@ impl P2pEndpoint {
         data.extend_from_slice(&remaining);
         let Some(payload) = decode_ack_bidi_request(&data) else {
             Self::send_ack_bidi_response(
+                ack_diagnostics,
+                peer_id,
+                conn_stable_id,
                 send,
                 AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
             )
@@ -4907,7 +5350,16 @@ impl P2pEndpoint {
         )
         .await;
 
-        match Self::admit_ack_requested_payload(data_tx, peer_id, payload.to_vec()).await {
+        let admission_started = Instant::now();
+        let admission = Self::admit_ack_requested_payload(data_tx, peer_id, payload.to_vec()).await;
+        ack_diagnostics.record_stage(
+            peer_id,
+            conn_stable_id,
+            AckLatencyStage::ReceiverAdmission,
+            admission_started.elapsed(),
+        );
+
+        match admission {
             Ok(()) => {
                 if let Err(e) = event_tx.send(P2pEvent::DataReceived {
                     peer_id,
@@ -4922,7 +5374,19 @@ impl P2pEndpoint {
                         "HIGH: silent drop"
                     );
                 }
-                Self::send_ack_bidi_response(send, AckControlOutcome::Accepted).await;
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverAccepted,
+                );
+                Self::send_ack_bidi_response(
+                    ack_diagnostics,
+                    peer_id,
+                    conn_stable_id,
+                    send,
+                    AckControlOutcome::Accepted,
+                )
+                .await;
                 true
             }
             Err(reason) => {
@@ -4935,7 +5399,19 @@ impl P2pEndpoint {
                         "receive pipeline backpressured; rejecting ACK-v2 payload"
                     );
                 }
-                Self::send_ack_bidi_response(send, AckControlOutcome::Rejected(reason)).await;
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverRejected,
+                );
+                Self::send_ack_bidi_response(
+                    ack_diagnostics,
+                    peer_id,
+                    conn_stable_id,
+                    send,
+                    AckControlOutcome::Rejected(reason),
+                )
+                .await;
                 reason != ReceiveRejectReason::ConsumerGone
             }
         }
@@ -5475,17 +5951,47 @@ impl P2pEndpoint {
             return Err(EndpointError::ConnectionClosed { reason });
         }
 
+        let stable_id = connection.stable_id();
         let envelope = encode_ack_bidi_request(data);
         let exchange = async {
+            let open_started = Instant::now();
             let (mut send_stream, mut recv_stream) = connection
                 .open_bi()
                 .await
                 .map_err(endpoint_error_from_connection_error)?;
-            send_stream
-                .write_all(&envelope)
-                .await
-                .map_err(endpoint_error_from_write_error)?;
-            send_stream.finish().map_err(|e| {
+            self.ack_diagnostics.record_stage(
+                *peer_id,
+                stable_id,
+                AckLatencyStage::SenderOpenBi,
+                open_started.elapsed(),
+            );
+            Self::set_stream_priority(
+                &send_stream,
+                ACK_STREAM_PRIORITY,
+                *peer_id,
+                stable_id,
+                "ack_v2_request",
+            );
+
+            let write_started = Instant::now();
+            let write_result = send_stream.write_all(&envelope).await;
+            self.ack_diagnostics.record_stage(
+                *peer_id,
+                stable_id,
+                AckLatencyStage::SenderRequestWrite,
+                write_started.elapsed(),
+            );
+            write_result.map_err(endpoint_error_from_write_error)?;
+
+            let finish_started = Instant::now();
+            let finish_result = send_stream.finish();
+            self.ack_diagnostics.record_stage(
+                *peer_id,
+                stable_id,
+                AckLatencyStage::SenderRequestFinish,
+                finish_started.elapsed(),
+            );
+            finish_result.map_err(|e| {
                 close_reason_from_connection(&connection)
                     .map(|reason| EndpointError::ConnectionClosed { reason })
                     .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
@@ -5500,10 +6006,15 @@ impl P2pEndpoint {
             )
             .await;
 
-            let response = recv_stream
-                .read_to_end(ACK_BIDI_RESPONSE_MAX_BYTES)
-                .await
-                .map_err(endpoint_error_from_read_to_end_error)?;
+            let read_started = Instant::now();
+            let read_result = recv_stream.read_to_end(ACK_BIDI_RESPONSE_MAX_BYTES).await;
+            self.ack_diagnostics.record_stage(
+                *peer_id,
+                stable_id,
+                AckLatencyStage::SenderResponseRead,
+                read_started.elapsed(),
+            );
+            let response = read_result.map_err(endpoint_error_from_read_to_end_error)?;
             let outcome = decode_ack_bidi_response(&response);
             if outcome.is_some() {
                 note_peer_activity(
@@ -5516,24 +6027,55 @@ impl P2pEndpoint {
                 .await;
             }
             match outcome {
-                Some(AckControlOutcome::Accepted) => Ok(()),
+                Some(AckControlOutcome::Accepted) => {
+                    self.ack_diagnostics.record_outcome(
+                        *peer_id,
+                        stable_id,
+                        AckOutcome::SenderAccepted,
+                    );
+                    Ok(())
+                }
                 Some(AckControlOutcome::Rejected(reason)) => {
+                    self.ack_diagnostics.record_outcome(
+                        *peer_id,
+                        stable_id,
+                        AckOutcome::SenderRejected,
+                    );
                     Err(EndpointError::ReceiveRejected { reason })
                 }
                 Some(AckControlOutcome::Closed(reason)) => {
+                    self.ack_diagnostics.record_outcome(
+                        *peer_id,
+                        stable_id,
+                        AckOutcome::SenderConnectionClosed,
+                    );
                     Err(EndpointError::ConnectionClosed { reason })
                 }
-                None => Err(EndpointError::Connection(format!(
-                    "invalid ACK-v2 response envelope: len={}, prefix={}",
-                    response.len(),
-                    hex::encode(&response[..response.len().min(16)])
-                ))),
+                None => {
+                    self.ack_diagnostics.record_outcome(
+                        *peer_id,
+                        stable_id,
+                        AckOutcome::SenderInvalidResponse,
+                    );
+                    Err(EndpointError::Connection(format!(
+                        "invalid ACK-v2 response envelope: len={}, prefix={}",
+                        response.len(),
+                        hex::encode(&response[..response.len().min(16)])
+                    )))
+                }
             }
         };
 
         match timeout(timeout_duration, exchange).await {
             Ok(result) => result,
-            Err(_) => Err(EndpointError::AckTimeout),
+            Err(_) => {
+                self.ack_diagnostics.record_outcome(
+                    *peer_id,
+                    stable_id,
+                    AckOutcome::SenderAckTimeout,
+                );
+                Err(EndpointError::AckTimeout)
+            }
         }
     }
 
@@ -5682,6 +6224,13 @@ impl P2pEndpoint {
                 .open_uni()
                 .await
                 .map_err(endpoint_error_from_connection_error)?;
+            Self::set_stream_priority(
+                &send_stream,
+                PROBE_STREAM_PRIORITY,
+                *peer_id,
+                stable_id,
+                "probe_request",
+            );
             send_stream
                 .write_all(&envelope)
                 .await
@@ -5862,6 +6411,11 @@ impl P2pEndpoint {
     /// Get endpoint statistics
     pub async fn stats(&self) -> EndpointStats {
         self.stats.read().await.clone()
+    }
+
+    /// Snapshot stage-by-stage ACK-v2 latency and outcome diagnostics.
+    pub fn ack_diagnostics(&self) -> AckDiagnosticsSnapshot {
+        self.ack_diagnostics.snapshot()
     }
 
     /// Get metrics for a specific connection
@@ -6672,6 +7226,7 @@ impl P2pEndpoint {
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
         let ack_waiters = Arc::clone(&self.ack_waiters);
+        let ack_diagnostics = Arc::clone(&self.ack_diagnostics);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let reader_exit_tx = self.reader_exit_tx.clone();
@@ -6748,6 +7303,7 @@ impl P2pEndpoint {
 
                 let mut recv_stream = match incoming {
                     IncomingStream::AckBidi { send, mut recv } => {
+                        let accepted_at = Instant::now();
                         let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
                         if let Err(e) = recv.read_exact(&mut prefix).await {
                             debug!(
@@ -6759,6 +7315,7 @@ impl P2pEndpoint {
 
                         if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
                             if !Self::handle_ack_bidi_stream(
+                                ack_diagnostics.as_ref(),
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
@@ -6768,6 +7325,7 @@ impl P2pEndpoint {
                                 send,
                                 recv,
                                 prefix,
+                                accepted_at,
                                 max_read_bytes,
                             )
                             .await
@@ -6883,6 +7441,8 @@ impl P2pEndpoint {
                     .await;
                     Self::send_ack_control_frame(
                         connection.clone(),
+                        peer_id,
+                        conn_stable_id,
                         tag,
                         AckControlOutcome::Accepted,
                     )
@@ -7510,6 +8070,7 @@ impl Clone for P2pEndpoint {
             reader_handles: Arc::clone(&self.reader_handles),
             peer_activity: Arc::clone(&self.peer_activity),
             ack_waiters: Arc::clone(&self.ack_waiters),
+            ack_diagnostics: Arc::clone(&self.ack_diagnostics),
             probe_flights: Arc::clone(&self.probe_flights),
             probe_semaphore: Arc::clone(&self.probe_semaphore),
             peer_event_tx: self.peer_event_tx.clone(),

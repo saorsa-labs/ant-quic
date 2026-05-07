@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.11] - 2026-05-07
+
+X0X-0036 part 2: ACK-v2 priority and diagnostics for the residual slow-drift
+class seen in x0x's 4 h soak after probe isolation landed.
+
+### Added
+
+- ACK-v2 stage diagnostics retained per peer/connection/minute with
+  p50/p95/p99/p999/max latency buckets for sender `open_bi`, request write,
+  request finish, sender response read, receiver demux, receiver admission,
+  and receiver response write+finish.
+- ACK-v2 outcome counters for accepted/rejected sends, sender timeout/invalid
+  response/connection close, and receiver response write/finish/timeout
+  failures. Exposed through `P2pEndpoint::ack_diagnostics()` and
+  `Node::ack_diagnostics()`.
+- Receiver-side ACK response write+finish timeout (`500 ms`) so slow or stuck
+  response writes are recorded at the receiver instead of being buried as an
+  opaque sender-side ACK timeout.
+
+### Changed
+
+- ACK-v2 request and response streams now request high QUIC stream priority.
+  Probe request/control streams request scavenger priority so they do not
+  compete directly with DM ACK traffic under mesh pressure.
+
 ## [0.27.10] - 2026-05-07
 
 X0X-0036 fix (part 1, ant-quic side): pressure isolation between control-plane

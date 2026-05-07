@@ -367,9 +367,10 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 pub use ack_frame::ReceiveRejectReason;
 pub use connection_lifecycle::ConnectionCloseReason;
 pub use p2p_endpoint::{
-    ConnectionHealth, ConnectionMetrics, DirectPathStatus, DirectPathUnavailableReason,
-    DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection,
-    PeerLifecycleEvent, TraversalPhase,
+    AckDiagnosticsSnapshot, AckOutcomeCounters, AckPeerDiagnosticsSnapshot,
+    AckStageDiagnosticsSnapshot, AckStageLatencySnapshot, ConnectionHealth, ConnectionMetrics,
+    DirectPathStatus, DirectPathUnavailableReason, DisconnectReason, EndpointError, EndpointStats,
+    P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern
