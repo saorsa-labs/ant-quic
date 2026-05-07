@@ -115,6 +115,8 @@ const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 /// receiver budget exposes response-write starvation directly instead of
 /// burying it inside an opaque sender timeout.
 const ACK_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Retry budget for the duplicate-safe ACK-v2 retry after sender timeout.
+const ACK_TIMEOUT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 /// ACK-v2 request/response stream priority.
 const ACK_STREAM_PRIORITY: i32 = 16;
 /// Probe request/response stream priority. Probes are diagnostic traffic and
@@ -142,6 +144,10 @@ const ACK_DIAGNOSTICS_RETENTION_MINUTES: u64 = 15;
 /// Per peer/stable-id/minute/stage sample cap. The soak path needs tail
 /// percentiles, not unbounded per-message history.
 const ACK_DIAGNOSTICS_MAX_STAGE_SAMPLES: usize = 2048;
+/// Short receiver-side idempotency window for ACK-v2 request IDs.
+const ACK_REQUEST_DEDUPE_TTL: Duration = Duration::from_secs(120);
+/// Bound receiver-side ACK request dedupe memory in long-lived daemons.
+const ACK_REQUEST_DEDUPE_MAX_ENTRIES: usize = 8192;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -629,6 +635,9 @@ pub struct P2pEndpoint {
     /// Stage-by-stage ACK-v2 latency and outcome diagnostics.
     ack_diagnostics: Arc<AckDiagnostics>,
 
+    /// Receiver-side ACK-v2 request-id dedupe cache.
+    ack_request_dedupe: Arc<AckRequestDedupeCache>,
+
     /// Probe single-flight/cache state keyed by peer.
     probe_flights: Arc<TokioMutex<HashMap<ProbeFlightKey, ProbeFlightState>>>,
 
@@ -880,11 +889,112 @@ enum AckOutcome {
     SenderInvalidResponse,
     SenderAckTimeout,
     SenderConnectionClosed,
+    SenderRetryAttempted,
+    SenderRetryAccepted,
+    SenderRetryFailed,
     ReceiverAccepted,
     ReceiverRejected,
+    ReceiverDuplicateReplayed,
+    ReceiverDuplicateConflict,
     ReceiverResponseWriteFailed,
     ReceiverResponseFinishFailed,
     ReceiverResponseTimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AckRequestDedupeKey {
+    peer_id: PeerId,
+    request_id: [u8; 16],
+}
+
+#[derive(Debug, Clone)]
+struct AckRequestDedupeEntry {
+    payload_hash: [u8; 32],
+    outcome: AckControlOutcome,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckRequestDedupeReplay {
+    Replay(AckControlOutcome),
+    Conflict,
+}
+
+#[derive(Debug, Default)]
+struct AckRequestDedupeCache {
+    entries: ParkingMutex<HashMap<AckRequestDedupeKey, AckRequestDedupeEntry>>,
+}
+
+impl AckRequestDedupeCache {
+    fn replay(
+        &self,
+        peer_id: PeerId,
+        request_id: [u8; 16],
+        payload: &[u8],
+    ) -> Option<AckRequestDedupeReplay> {
+        let mut entries = self.entries.lock();
+        Self::prune_locked(&mut entries);
+        let key = AckRequestDedupeKey {
+            peer_id,
+            request_id,
+        };
+        let entry = entries.get(&key)?;
+        if entry.payload_hash == ack_payload_hash(payload) {
+            Some(AckRequestDedupeReplay::Replay(entry.outcome))
+        } else {
+            Some(AckRequestDedupeReplay::Conflict)
+        }
+    }
+
+    fn remember(
+        &self,
+        peer_id: PeerId,
+        request_id: [u8; 16],
+        payload: &[u8],
+        outcome: AckControlOutcome,
+    ) {
+        let mut entries = self.entries.lock();
+        Self::prune_locked(&mut entries);
+        Self::evict_overflow_locked(&mut entries);
+        entries.insert(
+            AckRequestDedupeKey {
+                peer_id,
+                request_id,
+            },
+            AckRequestDedupeEntry {
+                payload_hash: ack_payload_hash(payload),
+                outcome,
+                expires_at: Instant::now() + ACK_REQUEST_DEDUPE_TTL,
+            },
+        );
+    }
+
+    fn prune_locked(entries: &mut HashMap<AckRequestDedupeKey, AckRequestDedupeEntry>) {
+        let now = Instant::now();
+        entries.retain(|_, entry| entry.expires_at > now);
+    }
+
+    fn evict_overflow_locked(entries: &mut HashMap<AckRequestDedupeKey, AckRequestDedupeEntry>) {
+        if entries.len() < ACK_REQUEST_DEDUPE_MAX_ENTRIES {
+            return;
+        }
+        let remove_count = entries
+            .len()
+            .saturating_add(1)
+            .saturating_sub(ACK_REQUEST_DEDUPE_MAX_ENTRIES);
+        let mut oldest: Vec<_> = entries
+            .iter()
+            .map(|(key, entry)| (*key, entry.expires_at))
+            .collect();
+        oldest.sort_by_key(|(_, expires_at)| *expires_at);
+        for (key, _) in oldest.into_iter().take(remove_count) {
+            entries.remove(&key);
+        }
+    }
+}
+
+fn ack_payload_hash(payload: &[u8]) -> [u8; 32] {
+    *blake3::hash(payload).as_bytes()
 }
 
 #[derive(Debug, Default)]
@@ -1002,10 +1112,20 @@ pub struct AckOutcomeCounters {
     pub sender_ack_timeout: u64,
     /// Sender observed the response side close before an ACK response arrived.
     pub sender_connection_closed: u64,
+    /// Sender attempted the duplicate-safe retry after an ACK timeout.
+    pub sender_retry_attempted: u64,
+    /// Sender retry received an accepted ACK response.
+    pub sender_retry_accepted: u64,
+    /// Sender retry completed with a non-accepted outcome.
+    pub sender_retry_failed: u64,
     /// Receiver admitted the payload and sent an accepted ACK response.
     pub receiver_accepted: u64,
     /// Receiver rejected the payload before sending the ACK response.
     pub receiver_rejected: u64,
+    /// Receiver replayed a cached ACK-v2 outcome for a duplicate request ID.
+    pub receiver_duplicate_replayed: u64,
+    /// Receiver rejected a request ID reused with a different payload.
+    pub receiver_duplicate_conflict: u64,
     /// Receiver failed while writing the ACK response.
     pub receiver_response_write_failed: u64,
     /// Receiver failed while finishing the ACK response stream.
@@ -1022,8 +1142,13 @@ impl AckOutcomeCounters {
             AckOutcome::SenderInvalidResponse => self.sender_invalid_response += 1,
             AckOutcome::SenderAckTimeout => self.sender_ack_timeout += 1,
             AckOutcome::SenderConnectionClosed => self.sender_connection_closed += 1,
+            AckOutcome::SenderRetryAttempted => self.sender_retry_attempted += 1,
+            AckOutcome::SenderRetryAccepted => self.sender_retry_accepted += 1,
+            AckOutcome::SenderRetryFailed => self.sender_retry_failed += 1,
             AckOutcome::ReceiverAccepted => self.receiver_accepted += 1,
             AckOutcome::ReceiverRejected => self.receiver_rejected += 1,
+            AckOutcome::ReceiverDuplicateReplayed => self.receiver_duplicate_replayed += 1,
+            AckOutcome::ReceiverDuplicateConflict => self.receiver_duplicate_conflict += 1,
             AckOutcome::ReceiverResponseWriteFailed => self.receiver_response_write_failed += 1,
             AckOutcome::ReceiverResponseFinishFailed => self.receiver_response_finish_failed += 1,
             AckOutcome::ReceiverResponseTimedOut => self.receiver_response_timed_out += 1,
@@ -2504,6 +2629,7 @@ impl P2pEndpoint {
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
         let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
         let ack_diagnostics = Arc::new(AckDiagnostics::default());
+        let ack_request_dedupe = Arc::new(AckRequestDedupeCache::default());
         let probe_flights = Arc::new(TokioMutex::new(HashMap::new()));
         let probe_semaphore = Arc::new(Semaphore::new(PROBE_GLOBAL_CONCURRENCY));
         let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
@@ -2540,6 +2666,7 @@ impl P2pEndpoint {
             peer_activity,
             ack_waiters,
             ack_diagnostics,
+            ack_request_dedupe,
             probe_flights,
             probe_semaphore,
             peer_event_tx,
@@ -2554,6 +2681,7 @@ impl P2pEndpoint {
             let connected_peers = Arc::clone(&endpoint.connected_peers);
             let peer_activity = Arc::clone(&endpoint.peer_activity);
             let ack_diagnostics = Arc::clone(&endpoint.ack_diagnostics);
+            let ack_request_dedupe = Arc::clone(&endpoint.ack_request_dedupe);
             let data_tx = endpoint.data_tx.clone();
             let event_tx = endpoint.event_tx.clone();
             let shutdown = endpoint.shutdown.clone();
@@ -2575,6 +2703,7 @@ impl P2pEndpoint {
                             };
                             if !Self::handle_ack_bidi_stream(
                                 ack_diagnostics.as_ref(),
+                                ack_request_dedupe.as_ref(),
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
@@ -5277,6 +5406,7 @@ impl P2pEndpoint {
 
     async fn handle_ack_bidi_stream(
         ack_diagnostics: &AckDiagnostics,
+        ack_request_dedupe: &AckRequestDedupeCache,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
         peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
         data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
@@ -5328,7 +5458,7 @@ impl P2pEndpoint {
 
         let mut data = prefix;
         data.extend_from_slice(&remaining);
-        let Some(payload) = decode_ack_bidi_request(&data) else {
+        let Some(request) = decode_ack_bidi_request(&data) else {
             Self::send_ack_bidi_response(
                 ack_diagnostics,
                 peer_id,
@@ -5339,7 +5469,45 @@ impl P2pEndpoint {
             .await;
             return true;
         };
+        let request_id = request.request_id;
+        let payload = request.payload;
         let payload_len = payload.len();
+
+        match ack_request_dedupe.replay(peer_id, request_id, payload) {
+            Some(AckRequestDedupeReplay::Replay(outcome)) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverDuplicateReplayed,
+                );
+                Self::send_ack_bidi_response(
+                    ack_diagnostics,
+                    peer_id,
+                    conn_stable_id,
+                    send,
+                    outcome,
+                )
+                .await;
+                return true;
+            }
+            Some(AckRequestDedupeReplay::Conflict) => {
+                ack_diagnostics.record_outcome(
+                    peer_id,
+                    conn_stable_id,
+                    AckOutcome::ReceiverDuplicateConflict,
+                );
+                Self::send_ack_bidi_response(
+                    ack_diagnostics,
+                    peer_id,
+                    conn_stable_id,
+                    send,
+                    AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
+                )
+                .await;
+                return true;
+            }
+            None => {}
+        }
 
         note_peer_activity(
             connected_peers,
@@ -5379,6 +5547,12 @@ impl P2pEndpoint {
                     conn_stable_id,
                     AckOutcome::ReceiverAccepted,
                 );
+                ack_request_dedupe.remember(
+                    peer_id,
+                    request_id,
+                    payload,
+                    AckControlOutcome::Accepted,
+                );
                 Self::send_ack_bidi_response(
                     ack_diagnostics,
                     peer_id,
@@ -5403,6 +5577,12 @@ impl P2pEndpoint {
                     peer_id,
                     conn_stable_id,
                     AckOutcome::ReceiverRejected,
+                );
+                ack_request_dedupe.remember(
+                    peer_id,
+                    request_id,
+                    payload,
+                    AckControlOutcome::Rejected(reason),
                 );
                 Self::send_ack_bidi_response(
                     ack_diagnostics,
@@ -5905,10 +6085,69 @@ impl P2pEndpoint {
     /// remote reader task decoded the payload and enqueued it into the receiver
     /// pipeline that backs `recv()`. It does not imply the remote application has
     /// consumed or processed the payload.
+    ///
+    /// On ACK timeout this performs one duplicate-safe retry with the same
+    /// ACK-v2 request ID. The receiver deduplicates accepted payloads, so the
+    /// retry can recover a late/lost ACK response without double-delivering.
     pub async fn send_with_receive_ack(
         &self,
         peer_id: &PeerId,
         data: &[u8],
+        timeout_duration: Duration,
+    ) -> Result<(), EndpointError> {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let mut request_id = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut request_id);
+
+        let first = self
+            .send_ack_exchange_once(peer_id, data, request_id, timeout_duration)
+            .await;
+        if !matches!(first, Err(EndpointError::AckTimeout)) {
+            return first;
+        }
+
+        self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryAttempted);
+        let retry_timeout = std::cmp::min(timeout_duration, ACK_TIMEOUT_RETRY_TIMEOUT);
+        if retry_timeout.is_zero() {
+            self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
+            return first;
+        }
+
+        let retry = self
+            .send_ack_exchange_once(peer_id, data, request_id, retry_timeout)
+            .await;
+        match retry {
+            Ok(()) => {
+                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryAccepted);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
+                Err(error)
+            }
+        }
+    }
+
+    fn record_ack_retry_outcome(&self, peer_id: PeerId, outcome: AckOutcome) {
+        let stable_id = self
+            .inner
+            .get_connection(&peer_id)
+            .ok()
+            .flatten()
+            .map(|connection| connection.stable_id())
+            .unwrap_or_default();
+        self.ack_diagnostics
+            .record_outcome(peer_id, stable_id, outcome);
+    }
+
+    async fn send_ack_exchange_once(
+        &self,
+        peer_id: &PeerId,
+        data: &[u8],
+        request_id: [u8; 16],
         timeout_duration: Duration,
     ) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
@@ -5952,7 +6191,7 @@ impl P2pEndpoint {
         }
 
         let stable_id = connection.stable_id();
-        let envelope = encode_ack_bidi_request(data);
+        let envelope = encode_ack_bidi_request(request_id, data);
         let exchange = async {
             let open_started = Instant::now();
             let (mut send_stream, mut recv_stream) = connection
@@ -7227,6 +7466,7 @@ impl P2pEndpoint {
         let peer_activity = Arc::clone(&self.peer_activity);
         let ack_waiters = Arc::clone(&self.ack_waiters);
         let ack_diagnostics = Arc::clone(&self.ack_diagnostics);
+        let ack_request_dedupe = Arc::clone(&self.ack_request_dedupe);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let reader_exit_tx = self.reader_exit_tx.clone();
@@ -7316,6 +7556,7 @@ impl P2pEndpoint {
                         if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
                             if !Self::handle_ack_bidi_stream(
                                 ack_diagnostics.as_ref(),
+                                ack_request_dedupe.as_ref(),
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
@@ -8071,6 +8312,7 @@ impl Clone for P2pEndpoint {
             peer_activity: Arc::clone(&self.peer_activity),
             ack_waiters: Arc::clone(&self.ack_waiters),
             ack_diagnostics: Arc::clone(&self.ack_diagnostics),
+            ack_request_dedupe: Arc::clone(&self.ack_request_dedupe),
             probe_flights: Arc::clone(&self.probe_flights),
             probe_semaphore: Arc::clone(&self.probe_semaphore),
             peer_event_tx: self.peer_event_tx.clone(),
@@ -8090,6 +8332,39 @@ mod tests {
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
     ) -> Vec<P2pEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn ack_request_dedupe_replays_matching_request_id_once() {
+        let cache = AckRequestDedupeCache::default();
+        let peer_id = PeerId([0x11; 32]);
+        let request_id = [0x22; 16];
+        let payload = b"idempotent payload";
+
+        assert_eq!(cache.replay(peer_id, request_id, payload), None);
+        cache.remember(peer_id, request_id, payload, AckControlOutcome::Accepted);
+        assert_eq!(
+            cache.replay(peer_id, request_id, payload),
+            Some(AckRequestDedupeReplay::Replay(AckControlOutcome::Accepted))
+        );
+    }
+
+    #[test]
+    fn ack_request_dedupe_rejects_request_id_payload_conflict() {
+        let cache = AckRequestDedupeCache::default();
+        let peer_id = PeerId([0x33; 32]);
+        let request_id = [0x44; 16];
+
+        cache.remember(
+            peer_id,
+            request_id,
+            b"first payload",
+            AckControlOutcome::Accepted,
+        );
+        assert_eq!(
+            cache.replay(peer_id, request_id, b"different payload"),
+            Some(AckRequestDedupeReplay::Conflict)
+        );
     }
 
     #[tokio::test]

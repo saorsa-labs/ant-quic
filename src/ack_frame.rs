@@ -1,10 +1,11 @@
 use crate::ConnectionCloseReason;
 
 const ACK_CONTROL_MAGIC: &[u8; 8] = b"ANQAckC1";
-pub(crate) const ACK_BIDI_REQUEST_MAGIC: &[u8; 8] = b"ANQAckB2";
+pub(crate) const ACK_BIDI_REQUEST_MAGIC: &[u8; 8] = b"ANQAckB3";
 const ACK_BIDI_RESPONSE_MAGIC: &[u8; 8] = b"ANQAckR2";
 const PROBE_REQUEST_MAGIC: &[u8; 8] = b"ANQProR1";
 
+const ACK_REQUEST_ID_LEN: usize = 16;
 pub(crate) const ACK_BIDI_RESPONSE_MAX_BYTES: usize = ACK_BIDI_RESPONSE_MAGIC.len() + 2;
 
 /// Reasons the remote receive pipeline rejected an ACK-requested payload.
@@ -42,19 +43,39 @@ pub(crate) enum AckControlOutcome {
     Closed(ConnectionCloseReason),
 }
 
-pub(crate) fn encode_ack_bidi_request(payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ACK_BIDI_REQUEST_MAGIC.len() + payload.len());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AckBidiRequest<'a> {
+    pub(crate) request_id: [u8; ACK_REQUEST_ID_LEN],
+    pub(crate) payload: &'a [u8],
+}
+
+pub(crate) fn encode_ack_bidi_request(
+    request_id: [u8; ACK_REQUEST_ID_LEN],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes =
+        Vec::with_capacity(ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN + payload.len());
     bytes.extend_from_slice(ACK_BIDI_REQUEST_MAGIC);
+    bytes.extend_from_slice(&request_id);
     bytes.extend_from_slice(payload);
     bytes
 }
 
-pub(crate) fn decode_ack_bidi_request(bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.len() < ACK_BIDI_REQUEST_MAGIC.len() || !bytes.starts_with(ACK_BIDI_REQUEST_MAGIC) {
+pub(crate) fn decode_ack_bidi_request(bytes: &[u8]) -> Option<AckBidiRequest<'_>> {
+    if bytes.len() < ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN
+        || !bytes.starts_with(ACK_BIDI_REQUEST_MAGIC)
+    {
         return None;
     }
 
-    Some(&bytes[ACK_BIDI_REQUEST_MAGIC.len()..])
+    let mut request_id = [0u8; ACK_REQUEST_ID_LEN];
+    request_id.copy_from_slice(
+        &bytes[ACK_BIDI_REQUEST_MAGIC.len()..ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN],
+    );
+    Some(AckBidiRequest {
+        request_id,
+        payload: &bytes[ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN..],
+    })
 }
 
 pub(crate) fn encode_ack_control(tag: [u8; 16], outcome: AckControlOutcome) -> Vec<u8> {
@@ -262,11 +283,16 @@ mod tests {
 
     #[test]
     fn ack_bidi_request_roundtrip() {
+        let request_id = [0xA5; 16];
         let payload = b"hello";
-        let encoded = encode_ack_bidi_request(payload);
+        let encoded = encode_ack_bidi_request(request_id, payload);
         let decoded = decode_ack_bidi_request(&encoded).expect("decode bidi request");
-        assert_eq!(decoded, payload);
-        assert_eq!(encoded.len(), ACK_BIDI_REQUEST_MAGIC.len() + payload.len());
+        assert_eq!(decoded.request_id, request_id);
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(
+            encoded.len(),
+            ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN + payload.len()
+        );
     }
 
     #[test]
@@ -304,7 +330,7 @@ mod tests {
             "ACK control frame must not decode as probe envelope"
         );
 
-        let ack_bidi = encode_ack_bidi_request(b"hi");
+        let ack_bidi = encode_ack_bidi_request([0x22; 16], b"hi");
         assert!(
             decode_probe_request(&ack_bidi).is_none(),
             "ACK-v2 request must not decode as probe envelope"

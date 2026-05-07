@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.12] - 2026-05-07
+
+X0X-0037: duplicate-safe ACK-v2 timeout retry.
+
+### Added
+
+- ACK-v2 request envelope `ANQAckB3` with a 16-byte request ID.
+- Receiver-side short-TTL dedupe cache keyed by `(sender_peer_id, request_id)`.
+  Duplicate requests with the same payload replay the cached ACK outcome
+  without delivering the payload again; request ID reuse with a different
+  payload is rejected as an invalid envelope.
+- Sender-side single retry after `AckTimeout`, using the same request ID and a
+  short retry budget. This converts the observed "payload delivered but ACK
+  read timed out" class into a cached ACK replay instead of a false failure.
+- Diagnostics counters for sender retry attempts / accepted retries / failed
+  retries and receiver duplicate replay / payload-conflict outcomes.
+
 ## [0.27.11] - 2026-05-07
 
 X0X-0036 part 2: ACK-v2 priority and diagnostics for the residual slow-drift
