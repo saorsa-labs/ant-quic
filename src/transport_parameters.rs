@@ -121,8 +121,8 @@ macro_rules! make_struct {
             /// When present, indicates support for QUIC Address Discovery extension
             pub(crate) address_discovery: Option<AddressDiscoveryConfig>,
 
-            /// Optional ACK-v1 receive-pipeline support.
-            pub(crate) ack_receive_v1: bool,
+            /// Optional ACK-v2 receive-pipeline support.
+            pub(crate) ack_receive_v2: bool,
 
             /// Post-Quantum Cryptography algorithms supported by this endpoint
             ///
@@ -169,7 +169,7 @@ macro_rules! make_struct {
                     nat_traversal: None,
                     rfc_nat_traversal: false,
                     address_discovery: None,
-                    ack_receive_v1: false,
+                    ack_receive_v2: false,
                     pqc_algorithms: None,
 
                     original_dst_cid: None,
@@ -234,7 +234,7 @@ impl TransportParameters {
             nat_traversal: config.nat_traversal_config.clone(),
             rfc_nat_traversal: config.nat_traversal_config.is_some(), // Enable RFC format when NAT traversal is enabled
             address_discovery: config.address_discovery_config,
-            ack_receive_v1: true,
+            ack_receive_v2: true,
             pqc_algorithms: config.pqc_algorithms.clone(),
             ..Self::default()
         })
@@ -252,7 +252,7 @@ impl TransportParameters {
             || cached.initial_max_streams_uni > self.initial_max_streams_uni
             || cached.max_datagram_frame_size > self.max_datagram_frame_size
             || cached.grease_quic_bit && !self.grease_quic_bit
-            || cached.ack_receive_v1 && !self.ack_receive_v1
+            || cached.ack_receive_v2 && !self.ack_receive_v2
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "0-RTT accepted with incompatible transport parameters",
@@ -615,8 +615,8 @@ impl TransportParameters {
                         write_var!(0); // Empty value
                     }
                 }
-                TransportParameterId::AckReceiveV1 => {
-                    if self.ack_receive_v1 {
+                TransportParameterId::AckReceiveV2 => {
+                    if self.ack_receive_v2 {
                         write_var!(id as u64);
                         write_var!(0);
                     }
@@ -792,11 +792,11 @@ impl TransportParameters {
                     }
                     params.rfc_nat_traversal = true;
                 }
-                TransportParameterId::AckReceiveV1 => {
-                    if params.ack_receive_v1 || len != 0 {
+                TransportParameterId::AckReceiveV2 => {
+                    if params.ack_receive_v2 || len != 0 {
                         return Err(Error::Malformed);
                     }
-                    params.ack_receive_v1 = true;
+                    params.ack_receive_v2 = true;
                 }
                 TransportParameterId::PqcAlgorithms => {
                     if params.pqc_algorithms.is_some() {
@@ -1139,8 +1139,8 @@ pub(crate) enum TransportParameterId {
     // Post-Quantum Cryptography Algorithms
     // Using experimental range for now (will be assigned by IANA)
     PqcAlgorithms = 0x50C0,
-    // Optional ACK-v1 receive-pipeline support
-    AckReceiveV1 = 0x50C1,
+    // Optional ACK-v2 receive-pipeline support
+    AckReceiveV2 = 0x50C2,
 }
 
 impl TransportParameterId {
@@ -1171,7 +1171,7 @@ impl TransportParameterId {
         Self::RfcNatTraversal,
         Self::AddressDiscovery,
         Self::PqcAlgorithms,
-        Self::AckReceiveV1,
+        Self::AckReceiveV2,
     ];
 }
 
@@ -1215,7 +1215,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::RfcNatTraversal == id => Self::RfcNatTraversal,
             id if Self::AddressDiscovery == id => Self::AddressDiscovery,
             id if Self::PqcAlgorithms == id => Self::PqcAlgorithms,
-            id if Self::AckReceiveV1 == id => Self::AckReceiveV1,
+            id if Self::AckReceiveV2 == id => Self::AckReceiveV2,
             _ => return Err(()),
         };
         Ok(param)
@@ -2315,16 +2315,16 @@ mod test {
     }
 
     #[test]
-    fn test_ack_receive_v1_roundtrip() {
+    fn test_ack_receive_v2_roundtrip() {
         let mut params = TransportParameters::default();
-        params.ack_receive_v1 = true;
+        params.ack_receive_v2 = true;
 
         let mut encoded = Vec::new();
         params.write(&mut encoded).expect("encode transport params");
 
         let decoded = TransportParameters::read(Side::Client, &mut encoded.as_slice())
             .expect("decode transport params");
-        assert!(decoded.ack_receive_v1);
+        assert!(decoded.ack_receive_v2);
     }
 
     // Include comprehensive tests module

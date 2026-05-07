@@ -496,12 +496,12 @@ impl Connection {
         self.0.state.lock("close_reason").error.clone()
     }
 
-    pub(crate) fn supports_ack_receive_v1(&self) -> bool {
+    pub(crate) fn supports_ack_receive_v2(&self) -> bool {
         self.0
             .state
-            .lock("supports_ack_receive_v1")
+            .lock("supports_ack_receive_v2")
             .inner
-            .supports_ack_receive_v1()
+            .supports_ack_receive_v2()
     }
 
     /// Close the connection immediately.

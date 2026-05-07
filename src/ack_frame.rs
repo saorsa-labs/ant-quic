@@ -1,15 +1,22 @@
 use crate::ConnectionCloseReason;
 
-const ACK_PAYLOAD_MAGIC: &[u8; 8] = b"ANQAckP1";
 const ACK_CONTROL_MAGIC: &[u8; 8] = b"ANQAckC1";
+const ACK_BIDI_REQUEST_MAGIC: &[u8; 8] = b"ANQAckB2";
+const ACK_BIDI_RESPONSE_MAGIC: &[u8; 8] = b"ANQAckR2";
 const PROBE_REQUEST_MAGIC: &[u8; 8] = b"ANQProR1";
+
+pub(crate) const ACK_BIDI_RESPONSE_MAX_BYTES: usize = ACK_BIDI_RESPONSE_MAGIC.len() + 2;
+
+pub(crate) fn ack_bidi_request_size_limit(payload_limit: usize) -> usize {
+    payload_limit.saturating_add(ACK_BIDI_REQUEST_MAGIC.len())
+}
 
 /// Reasons the remote receive pipeline rejected an ACK-requested payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiveRejectReason {
     /// The local consumer side of `recv()` is no longer available.
     ConsumerGone,
-    /// The payload format was invalid for ACK-v1.
+    /// The payload format was invalid for the ACK request protocol.
     InvalidEnvelope,
     /// The request is not supported on this connection.
     NotSupported,
@@ -39,22 +46,19 @@ pub(crate) enum AckControlOutcome {
     Closed(ConnectionCloseReason),
 }
 
-pub(crate) fn encode_ack_payload(tag: [u8; 16], payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ACK_PAYLOAD_MAGIC.len() + tag.len() + payload.len());
-    bytes.extend_from_slice(ACK_PAYLOAD_MAGIC);
-    bytes.extend_from_slice(&tag);
+pub(crate) fn encode_ack_bidi_request(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ACK_BIDI_REQUEST_MAGIC.len() + payload.len());
+    bytes.extend_from_slice(ACK_BIDI_REQUEST_MAGIC);
     bytes.extend_from_slice(payload);
     bytes
 }
 
-pub(crate) fn decode_ack_payload(bytes: &[u8]) -> Option<([u8; 16], &[u8])> {
-    if bytes.len() < ACK_PAYLOAD_MAGIC.len() + 16 || !bytes.starts_with(ACK_PAYLOAD_MAGIC) {
+pub(crate) fn decode_ack_bidi_request(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < ACK_BIDI_REQUEST_MAGIC.len() || !bytes.starts_with(ACK_BIDI_REQUEST_MAGIC) {
         return None;
     }
 
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&bytes[ACK_PAYLOAD_MAGIC.len()..ACK_PAYLOAD_MAGIC.len() + 16]);
-    Some((tag, &bytes[ACK_PAYLOAD_MAGIC.len() + 16..]))
+    Some(&bytes[ACK_BIDI_REQUEST_MAGIC.len()..])
 }
 
 pub(crate) fn encode_ack_control(tag: [u8; 16], outcome: AckControlOutcome) -> Vec<u8> {
@@ -99,6 +103,83 @@ pub(crate) fn encode_ack_control(tag: [u8; 16], outcome: AckControlOutcome) -> V
     bytes
 }
 
+pub(crate) fn encode_ack_bidi_response(outcome: AckControlOutcome) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ACK_BIDI_RESPONSE_MAX_BYTES);
+    bytes.extend_from_slice(ACK_BIDI_RESPONSE_MAGIC);
+    match outcome {
+        AckControlOutcome::Accepted => {
+            bytes.push(0);
+            bytes.push(0);
+        }
+        AckControlOutcome::Rejected(reason) => {
+            bytes.push(1);
+            bytes.push(match reason {
+                ReceiveRejectReason::ConsumerGone => 1,
+                ReceiveRejectReason::InvalidEnvelope => 2,
+                ReceiveRejectReason::NotSupported => 3,
+                ReceiveRejectReason::Backpressured => 4,
+                ReceiveRejectReason::Unknown => 255,
+            });
+        }
+        AckControlOutcome::Closed(reason) => {
+            bytes.push(2);
+            bytes.push(match reason {
+                ConnectionCloseReason::Superseded => 1,
+                ConnectionCloseReason::ReaderExit => 2,
+                ConnectionCloseReason::PeerShutdown => 3,
+                ConnectionCloseReason::Banned => 4,
+                ConnectionCloseReason::LifecycleCleanup => 5,
+                ConnectionCloseReason::ApplicationClosed => 6,
+                ConnectionCloseReason::ConnectionClosed => 7,
+                ConnectionCloseReason::TimedOut => 8,
+                ConnectionCloseReason::Reset => 9,
+                ConnectionCloseReason::TransportError => 10,
+                ConnectionCloseReason::LocallyClosed => 11,
+                ConnectionCloseReason::VersionMismatch => 12,
+                ConnectionCloseReason::CidsExhausted => 13,
+                ConnectionCloseReason::Unknown => 255,
+            });
+        }
+    }
+    bytes
+}
+
+pub(crate) fn decode_ack_bidi_response(bytes: &[u8]) -> Option<AckControlOutcome> {
+    if bytes.len() != ACK_BIDI_RESPONSE_MAX_BYTES || !bytes.starts_with(ACK_BIDI_RESPONSE_MAGIC) {
+        return None;
+    }
+
+    let kind = bytes[ACK_BIDI_RESPONSE_MAGIC.len()];
+    let value = bytes[ACK_BIDI_RESPONSE_MAGIC.len() + 1];
+    match kind {
+        0 => Some(AckControlOutcome::Accepted),
+        1 => Some(AckControlOutcome::Rejected(match value {
+            1 => ReceiveRejectReason::ConsumerGone,
+            2 => ReceiveRejectReason::InvalidEnvelope,
+            3 => ReceiveRejectReason::NotSupported,
+            4 => ReceiveRejectReason::Backpressured,
+            _ => ReceiveRejectReason::Unknown,
+        })),
+        2 => Some(AckControlOutcome::Closed(match value {
+            1 => ConnectionCloseReason::Superseded,
+            2 => ConnectionCloseReason::ReaderExit,
+            3 => ConnectionCloseReason::PeerShutdown,
+            4 => ConnectionCloseReason::Banned,
+            5 => ConnectionCloseReason::LifecycleCleanup,
+            6 => ConnectionCloseReason::ApplicationClosed,
+            7 => ConnectionCloseReason::ConnectionClosed,
+            8 => ConnectionCloseReason::TimedOut,
+            9 => ConnectionCloseReason::Reset,
+            10 => ConnectionCloseReason::TransportError,
+            11 => ConnectionCloseReason::LocallyClosed,
+            12 => ConnectionCloseReason::VersionMismatch,
+            13 => ConnectionCloseReason::CidsExhausted,
+            _ => ConnectionCloseReason::Unknown,
+        })),
+        _ => None,
+    }
+}
+
 pub(crate) fn decode_ack_control(bytes: &[u8]) -> Option<([u8; 16], AckControlOutcome)> {
     if bytes.len() != ACK_CONTROL_MAGIC.len() + 18 || !bytes.starts_with(ACK_CONTROL_MAGIC) {
         return None;
@@ -141,7 +222,7 @@ pub(crate) fn decode_ack_control(bytes: &[u8]) -> Option<([u8; 16], AckControlOu
 /// Encode a probe-liveness request envelope.
 ///
 /// Carries only the 16-byte correlation tag — no user payload. Distinct magic
-/// from [`encode_ack_payload`] so the reader path can short-circuit probes
+/// from ACK-v2 request envelopes so the reader path can short-circuit probes
 /// without forwarding anything to the application receive channel.
 pub(crate) fn encode_probe_request(tag: [u8; 16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(PROBE_REQUEST_MAGIC.len() + tag.len());
@@ -169,16 +250,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ack_payload_roundtrip() {
-        let tag = [0xAB; 16];
-        let payload = b"hello";
-        let encoded = encode_ack_payload(tag, payload);
-        let (decoded_tag, decoded_payload) = decode_ack_payload(&encoded).expect("decode payload");
-        assert_eq!(decoded_tag, tag);
-        assert_eq!(decoded_payload, payload);
-    }
-
-    #[test]
     fn ack_control_roundtrip() {
         let tag = [0xCD; 16];
         let encoded = encode_ack_control(
@@ -190,6 +261,30 @@ mod tests {
         assert_eq!(
             outcome,
             AckControlOutcome::Rejected(ReceiveRejectReason::ConsumerGone)
+        );
+    }
+
+    #[test]
+    fn ack_bidi_request_roundtrip() {
+        let payload = b"hello";
+        let encoded = encode_ack_bidi_request(payload);
+        let decoded = decode_ack_bidi_request(&encoded).expect("decode bidi request");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            ack_bidi_request_size_limit(payload.len()),
+            ACK_BIDI_REQUEST_MAGIC.len() + payload.len()
+        );
+    }
+
+    #[test]
+    fn ack_bidi_response_roundtrip() {
+        let encoded = encode_ack_bidi_response(AckControlOutcome::Rejected(
+            ReceiveRejectReason::Backpressured,
+        ));
+        let decoded = decode_ack_bidi_response(&encoded).expect("decode bidi response");
+        assert_eq!(
+            decoded,
+            AckControlOutcome::Rejected(ReceiveRejectReason::Backpressured)
         );
     }
 
@@ -206,24 +301,24 @@ mod tests {
         let tag = [0x77; 16];
         let probe = encode_probe_request(tag);
         assert!(
-            decode_ack_payload(&probe).is_none(),
-            "probe envelope must not decode as ACK payload"
-        );
-        assert!(
             decode_ack_control(&probe).is_none(),
             "probe envelope must not decode as ACK control frame"
-        );
-
-        let ack_payload = encode_ack_payload(tag, b"hi");
-        assert!(
-            decode_probe_request(&ack_payload).is_none(),
-            "ACK payload must not decode as probe envelope"
         );
 
         let ack_control = encode_ack_control(tag, AckControlOutcome::Accepted);
         assert!(
             decode_probe_request(&ack_control).is_none(),
             "ACK control frame must not decode as probe envelope"
+        );
+
+        let ack_bidi = encode_ack_bidi_request(b"hi");
+        assert!(
+            decode_probe_request(&ack_bidi).is_none(),
+            "ACK-v2 request must not decode as probe envelope"
+        );
+        assert!(
+            decode_ack_control(&ack_bidi).is_none(),
+            "ACK-v2 request must not decode as probe ACK control"
         );
     }
 

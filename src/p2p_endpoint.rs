@@ -64,8 +64,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::ack_frame::{
-    AckControlOutcome, ReceiveRejectReason, decode_ack_control, decode_ack_payload,
-    decode_probe_request, encode_ack_control, encode_ack_payload, encode_probe_request,
+    ACK_BIDI_RESPONSE_MAX_BYTES, AckControlOutcome, ReceiveRejectReason,
+    ack_bidi_request_size_limit, decode_ack_bidi_request, decode_ack_bidi_response,
+    decode_ack_control, decode_probe_request, encode_ack_bidi_request, encode_ack_bidi_response,
+    encode_ack_control, encode_probe_request,
 };
 use crate::bootstrap_cache::{
     BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
@@ -100,12 +102,15 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Maximum time an ACK-requested payload may wait for receiver queue admission.
 ///
-/// The ACK-v1 contract is "decoded and admitted into the `recv()` pipeline".
+/// The ACK contract is "decoded and admitted into the `recv()` pipeline".
 /// Waiting without bound here couples sender-visible ACK latency to application
 /// drain speed and can cascade into mesh-wide send timeouts. A bounded wait
 /// preserves the accepted-delivery meaning while returning structured
 /// backpressure to callers.
 const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Grace period for superseded reader tasks to drain in-flight request/ACK
+/// streams before cooperative cancellation at the next accept boundary.
+const SUPERSEDED_READER_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -140,7 +145,7 @@ struct ReaderTaskHandle {
     /// connections (simultaneous-open races, coordinated + direct paths
     /// converging); each has its own reader, uniquely identified by this id.
     generation: u64,
-    /// Cooperative shutdown signal. Honored at the `accept_uni()` boundary only,
+    /// Cooperative shutdown signal. Honored only at stream-accept boundaries,
     /// so an in-flight `read_to_end()` always completes before the task exits.
     /// This prevents silent loss of already-ACKed bytes during connection
     /// replacement (issue #166).
@@ -587,7 +592,7 @@ pub struct P2pEndpoint {
     /// Directional application activity timestamps per peer.
     peer_activity: Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
 
-    /// Pending ACK-v1 waiters keyed by live connection stable id + request tag.
+    /// Pending probe waiters keyed by live connection stable id + request tag.
     ack_waiters: Arc<ParkingRwLock<HashMap<usize, AckWaiterMap>>>,
 
     /// Global broadcast fanout for peer lifecycle transitions.
@@ -1196,6 +1201,28 @@ fn endpoint_error_from_write_error(error: crate::high_level::WriteError) -> Endp
             endpoint_error_from_connection_error(error)
         }
         other => EndpointError::Connection(other.to_string()),
+    }
+}
+
+fn endpoint_error_from_read_error(error: crate::high_level::ReadError) -> EndpointError {
+    match error {
+        crate::high_level::ReadError::ConnectionLost(error) => {
+            endpoint_error_from_connection_error(error)
+        }
+        other => EndpointError::Connection(other.to_string()),
+    }
+}
+
+fn endpoint_error_from_read_to_end_error(
+    error: crate::high_level::ReadToEndError,
+) -> EndpointError {
+    match error {
+        crate::high_level::ReadToEndError::Read(read_error) => {
+            endpoint_error_from_read_error(read_error)
+        }
+        crate::high_level::ReadToEndError::TooLong => {
+            EndpointError::Connection("ACK-v2 response too long".to_string())
+        }
     }
 }
 
@@ -4052,7 +4079,11 @@ impl P2pEndpoint {
             ..
         } = registration
         {
-            self.cancel_reader_generation(&peer_id, generation).await;
+            self.schedule_reader_generation_cancel(
+                peer_id,
+                generation,
+                SUPERSEDED_READER_DRAIN_GRACE,
+            );
         }
         publish_direct_path_status(
             self.direct_path_statuses.as_ref(),
@@ -4545,8 +4576,11 @@ impl P2pEndpoint {
             ..
         } = registration
         {
-            self.cancel_reader_generation(&relay_peer_id, generation)
-                .await;
+            self.schedule_reader_generation_cancel(
+                relay_peer_id,
+                generation,
+                SUPERSEDED_READER_DRAIN_GRACE,
+            );
         }
 
         info!(
@@ -4637,6 +4671,20 @@ impl P2pEndpoint {
             Err(error) => {
                 warn!(error = %error, "failed to open ACK control stream");
             }
+        }
+    }
+
+    async fn send_ack_bidi_response(
+        mut stream: crate::high_level::SendStream,
+        outcome: AckControlOutcome,
+    ) {
+        let bytes = encode_ack_bidi_response(outcome);
+        if let Err(error) = stream.write_all(&bytes).await {
+            warn!(error = %error, "failed to send ACK-v2 response");
+            return;
+        }
+        if let Err(error) = stream.finish() {
+            warn!(error = %error, "failed to finish ACK-v2 response stream");
         }
     }
 
@@ -4806,8 +4854,11 @@ impl P2pEndpoint {
                     ..
                 }) = registration
                 {
-                    self.cancel_reader_generation(&resolved_peer_id, generation)
-                        .await;
+                    self.schedule_reader_generation_cancel(
+                        resolved_peer_id,
+                        generation,
+                        SUPERSEDED_READER_DRAIN_GRACE,
+                    );
                 }
 
                 Some(peer_conn)
@@ -5089,27 +5140,17 @@ impl P2pEndpoint {
             .map_err(EndpointError::NatTraversal)?
             .ok_or(EndpointError::PeerNotFound(*peer_id))?;
 
-        if !connection.supports_ack_receive_v1() {
+        if !connection.supports_ack_receive_v2() {
             return Err(EndpointError::NotSupported);
         }
         if let Some(reason) = close_reason_from_connection(&connection) {
             return Err(EndpointError::ConnectionClosed { reason });
         }
 
-        let stable_id = connection.stable_id();
-        let tag = self.next_ack_request_tag(stable_id);
-        let (tx, rx) = oneshot::channel();
-        let inserted = register_ack_waiter(self.ack_waiters.as_ref(), stable_id, tag, tx);
-        if !inserted {
-            return Err(EndpointError::Connection(
-                "failed to reserve unique ACK request tag".to_string(),
-            ));
-        }
-
-        let envelope = encode_ack_payload(tag, data);
-        let send_result = async {
-            let mut send_stream = connection
-                .open_uni()
+        let envelope = encode_ack_bidi_request(data);
+        let exchange = async {
+            let (mut send_stream, mut recv_stream) = connection
+                .open_bi()
                 .await
                 .map_err(endpoint_error_from_connection_error)?;
             send_stream
@@ -5120,69 +5161,38 @@ impl P2pEndpoint {
                 close_reason_from_connection(&connection)
                     .map(|reason| EndpointError::ConnectionClosed { reason })
                     .unwrap_or_else(|| EndpointError::Connection(e.to_string()))
-            })
-        }
-        .await;
+            })?;
 
-        if let Err(error) = send_result {
-            if !resolve_ack_waiter(
-                self.ack_waiters.as_ref(),
-                stable_id,
-                tag,
-                AckWaiterResult::Closed(ConnectionCloseReason::LocallyClosed),
-            ) {
-                tracing::warn!(
-                    target: "ant_quic::silent_drop",
-                    kind = "resolve_ack_waiter_miss",
-                    stable_id = stable_id,
-                    "no waiter for tag"
-                );
-            }
-            return Err(error);
-        }
+            note_peer_activity(
+                &self.connected_peers,
+                &self.peer_activity,
+                *peer_id,
+                PeerActivityKind::Sent,
+                Instant::now(),
+            )
+            .await;
 
-        note_peer_activity(
-            &self.connected_peers,
-            &self.peer_activity,
-            *peer_id,
-            PeerActivityKind::Sent,
-            Instant::now(),
-        )
-        .await;
-
-        match timeout(timeout_duration, rx).await {
-            Ok(Ok(AckWaiterResult::Accepted)) => Ok(()),
-            Ok(Ok(AckWaiterResult::Rejected(reason))) => {
-                Err(EndpointError::ReceiveRejected { reason })
-            }
-            Ok(Ok(AckWaiterResult::Closed(reason))) => {
-                Err(EndpointError::ConnectionClosed { reason })
-            }
-            Ok(Err(_)) => {
-                if let Some(reason) = close_reason_from_connection(&connection) {
+            let response = recv_stream
+                .read_to_end(ACK_BIDI_RESPONSE_MAX_BYTES)
+                .await
+                .map_err(endpoint_error_from_read_to_end_error)?;
+            match decode_ack_bidi_response(&response) {
+                Some(AckControlOutcome::Accepted) => Ok(()),
+                Some(AckControlOutcome::Rejected(reason)) => {
+                    Err(EndpointError::ReceiveRejected { reason })
+                }
+                Some(AckControlOutcome::Closed(reason)) => {
                     Err(EndpointError::ConnectionClosed { reason })
-                } else {
-                    Err(EndpointError::Connection(
-                        "ACK waiter dropped before completion".to_string(),
-                    ))
                 }
+                None => Err(EndpointError::Connection(
+                    "invalid ACK-v2 response envelope".to_string(),
+                )),
             }
-            Err(_) => {
-                if !resolve_ack_waiter(
-                    self.ack_waiters.as_ref(),
-                    stable_id,
-                    tag,
-                    AckWaiterResult::Closed(ConnectionCloseReason::TimedOut),
-                ) {
-                    tracing::warn!(
-                        target: "ant_quic::silent_drop",
-                        kind = "resolve_ack_waiter_miss",
-                        stable_id = stable_id,
-                        "no waiter for tag"
-                    );
-                }
-                Err(EndpointError::AckTimeout)
-            }
+        };
+
+        match timeout(timeout_duration, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(EndpointError::AckTimeout),
         }
     }
 
@@ -5209,7 +5219,7 @@ impl P2pEndpoint {
     /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
     /// - [`EndpointError::PeerNotFound`] if no live QUIC connection exists.
     /// - [`EndpointError::NotSupported`] if the connection or transport cannot
-    ///   carry ACK-v1 control frames (e.g. constrained transports, or peers
+    ///   carry probe ACK control frames (e.g. constrained transports, or peers
     ///   that did not negotiate the capability).
     /// - [`EndpointError::ConnectionClosed`] if the connection is already
     ///   transitioning out of `Live`.
@@ -5252,7 +5262,7 @@ impl P2pEndpoint {
             .map_err(EndpointError::NatTraversal)?
             .ok_or(EndpointError::PeerNotFound(*peer_id))?;
 
-        if !connection.supports_ack_receive_v1() {
+        if !connection.supports_ack_receive_v2() {
             return Err(EndpointError::NotSupported);
         }
         if let Some(reason) = close_reason_from_connection(&connection) {
@@ -6217,33 +6227,40 @@ impl P2pEndpoint {
         }
     }
 
-    /// Spawn a background tokio task that reads uni streams from a QUIC connection
-    /// and forwards received data into the shared `data_tx` channel.
+    /// Schedule cooperative cancellation for a superseded reader after a short
+    /// drain window. This lets in-flight request/ACK streams on the old
+    /// generation finish before the reader exits at its next accept boundary.
+    fn schedule_reader_generation_cancel(&self, peer_id: PeerId, generation: u64, after: Duration) {
+        let reader_handles = Arc::clone(&self.reader_handles);
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let handles = reader_handles.read().await;
+            if let Some(handle) = handles
+                .get(&peer_id)
+                .and_then(|entries| entries.iter().find(|entry| entry.generation == generation))
+            {
+                handle.cancel.cancel();
+            }
+        });
+    }
+
+    /// Spawn a background tokio task that reads streams from a QUIC connection
+    /// and forwards received application data into the shared `data_tx` channel.
     ///
     /// # Multiple readers per peer (issue #166)
     ///
     /// A peer may briefly have two live QUIC connections (simultaneous-open,
     /// coordinated + direct paths converging). Each connection gets its own
-    /// reader; readers are never pre-empted on connection replacement. They
-    /// exit when their own connection terminates or idles out.
+    /// reader. Superseded readers are cancelled only after a short drain window
+    /// so request/ACK streams in flight on the old connection can complete.
     ///
     /// # Cooperative cancellation
     ///
-    /// The reader honors a [`CancellationToken`] only at the `accept_uni()`
+    /// The reader honors a [`CancellationToken`] only at a stream-accept
     /// boundary. An in-flight `read_to_end()` (which drains already-ACKed bytes
     /// that Quinn has buffered) is NEVER interrupted — this is the core
     /// correctness property against issue #166. Explicit teardown
     /// (`cleanup_connection`, `shutdown`) also calls `abort()` as a backstop.
-    async fn cancel_reader_generation(&self, peer_id: &PeerId, generation: u64) {
-        let handles = self.reader_handles.read().await;
-        if let Some(handle) = handles
-            .get(peer_id)
-            .and_then(|entries| entries.iter().find(|entry| entry.generation == generation))
-        {
-            handle.cancel.cancel();
-        }
-    }
-
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
@@ -6279,12 +6296,20 @@ impl P2pEndpoint {
         }
         let reader_cancel = cancel.clone();
 
+        enum IncomingStream {
+            Uni(crate::high_level::RecvStream),
+            AckBidi {
+                send: crate::high_level::SendStream,
+                recv: crate::high_level::RecvStream,
+            },
+        }
+
         let join_handle = tokio::spawn(async move {
             loop {
                 // Cancel only between streams. If the token fires while we're
                 // mid-`read_to_end()`, the read completes first (Quinn already
                 // holds the ACKed bytes) and the NEXT iteration exits here.
-                let mut recv_stream = tokio::select! {
+                let incoming = tokio::select! {
                     biased;
                     _ = reader_cancel.cancelled() => {
                         debug!(
@@ -6293,8 +6318,18 @@ impl P2pEndpoint {
                         );
                         break;
                     }
+                    result = connection.accept_bi() => match result {
+                        Ok((send, recv)) => IncomingStream::AckBidi { send, recv },
+                        Err(e) => {
+                            debug!(
+                                "Reader task for peer {:?} (conn stable_id={}) ending: accept_bi error: {}",
+                                peer_id, conn_stable_id, e
+                            );
+                            break;
+                        }
+                    },
                     result = connection.accept_uni() => match result {
-                        Ok(stream) => stream,
+                        Ok(stream) => IncomingStream::Uni(stream),
                         Err(e) => {
                             debug!(
                                 "Reader task for peer {:?} (conn stable_id={}) ending: accept_uni error: {}",
@@ -6303,6 +6338,91 @@ impl P2pEndpoint {
                             break;
                         }
                     }
+                };
+
+                let mut recv_stream = match incoming {
+                    IncomingStream::AckBidi { send, mut recv } => {
+                        let data = match recv
+                            .read_to_end(ack_bidi_request_size_limit(max_read_bytes))
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(e) => {
+                                debug!(
+                                    "Reader task for peer {:?} (conn stable_id={}): ACK-v2 read_to_end error: {}",
+                                    peer_id, conn_stable_id, e
+                                );
+                                break;
+                            }
+                        };
+
+                        let Some(payload) = decode_ack_bidi_request(&data) else {
+                            Self::send_ack_bidi_response(
+                                send,
+                                AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
+                            )
+                            .await;
+                            continue;
+                        };
+                        let payload_len = payload.len();
+
+                        note_peer_activity(
+                            &connected_peers,
+                            &peer_activity,
+                            peer_id,
+                            PeerActivityKind::Received,
+                            Instant::now(),
+                        )
+                        .await;
+
+                        match Self::admit_ack_requested_payload(&data_tx, peer_id, payload.to_vec())
+                            .await
+                        {
+                            Ok(()) => {
+                                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                                    peer_id,
+                                    bytes: payload_len,
+                                }) {
+                                    tracing::warn!(
+                                        target: "ant_quic::silent_drop",
+                                        kind = "event_tx_data_received_reader",
+                                        peer_id = ?peer_id,
+                                        bytes = payload_len,
+                                        error = %e,
+                                        "HIGH: silent drop"
+                                    );
+                                }
+                                Self::send_ack_bidi_response(send, AckControlOutcome::Accepted)
+                                    .await;
+                            }
+                            Err(reason) => {
+                                if reason == ReceiveRejectReason::Backpressured {
+                                    tracing::warn!(
+                                        peer_id = ?peer_id,
+                                        bytes = payload_len,
+                                        admission_timeout_ms =
+                                            ACK_RECEIVE_ADMISSION_TIMEOUT.as_millis() as u64,
+                                        "receive pipeline backpressured; rejecting ACK-v2 payload"
+                                    );
+                                }
+                                Self::send_ack_bidi_response(
+                                    send,
+                                    AckControlOutcome::Rejected(reason),
+                                )
+                                .await;
+
+                                if reason == ReceiveRejectReason::ConsumerGone {
+                                    debug!(
+                                        "Reader task for peer {:?}: channel closed, exiting",
+                                        peer_id
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    IncomingStream::Uni(stream) => stream,
                 };
 
                 // Uncancellable: drain the already-ACKed bytes. Cancelling here
@@ -6393,11 +6513,7 @@ impl P2pEndpoint {
                     continue;
                 }
 
-                let (payload, ack_tag) = if let Some((tag, payload)) = decode_ack_payload(&data) {
-                    (payload.to_vec(), Some(tag))
-                } else {
-                    (data, None)
-                };
+                let payload = data;
                 let payload_len = payload.len();
 
                 let now = Instant::now();
@@ -6410,83 +6526,29 @@ impl P2pEndpoint {
                 )
                 .await;
 
-                if let Some(tag) = ack_tag {
-                    match Self::admit_ack_requested_payload(&data_tx, peer_id, payload).await {
-                        Ok(()) => {
-                            // Emit DataReceived event — HIGH priority: upper layer missed inbound data
-                            if let Err(e) = event_tx.send(P2pEvent::DataReceived {
-                                peer_id,
-                                bytes: payload_len,
-                            }) {
-                                tracing::warn!(
-                                    target: "ant_quic::silent_drop",
-                                    kind = "event_tx_data_received_reader",
-                                    peer_id = ?peer_id,
-                                    bytes = payload_len,
-                                    error = %e,
-                                    "HIGH: silent drop"
-                                );
-                            }
+                // Fire-and-forget sends keep the existing backpressure policy:
+                // wait for capacity rather than dropping silently.
+                if data_tx.send((peer_id, payload)).await.is_err() {
+                    debug!(
+                        "Reader task for peer {:?}: channel closed, exiting",
+                        peer_id
+                    );
+                    break;
+                }
 
-                            Self::send_ack_control_frame(
-                                connection.clone(),
-                                tag,
-                                AckControlOutcome::Accepted,
-                            )
-                            .await;
-                        }
-                        Err(reason) => {
-                            if reason == ReceiveRejectReason::Backpressured {
-                                tracing::warn!(
-                                    peer_id = ?peer_id,
-                                    bytes = payload_len,
-                                    admission_timeout_ms =
-                                        ACK_RECEIVE_ADMISSION_TIMEOUT.as_millis() as u64,
-                                    "receive pipeline backpressured; rejecting ACK-requested payload"
-                                );
-                            }
-
-                            Self::send_ack_control_frame(
-                                connection.clone(),
-                                tag,
-                                AckControlOutcome::Rejected(reason),
-                            )
-                            .await;
-
-                            if reason == ReceiveRejectReason::ConsumerGone {
-                                debug!(
-                                    "Reader task for peer {:?}: channel closed, exiting",
-                                    peer_id
-                                );
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // Fire-and-forget sends keep the existing backpressure policy:
-                    // wait for capacity rather than dropping silently.
-                    if data_tx.send((peer_id, payload)).await.is_err() {
-                        debug!(
-                            "Reader task for peer {:?}: channel closed, exiting",
-                            peer_id
-                        );
-                        break;
-                    }
-
-                    // Emit DataReceived event — HIGH priority: upper layer missed inbound data
-                    if let Err(e) = event_tx.send(P2pEvent::DataReceived {
-                        peer_id,
-                        bytes: payload_len,
-                    }) {
-                        tracing::warn!(
-                            target: "ant_quic::silent_drop",
-                            kind = "event_tx_data_received_reader",
-                            peer_id = ?peer_id,
-                            bytes = payload_len,
-                            error = %e,
-                            "HIGH: silent drop"
-                        );
-                    }
+                // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                    peer_id,
+                    bytes: payload_len,
+                }) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "event_tx_data_received_reader",
+                        peer_id = ?peer_id,
+                        bytes = payload_len,
+                        error = %e,
+                        "HIGH: silent drop"
+                    );
                 }
             }
 

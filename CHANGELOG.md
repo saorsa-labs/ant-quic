@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.8] - 2026-05-07
+
+X0X-0034 fix: `send_with_receive_ack` migrated from a dual uni-stream protocol
+(payload + separate ACK control stream) to a **single bidirectional stream**.
+This eliminates the supersede-race where in-flight sends on a soon-to-be
+superseded connection saw phantom ACK timeouts (because the ACK was on a
+separate stream that couldn't be correlated to the request) or `ReaderExit`
+closes (when the supersede notification raced the response).
+
+x0x 0.19.26 + ant-quic 0.27.7 in production observed reproducible 8-failure
+patterns on the X0X-0033 fleet pre-warm: 6 × `Timed out waiting for remote
+receive acknowledgement`, 2 × `Connection closed: ReaderExit`, 0 ×
+`receiver_backpressured`. The 0.27.8 protocol change makes both of these
+classes surface as a single, correlated stream-error.
+
+### Changed
+
+- **ACK protocol v1 → v2**: removed the legacy uni-stream payload (`ANQAckP1`)
+  + separate uni-stream ACK control (`ANQAckC1`) pair. Replaced with bidi
+  request (`ANQAckB2`) and bidi response (`ANQAckR2`) on the same stream.
+  - `encode_ack_payload` / `decode_ack_payload` removed.
+  - `encode_ack_bidi_request` / `decode_ack_bidi_request` /
+    `encode_ack_bidi_response` / `decode_ack_bidi_response` added.
+- **Transport parameter rename**: `ack_receive_v1` → `ack_receive_v2`. Peers
+  advertising the old `ack_receive_v1` flag are detected as not supporting
+  ACK; `send_with_receive_ack` returns `EndpointError::NotSupported` so
+  callers can fall back. **Brief mismatch window during a rolling deploy is
+  expected and survivable** — applications with a gossip / non-ACK fallback
+  (e.g. x0x) handle it transparently.
+- **`Connection::supports_ack_receive_v1` → `supports_ack_receive_v2`** in
+  `connection/mod.rs` and `high_level/connection.rs`.
+
+### Added
+
+- **`SUPERSEDED_READER_DRAIN_GRACE = 5 s`**: superseded reader tasks are not
+  cancelled immediately. They are given a 5 s drain window at the next
+  stream-accept boundary so in-flight ACK request/response streams on the old
+  generation can complete before the reader exits. Closes the supersede-race
+  X0X-0034 hypothesised.
+- **Reader task accepts both uni AND bidi streams** (`tokio::select!` on
+  `accept_uni()` + `accept_bi()`). Backwards compatible with non-ACK uni-stream
+  data flows.
+
+### Fixed
+
+- The 0.27.7 bounded admission path is preserved (`admit_ack_requested_payload`
+  with 100 ms `data_tx.reserve()` + `Backpressured` rejection) but it now sits
+  on the bidi response stream — the ACK reaches the sender even when the
+  receiver-side mpsc is genuinely full, instead of being lost in a separate
+  uni-stream that the sender's connection generation can't resolve.
+
+### Migration notes
+
+This is a wire-protocol change. v0.27.8 peers cannot exchange ACK-requested
+payloads with v0.27.7 peers (the negotiation-flag rename guards this — the
+sender sees `supports_ack_receive_v2() == false` and returns `NotSupported`).
+Deploy v0.27.8 across the entire mesh; dual-version operation falls back to
+non-ACK sends.
+
 ## [0.27.7] - 2026-05-06
 
 X0X-0032 fix: bounded admission for `send_with_receive_ack` so receiver-side

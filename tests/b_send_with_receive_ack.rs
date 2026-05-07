@@ -28,7 +28,7 @@ async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
     sleep(Duration::from_millis(150)).await;
 
     sender
-        .send_with_receive_ack(&receiver_id, b"ack-v1 payload", Duration::from_secs(5))
+        .send_with_receive_ack(&receiver_id, b"ack-v2 payload", Duration::from_secs(5))
         .await
         .expect("send_with_receive_ack");
 
@@ -37,7 +37,7 @@ async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
         .expect("recv timeout")
         .expect("recv result");
     assert_eq!(peer_id, sender_id);
-    assert_eq!(payload, b"ack-v1 payload");
+    assert_eq!(payload, b"ack-v2 payload");
 
     sender.shutdown().await;
     receiver.shutdown().await;
