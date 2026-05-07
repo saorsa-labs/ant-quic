@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.10] - 2026-05-07
+
+X0X-0036 fix (part 1, ant-quic side): pressure isolation between control-plane
+probes and data-plane DM/ACK-v2 sends. Targets the load-coupled ACK starvation
+that x0x's W1→W2 soak collapse exposed (W1 30/28 then W2 24/21 with pp_to
+60→473 and suppressed_peers 220→384, 0 of every framing class).
+
+The cure isn't widening the 3 s ACK budget — it's preventing probes from
+competing with data-plane sends under sustained mesh load.
+
+### Added
+
+- **Recent-receive suppression** (`PROBE_RECENT_RECEIVE_SUPPRESSION = 30 s`,
+  `src/p2p_endpoint.rs:117`): inbound data and ACK-v2 responses register peer
+  activity. Active probes are suppressed for 30 s after the most recent
+  receive. Real data-plane traffic now satisfies liveness without redundant
+  probe round-trips.
+- **Probe result cache** (`PROBE_SUCCESS_CACHE_TTL = 5 s`,
+  `PROBE_FAILURE_CACHE_TTL = 1 s`, `src/p2p_endpoint.rs:119-122`): coalesces
+  burst probe requests into one underlying probe. Successful probes reuse the
+  result for 5 s; failures evict fast (1 s) so a transient hazard doesn't
+  poison the next genuine retry.
+- **Per-peer / per-connection-stable-id single-flight**: only one active probe
+  per (peer, connection-generation). Concurrent probe requests coalesce or
+  block on the in-flight result, never spawn parallel streams.
+- **Global probe concurrency cap** (`PROBE_GLOBAL_CONCURRENCY = 4`,
+  `src/p2p_endpoint.rs:124`): system-wide ceiling on simultaneous active
+  probe streams. Probe budget acquisition uses a short wait
+  (`PROBE_BUDGET_WAIT = 50 ms`); under saturation, probes return
+  `EndpointError::ProbeOverBudget` rather than `ProbeTimeout`. Callers must
+  treat `ProbeOverBudget` as local throttling, NOT peer death.
+- **`CachedProbeOutcome` + `EndpointError::ProbeOverBudget`** new public
+  variants — callers can distinguish "probe never tried because we're locally
+  throttled" from "probe tried and remote didn't respond".
+- **Regression tests** (`tests/b_probe_peer.rs:46-`): concurrent probe
+  coalescing test (single physical probe under burst load), and recent-ACK
+  suppression test (no probe fires when ACK-v2 traffic recently active).
+
+### Changed
+
+- **ACK-v2 response receive path now records peer activity**, mirroring the
+  inbound data path. ACK-v2 traffic on a connection counts as proof of life
+  for the suppression window — under steady DM load, probes drop to zero.
+
+### Notes
+
+This is part 1 of the X0X-0036 fix (ant-quic side: probe scavenger priority
++ single-flight + cache + cap). Part 2 (x0x side: priority-aware ACK
+instrumentation, A/B soak harness) lands separately.
+
+The cleaner architectural follow-up (Iroh-style single typed ingress
+dispatcher per connection, replacing the X0X-0035 prefix-peek bridge) is
+still ahead — the current bridge is acceptable production behaviour but
+not the SOTA expression.
+
 ## [0.27.9] - 2026-05-07
 
 X0X-0035 fix: ACK-v2 / relay-CONNECT-UDP bidi accept-race resolved.

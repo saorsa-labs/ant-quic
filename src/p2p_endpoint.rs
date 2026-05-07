@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock as ParkingRwLock;
 use rand::RngCore;
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, Notify, RwLock, Semaphore, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -111,6 +111,20 @@ const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 /// Grace period for superseded reader tasks to drain in-flight request/ACK
 /// streams before cooperative cancellation at the next accept boundary.
 const SUPERSEDED_READER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Recently observed inbound traffic is a stronger liveness signal than an
+/// active probe. Suppress probe sends while this signal is fresh so diagnostic
+/// traffic cannot compete with data-plane ACKs under load.
+const PROBE_RECENT_RECEIVE_SUPPRESSION: Duration = Duration::from_secs(30);
+/// Successful probe results are briefly reused to coalesce probe bursts.
+const PROBE_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Failed probe results are cached only long enough to stop immediate retry
+/// storms while still allowing quick recovery.
+const PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Maximum number of active probe streams per endpoint.
+const PROBE_GLOBAL_CONCURRENCY: usize = 4;
+/// Probe budget acquisition is deliberately short: probes are lower priority
+/// than application sends and ACK-v2 response handling.
+const PROBE_BUDGET_WAIT: Duration = Duration::from_millis(50);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -595,6 +609,12 @@ pub struct P2pEndpoint {
     /// Pending probe waiters keyed by live connection stable id + request tag.
     ack_waiters: Arc<ParkingRwLock<HashMap<usize, AckWaiterMap>>>,
 
+    /// Probe single-flight/cache state keyed by peer.
+    probe_flights: Arc<TokioMutex<HashMap<ProbeFlightKey, ProbeFlightState>>>,
+
+    /// Global low-priority budget for explicit liveness probes.
+    probe_semaphore: Arc<Semaphore>,
+
     /// Global broadcast fanout for peer lifecycle transitions.
     peer_event_tx: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
 
@@ -728,6 +748,76 @@ impl ConnectionHealth {
 struct PeerActivityRecord {
     last_sent_at: Option<Instant>,
     last_received_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CachedProbeOutcome {
+    Success(Duration),
+    Rejected(ReceiveRejectReason),
+    Closed(ConnectionCloseReason),
+    Timeout,
+    OverBudget,
+    NotSupported,
+    PeerNotFound(PeerId),
+    ShuttingDown,
+}
+
+impl CachedProbeOutcome {
+    fn into_result(self) -> Result<Duration, EndpointError> {
+        match self {
+            Self::Success(rtt) => Ok(rtt),
+            Self::Rejected(reason) => Err(EndpointError::ReceiveRejected { reason }),
+            Self::Closed(reason) => Err(EndpointError::ConnectionClosed { reason }),
+            Self::Timeout => Err(EndpointError::ProbeTimeout),
+            Self::OverBudget => Err(EndpointError::ProbeOverBudget),
+            Self::NotSupported => Err(EndpointError::NotSupported),
+            Self::PeerNotFound(peer_id) => Err(EndpointError::PeerNotFound(peer_id)),
+            Self::ShuttingDown => Err(EndpointError::ShuttingDown),
+        }
+    }
+
+    fn ttl(self) -> Duration {
+        match self {
+            Self::Success(_) => PROBE_SUCCESS_CACHE_TTL,
+            Self::Rejected(_)
+            | Self::Closed(_)
+            | Self::Timeout
+            | Self::OverBudget
+            | Self::NotSupported
+            | Self::PeerNotFound(_)
+            | Self::ShuttingDown => PROBE_FAILURE_CACHE_TTL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedProbeResult {
+    completed_at: Instant,
+    outcome: CachedProbeOutcome,
+}
+
+impl CachedProbeResult {
+    fn fresh(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.completed_at) <= self.outcome.ttl()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProbeFlightState {
+    in_flight: Option<Arc<Notify>>,
+    last_result: Option<CachedProbeResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProbeFlightKey {
+    peer_id: PeerId,
+    stable_id: usize,
+}
+
+#[derive(Debug)]
+enum ProbeFlightDecision {
+    Start(Arc<Notify>),
+    Cached(CachedProbeOutcome),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1281,6 +1371,11 @@ pub enum EndpointError {
     #[error("Timed out waiting for peer liveness probe response")]
     ProbeTimeout,
 
+    /// Probe traffic was skipped because the endpoint's low-priority probe
+    /// budget was already saturated.
+    #[error("Peer liveness probe skipped because probe budget is saturated")]
+    ProbeOverBudget,
+
     /// The remote receive pipeline rejected the payload.
     #[error("Remote receive pipeline rejected payload: {reason}")]
     ReceiveRejected {
@@ -1595,6 +1690,19 @@ async fn note_peer_activity(
         PeerActivityKind::Sent => entry.last_sent_at = Some(at),
         PeerActivityKind::Received => entry.last_received_at = Some(at),
     }
+}
+
+async fn recent_peer_receive_activity(
+    peer_activity: &RwLock<HashMap<PeerId, PeerActivityRecord>>,
+    peer_id: PeerId,
+    now: Instant,
+) -> Option<Duration> {
+    let activity = peer_activity.read().await;
+    activity
+        .get(&peer_id)
+        .and_then(|record| record.last_received_at)
+        .map(|last_received_at| now.saturating_duration_since(last_received_at))
+        .filter(|age| *age <= PROBE_RECENT_RECEIVE_SUPPRESSION)
 }
 
 fn peer_event_sender(
@@ -2064,6 +2172,8 @@ impl P2pEndpoint {
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
         let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
+        let probe_flights = Arc::new(TokioMutex::new(HashMap::new()));
+        let probe_semaphore = Arc::new(Semaphore::new(PROBE_GLOBAL_CONCURRENCY));
         let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
         let peer_event_channels = Arc::new(ParkingRwLock::new(HashMap::new()));
         let peer_event_generations = Arc::new(ParkingRwLock::new(HashMap::new()));
@@ -2097,6 +2207,8 @@ impl P2pEndpoint {
             reader_handles,
             peer_activity,
             ack_waiters,
+            probe_flights,
+            probe_semaphore,
             peer_event_tx,
             peer_event_channels,
             peer_event_generations,
@@ -4844,6 +4956,81 @@ impl P2pEndpoint {
         }
     }
 
+    fn cacheable_probe_outcome(
+        key: ProbeFlightKey,
+        result: &Result<Duration, EndpointError>,
+    ) -> CachedProbeOutcome {
+        match result {
+            Ok(rtt) => CachedProbeOutcome::Success(*rtt),
+            Err(EndpointError::ReceiveRejected { reason }) => CachedProbeOutcome::Rejected(*reason),
+            Err(EndpointError::ConnectionClosed { reason }) => CachedProbeOutcome::Closed(*reason),
+            Err(EndpointError::ProbeTimeout) => CachedProbeOutcome::Timeout,
+            Err(EndpointError::ProbeOverBudget) => CachedProbeOutcome::OverBudget,
+            Err(EndpointError::NotSupported) => CachedProbeOutcome::NotSupported,
+            Err(EndpointError::PeerNotFound(_)) => CachedProbeOutcome::PeerNotFound(key.peer_id),
+            Err(EndpointError::ShuttingDown) => CachedProbeOutcome::ShuttingDown,
+            Err(_) => CachedProbeOutcome::Timeout,
+        }
+    }
+
+    async fn begin_probe_flight(
+        &self,
+        key: ProbeFlightKey,
+        timeout_duration: Duration,
+    ) -> Result<ProbeFlightDecision, EndpointError> {
+        loop {
+            let wait_for_existing = {
+                let mut flights = self.probe_flights.lock().await;
+                let state = flights.entry(key).or_default();
+                let now = Instant::now();
+                if let Some(cached) = state.last_result
+                    && cached.fresh(now)
+                {
+                    return Ok(ProbeFlightDecision::Cached(cached.outcome));
+                }
+
+                if let Some(notify) = state.in_flight.clone() {
+                    Some(notify)
+                } else {
+                    let notify = Arc::new(Notify::new());
+                    state.in_flight = Some(notify.clone());
+                    return Ok(ProbeFlightDecision::Start(notify));
+                }
+            };
+
+            if let Some(notify) = wait_for_existing {
+                if timeout(timeout_duration, notify.notified()).await.is_err() {
+                    return Err(EndpointError::ProbeTimeout);
+                }
+            }
+        }
+    }
+
+    async fn finish_probe_flight(
+        &self,
+        key: ProbeFlightKey,
+        flight: Arc<Notify>,
+        result: &Result<Duration, EndpointError>,
+    ) {
+        let outcome = Self::cacheable_probe_outcome(key, result);
+        {
+            let mut flights = self.probe_flights.lock().await;
+            let state = flights.entry(key).or_default();
+            if state
+                .in_flight
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &flight))
+            {
+                state.in_flight = None;
+                state.last_result = Some(CachedProbeResult {
+                    completed_at: Instant::now(),
+                    outcome,
+                });
+            }
+        }
+        flight.notify_waiters();
+    }
+
     async fn register_connected_peer(&self, peer_conn: PeerConnection) {
         store_connected_peer(
             self.connected_peers.as_ref(),
@@ -5317,7 +5504,18 @@ impl P2pEndpoint {
                 .read_to_end(ACK_BIDI_RESPONSE_MAX_BYTES)
                 .await
                 .map_err(endpoint_error_from_read_to_end_error)?;
-            match decode_ack_bidi_response(&response) {
+            let outcome = decode_ack_bidi_response(&response);
+            if outcome.is_some() {
+                note_peer_activity(
+                    &self.connected_peers,
+                    &self.peer_activity,
+                    *peer_id,
+                    PeerActivityKind::Received,
+                    Instant::now(),
+                )
+                .await;
+            }
+            match outcome {
                 Some(AckControlOutcome::Accepted) => Ok(()),
                 Some(AckControlOutcome::Rejected(reason)) => {
                     Err(EndpointError::ReceiveRejected { reason })
@@ -5339,11 +5537,15 @@ impl P2pEndpoint {
         }
     }
 
-    /// Actively probe peer liveness and measure round-trip time.
+    /// Probe peer liveness and measure round-trip time when an active probe is needed.
     ///
-    /// Sends a minimal probe envelope over a fresh uni-stream and waits for the
-    /// remote ant-quic reader to reply with an ACK control frame. Returns the
-    /// measured round-trip duration on success.
+    /// Recent inbound data or ACK activity is treated as a stronger liveness
+    /// signal than a diagnostic probe, so this method may return
+    /// `Duration::ZERO` without sending probe traffic while that signal is
+    /// fresh. Otherwise it sends a minimal probe envelope over a fresh
+    /// uni-stream and waits for the remote ant-quic reader to reply with an ACK
+    /// control frame. Returns the measured round-trip duration on active-probe
+    /// success.
     ///
     /// This is the preferred primitive for applications that need to
     /// distinguish a genuinely-alive peer from a zombie (half-open) connection.
@@ -5368,6 +5570,57 @@ impl P2pEndpoint {
     ///   transitioning out of `Live`.
     /// - [`EndpointError::ProbeTimeout`] if no ACK arrives within `timeout`.
     pub async fn probe_peer(
+        &self,
+        peer_id: &PeerId,
+        timeout_duration: Duration,
+    ) -> Result<Duration, EndpointError> {
+        if let Some(age) =
+            recent_peer_receive_activity(&self.peer_activity, *peer_id, Instant::now()).await
+        {
+            debug!(
+                peer_id = ?peer_id,
+                recent_receive_age_ms = age.as_millis() as u64,
+                "suppressing active probe because recent inbound/ACK activity proves liveness"
+            );
+            return Ok(Duration::ZERO);
+        }
+
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        let key = ProbeFlightKey {
+            peer_id: *peer_id,
+            stable_id: connection.stable_id(),
+        };
+
+        let flight = match self.begin_probe_flight(key, timeout_duration).await? {
+            ProbeFlightDecision::Cached(outcome) => return outcome.into_result(),
+            ProbeFlightDecision::Start(flight) => flight,
+        };
+
+        let permit = match timeout(
+            PROBE_BUDGET_WAIT.min(timeout_duration),
+            self.probe_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                let result = Err(EndpointError::ProbeOverBudget);
+                self.finish_probe_flight(key, flight, &result).await;
+                return result;
+            }
+        };
+
+        let result = self.probe_peer_inner(peer_id, timeout_duration).await;
+        drop(permit);
+        self.finish_probe_flight(key, flight, &result).await;
+        result
+    }
+
+    async fn probe_peer_inner(
         &self,
         peer_id: &PeerId,
         timeout_duration: Duration,
@@ -5468,7 +5721,17 @@ impl P2pEndpoint {
         .await;
 
         match timeout(timeout_duration, rx).await {
-            Ok(Ok(AckWaiterResult::Accepted)) => Ok(sent_at.elapsed()),
+            Ok(Ok(AckWaiterResult::Accepted)) => {
+                note_peer_activity(
+                    &self.connected_peers,
+                    &self.peer_activity,
+                    *peer_id,
+                    PeerActivityKind::Received,
+                    Instant::now(),
+                )
+                .await;
+                Ok(sent_at.elapsed())
+            }
             Ok(Ok(AckWaiterResult::Rejected(reason))) => {
                 Err(EndpointError::ReceiveRejected { reason })
             }
@@ -7247,6 +7510,8 @@ impl Clone for P2pEndpoint {
             reader_handles: Arc::clone(&self.reader_handles),
             peer_activity: Arc::clone(&self.peer_activity),
             ack_waiters: Arc::clone(&self.ack_waiters),
+            probe_flights: Arc::clone(&self.probe_flights),
+            probe_semaphore: Arc::clone(&self.probe_semaphore),
             peer_event_tx: self.peer_event_tx.clone(),
             peer_event_channels: Arc::clone(&self.peer_event_channels),
             peer_event_generations: Arc::clone(&self.peer_event_generations),
