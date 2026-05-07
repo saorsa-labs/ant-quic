@@ -3,6 +3,7 @@
 mod support;
 
 use ant_quic::{EndpointError, P2pEndpoint, ReceiveRejectReason};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard, test_node_config};
@@ -38,6 +39,60 @@ async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
         .expect("recv result");
     assert_eq!(peer_id, sender_id);
     assert_eq!(payload, b"ack-v2 payload");
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn send_with_receive_ack_survives_relay_handler_bidi_accept_competition() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let sender = sender.clone();
+        tasks.push(tokio::spawn(async move {
+            let payload = format!("ack-v2 concurrent payload {index:02}").into_bytes();
+            sender
+                .send_with_receive_ack(&receiver_id, &payload, Duration::from_secs(5))
+                .await
+                .map(|()| payload)
+        }));
+    }
+
+    let mut sent = HashSet::new();
+    for task in tasks {
+        let payload = task.await.expect("send task join").expect("ACK send");
+        sent.insert(payload);
+    }
+
+    let mut received = HashSet::new();
+    for _ in 0..sent.len() {
+        let (peer_id, payload) = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv result");
+        assert_eq!(peer_id, sender_id);
+        received.insert(payload);
+    }
+    assert_eq!(received, sent);
 
     sender.shutdown().await;
     receiver.shutdown().await;

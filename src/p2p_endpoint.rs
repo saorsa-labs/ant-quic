@@ -64,10 +64,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::ack_frame::{
-    ACK_BIDI_RESPONSE_MAX_BYTES, AckControlOutcome, ReceiveRejectReason,
-    ack_bidi_request_size_limit, decode_ack_bidi_request, decode_ack_bidi_response,
-    decode_ack_control, decode_probe_request, encode_ack_bidi_request, encode_ack_bidi_response,
-    encode_ack_control, encode_probe_request,
+    ACK_BIDI_REQUEST_MAGIC, ACK_BIDI_RESPONSE_MAX_BYTES, AckControlOutcome, ReceiveRejectReason,
+    decode_ack_bidi_request, decode_ack_bidi_response, decode_ack_control, decode_probe_request,
+    encode_ack_bidi_request, encode_ack_bidi_response, encode_ack_control, encode_probe_request,
 };
 use crate::bootstrap_cache::{
     BootstrapCache, BootstrapTokenStore, CachedPeer, PeerCapabilities, PeerSource,
@@ -87,7 +86,8 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
-    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId, TraversalFailureReason,
+    IncomingAckBidiStream, NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
+    TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effort_port_mapping};
@@ -2102,6 +2102,55 @@ impl P2pEndpoint {
             peer_event_generations,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
         };
+
+        let (ack_bidi_tx, mut ack_bidi_rx) = mpsc::unbounded_channel();
+        endpoint.inner.set_ack_bidi_stream_sender(ack_bidi_tx);
+        {
+            let connected_peers = Arc::clone(&endpoint.connected_peers);
+            let peer_activity = Arc::clone(&endpoint.peer_activity);
+            let data_tx = endpoint.data_tx.clone();
+            let event_tx = endpoint.event_tx.clone();
+            let shutdown = endpoint.shutdown.clone();
+            let max_read_bytes = endpoint.config.max_message_size;
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        stream = ack_bidi_rx.recv() => {
+                            let Some(IncomingAckBidiStream {
+                                peer_id,
+                                conn_stable_id,
+                                send,
+                                recv,
+                                prefix,
+                            }) = stream else {
+                                break;
+                            };
+                            if !Self::handle_ack_bidi_stream(
+                                &connected_peers,
+                                &peer_activity,
+                                &data_tx,
+                                &event_tx,
+                                peer_id,
+                                conn_stable_id,
+                                send,
+                                recv,
+                                prefix,
+                                max_read_bytes,
+                            )
+                            .await
+                            {
+                                debug!(
+                                    "ACK-v2 bidi bridge stopping for peer {:?}: consumer gone",
+                                    peer_id
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Spawn background pollers for transport and peer-address updates.
         endpoint.spawn_constrained_poller();
@@ -4688,6 +4737,98 @@ impl P2pEndpoint {
         }
     }
 
+    async fn handle_ack_bidi_stream(
+        connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
+        peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
+        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        event_tx: &broadcast::Sender<P2pEvent>,
+        peer_id: PeerId,
+        conn_stable_id: usize,
+        send: crate::high_level::SendStream,
+        mut recv: crate::high_level::RecvStream,
+        prefix: Vec<u8>,
+        max_read_bytes: usize,
+    ) -> bool {
+        if prefix.as_slice() != &ACK_BIDI_REQUEST_MAGIC[..] {
+            Self::send_ack_bidi_response(
+                send,
+                AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
+            )
+            .await;
+            return true;
+        }
+
+        let remaining = match recv.read_to_end(max_read_bytes).await {
+            Ok(data) => data,
+            Err(e) => {
+                debug!(
+                    "Reader task for peer {:?} (conn stable_id={}): ACK-v2 read_to_end error: {}",
+                    peer_id, conn_stable_id, e
+                );
+                Self::send_ack_bidi_response(
+                    send,
+                    AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
+                )
+                .await;
+                return true;
+            }
+        };
+
+        let mut data = prefix;
+        data.extend_from_slice(&remaining);
+        let Some(payload) = decode_ack_bidi_request(&data) else {
+            Self::send_ack_bidi_response(
+                send,
+                AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
+            )
+            .await;
+            return true;
+        };
+        let payload_len = payload.len();
+
+        note_peer_activity(
+            connected_peers,
+            peer_activity,
+            peer_id,
+            PeerActivityKind::Received,
+            Instant::now(),
+        )
+        .await;
+
+        match Self::admit_ack_requested_payload(data_tx, peer_id, payload.to_vec()).await {
+            Ok(()) => {
+                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                    peer_id,
+                    bytes: payload_len,
+                }) {
+                    tracing::warn!(
+                        target: "ant_quic::silent_drop",
+                        kind = "event_tx_data_received_reader",
+                        peer_id = ?peer_id,
+                        bytes = payload_len,
+                        error = %e,
+                        "HIGH: silent drop"
+                    );
+                }
+                Self::send_ack_bidi_response(send, AckControlOutcome::Accepted).await;
+                true
+            }
+            Err(reason) => {
+                if reason == ReceiveRejectReason::Backpressured {
+                    tracing::warn!(
+                        peer_id = ?peer_id,
+                        bytes = payload_len,
+                        admission_timeout_ms =
+                            ACK_RECEIVE_ADMISSION_TIMEOUT.as_millis() as u64,
+                        "receive pipeline backpressured; rejecting ACK-v2 payload"
+                    );
+                }
+                Self::send_ack_bidi_response(send, AckControlOutcome::Rejected(reason)).await;
+                reason != ReceiveRejectReason::ConsumerGone
+            }
+        }
+    }
+
     async fn admit_ack_requested_payload(
         data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
         peer_id: PeerId,
@@ -5184,9 +5325,11 @@ impl P2pEndpoint {
                 Some(AckControlOutcome::Closed(reason)) => {
                     Err(EndpointError::ConnectionClosed { reason })
                 }
-                None => Err(EndpointError::Connection(
-                    "invalid ACK-v2 response envelope".to_string(),
-                )),
+                None => Err(EndpointError::Connection(format!(
+                    "invalid ACK-v2 response envelope: len={}, prefix={}",
+                    response.len(),
+                    hex::encode(&response[..response.len().min(16)])
+                ))),
             }
         };
 
@@ -6342,84 +6485,55 @@ impl P2pEndpoint {
 
                 let mut recv_stream = match incoming {
                     IncomingStream::AckBidi { send, mut recv } => {
-                        let data = match recv
-                            .read_to_end(ack_bidi_request_size_limit(max_read_bytes))
+                        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
+                        if let Err(e) = recv.read_exact(&mut prefix).await {
+                            debug!(
+                                "Reader task for peer {:?} (conn stable_id={}): bidi prefix read error: {}",
+                                peer_id, conn_stable_id, e
+                            );
+                            continue;
+                        }
+
+                        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
+                            if !Self::handle_ack_bidi_stream(
+                                &connected_peers,
+                                &peer_activity,
+                                &data_tx,
+                                &event_tx,
+                                peer_id,
+                                conn_stable_id,
+                                send,
+                                recv,
+                                prefix,
+                                max_read_bytes,
+                            )
                             .await
-                        {
-                            Ok(data) => data,
-                            Err(e) => {
+                            {
                                 debug!(
-                                    "Reader task for peer {:?} (conn stable_id={}): ACK-v2 read_to_end error: {}",
-                                    peer_id, conn_stable_id, e
+                                    "Reader task for peer {:?}: channel closed, exiting",
+                                    peer_id
                                 );
                                 break;
                             }
-                        };
-
-                        let Some(payload) = decode_ack_bidi_request(&data) else {
-                            Self::send_ack_bidi_response(
-                                send,
-                                AckControlOutcome::Rejected(ReceiveRejectReason::InvalidEnvelope),
-                            )
-                            .await;
                             continue;
-                        };
-                        let payload_len = payload.len();
+                        }
 
-                        note_peer_activity(
-                            &connected_peers,
-                            &peer_activity,
-                            peer_id,
-                            PeerActivityKind::Received,
-                            Instant::now(),
-                        )
-                        .await;
-
-                        match Self::admit_ack_requested_payload(&data_tx, peer_id, payload.to_vec())
+                        if inner
+                            .handle_relay_bidi_stream_from_app_reader(
+                                connection.clone(),
+                                send,
+                                recv,
+                                prefix,
+                            )
                             .await
                         {
-                            Ok(()) => {
-                                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
-                                    peer_id,
-                                    bytes: payload_len,
-                                }) {
-                                    tracing::warn!(
-                                        target: "ant_quic::silent_drop",
-                                        kind = "event_tx_data_received_reader",
-                                        peer_id = ?peer_id,
-                                        bytes = payload_len,
-                                        error = %e,
-                                        "HIGH: silent drop"
-                                    );
-                                }
-                                Self::send_ack_bidi_response(send, AckControlOutcome::Accepted)
-                                    .await;
-                            }
-                            Err(reason) => {
-                                if reason == ReceiveRejectReason::Backpressured {
-                                    tracing::warn!(
-                                        peer_id = ?peer_id,
-                                        bytes = payload_len,
-                                        admission_timeout_ms =
-                                            ACK_RECEIVE_ADMISSION_TIMEOUT.as_millis() as u64,
-                                        "receive pipeline backpressured; rejecting ACK-v2 payload"
-                                    );
-                                }
-                                Self::send_ack_bidi_response(
-                                    send,
-                                    AckControlOutcome::Rejected(reason),
-                                )
-                                .await;
-
-                                if reason == ReceiveRejectReason::ConsumerGone {
-                                    debug!(
-                                        "Reader task for peer {:?}: channel closed, exiting",
-                                        peer_id
-                                    );
-                                    break;
-                                }
-                            }
+                            continue;
                         }
+
+                        debug!(
+                            "Reader task for peer {:?} (conn stable_id={}): unknown bidi stream prefix",
+                            peer_id, conn_stable_id
+                        );
                         continue;
                     }
                     IncomingStream::Uni(stream) => stream,

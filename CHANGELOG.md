@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.9] - 2026-05-07
+
+X0X-0035 fix: ACK-v2 / relay-CONNECT-UDP bidi accept-race resolved.
+
+The 0.27.8 ACK-v2 protocol added a second `accept_bi()` consumer in
+`P2pEndpoint`'s reader, racing against the existing MASQUE relay
+`handle_relay_requests` bidi acceptor. When the relay handler won an
+ACK-v2 stream, it treated the bytes as a relay request, returned without
+writing `ANQAckR2`, and the sender saw "invalid ACK-v2 response envelope".
+This is the failure x0x's 30-min soak under v0.19.27 + ant-quic 0.27.8
+reproduced (5 + 4 = 9 invalid-envelope errors across two windows).
+
+### Added
+
+- **Prefix-peek bidi demux**: both bidi acceptors now read the first 8 bytes
+  of every accepted bidi stream and dispatch on the magic prefix.
+  - `ACK_BIDI_REQUEST_MAGIC` (`ANQAckB2`) is now `pub(crate)` so the relay
+    handler can identify ACK-v2 streams.
+  - Relay handler forwards ACK-v2 streams to the endpoint reader's ACK
+    handler instead of consuming/closing them
+    (`handle_relay_bidi_stream_with_prefix` / `dispatch_ack_bidi_stream`).
+  - Endpoint reader peeks the prefix; non-ACK bidi streams are routed back
+    to the relay path
+    (`handle_relay_bidi_stream_from_app_reader`).
+- **Diagnostic detail on `invalid ACK-v2 response envelope`**: error now
+  includes response length and the first bytes received, so wrong-protocol
+  responses are distinguishable from truncated ones at log-time.
+- **Regression test**: `send_with_receive_ack_survives_relay_handler_bidi_accept_competition`
+  drives 32 concurrent `send_with_receive_ack` calls while the relay
+  service is active, reproducing the accept-race shape before the fix.
+
+### Removed
+
+- Unused `ack_bidi_request_size_limit` helper from `ack_frame`.
+
+### Notes
+
+This is an interim demux bridge. The cleaner follow-up is to consolidate
+all `accept_bi()` ownership behind a single typed dispatcher; the bridge
+unblocks production while that refactor is staged separately.
+
+### Migration
+
+Wire-compatible with 0.27.8 (same `ANQAckB2`/`ANQAckR2` magic, same
+`ack_receive_v2` transport parameter). Mixed 0.27.8 ↔ 0.27.9 mesh is
+safe; 0.27.9 ↔ 0.27.7 still falls back to non-ACK as before.
+
 ## [0.27.8] - 2026-05-07
 
 X0X-0034 fix: `send_with_receive_ack` migrated from a dual uni-stream protocol

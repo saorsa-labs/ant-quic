@@ -1,15 +1,11 @@
 use crate::ConnectionCloseReason;
 
 const ACK_CONTROL_MAGIC: &[u8; 8] = b"ANQAckC1";
-const ACK_BIDI_REQUEST_MAGIC: &[u8; 8] = b"ANQAckB2";
+pub(crate) const ACK_BIDI_REQUEST_MAGIC: &[u8; 8] = b"ANQAckB2";
 const ACK_BIDI_RESPONSE_MAGIC: &[u8; 8] = b"ANQAckR2";
 const PROBE_REQUEST_MAGIC: &[u8; 8] = b"ANQProR1";
 
 pub(crate) const ACK_BIDI_RESPONSE_MAX_BYTES: usize = ACK_BIDI_RESPONSE_MAGIC.len() + 2;
-
-pub(crate) fn ack_bidi_request_size_limit(payload_limit: usize) -> usize {
-    payload_limit.saturating_add(ACK_BIDI_REQUEST_MAGIC.len())
-}
 
 /// Reasons the remote receive pipeline rejected an ACK-requested payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -270,10 +266,7 @@ mod tests {
         let encoded = encode_ack_bidi_request(payload);
         let decoded = decode_ack_bidi_request(&encoded).expect("decode bidi request");
         assert_eq!(decoded, payload);
-        assert_eq!(
-            ack_bidi_request_size_limit(payload.len()),
-            ACK_BIDI_REQUEST_MAGIC.len() + payload.len()
-        );
+        assert_eq!(encoded.len(), ACK_BIDI_REQUEST_MAGIC.len() + payload.len());
     }
 
     #[test]

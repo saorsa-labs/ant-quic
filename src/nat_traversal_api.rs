@@ -201,6 +201,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+use crate::ack_frame::{
+    ACK_BIDI_REQUEST_MAGIC, AckControlOutcome, ReceiveRejectReason, encode_ack_bidi_response,
+};
 use crate::connection_lifecycle::{ConnectionCloseReason, ConnectionLifecycleState};
 use crate::high_level::default_runtime;
 
@@ -220,7 +223,10 @@ use crate::{
 
 use crate::{
     ClientConfig, EndpointConfig, ServerConfig, Side, TransportConfig,
-    high_level::{Connection as InnerConnection, Endpoint as InnerEndpoint},
+    high_level::{
+        Connection as InnerConnection, Endpoint as InnerEndpoint, RecvStream as InnerRecvStream,
+        SendStream as InnerSendStream,
+    },
 };
 
 use crate::{crypto::rustls::QuicClientConfig, crypto::rustls::QuicServerConfig};
@@ -417,6 +423,12 @@ pub struct NatTraversalEndpoint {
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
     relay_server: Option<Arc<MasqueRelayServer>>,
+    /// Endpoint-level ACK-v2 bidi stream sink.
+    ///
+    /// The NAT relay service also accepts bidi streams on peer connections. If
+    /// it wins the accept race for an ACK-v2 stream, it forwards the stream here
+    /// instead of closing it as an invalid relay request.
+    ack_bidi_stream_tx: Arc<ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>>,
     /// Successful candidate pairs discovered via hole punching
     /// Maps peer ID to the remote address that successfully responded
     /// Uses DashMap for fine-grained concurrent access without blocking workers
@@ -631,6 +643,17 @@ fn default_max_concurrent_uni_streams() -> u32 {
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct PeerId(pub [u8; 32]);
+
+/// ACK-v2 bidi stream accepted by a NAT-layer relay handler and forwarded to
+/// the endpoint-level app reader. This bridges the current split accept loops
+/// until bidi streams are owned by a single typed dispatcher.
+pub(crate) struct IncomingAckBidiStream {
+    pub(crate) peer_id: PeerId,
+    pub(crate) conn_stable_id: usize,
+    pub(crate) send: InnerSendStream,
+    pub(crate) recv: InnerRecvStream,
+    pub(crate) prefix: Vec<u8>,
+}
 
 /// Information about a bootstrap/coordinator node
 #[derive(Debug, Clone)]
@@ -1735,6 +1758,7 @@ impl NatTraversalEndpoint {
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
+            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -1921,6 +1945,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -1937,6 +1962,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -2242,6 +2268,7 @@ impl NatTraversalEndpoint {
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
+            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -2428,6 +2455,7 @@ impl NatTraversalEndpoint {
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
             let relay_server_clone = endpoint.relay_server.clone();
+            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -2444,6 +2472,7 @@ impl NatTraversalEndpoint {
                     local_peer_id,
                     emitted_events_clone,
                     relay_server_clone,
+                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -2925,6 +2954,37 @@ impl NatTraversalEndpoint {
     /// enabling multi-transport support and shared socket management.
     pub fn transport_registry(&self) -> Option<&Arc<TransportRegistry>> {
         self.transport_registry.as_ref()
+    }
+
+    /// Register the endpoint-level ACK-v2 bidi stream sink.
+    pub(crate) fn set_ack_bidi_stream_sender(
+        &self,
+        tx: mpsc::UnboundedSender<IncomingAckBidiStream>,
+    ) {
+        *self.ack_bidi_stream_tx.write() = Some(tx);
+    }
+
+    /// Let the endpoint-level reader hand a non-ACK bidi stream back to the
+    /// relay service after it has consumed the protocol prefix.
+    pub(crate) async fn handle_relay_bidi_stream_from_app_reader(
+        &self,
+        connection: InnerConnection,
+        send_stream: InnerSendStream,
+        recv_stream: InnerRecvStream,
+        prefix: Vec<u8>,
+    ) -> bool {
+        let Some(server) = self.relay_server.clone() else {
+            return false;
+        };
+        Self::handle_relay_bidi_stream_with_prefix(
+            server,
+            connection.remote_address(),
+            send_stream,
+            recv_stream,
+            prefix,
+        )
+        .await;
+        true
     }
 
     /// Get a reference to the constrained protocol engine
@@ -5051,6 +5111,7 @@ impl NatTraversalEndpoint {
         let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
+        let ack_bidi_stream_tx_clone = self.ack_bidi_stream_tx.clone();
         let observed_address_tx_clone = self.observed_address_tx.clone();
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
@@ -5067,6 +5128,7 @@ impl NatTraversalEndpoint {
                 local_peer_id,
                 emitted_events_clone,
                 relay_server_clone,
+                ack_bidi_stream_tx_clone,
                 observed_address_tx_clone,
                 traversal_event_notify_clone,
                 incoming_notify_clone,
@@ -5089,6 +5151,9 @@ impl NatTraversalEndpoint {
         local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
+        ack_bidi_stream_tx: Arc<
+            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
+        >,
         observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
@@ -5103,6 +5168,7 @@ impl NatTraversalEndpoint {
                     let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
+                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
                     let observed_address_tx = observed_address_tx.clone();
                     let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
@@ -5166,8 +5232,15 @@ impl NatTraversalEndpoint {
                                 if let Some(ref server) = relay_server {
                                     let conn_clone = connection.clone();
                                     let server_clone = Arc::clone(server);
+                                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
                                     tokio::spawn(async move {
-                                        Self::handle_relay_requests(conn_clone, server_clone).await;
+                                        Self::handle_relay_requests(
+                                            peer_id,
+                                            conn_clone,
+                                            server_clone,
+                                            ack_bidi_stream_tx,
+                                        )
+                                        .await;
                                     });
                                 }
 
@@ -5203,9 +5276,147 @@ impl NatTraversalEndpoint {
     ///
     /// This listens for bidirectional streams and processes CONNECT-UDP Bind requests.
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
+    fn dispatch_ack_bidi_stream(
+        ack_bidi_stream_tx: &Arc<
+            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
+        >,
+        stream: IncomingAckBidiStream,
+    ) -> Result<(), IncomingAckBidiStream> {
+        let tx = ack_bidi_stream_tx.read().clone();
+        match tx {
+            Some(tx) => tx.send(stream).map_err(|error| error.0),
+            None => Err(stream),
+        }
+    }
+
+    async fn send_ack_bidi_not_supported(mut send_stream: InnerSendStream) {
+        let bytes = encode_ack_bidi_response(AckControlOutcome::Rejected(
+            ReceiveRejectReason::NotSupported,
+        ));
+        if let Err(error) = send_stream.write_all(&bytes).await {
+            debug!(error = %error, "failed to send ACK-v2 NotSupported response");
+            return;
+        }
+        if let Err(error) = send_stream.finish() {
+            debug!(error = %error, "failed to finish ACK-v2 NotSupported response");
+        }
+    }
+
+    async fn handle_relay_bidi_stream_with_prefix(
+        relay_server: Arc<MasqueRelayServer>,
+        client_addr: SocketAddr,
+        mut send_stream: InnerSendStream,
+        mut recv_stream: InnerRecvStream,
+        mut prefix: Vec<u8>,
+    ) {
+        while prefix.len() < 4 {
+            let mut buf = vec![0u8; 4 - prefix.len()];
+            if let Err(e) = recv_stream.read_exact(&mut buf).await {
+                debug!(
+                    "Failed to read relay request length from {}: {}",
+                    client_addr, e
+                );
+                return;
+            }
+            prefix.extend_from_slice(&buf);
+        }
+
+        let req_len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        if req_len > 1024 {
+            debug!(
+                "Relay request too large from {}: {} bytes",
+                client_addr, req_len
+            );
+            return;
+        }
+
+        let frame_len = 4 + req_len;
+        if prefix.len() > frame_len {
+            debug!(
+                "Relay request from {} included unsupported pipelined bytes",
+                client_addr
+            );
+            return;
+        }
+        while prefix.len() < frame_len {
+            let mut buf = vec![0u8; frame_len - prefix.len()];
+            if let Err(e) = recv_stream.read_exact(&mut buf).await {
+                debug!("Failed to read relay request from {}: {}", client_addr, e);
+                return;
+            }
+            prefix.extend_from_slice(&buf);
+        }
+
+        let request_bytes = prefix[4..frame_len].to_vec();
+        match ConnectUdpRequest::decode(&mut bytes::Bytes::from(request_bytes)) {
+            Ok(request) => {
+                debug!(
+                    "Received CONNECT-UDP request from {}: {:?}",
+                    client_addr, request
+                );
+
+                match relay_server
+                    .handle_connect_request(&request, client_addr)
+                    .await
+                {
+                    Ok(response) => {
+                        let is_success = response.is_success();
+                        debug!(
+                            "Sending CONNECT-UDP response to {}: {:?}",
+                            client_addr, response
+                        );
+
+                        let response_frame = encode_relay_response_frame(&response);
+                        if let Err(e) = send_stream.write_all(&response_frame).await {
+                            warn!("Failed to send relay response to {}: {}", client_addr, e);
+                            return;
+                        }
+
+                        // Do NOT call finish() — successful relay streams stay
+                        // open for forwarding.
+                        if is_success
+                            && let Some(session_info) =
+                                relay_server.get_session_for_client(client_addr).await
+                        {
+                            info!(
+                                "Starting stream-based relay forwarding for session {} (client: {})",
+                                session_info.session_id, client_addr
+                            );
+                            relay_server
+                                .run_stream_forwarding_loop(
+                                    session_info.session_id,
+                                    send_stream,
+                                    recv_stream,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to handle relay request from {}: {}", client_addr, e);
+                        let response =
+                            ConnectUdpResponse::error(500, format!("Internal error: {}", e));
+                        let response_frame = encode_relay_response_frame(&response);
+                        let _ = send_stream.write_all(&response_frame).await;
+                        let _ = send_stream.finish();
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Stream from {} is not a CONNECT-UDP request: {}",
+                    client_addr, e
+                );
+            }
+        }
+    }
+
     async fn handle_relay_requests(
+        peer_id: PeerId,
         connection: InnerConnection,
         relay_server: Arc<MasqueRelayServer>,
+        ack_bidi_stream_tx: Arc<
+            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
+        >,
     ) {
         let client_addr = connection.remote_address();
         debug!("Started relay request handler for peer at {}", client_addr);
@@ -5213,111 +5424,43 @@ impl NatTraversalEndpoint {
         loop {
             // Accept bidirectional streams for relay requests
             match connection.accept_bi().await {
-                Ok((mut send_stream, mut recv_stream)) => {
+                Ok((send_stream, mut recv_stream)) => {
                     let server = Arc::clone(&relay_server);
                     let addr = client_addr;
-                    let _conn_for_relay = connection.clone();
+                    let conn_stable_id = connection.stable_id();
+                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
 
                     tokio::spawn(async move {
-                        // Read length-prefixed request
-                        let mut req_len_buf = [0u8; 4];
-                        if let Err(e) = recv_stream.read_exact(&mut req_len_buf).await {
-                            debug!("Failed to read relay request length from {}: {}", addr, e);
-                            return;
-                        }
-                        let req_len = u32::from_be_bytes(req_len_buf) as usize;
-                        if req_len > 1024 {
-                            debug!("Relay request too large from {}: {} bytes", addr, req_len);
-                            return;
-                        }
-                        let mut request_bytes = vec![0u8; req_len];
-                        if let Err(e) = recv_stream.read_exact(&mut request_bytes).await {
-                            debug!("Failed to read relay request from {}: {}", addr, e);
+                        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
+                        if let Err(e) = recv_stream.read_exact(&mut prefix).await {
+                            debug!("Failed to read bidi stream prefix from {}: {}", addr, e);
                             return;
                         }
 
-                        {
+                        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
+                            let stream = IncomingAckBidiStream {
+                                peer_id,
+                                conn_stable_id,
+                                send: send_stream,
+                                recv: recv_stream,
+                                prefix,
+                            };
+                            if let Err(stream) =
+                                Self::dispatch_ack_bidi_stream(&ack_bidi_stream_tx, stream)
                             {
-                                // Try to parse as CONNECT-UDP request
-                                match ConnectUdpRequest::decode(&mut bytes::Bytes::from(
-                                    request_bytes,
-                                )) {
-                                    Ok(request) => {
-                                        debug!(
-                                            "Received CONNECT-UDP request from {}: {:?}",
-                                            addr, request
-                                        );
-
-                                        // Handle the request via relay server
-                                        match server.handle_connect_request(&request, addr).await {
-                                            Ok(response) => {
-                                                let is_success = response.is_success();
-                                                debug!(
-                                                    "Sending CONNECT-UDP response to {}: {:?}",
-                                                    addr, response
-                                                );
-
-                                                // Send response with length prefix (stream stays open for data)
-                                                let response_frame =
-                                                    encode_relay_response_frame(&response);
-                                                if let Err(e) =
-                                                    send_stream.write_all(&response_frame).await
-                                                {
-                                                    warn!(
-                                                        "Failed to send relay response to {}: {}",
-                                                        addr, e
-                                                    );
-                                                    return;
-                                                }
-                                                // Do NOT call finish() — stream stays open for forwarding
-
-                                                // Start stream-based forwarding loop
-                                                if is_success {
-                                                    if let Some(session_info) =
-                                                        server.get_session_for_client(addr).await
-                                                    {
-                                                        info!(
-                                                            "Starting stream-based relay forwarding for session {} (client: {})",
-                                                            session_info.session_id, addr
-                                                        );
-                                                        server
-                                                            .run_stream_forwarding_loop(
-                                                                session_info.session_id,
-                                                                send_stream,
-                                                                recv_stream,
-                                                            )
-                                                            .await;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to handle relay request from {}: {}",
-                                                    addr, e
-                                                );
-                                                // Send error response
-                                                let response = ConnectUdpResponse::error(
-                                                    500,
-                                                    format!("Internal error: {}", e),
-                                                );
-                                                let response_frame =
-                                                    encode_relay_response_frame(&response);
-                                                let _ =
-                                                    send_stream.write_all(&response_frame).await;
-                                                let _ = send_stream.finish();
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Not a CONNECT-UDP request, ignore
-                                        debug!(
-                                            "Stream from {} is not a CONNECT-UDP request: {}",
-                                            addr, e
-                                        );
-                                    }
-                                }
+                                Self::send_ack_bidi_not_supported(stream.send).await;
                             }
+                            return;
                         }
+
+                        Self::handle_relay_bidi_stream_with_prefix(
+                            server,
+                            addr,
+                            send_stream,
+                            recv_stream,
+                            prefix,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
