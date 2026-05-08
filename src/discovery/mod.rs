@@ -40,3 +40,21 @@ pub mod macos;
 // Mock implementation for testing
 #[cfg(test)]
 pub mod mock;
+
+// X0X-0038: AddressLookup trait + parallel resolver registry.
+// `lookup` provides the trait, the LookupRegistry, and three default impls
+// (BootstrapCacheLookup, MdnsLookup, HardcodedLookup). `filter` provides an
+// AddrFilter trait + a small library of stateless filters (drop loopback,
+// dedup, prefer-ipv6, composite). Both are additive — existing
+// `Endpoint::connect` callers are unchanged.
+pub mod filter;
+pub mod lookup;
+
+pub use filter::{
+    AddrFilter, CompositeFilter, DedupFilter, DropLoopbackFilter, DropUnspecifiedFilter,
+    PassThroughFilter, PreferIpv6Filter,
+};
+pub use lookup::{
+    AddressLookup, BootstrapCacheLookup, HardcodedLookup, LookupError, LookupRegistry, MdnsLookup,
+    ParallelLookupStream,
+};

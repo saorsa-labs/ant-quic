@@ -59,8 +59,8 @@ use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
 use crate::p2p_endpoint::{
-    AckDiagnosticsSnapshot, ConnectionHealth, EndpointError, P2pEndpoint, P2pEvent, PeerConnection,
-    PeerLifecycleEvent,
+    AckDiagnosticsSnapshot, ConnectionHealth, DataChannelDiagnosticsSnapshot, EndpointError,
+    P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent,
 };
 use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
@@ -680,6 +680,28 @@ impl Node {
     /// Snapshot stage-by-stage ACK-v2 latency and outcome diagnostics.
     pub fn ack_diagnostics(&self) -> AckDiagnosticsSnapshot {
         self.inner.ack_diagnostics()
+    }
+
+    /// Snapshot `data_tx` channel saturation diagnostics (X0X-0039).
+    ///
+    /// Surfaces depth, capacity, and cumulative high-water-count for the
+    /// shared `mpsc::Sender` fed by every per-connection reader task.
+    /// Consumed by `x0x` `/diagnostics/connectivity` to detect mesh-burst
+    /// back-pressure.
+    pub fn data_channel_diagnostics(&self) -> DataChannelDiagnosticsSnapshot {
+        self.inner.data_channel_diagnostics()
+    }
+
+    /// Snapshot GSO bundle send diagnostics (X0X-0043).
+    ///
+    /// Returns cumulative counts of multi-segment GSO bundles submitted to
+    /// the kernel send path and of bundles reported as partial / failed.
+    /// Consumed by `x0x` `/diagnostics/connectivity` to test the Quinn
+    /// issue #2627 GSO-tail-drop hypothesis as an alternative root cause
+    /// for X0X-0030 idle-rot send timeouts. See
+    /// [`crate::diagnostics::gso`] for the full discussion.
+    pub fn gso_diagnostics(&self) -> crate::GsoDiagnosticsSnapshot {
+        self.inner.gso_diagnostics()
     }
 
     /// Receive data from any peer

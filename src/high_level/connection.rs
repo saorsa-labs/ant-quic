@@ -1315,6 +1315,25 @@ impl State {
                 return Ok(false);
             }
 
+            // X0X-0043 GSO bundle accounting. We only count multi-segment
+            // bundles (`segment_size.is_some()` and segment count > 1);
+            // single datagrams are not GSO bundles and would muddy the
+            // "did GSO actually fire?" question this telemetry exists to
+            // answer. See `crate::diagnostics::gso` module docs for the
+            // current observability limitation: ant-quic's in-tree
+            // `AsyncUdpSocket` impls return `max_transmit_segments() = 1`
+            // and use `try_send_to(transmit.contents, ...)`, so under
+            // current code paths `t.segment_size` is `None` and this
+            // branch is dead until kernel GSO is wired into the runtime.
+            let segment_count = match t.segment_size {
+                Some(s) if s > 0 => t.size.div_ceil(s),
+                _ => 1,
+            };
+            let is_gso_bundle = segment_count > 1;
+            if is_gso_bundle {
+                crate::diagnostics::gso_diagnostics().record_bundle_submitted(segment_count);
+            }
+
             let len = t.size;
             let retry = match self
                 .socket
@@ -1322,7 +1341,22 @@ impl State {
             {
                 Ok(()) => false,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // X0X-0043: a GSO bundle that we already accounted as
+                    // submitted now has a hard error from the kernel send
+                    // path. The closest measurable proxy for a "partial
+                    // send" today (the runtime impls call `try_send_to`
+                    // which is whole-or-nothing) is exactly this: an
+                    // error after the bundle counter has already
+                    // incremented. When the runtime is rewritten to use
+                    // `quinn_udp::UdpSocketState::send`, the per-segment
+                    // delivered count it returns will replace this
+                    // heuristic.
+                    if is_gso_bundle {
+                        crate::diagnostics::gso_diagnostics().record_bundle_partial_send();
+                    }
+                    return Err(e);
+                }
             };
             if retry {
                 // We thought the socket was writable, but it wasn't. Retry so that either another

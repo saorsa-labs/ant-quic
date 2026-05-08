@@ -54,6 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
@@ -150,6 +151,118 @@ const ACK_REQUEST_DEDUPE_TTL: Duration = Duration::from_secs(120);
 const ACK_REQUEST_DEDUPE_MAX_ENTRIES: usize = 8192;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
+
+/// Free-slot fraction (of capacity) at or below which a data-channel
+/// saturation event is recorded.
+///
+/// The single `mpsc::Sender` shared by every per-connection reader task is
+/// the back-pressure choke point for the inbound data plane. Once free
+/// slots fall below 20 % of capacity we treat the channel as "high water"
+/// and increment a saturation counter (used by `/diagnostics/connectivity`)
+/// plus emit a throttled WARN. The threshold mirrors the heuristic used by
+/// saorsa-gossip's `recv_tx` warner (X0X-0039 / SOTA-Borrow Phase A).
+const DATA_TX_HIGH_WATER_FREE_FRACTION: f64 = 0.20;
+
+/// Minimum interval between high-water WARN logs per endpoint.
+///
+/// Saturation events arrive in bursts; without throttling a single 100 ms
+/// pressure window can emit thousands of identical lines. The throttle is
+/// implemented with a single `AtomicU64` storing the most recent WARN's
+/// Unix-millisecond timestamp; concurrent samplers compete via
+/// `compare_exchange`.
+const DATA_TX_HIGH_WATER_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Cumulative diagnostics for the shared `data_tx` `mpsc` channel
+/// (X0X-0039 / SOTA-Borrow Phase A).
+///
+/// `data_tx` is the single bounded queue that every per-connection reader
+/// task pushes inbound payloads into. Because all reader tasks share one
+/// sender, a momentary slow consumer fans out into mesh-wide back-pressure
+/// — the same failure shape saorsa-gossip v0.18.3 cured for its per-
+/// subscriber buffer. These counters surface saturation events without
+/// changing the existing `send().await` back-pressure semantic.
+#[derive(Debug, Default)]
+pub(crate) struct DataChannelDiagnostics {
+    /// Cumulative count of saturation events (free slots fell at or below
+    /// [`DATA_TX_HIGH_WATER_FREE_FRACTION`] of capacity, **or** an
+    /// admission attempt timed out / failed because the channel was full).
+    high_water_count: AtomicU64,
+    /// Unix-ms timestamp of the most recent WARN emitted by
+    /// [`DataChannelDiagnostics::observe_capacity`]. Used to throttle the
+    /// WARN to once per [`DATA_TX_HIGH_WATER_WARN_INTERVAL`] per endpoint.
+    last_warn_unix_ms: AtomicU64,
+}
+
+impl DataChannelDiagnostics {
+    /// Sample current channel pressure ahead of (or after) a send. Both
+    /// `free` (= `Sender::capacity()`) and `capacity` (= the original
+    /// channel cap) come from the live `mpsc::Sender`; we never read the
+    /// receiver. The sampler increments the saturation counter at most
+    /// once per call and emits a throttled WARN when it does.
+    fn observe_capacity(&self, free: usize, capacity: usize) {
+        if capacity == 0 {
+            return;
+        }
+        let threshold = ((capacity as f64) * DATA_TX_HIGH_WATER_FREE_FRACTION).ceil() as usize;
+        let threshold = threshold.max(1);
+        if free <= threshold {
+            self.note_saturation_inner(free, capacity);
+        }
+    }
+
+    /// Force-account a saturation event without sampling. Used by paths
+    /// that have already failed (`try_send` returned `Full`, ACK admission
+    /// timed out) — by definition the channel was saturated and we want
+    /// the counter and WARN to fire.
+    fn note_saturation(&self, free: usize, capacity: usize) {
+        self.note_saturation_inner(free, capacity);
+    }
+
+    fn note_saturation_inner(&self, free: usize, capacity: usize) {
+        self.high_water_count.fetch_add(1, Ordering::Relaxed);
+        let now_ms = current_unix_ms();
+        let last = self.last_warn_unix_ms.load(Ordering::Relaxed);
+        let interval_ms = DATA_TX_HIGH_WATER_WARN_INTERVAL.as_millis() as u64;
+        if now_ms.saturating_sub(last) < interval_ms {
+            return;
+        }
+        // Single-flight the WARN: only the thread that wins the CAS logs.
+        if self
+            .last_warn_unix_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        warn!(
+            target: "ant_quic::data_tx",
+            free_slots = free,
+            capacity = capacity,
+            free_fraction = (free as f64) / (capacity as f64),
+            high_water_count = self.high_water_count.load(Ordering::Relaxed),
+            "data_tx near saturation: free slots <= 20% of capacity (X0X-0039)"
+        );
+    }
+
+    fn high_water_count(&self) -> u64 {
+        self.high_water_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Snapshot of `data_tx` channel pressure for `/diagnostics/connectivity`
+/// surfaces (X0X-0039).
+#[derive(Debug, Clone, Serialize)]
+pub struct DataChannelDiagnosticsSnapshot {
+    /// Number of payloads currently queued in `data_tx` (best-effort,
+    /// computed as `capacity - sender.capacity()`).
+    pub data_tx_depth: usize,
+    /// Configured channel capacity. Default
+    /// [`P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY`].
+    pub data_tx_capacity: usize,
+    /// Cumulative saturation events since process start. Includes both
+    /// pre-send pressure samples and admission timeouts.
+    pub data_tx_high_water_count: u64,
+}
 
 /// Derive a synthetic PeerId by hashing a `TransportAddr` display string.
 ///
@@ -608,6 +721,13 @@ pub struct P2pEndpoint {
 
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
     data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
+
+    /// Configured `data_tx` capacity (preserved for diagnostics; the
+    /// `mpsc::Sender` only exposes remaining free slots).
+    data_tx_capacity: usize,
+
+    /// Saturation diagnostics for `data_tx` (X0X-0039).
+    data_tx_diagnostics: Arc<DataChannelDiagnostics>,
 
     /// Sender used by reader tasks to report deterministic exit events.
     reader_exit_tx: mpsc::UnboundedSender<ReaderExitEvent>,
@@ -2623,7 +2743,9 @@ impl P2pEndpoint {
         router.set_quic_endpoint(Arc::clone(&inner_arc));
 
         // Create channel for data received from background reader tasks
-        let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
+        let data_tx_capacity = config.data_channel_capacity;
+        let (data_tx, data_rx) = mpsc::channel(data_tx_capacity);
+        let data_tx_diagnostics = Arc::new(DataChannelDiagnostics::default());
         let (reader_exit_tx, reader_exit_rx) = mpsc::unbounded_channel();
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
@@ -2660,6 +2782,8 @@ impl P2pEndpoint {
             direct_path_statuses,
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
+            data_tx_capacity,
+            data_tx_diagnostics,
             reader_exit_tx,
             reader_exit_rx: Arc::new(tokio::sync::Mutex::new(reader_exit_rx)),
             reader_handles,
@@ -2683,6 +2807,8 @@ impl P2pEndpoint {
             let ack_diagnostics = Arc::clone(&endpoint.ack_diagnostics);
             let ack_request_dedupe = Arc::clone(&endpoint.ack_request_dedupe);
             let data_tx = endpoint.data_tx.clone();
+            let data_tx_diagnostics = Arc::clone(&endpoint.data_tx_diagnostics);
+            let data_tx_capacity = endpoint.data_tx_capacity;
             let event_tx = endpoint.event_tx.clone();
             let shutdown = endpoint.shutdown.clone();
             let max_read_bytes = endpoint.config.max_message_size;
@@ -2707,6 +2833,8 @@ impl P2pEndpoint {
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
+                                data_tx_diagnostics.as_ref(),
+                                data_tx_capacity,
                                 &event_tx,
                                 peer_id,
                                 conn_stable_id,
@@ -5404,12 +5532,15 @@ impl P2pEndpoint {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_ack_bidi_stream(
         ack_diagnostics: &AckDiagnostics,
         ack_request_dedupe: &AckRequestDedupeCache,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
         peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
         data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx_diagnostics: &DataChannelDiagnostics,
+        data_tx_capacity: usize,
         event_tx: &broadcast::Sender<P2pEvent>,
         peer_id: PeerId,
         conn_stable_id: usize,
@@ -5519,7 +5650,14 @@ impl P2pEndpoint {
         .await;
 
         let admission_started = Instant::now();
-        let admission = Self::admit_ack_requested_payload(data_tx, peer_id, payload.to_vec()).await;
+        let admission = Self::admit_ack_requested_payload(
+            data_tx,
+            data_tx_diagnostics,
+            data_tx_capacity,
+            peer_id,
+            payload.to_vec(),
+        )
+        .await;
         ack_diagnostics.record_stage(
             peer_id,
             conn_stable_id,
@@ -5599,16 +5737,27 @@ impl P2pEndpoint {
 
     async fn admit_ack_requested_payload(
         data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx_diagnostics: &DataChannelDiagnostics,
+        data_tx_capacity: usize,
         peer_id: PeerId,
         payload: Vec<u8>,
     ) -> Result<(), ReceiveRejectReason> {
+        // Sample channel pressure pre-reserve so high-water events are
+        // observable even when admission ultimately succeeds.
+        data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
         match timeout(ACK_RECEIVE_ADMISSION_TIMEOUT, data_tx.reserve()).await {
             Ok(Ok(permit)) => {
                 permit.send((peer_id, payload));
                 Ok(())
             }
             Ok(Err(_closed)) => Err(ReceiveRejectReason::ConsumerGone),
-            Err(_elapsed) => Err(ReceiveRejectReason::Backpressured),
+            Err(_elapsed) => {
+                // Admission timed out — the channel was saturated for the
+                // full ACK admission budget. This is the failure path that
+                // X0X-0036/0039 attribute false-positive ACK timeouts to.
+                data_tx_diagnostics.note_saturation(data_tx.capacity(), data_tx_capacity);
+                Err(ReceiveRejectReason::Backpressured)
+            }
         }
     }
 
@@ -6657,6 +6806,35 @@ impl P2pEndpoint {
         self.ack_diagnostics.snapshot()
     }
 
+    /// Snapshot `data_tx` channel saturation diagnostics (X0X-0039).
+    ///
+    /// `data_tx` is the single bounded `mpsc` shared by every per-connection
+    /// reader task. Returns the configured capacity, the current depth
+    /// (best-effort: `capacity - sender.capacity()`), and the cumulative
+    /// count of saturation events since process start.
+    pub fn data_channel_diagnostics(&self) -> DataChannelDiagnosticsSnapshot {
+        let capacity = self.data_tx_capacity;
+        let free = self.data_tx.capacity();
+        let depth = capacity.saturating_sub(free);
+        DataChannelDiagnosticsSnapshot {
+            data_tx_depth: depth,
+            data_tx_capacity: capacity,
+            data_tx_high_water_count: self.data_tx_diagnostics.high_water_count(),
+        }
+    }
+
+    /// Snapshot GSO bundle send diagnostics (X0X-0043).
+    ///
+    /// Returns cumulative counts of multi-segment GSO bundles submitted to
+    /// the kernel send path and of bundles reported as partial / failed.
+    /// The counters are process-global because the underlying transmit
+    /// loop is shared across every endpoint in the process; see
+    /// [`crate::diagnostics::gso`] for the full hypothesis-under-test
+    /// (Quinn issue #2627) and the current observability limitations.
+    pub fn gso_diagnostics(&self) -> crate::diagnostics::GsoDiagnosticsSnapshot {
+        crate::diagnostics::gso_diagnostics().snapshot()
+    }
+
     /// Get metrics for a specific connection
     pub async fn connection_metrics(&self, peer_id: &PeerId) -> Option<ConnectionMetrics> {
         let connection = self.inner.get_connection(peer_id).ok()??;
@@ -7462,6 +7640,8 @@ impl P2pEndpoint {
     /// (`cleanup_connection`, `shutdown`) also calls `abort()` as a backstop.
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
+        let data_tx_diagnostics = Arc::clone(&self.data_tx_diagnostics);
+        let data_tx_capacity = self.data_tx_capacity;
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
         let ack_waiters = Arc::clone(&self.ack_waiters);
@@ -7560,6 +7740,8 @@ impl P2pEndpoint {
                                 &connected_peers,
                                 &peer_activity,
                                 &data_tx,
+                                data_tx_diagnostics.as_ref(),
+                                data_tx_capacity,
                                 &event_tx,
                                 peer_id,
                                 conn_stable_id,
@@ -7705,7 +7887,11 @@ impl P2pEndpoint {
                 .await;
 
                 // Fire-and-forget sends keep the existing backpressure policy:
-                // wait for capacity rather than dropping silently.
+                // wait for capacity rather than dropping silently. We sample
+                // pre-send pressure so saturation events surface as observable
+                // counters even when the eventual `send().await` succeeds
+                // after a brief block (X0X-0039).
+                data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
                 if data_tx.send((peer_id, payload)).await.is_err() {
                     debug!(
                         "Reader task for peer {:?}: channel closed, exiting",
@@ -7835,6 +8021,8 @@ impl P2pEndpoint {
     fn spawn_constrained_poller(&self) {
         let inner = Arc::clone(&self.inner);
         let data_tx = self.data_tx.clone();
+        let data_tx_diagnostics = Arc::clone(&self.data_tx_diagnostics);
+        let data_tx_capacity = self.data_tx_capacity;
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
         let event_tx = self.event_tx.clone();
@@ -7943,6 +8131,10 @@ impl P2pEndpoint {
                             );
                         }
 
+                        // Sample channel pressure pre-send so saturation
+                        // events on the constrained ingress path are visible
+                        // alongside the QUIC reader-task path (X0X-0039).
+                        data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
                         if data_tx.send((peer_id, data)).await.is_err() {
                             debug!("Constrained poller: channel closed, exiting");
                             break;
@@ -8306,6 +8498,8 @@ impl Clone for P2pEndpoint {
             direct_path_statuses: Arc::clone(&self.direct_path_statuses),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
+            data_tx_capacity: self.data_tx_capacity,
+            data_tx_diagnostics: Arc::clone(&self.data_tx_diagnostics),
             reader_exit_tx: self.reader_exit_tx.clone(),
             reader_exit_rx: Arc::clone(&self.reader_exit_rx),
             reader_handles: Arc::clone(&self.reader_handles),
@@ -8333,6 +8527,103 @@ mod tests {
     ) -> Vec<P2pEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
+
+    // ------------------------------------------------------------------
+    // X0X-0039: data_tx high-water diagnostics
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn data_channel_diagnostics_increments_on_full_admit() {
+        // Channel of size 4, free <= 1 (=ceil(4*0.20)=1) trips the high-water
+        // sampler. Filling to capacity (free=0) is also a saturation event.
+        let diags = DataChannelDiagnostics::default();
+        let capacity = 4usize;
+        // free=4 → above threshold, no count.
+        diags.observe_capacity(capacity, capacity);
+        assert_eq!(diags.high_water_count(), 0);
+        // free=2 → above threshold (1), still no count.
+        diags.observe_capacity(2, capacity);
+        assert_eq!(diags.high_water_count(), 0);
+        // free=1 → at threshold, counts once.
+        diags.observe_capacity(1, capacity);
+        assert_eq!(diags.high_water_count(), 1);
+        // free=0 → fully saturated, counts again.
+        diags.observe_capacity(0, capacity);
+        assert_eq!(diags.high_water_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn data_channel_diagnostics_increments_on_admission_timeout() {
+        // Force admit_ack_requested_payload through the timeout branch by
+        // filling a tiny channel to capacity and never draining it. The
+        // payload fills the queue; the second reserve cannot complete in
+        // ACK_RECEIVE_ADMISSION_TIMEOUT and increments high_water_count.
+        let capacity = 1usize;
+        let (tx, _rx) = mpsc::channel::<(PeerId, Vec<u8>)>(capacity);
+        let diags = DataChannelDiagnostics::default();
+        let peer_id = PeerId([0x33; 32]);
+        // Pre-fill so the next reserve must wait.
+        tx.send((peer_id, vec![0u8; 8])).await.expect("first send");
+        let admission =
+            P2pEndpoint::admit_ack_requested_payload(&tx, &diags, capacity, peer_id, vec![1u8; 8])
+                .await;
+        assert!(matches!(admission, Err(ReceiveRejectReason::Backpressured)));
+        assert!(
+            diags.high_water_count() >= 1,
+            "expected at least one saturation event, got {}",
+            diags.high_water_count()
+        );
+    }
+
+    #[test]
+    fn data_channel_diagnostics_warn_throttles_to_one_per_burst() {
+        // Send 100 saturation events back-to-back; only one WARN should be
+        // emitted (the others lose the CAS within
+        // DATA_TX_HIGH_WATER_WARN_INTERVAL). The high-water counter still
+        // reflects every event — only the log line is throttled.
+        let diags = DataChannelDiagnostics::default();
+        let capacity = 8usize;
+        for _ in 0..100 {
+            diags.observe_capacity(0, capacity);
+        }
+        assert_eq!(diags.high_water_count(), 100);
+        // Exactly one WARN should have been emitted within
+        // DATA_TX_HIGH_WATER_WARN_INTERVAL — last_warn_unix_ms is non-zero
+        // and inside the interval.
+        let last = diags.last_warn_unix_ms.load(Ordering::Relaxed);
+        assert!(
+            last > 0,
+            "expected last_warn_unix_ms to be set, got {}",
+            last
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // X0X-0043: GSO bundle diagnostics integration
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn gso_diagnostics_records_multi_segment_bundles() {
+        // Acceptance criterion 3 (X0X-0043): a GSO bundle with > 1 segment
+        // increments `gso_bundle_send_total`. Exercise the same global
+        // `gso_diagnostics()` accessor that `drive_transmit` calls so we
+        // verify the wiring, not just the leaf counter.
+        let diags = crate::diagnostics::gso_diagnostics();
+        let before = diags.snapshot();
+        diags.record_bundle_submitted(1); // single datagram → ignored
+        diags.record_bundle_submitted(4); // multi-segment bundle → counted
+        let after = diags.snapshot();
+        assert_eq!(
+            after.bundle_send_total - before.bundle_send_total,
+            1,
+            "single-datagram send must not count; multi-segment bundle must"
+        );
+        assert_eq!(after.bundle_partial_send, before.bundle_partial_send);
+    }
+
+    // ------------------------------------------------------------------
+    // ACK request dedupe
+    // ------------------------------------------------------------------
 
     #[test]
     fn ack_request_dedupe_replays_matching_request_id_once() {

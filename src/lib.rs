@@ -121,6 +121,9 @@ pub use varint::{VarInt, VarIntBoundsExceeded};
 /// Bounded pending data buffer with TTL expiration
 pub mod bounded_pending_buffer;
 
+/// Process-global diagnostics surfaces (X0X-0043 GSO bundle counters etc.).
+pub mod diagnostics;
+
 /// RTT-based path selection with hysteresis
 pub mod path_selection;
 
@@ -216,6 +219,14 @@ pub mod constrained;
 pub mod crypto;
 /// Platform-specific network interface discovery
 pub mod discovery;
+
+// X0X-0038: re-export the AddressLookup trait + filter trait + registry from
+// the discovery module so callers can write `use ant_quic::AddressLookup;`.
+pub use discovery::{
+    AddrFilter, AddressLookup, BootstrapCacheLookup, CompositeFilter, DedupFilter,
+    DropLoopbackFilter, DropUnspecifiedFilter, HardcodedLookup, LookupError, LookupRegistry,
+    MdnsLookup, ParallelLookupStream, PassThroughFilter, PreferIpv6Filter,
+};
 /// NAT traversal protocol implementation
 pub mod nat_traversal;
 /// Transport-level protocol implementation
@@ -366,11 +377,13 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 /// P2P endpoint - for advanced use, prefer Node for most applications
 pub use ack_frame::ReceiveRejectReason;
 pub use connection_lifecycle::ConnectionCloseReason;
+pub use diagnostics::{GsoDiagnostics, GsoDiagnosticsSnapshot};
 pub use p2p_endpoint::{
     AckDiagnosticsSnapshot, AckOutcomeCounters, AckPeerDiagnosticsSnapshot,
     AckStageDiagnosticsSnapshot, AckStageLatencySnapshot, ConnectionHealth, ConnectionMetrics,
-    DirectPathStatus, DirectPathUnavailableReason, DisconnectReason, EndpointError, EndpointStats,
-    P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent, TraversalPhase,
+    DataChannelDiagnosticsSnapshot, DirectPathStatus, DirectPathUnavailableReason,
+    DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection,
+    PeerLifecycleEvent, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern

@@ -468,7 +468,15 @@ impl Default for P2pConfig {
 
 impl P2pConfig {
     /// Default capacity of the data channel between reader tasks and `recv()`.
-    pub const DEFAULT_DATA_CHANNEL_CAPACITY: usize = 256;
+    ///
+    /// Bumped 256 → 8192 in X0X-0039 (SOTA-Borrow Phase A) to match
+    /// saorsa-gossip's per-subscriber buffer (raised 128 → 10_000 in v0.18.3
+    /// for the same class of mesh-burst back-pressure). The single shared
+    /// `mpsc` is fed by every per-connection reader task; on a 12-peer mesh
+    /// under burst, 256 is a known historical choke point that produces
+    /// false-positive ACK admission timeouts. See
+    /// `x0x/docs/design/sota-borrow-plan.md` §4 X0X-0039.
+    pub const DEFAULT_DATA_CHANNEL_CAPACITY: usize = 8192;
 
     /// Default maximum message size (4 MiB).
     ///
@@ -1001,7 +1009,7 @@ impl P2pConfigBuilder {
     ///
     /// Controls the bounded `mpsc` buffer size. Higher values allow more
     /// in-flight messages before back-pressure is applied to reader tasks.
-    /// Default: [`P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY`] (256).
+    /// Default: [`P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY`] (8192).
     pub fn data_channel_capacity(mut self, capacity: usize) -> Self {
         self.data_channel_capacity = Some(capacity);
         self
