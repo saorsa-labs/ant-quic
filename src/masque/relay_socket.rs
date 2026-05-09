@@ -25,7 +25,7 @@ use std::task::{Context, Poll, Waker};
 use quinn_udp::{RecvMeta, Transmit};
 
 use crate::VarInt;
-use crate::high_level::{AsyncUdpSocket, UdpPoller};
+use crate::high_level::{AsyncUdpSocket, UdpSender};
 use crate::masque::UncompressedDatagram;
 
 /// A virtual UDP socket that tunnels packets through a MASQUE relay
@@ -146,21 +146,10 @@ impl MasqueRelaySocket {
 }
 
 impl AsyncUdpSocket for MasqueRelaySocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let datagram = UncompressedDatagram::new(
-            VarInt::from_u32(0),
-            transmit.destination,
-            Bytes::copy_from_slice(transmit.contents),
-        );
-        let encoded = datagram.encode();
-
-        self.send_tx
-            .send(encoded)
-            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "relay stream closed"))
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(MasqueRelaySender {
+            send_tx: self.send_tx.clone(),
+        })
     }
 
     fn poll_recv(
@@ -208,10 +197,27 @@ impl AsyncUdpSocket for MasqueRelaySocket {
 }
 
 #[derive(Debug)]
-struct AlwaysWritable;
+struct MasqueRelaySender {
+    send_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
 
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+impl UdpSender for MasqueRelaySender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let datagram = UncompressedDatagram::new(
+            VarInt::from_u32(0),
+            transmit.destination,
+            Bytes::copy_from_slice(transmit.contents),
+        );
+        let encoded = datagram.encode();
+
+        Poll::Ready(
+            self.send_tx.send(encoded).map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "relay stream closed")
+            }),
+        )
     }
 }

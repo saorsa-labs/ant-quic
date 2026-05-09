@@ -29,7 +29,7 @@ use quinn_udp::{RecvMeta, Transmit};
 use tokio::io::ReadBuf;
 use tracing::debug;
 
-use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller};
+use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller, UdpSender};
 
 /// A dual-stack UDP socket that manages separate IPv4 and IPv6 sockets.
 ///
@@ -108,30 +108,6 @@ impl DualStackSocket {
         self.v4.is_some() && self.v6.is_some()
     }
 
-    /// Select the appropriate socket for a destination address.
-    ///
-    /// Returns `(socket, socket_is_v6)` so that hot-path callers do not
-    /// need to call `local_addr()` (a `getsockname` syscall) on every
-    /// packet just to check the socket's address family.
-    ///
-    /// IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are routed to the IPv4 socket.
-    fn select_socket(&self, dest: &SocketAddr) -> Option<(&Arc<tokio::net::UdpSocket>, bool)> {
-        let v4 = self.v4.as_ref().map(|s| (s, false));
-        let v6 = self.v6.as_ref().map(|s| (s, true));
-        match dest {
-            SocketAddr::V4(_) => v4.or(v6),
-            SocketAddr::V6(addr) => {
-                if addr.ip().to_ipv4_mapped().is_some() {
-                    // IPv4-mapped address: prefer the IPv4 socket
-                    v4.or(v6)
-                } else {
-                    // Native IPv6 address
-                    v6.or(v4)
-                }
-            }
-        }
-    }
-
     /// Convert a destination address for the selected socket.
     ///
     /// If sending an IPv4-mapped IPv6 address through the IPv4 socket, unwrap to native IPv4.
@@ -202,53 +178,13 @@ impl DualStackSocket {
 }
 
 impl AsyncUdpSocket for DualStackSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(UdpPollHelper::new(move || {
-            let socket = self.clone();
-            async move {
-                // Wait until EVERY present socket is writable.
-                //
-                // `try_send` routes each datagram to exactly one of v4/v6 by
-                // destination family. If we returned Ready when *either* side
-                // was writable (as the prior OR-via-`tokio::select!` did), and
-                // the selected target's buffer was full, `drive_transmit` would
-                // spin: `try_send_to` clears readiness on the target socket,
-                // but the other socket's stale Ready keeps `poll_writable`
-                // returning Ready immediately on the next iteration. With an
-                // AND-combination the poller waits for a real POLLOUT on both
-                // families, guaranteeing forward progress without CPU spin.
-                let v4_fut = async {
-                    if let Some(ref s) = socket.v4 {
-                        s.writable().await
-                    } else {
-                        Ok(())
-                    }
-                };
-                let v6_fut = async {
-                    if let Some(ref s) = socket.v6 {
-                        s.writable().await
-                    } else {
-                        Ok(())
-                    }
-                };
-                let (r4, r6) = tokio::join!(v4_fut, v6_fut);
-                r4.and(r6)
-            }
-        }))
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let (socket, socket_is_v6) =
-            self.select_socket(&transmit.destination).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "no socket available for destination address family",
-                )
-            })?;
-
-        let dest = Self::convert_dest(transmit.destination, socket_is_v6)?;
-        socket.try_send_to(transmit.contents, dest)?;
-        Ok(())
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(DualStackUdpSender {
+            v4: self.v4.clone(),
+            v6: self.v6.clone(),
+            v4_writable: self.v4.as_ref().map(make_socket_poller),
+            v6_writable: self.v6.as_ref().map(make_socket_poller),
+        })
     }
 
     fn poll_recv(
@@ -326,6 +262,102 @@ impl AsyncUdpSocket for DualStackSocket {
             .unwrap_or(true);
         let v6_frag = self.v6.as_ref().map(|_| true).unwrap_or(true);
         v4_frag || v6_frag
+    }
+}
+
+fn make_socket_poller(socket: &Arc<tokio::net::UdpSocket>) -> Pin<Box<dyn UdpPoller>> {
+    let socket = Arc::clone(socket);
+    Box::pin(UdpPollHelper::new(move || {
+        let socket = Arc::clone(&socket);
+        async move { socket.writable().await }
+    }))
+}
+
+#[derive(Debug)]
+struct DualStackUdpSender {
+    v4: Option<Arc<tokio::net::UdpSocket>>,
+    v6: Option<Arc<tokio::net::UdpSocket>>,
+    v4_writable: Option<Pin<Box<dyn UdpPoller>>>,
+    v6_writable: Option<Pin<Box<dyn UdpPoller>>>,
+}
+
+impl DualStackUdpSender {
+    fn select_family(&self, dest: &SocketAddr) -> Option<bool> {
+        let has_v4 = self.v4.is_some();
+        let has_v6 = self.v6.is_some();
+        match dest {
+            SocketAddr::V4(_) => {
+                if has_v4 {
+                    Some(false)
+                } else {
+                    has_v6.then_some(true)
+                }
+            }
+            SocketAddr::V6(addr) if addr.ip().to_ipv4_mapped().is_some() => {
+                if has_v4 {
+                    Some(false)
+                } else {
+                    has_v6.then_some(true)
+                }
+            }
+            SocketAddr::V6(_) => {
+                if has_v6 {
+                    Some(true)
+                } else {
+                    has_v4.then_some(false)
+                }
+            }
+        }
+    }
+}
+
+impl UdpSender for DualStackUdpSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &Transmit,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let socket_is_v6 = self.select_family(&transmit.destination).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no socket available for destination address family",
+            )
+        })?;
+
+        loop {
+            let (socket, poller) = if socket_is_v6 {
+                (
+                    self.v6.as_ref().cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv6 socket unavailable")
+                    })?,
+                    self.v6_writable.as_mut().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv6 poller unavailable")
+                    })?,
+                )
+            } else {
+                (
+                    self.v4.as_ref().cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 socket unavailable")
+                    })?,
+                    self.v4_writable.as_mut().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 poller unavailable")
+                    })?,
+                )
+            };
+
+            match poller.as_mut().poll_writable(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            let dest = DualStackSocket::convert_dest(transmit.destination, socket_is_v6)?;
+            match socket.try_send_to(transmit.contents, dest) {
+                Ok(_) => return Poll::Ready(Ok(())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
     }
 }
 
@@ -584,7 +616,10 @@ mod tests {
             segment_size: None,
             src_ip: None,
         };
-        ds.try_send(&transmit).unwrap();
+        let mut sender = ds.create_sender();
+        std::future::poll_fn(|cx| sender.as_mut().poll_send(&transmit, cx))
+            .await
+            .unwrap();
 
         // Verify receipt on the v4 receiver
         let mut buf = [0u8; 64];
@@ -628,7 +663,10 @@ mod tests {
             segment_size: None,
             src_ip: None,
         };
-        ds.try_send(&transmit).unwrap();
+        let mut sender = ds.create_sender();
+        std::future::poll_fn(|cx| sender.as_mut().poll_send(&transmit, cx))
+            .await
+            .unwrap();
 
         // Verify receipt
         let mut buf = [0u8; 64];

@@ -25,13 +25,14 @@ mod work_limiter;
 // Re-export the main types
 pub use self::connection::{
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    SendDatagramError, WeakConnectionHandle, ZeroRttAccepted,
 };
 pub use self::endpoint::{Accept, Endpoint, EndpointStats};
 pub use self::incoming::{Incoming, IncomingFuture, RetryError};
 pub use self::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
-pub use self::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, default_runtime};
+pub use self::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, default_runtime};
 pub use self::send_stream::{SendStream, StoppedError, WriteError};
+pub use crate::path::{Path, PathId, WeakPathHandle};
 
 // TokioRuntime is always available (tokio is a required dependency)
 pub use self::runtime::TokioRuntime;

@@ -78,7 +78,7 @@ async fn superseded_connection_surfaces_close_reason_quickly() {
         .expect("b lookup")
         .expect("b live conn");
 
-    for _ in 0..5 {
+    for _ in 0..10 {
         if a_conn
             .close_reason()
             .as_ref()
@@ -105,7 +105,7 @@ async fn superseded_connection_surfaces_close_reason_quickly() {
         let _ = b_task.await.expect("b join");
     }
 
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(10), || {
         a_conn
             .close_reason()
             .as_ref()

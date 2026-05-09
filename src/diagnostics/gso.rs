@@ -28,14 +28,14 @@
 //!   && size > segment_size`). Single-datagram sends are not GSO bundles and
 //!   do not bump the counter.
 //! - [`GsoDiagnostics::record_bundle_partial_send`] is invoked when the
-//!   underlying send returns evidence of a partial send (e.g. an `EAGAIN` /
-//!   `EMSGSIZE` / `ENOBUFS` after we already accounted the bundle as
-//!   submitted, or an OS-level "fewer segments delivered than requested"
-//!   error path). See "Limitations" below for the current observable signal.
+//!   underlying send returns evidence of a partial send (e.g. `EMSGSIZE` /
+//!   `ENOBUFS` on a submitted bundle, or an OS-level "fewer segments delivered
+//!   than requested" path). See "Limitations" below for the current observable
+//!   signal.
 //!
 //! # Limitations (read this before interpreting a soak result)
 //!
-//! ant-quic's [`crate::high_level::runtime::AsyncUdpSocket`] trait defaults
+//! ant-quic's [`crate::high_level::runtime::UdpSender`] trait defaults
 //! `max_transmit_segments()` to `1`, and the in-tree implementations
 //! ([`crate::high_level::runtime::tokio::TokioRuntime`]'s `UdpSocket` and
 //! [`crate::high_level::runtime::dual_stack::DualStackSocket`]) both use
@@ -47,18 +47,18 @@
 //!    outbound packet. The "is this a GSO bundle?" check is structurally
 //!    `false` today, so [`GsoDiagnostics::record_bundle_submitted`] will
 //!    not be invoked from this path until either:
-//!    - `AsyncUdpSocket::max_transmit_segments` is overridden to return > 1
+//!    - `UdpSender::max_transmit_segments` is overridden to return > 1
 //!      from the in-tree runtime impl, **or**
-//!    - the `try_send` impl is rewritten to call `quinn_udp::UdpSocketState::send`
+//!    - the `poll_send` impl is rewritten to call `quinn_udp::UdpSocketState::send`
 //!      with a multi-segment `Transmit`.
 //! 2. `try_send_to` does not surface a per-segment delivered count; the
-//!    closest measurable signal is an `io::ErrorKind::WouldBlock` path
-//!    (which retries the same `Transmit` whole) or a raw error return
-//!    from `try_send_to`. The instrumentation here therefore counts
-//!    submission *intent* and reserves [`GsoDiagnostics::record_bundle_partial_send`]
-//!    for explicit kernel-reported partial sends from any future path
-//!    that wires `quinn_udp::UdpSocketState::send` (which exposes
-//!    `Result<usize, io::Error>` where `usize` is segments accepted).
+//!    closest measurable signal is a raw error return from `try_send_to`.
+//!    The instrumentation here therefore counts submitted bundles only after
+//!    `poll_send` resolves, and reserves
+//!    [`GsoDiagnostics::record_bundle_partial_send`] for explicit
+//!    kernel-reported partial sends from any future path that wires
+//!    `quinn_udp::UdpSocketState::send` (which exposes `Result<usize,
+//!    io::Error>` where `usize` is segments accepted).
 //!
 //! These limitations are the reason the X0X-0043 acceptance criteria allow
 //! `inconclusive` as a valid finding state. A soak run before kernel GSO is

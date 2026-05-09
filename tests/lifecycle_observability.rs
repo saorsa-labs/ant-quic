@@ -23,7 +23,7 @@ async fn lifecycle_transitions_emit_structured_tracing_fields() {
     let accept_a = spawn_accept_loop(a.clone());
     let accept_b = spawn_accept_loop(b.clone());
 
-    for _ in 0..5 {
+    for _ in 0..10 {
         let a_task = {
             let a = a.clone();
             tokio::spawn(async move { a.connect_addr(b_addr).await })

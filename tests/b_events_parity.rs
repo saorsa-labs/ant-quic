@@ -123,10 +123,22 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     let (all_peer_events, all_peer_events_task) =
         spawn_all_peer_event_collector(sender.subscribe_all_peer_events());
 
-    sender
-        .connect_addr(receiver_addr)
+    let sender_connect = {
+        let sender = sender.clone();
+        tokio::spawn(async move { sender.connect_addr(receiver_addr).await })
+    };
+    let receiver_connect = {
+        let receiver = receiver.clone();
+        tokio::spawn(async move { receiver.connect_addr(sender_addr).await })
+    };
+    sender_connect
         .await
-        .expect("initial connect");
+        .expect("sender connect task")
+        .expect("initial sender connect");
+    receiver_connect
+        .await
+        .expect("receiver connect task")
+        .expect("initial receiver connect");
 
     let established = wait_for_peer_event("established(peer)", &peer_events, |event| {
         matches!(event, PeerLifecycleEvent::Established { .. })
@@ -149,19 +161,33 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         }
     );
 
-    for _ in 0..5 {
-        receiver
-            .connect_addr(sender_addr)
-            .await
-            .expect("replacement connect");
-        sleep(Duration::from_millis(100)).await;
-
-        let health = sender.connection_health(&receiver_id).await;
-        if let Some(generation) = health.generation
-            && generation > initial_generation
-        {
-            break;
+    'replacement: for _ in 0..10 {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if peer_events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    PeerLifecycleEvent::Replaced {
+                        old_generation,
+                        new_generation,
+                    } if *old_generation == initial_generation && *new_generation > initial_generation
+                )
+            }) {
+                break 'replacement;
+            }
+            sleep(Duration::from_millis(20)).await;
         }
+
+        let sender_connect = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.connect_addr(receiver_addr).await })
+        };
+        let receiver_connect = {
+            let receiver = receiver.clone();
+            tokio::spawn(async move { receiver.connect_addr(sender_addr).await })
+        };
+        let _ = sender_connect.await.expect("sender replacement task");
+        let _ = receiver_connect.await.expect("receiver replacement task");
     }
 
     let replacement_generation =
@@ -296,6 +322,17 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
         .await;
     assert_eq!(closed_old_all, closed_old);
 
+    sleep(Duration::from_millis(200)).await;
+    let live_generation = sender
+        .connection_health(&receiver_id)
+        .await
+        .generation
+        .expect("sender should still have a live peer generation");
+    assert!(
+        live_generation >= replacement_generation,
+        "live generation {live_generation} should include the observed replacement {replacement_generation}"
+    );
+
     sender
         .disconnect(&receiver_id)
         .await
@@ -307,14 +344,14 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             PeerLifecycleEvent::Closing {
                 generation,
                 reason: ConnectionCloseReason::LifecycleCleanup,
-            } if *generation == replacement_generation
+            } if *generation == live_generation
         )
     })
     .await;
     assert_eq!(
         closing_live,
         PeerLifecycleEvent::Closing {
-            generation: replacement_generation,
+            generation: live_generation,
             reason: ConnectionCloseReason::LifecycleCleanup,
         }
     );
@@ -328,7 +365,7 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
                 PeerLifecycleEvent::Closing {
                     generation,
                     reason: ConnectionCloseReason::LifecycleCleanup,
-                } if *generation == replacement_generation
+                } if *generation == live_generation
             )
         },
     )
@@ -341,14 +378,14 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             PeerLifecycleEvent::Closed {
                 generation,
                 reason: ConnectionCloseReason::LifecycleCleanup,
-            } if *generation == replacement_generation
+            } if *generation == live_generation
         )
     })
     .await;
     assert_eq!(
         closed_live,
         PeerLifecycleEvent::Closed {
-            generation: replacement_generation,
+            generation: live_generation,
             reason: ConnectionCloseReason::LifecycleCleanup,
         }
     );
@@ -359,7 +396,7 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
                 PeerLifecycleEvent::Closed {
                     generation,
                     reason: ConnectionCloseReason::LifecycleCleanup,
-                } if *generation == replacement_generation
+                } if *generation == live_generation
             )
         })
         .await;

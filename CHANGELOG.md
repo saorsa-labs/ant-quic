@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+SOTA-Borrow Phase B (X0X-0045 + X0X-0046 + X0X-0047).
+
+### Added
+
+- `WeakConnectionHandle` (X0X-0045): observers can hold a reference to a
+  connection's identity without keeping it alive. Implements `is_alive`,
+  `upgrade`, `is_same_connection`. `Connection::weak_handle()` and
+  `Connection::on_closed()` exposed.
+- `Path` and `WeakPathHandle` read-only skeleton (X0X-0046): observers can
+  inspect per-path stats, remote address, and observed external address.
+  `Connection::paths()` and `Connection::path_stats(PathId)` added. The current
+  skeleton exposes only the primary single-path route (`PathId::PRIMARY`);
+  multipath wire format and selection land in Phase C (X0X-0049 / X0X-0050).
+  Path stats remain readable via `WeakPathHandle` after the underlying path
+  closes, via drop-time snapshot retention.
+- `UdpSender` trait split (X0X-0047): an `AsyncUdpSocket` can produce any
+  number of `UdpSender`s, each with an independent write-readiness
+  registration. Mirrors noq's runtime split.
+- `udp_sender_mock` and `path_stats_retention` integration tests.
+
+### Changed
+
+- **Breaking:** `AsyncUdpSocket` trait shape changed. `try_send`,
+  `create_io_poller`, and `max_transmit_segments` are removed. Implementors
+  now provide `create_sender(&self) -> Pin<Box<dyn UdpSender>>` and the
+  per-transmit segment cap moves onto the `UdpSender` trait. In-tree
+  implementors (`tokio.rs`, `dual_stack.rs`, `MasqueRelaySocket`) and the
+  call site in `endpoint.rs` are migrated.
+- Lifecycle test stabilization: `lifecycle_sender_stale` rewritten to use a
+  one-directional connect (a→b) so the stale-side selection is deterministic
+  and not a victim of the simultaneous-connect supersede race that the test
+  is not trying to exercise. `b_events_parity` now polls for the actual
+  `Replaced` lifecycle event rather than using local generation as a proxy.
+  Several other lifecycle tests had their concurrent-reconnect retry budgets
+  bumped 5→10 to absorb timing variance from the trait reshape.
+
+## [0.27.14] - 2026-05-09
+
+X0X-0055: LookupRegistry per-service stream drain fix.
+
+### Fixed
+
+- `ParallelLookupStream` now drains every address from every registered
+  service stream instead of dropping each per-service stream after its first
+  item.
+- Added regression coverage for multi-address lookup sources so the registry
+  surfaces all addresses from each service.
+
 ## [0.27.12] - 2026-05-07
 
 X0X-0037: duplicate-safe ACK-v2 timeout retry.

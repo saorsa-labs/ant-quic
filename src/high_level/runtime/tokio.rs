@@ -19,7 +19,7 @@ use tokio::{
     time::{Sleep, sleep_until},
 };
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper, UdpPoller};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper, UdpPoller, UdpSender};
 use crate::Instant;
 
 /// Tokio runtime implementation
@@ -38,7 +38,7 @@ impl Runtime for TokioRuntime {
     fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
         t.set_nonblocking(true)?;
         Ok(Arc::new(UdpSocket {
-            inner: tokio::net::UdpSocket::from_std(t)?,
+            inner: Arc::new(tokio::net::UdpSocket::from_std(t)?),
             may_fragment: true, // Default to true for now
         }))
     }
@@ -65,27 +65,21 @@ impl AsyncTimer for TokioTimer {
 /// Tokio UDP socket implementation
 #[derive(Debug)]
 struct UdpSocket {
-    inner: tokio::net::UdpSocket,
+    inner: Arc<tokio::net::UdpSocket>,
     may_fragment: bool,
 }
 
 impl AsyncUdpSocket for UdpSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(UdpPollHelper::new(move || {
-            let socket = self.clone();
-            async move {
-                loop {
-                    socket.inner.writable().await?;
-                    return Ok(());
-                }
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        let inner = Arc::clone(&self.inner);
+        let writable = Box::pin(UdpPollHelper::new({
+            let inner = Arc::clone(&inner);
+            move || {
+                let socket = Arc::clone(&inner);
+                async move { socket.writable().await }
             }
-        }))
-    }
-
-    fn try_send(&self, transmit: &quinn_udp::Transmit) -> io::Result<()> {
-        self.inner
-            .try_send_to(transmit.contents, transmit.destination)?;
-        Ok(())
+        }));
+        Box::pin(TokioUdpSender { inner, writable })
     }
 
     fn poll_recv(
@@ -126,6 +120,37 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn may_fragment(&self) -> bool {
         self.may_fragment
+    }
+}
+
+#[derive(Debug)]
+struct TokioUdpSender {
+    inner: Arc<tokio::net::UdpSocket>,
+    writable: Pin<Box<dyn UdpPoller>>,
+}
+
+impl UdpSender for TokioUdpSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &quinn_udp::Transmit,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            match self.writable.as_mut().poll_writable(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            match self
+                .inner
+                .try_send_to(transmit.contents, transmit.destination)
+            {
+                Ok(_) => return Poll::Ready(Ok(())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
     }
 }
 
