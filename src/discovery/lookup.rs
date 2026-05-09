@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures_util::stream::{FuturesUnordered, Stream, StreamExt};
+use futures_util::stream::{SelectAll, Stream, StreamExt};
 
 use crate::bootstrap_cache::BootstrapCache;
 use crate::link_transport::BoxStream;
@@ -156,8 +156,14 @@ impl LookupRegistry {
     /// service. Per-service errors are forwarded as `Err(LookupError)` items
     /// rather than terminating the overall stream — successful items from
     /// peer services keep flowing.
+    ///
+    /// Each per-service stream is drained to completion, so multi-address
+    /// sources (e.g. [`BootstrapCacheLookup`] backed by a peer with several
+    /// known addresses) surface every item, not just the first. See X0X-0055
+    /// for the bug history that motivated treating named lookups as streams
+    /// rather than futures.
     pub fn lookup(&self, peer_id: PeerId) -> ParallelLookupStream {
-        let inner = FuturesUnordered::new();
+        let mut inner = SelectAll::new();
 
         for service in &self.services {
             let service = Arc::clone(service);
@@ -171,27 +177,14 @@ impl LookupRegistry {
 /// A stream that drains `(name, item)` pairs from all registered services in
 /// parallel. Public so callers can hold it in their own state.
 pub struct ParallelLookupStream {
-    inner: FuturesUnordered<NamedLookup>,
+    inner: SelectAll<NamedLookup>,
 }
 
 impl Stream for ParallelLookupStream {
     type Item = (&'static str, Result<SocketAddr, LookupError>);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.inner.poll_next_unpin(cx) {
-                // A NamedLookup completed (its inner stream ended) — drop it
-                // and keep polling the rest.
-                Poll::Ready(Some(NamedLookupItem::Done)) => continue,
-                // A NamedLookup produced an item; forward it tagged with its
-                // service name so callers can audit per-source results.
-                Poll::Ready(Some(NamedLookupItem::Item(name, item))) => {
-                    return Poll::Ready(Some((name, item)));
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        self.inner.poll_next_unpin(cx)
     }
 }
 
@@ -203,11 +196,14 @@ impl std::fmt::Debug for ParallelLookupStream {
     }
 }
 
-enum NamedLookupItem {
-    Item(&'static str, Result<SocketAddr, LookupError>),
-    Done,
-}
-
+/// Per-service stream wrapper. Yields one tagged item per inner-stream item
+/// and terminates (returns `Poll::Ready(None)`) when the inner stream ends.
+///
+/// This is a `Stream`, not a `Future` — that distinction is load-bearing.
+/// Earlier (`ant-quic` 0.27.13, X0X-0038) `NamedLookup` was a `Future` that
+/// completed on the first inner item; combining many of them via
+/// `FuturesUnordered` silently dropped every address after the first per
+/// source. See X0X-0055.
 struct NamedLookup {
     name: &'static str,
     stream: BoxStream<'static, Result<SocketAddr, LookupError>>,
@@ -221,14 +217,14 @@ impl NamedLookup {
     }
 }
 
-impl std::future::Future for NamedLookup {
-    type Output = NamedLookupItem;
+impl Stream for NamedLookup {
+    type Item = (&'static str, Result<SocketAddr, LookupError>);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let name = self.name;
         match self.stream.as_mut().poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(NamedLookupItem::Item(name, item)),
-            Poll::Ready(None) => Poll::Ready(NamedLookupItem::Done),
+            Poll::Ready(Some(item)) => Poll::Ready(Some((name, item))),
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -652,6 +648,91 @@ mod tests {
             "fanout did not happen in parallel: elapsed = {:?}",
             start.elapsed()
         );
+    }
+
+    /// Regression test for X0X-0055: a service that yields N addresses for
+    /// the requested peer must surface all N items via the registry, not just
+    /// the first.
+    ///
+    /// The pre-fix `NamedLookup` was a `Future` that completed on the first
+    /// inner-stream item, so `FuturesUnordered<NamedLookup>` dropped the
+    /// underlying stream after one item. This test exercises a 3-source
+    /// registry where one source carries 3 addresses and asserts all three
+    /// surface.
+    #[tokio::test]
+    async fn registry_surfaces_all_addresses_per_service() {
+        let p = peer(11);
+
+        // Source A: 3 addresses for `p`.
+        let svc_a =
+            HardcodedLookup::from_pairs("multi-a", [(p, vec![addr(7100), addr(7101), addr(7102)])]);
+        // Source B: 1 address.
+        let svc_b = HardcodedLookup::from_pairs("single-b", [(p, vec![addr(7200)])]);
+        // Source C: error only.
+        struct ErrorOnly;
+        impl AddressLookup for ErrorOnly {
+            fn name(&self) -> &'static str {
+                "err-c"
+            }
+            fn lookup(
+                &self,
+                _peer_id: PeerId,
+            ) -> BoxStream<'static, Result<SocketAddr, LookupError>> {
+                Box::pin(futures_util::stream::iter(vec![Err(
+                    LookupError::transient("synthetic"),
+                )]))
+            }
+        }
+
+        let mut reg = LookupRegistry::new();
+        reg.add_service(svc_a);
+        reg.add_service(svc_b);
+        reg.add_service(ErrorOnly);
+
+        let items = drain_registry(reg.lookup(p)).await;
+        // 3 from multi-a + 1 from single-b + 1 from err-c = 5 total items.
+        assert_eq!(items.len(), 5, "expected 5 items (3+1+1), got: {:?}", items);
+
+        // All 3 multi-a addresses surfaced.
+        let multi_a_addrs: Vec<SocketAddr> = items
+            .iter()
+            .filter_map(|(name, r)| {
+                if *name == "multi-a" {
+                    r.as_ref().ok().copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            multi_a_addrs.len(),
+            3,
+            "multi-a must surface all 3 addresses, got: {:?}",
+            multi_a_addrs
+        );
+        assert!(multi_a_addrs.contains(&addr(7100)));
+        assert!(multi_a_addrs.contains(&addr(7101)));
+        assert!(multi_a_addrs.contains(&addr(7102)));
+
+        // single-b's one address surfaced.
+        let single_b_addrs: Vec<SocketAddr> = items
+            .iter()
+            .filter_map(|(name, r)| {
+                if *name == "single-b" {
+                    r.as_ref().ok().copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(single_b_addrs, vec![addr(7200)]);
+
+        // err-c's error surfaced.
+        let err_c_count = items
+            .iter()
+            .filter(|(name, r)| *name == "err-c" && r.is_err())
+            .count();
+        assert_eq!(err_c_count, 1);
     }
 
     /// Registry survives a service whose stream is empty (no items, no error).
