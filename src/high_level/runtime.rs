@@ -47,23 +47,15 @@ pub trait AsyncTimer: Send + Debug + 'static {
 
 /// Abstract implementation of a UDP socket for runtime independence
 pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
-    /// Create a [`UdpPoller`] that can register a single task for write-readiness notifications
+    /// Create a [`UdpSender`] with independent write-readiness notifications.
     ///
-    /// A `poll_send` method on a single object can usually store only one [`Waker`] at a time,
-    /// i.e. allow at most one caller to wait for an event. This method allows any number of
-    /// interested tasks to construct their own [`UdpPoller`] object. They can all then wait for the
-    /// same event and be notified concurrently, because each [`UdpPoller`] can store a separate
-    /// [`Waker`].
+    /// A `poll_send` method on a single object can usually store only one
+    /// [`Waker`] at a time. This method allows any number of interested tasks
+    /// to construct their own [`UdpSender`] object, each with a separate
+    /// readiness registration.
     ///
     /// [`Waker`]: std::task::Waker
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>>;
-
-    /// Send UDP datagrams from `transmits`, or return `WouldBlock` and clear the underlying
-    /// socket's readiness, or return an I/O error
-    ///
-    /// If this returns [`io::ErrorKind::WouldBlock`], [`UdpPoller::poll_writable`] must be called
-    /// to register the calling task to be woken when a send should be attempted again.
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()>;
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>>;
 
     /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
     fn poll_recv(
@@ -75,11 +67,6 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
 
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
-
-    /// Maximum number of datagrams that a [`Transmit`] may encode
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
 
     /// Maximum number of datagrams that might be described by a single [`RecvMeta`]
     fn max_receive_segments(&self) -> usize {
@@ -95,11 +82,33 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     }
 }
 
+/// An object for asynchronously writing to an associated [`AsyncUdpSocket`].
+///
+/// Any number of `UdpSender`s may exist for a single socket. Each sender is
+/// responsible for notifying at most one task for send readiness.
+pub trait UdpSender: Send + Sync + Debug + 'static {
+    /// Send a UDP datagram, or register to be woken if sending may succeed in
+    /// the future.
+    ///
+    /// A single `UdpSender` is reused even after returning `Ready`, unlike a
+    /// `Future`, so implementations must tolerate repeated calls.
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>>;
+
+    /// Maximum number of datagrams that a [`Transmit`] may encode.
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+}
+
 /// An object polled to detect when an associated [`AsyncUdpSocket`] is writable
 ///
 /// Any number of `UdpPoller`s may exist for a single [`AsyncUdpSocket`]. Each `UdpPoller` is
 /// responsible for notifying at most one task when that socket becomes writable.
-pub trait UdpPoller: Send + Sync + Debug + 'static {
+pub(crate) trait UdpPoller: Send + Sync + Debug + 'static {
     /// Check whether the associated socket is likely to be writable
     ///
     /// Must be called after [`AsyncUdpSocket::try_send`] returns [`io::ErrorKind::WouldBlock`] to

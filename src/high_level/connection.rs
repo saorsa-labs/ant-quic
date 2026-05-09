@@ -13,7 +13,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Weak},
     task::{Context, Poll, Waker, ready},
 };
 
@@ -28,13 +28,15 @@ use super::{
     ConnectionEvent,
     mutex::Mutex,
     recv_stream::RecvStream,
-    runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
+    runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender},
     send_stream::SendStream,
     udp_transmit,
 };
 use crate::{
     ConnectionError, ConnectionHandle, ConnectionStats, DatagramDropStats, Dir, Duration,
-    EndpointEvent, Instant, Side, StreamEvent, StreamId, VarInt, congestion::Controller,
+    EndpointEvent, Instant, Side, StreamEvent, StreamId, VarInt,
+    congestion::Controller,
+    path::{Path, PathId, PathSnapshot},
 };
 
 /// In-progress connection attempt future
@@ -391,6 +393,34 @@ impl Future for ConnectionDriver {
 #[derive(Debug, Clone)]
 pub struct Connection(ConnectionRef);
 
+/// Weak handle to a QUIC connection.
+///
+/// This lets observers retain a reference to connection identity without
+/// keeping the connection alive.
+#[derive(Debug, Clone)]
+pub struct WeakConnectionHandle(Weak<ConnectionInner>);
+
+impl WeakConnectionHandle {
+    /// Returns true while the connection still exists and has not closed.
+    pub fn is_alive(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|inner| inner.state.lock("weak_is_alive").error.is_none())
+    }
+
+    /// Upgrade to a strong connection handle if the connection state still exists.
+    pub fn upgrade(&self) -> Option<Connection> {
+        let conn = ConnectionRef(self.0.upgrade()?);
+        conn.state.lock("weak_upgrade").ref_count += 1;
+        Some(Connection(conn))
+    }
+
+    /// Returns true if both weak handles refer to the same connection allocation.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
 impl Connection {
     /// Initiate a new outgoing unidirectional stream.
     ///
@@ -478,6 +508,49 @@ impl Connection {
             .as_ref()
             .unwrap_or_else(|| &crate::connection::ConnectionError::LocallyClosed)
             .clone()
+    }
+
+    /// Wait for the connection to be closed for any reason.
+    pub fn on_closed(&self) -> impl Future<Output = ConnectionError> + '_ {
+        self.closed()
+    }
+
+    /// Downgrade this connection to a weak handle.
+    pub fn weak_handle(&self) -> WeakConnectionHandle {
+        WeakConnectionHandle(Arc::downgrade(&self.0.0))
+    }
+
+    /// Return read-only handles for the connection's currently known paths.
+    ///
+    /// The current high-level API exposes the primary single-path route. Future
+    /// multipath support will extend this list without changing the handle
+    /// shape.
+    pub fn paths(&self) -> Vec<Path> {
+        self.path_snapshot(PathId::PRIMARY)
+            .map(|snapshot| Path::new(self.weak_handle(), PathId::PRIMARY, snapshot))
+            .into_iter()
+            .collect()
+    }
+
+    /// Return statistics for a path if the path is currently known.
+    pub fn path_stats(&self, id: PathId) -> Option<crate::connection::PathStats> {
+        self.path_snapshot(id).map(|snapshot| snapshot.stats)
+    }
+
+    pub(crate) fn path_snapshot(&self, id: PathId) -> Option<PathSnapshot> {
+        if id != PathId::PRIMARY {
+            return None;
+        }
+
+        let conn = self.0.state.lock("path_snapshot");
+        let stats = conn.inner.stats().path;
+        let remote_address = conn.inner.remote_address();
+        let observed_external_addr = conn.inner.observed_address();
+        Some(PathSnapshot {
+            stats,
+            remote_address,
+            observed_external_addr,
+        })
     }
 
     /// Check if this connection is still alive (not closed or draining).
@@ -1181,7 +1254,7 @@ impl ConnectionRef {
                 error: None,
                 ref_count: 0,
                 datagram_drop_events: VecDeque::new(),
-                io_poller: socket.clone().create_io_poller(),
+                udp_sender: socket.create_sender(),
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
@@ -1267,7 +1340,7 @@ pub(crate) struct State {
     ref_count: usize,
     datagram_drop_events: VecDeque<DatagramDropStats>,
     socket: Arc<dyn AsyncUdpSocket>,
-    io_poller: Pin<Box<dyn UdpPoller>>,
+    udp_sender: Pin<Box<dyn UdpSender>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
@@ -1282,7 +1355,7 @@ impl State {
         let mut transmits = 0;
 
         let max_datagrams = self
-            .socket
+            .udp_sender
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
@@ -1309,19 +1382,13 @@ impl State {
                 }
             };
 
-            if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
-                // Retry after a future wakeup
-                self.buffered_transmit = Some(t);
-                return Ok(false);
-            }
-
             // X0X-0043 GSO bundle accounting. We only count multi-segment
             // bundles (`segment_size.is_some()` and segment count > 1);
             // single datagrams are not GSO bundles and would muddy the
             // "did GSO actually fire?" question this telemetry exists to
             // answer. See `crate::diagnostics::gso` module docs for the
             // current observability limitation: ant-quic's in-tree
-            // `AsyncUdpSocket` impls return `max_transmit_segments() = 1`
+            // `UdpSender` impls return `max_transmit_segments() = 1`
             // and use `try_send_to(transmit.contents, ...)`, so under
             // current code paths `t.segment_size` is `None` and this
             // branch is dead until kernel GSO is wired into the runtime.
@@ -1330,41 +1397,36 @@ impl State {
                 _ => 1,
             };
             let is_gso_bundle = segment_count > 1;
-            if is_gso_bundle {
-                crate::diagnostics::gso_diagnostics().record_bundle_submitted(segment_count);
-            }
 
             let len = t.size;
-            let retry = match self
-                .socket
-                .try_send(&udp_transmit(&t, &self.send_buffer[..len]))
+            match self
+                .udp_sender
+                .as_mut()
+                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
-                Ok(()) => false,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(e) => {
-                    // X0X-0043: a GSO bundle that we already accounted as
-                    // submitted now has a hard error from the kernel send
-                    // path. The closest measurable proxy for a "partial
-                    // send" today (the runtime impls call `try_send_to`
-                    // which is whole-or-nothing) is exactly this: an
-                    // error after the bundle counter has already
-                    // incremented. When the runtime is rewritten to use
-                    // `quinn_udp::UdpSocketState::send`, the per-segment
-                    // delivered count it returns will replace this
-                    // heuristic.
+                Poll::Pending => {
+                    self.buffered_transmit = Some(t);
+                    return Ok(false);
+                }
+                Poll::Ready(Ok(())) => {
                     if is_gso_bundle {
+                        crate::diagnostics::gso_diagnostics()
+                            .record_bundle_submitted(segment_count);
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    // X0X-0043: a hard error from the kernel send path is
+                    // the closest measurable proxy for a "partial send"
+                    // today. When the runtime is rewritten to use
+                    // `quinn_udp::UdpSocketState::send`, the per-segment
+                    // delivered count it returns will replace this heuristic.
+                    if is_gso_bundle {
+                        crate::diagnostics::gso_diagnostics()
+                            .record_bundle_submitted(segment_count);
                         crate::diagnostics::gso_diagnostics().record_bundle_partial_send();
                     }
                     return Err(e);
                 }
-            };
-            if retry {
-                // We thought the socket was writable, but it wasn't. Retry so that either another
-                // `poll_writable` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                self.buffered_transmit = Some(t);
-                continue;
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
@@ -1396,7 +1458,7 @@ impl State {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
                     self.socket = socket;
-                    self.io_poller = self.socket.clone().create_io_poller();
+                    self.udp_sender = self.socket.create_sender();
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
@@ -1612,6 +1674,93 @@ impl Drop for State {
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("State").field("inner", &self.inner).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio::time::{Duration, timeout};
+
+    use crate::config::{ClientConfig, ServerConfig};
+    use crate::high_level::Endpoint;
+
+    fn gen_self_signed_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_der = CertificateDer::from(cert.cert);
+        let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        (vec![cert_der], key_der)
+    }
+
+    fn client_config(chain: &[CertificateDer<'static>]) -> ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in chain.iter().cloned() {
+            roots.add(cert).expect("add root");
+        }
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config")
+    }
+
+    #[tokio::test]
+    async fn weak_connection_handle_does_not_keep_connection_alive() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let (chain, key) = gen_self_signed_cert();
+        let server_config =
+            ServerConfig::with_single_cert(chain.clone(), key).expect("server config");
+        let server =
+            Endpoint::server(server_config, ([127, 0, 0, 1], 0).into()).expect("server endpoint");
+        let server_addr = server.local_addr().expect("server local addr");
+
+        let server_task = tokio::spawn(async move {
+            let incoming = timeout(Duration::from_secs(10), server.accept())
+                .await
+                .expect("server accept wait")
+                .expect("incoming connection");
+            let conn = timeout(Duration::from_secs(10), incoming)
+                .await
+                .expect("server handshake wait")
+                .expect("server handshake");
+            let _ = timeout(Duration::from_secs(10), conn.closed()).await;
+        });
+
+        let mut client = Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client endpoint");
+        client.set_default_client_config(client_config(&chain));
+        let connecting = client
+            .connect(server_addr, "localhost")
+            .expect("connect start");
+        let conn = timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("client handshake wait")
+            .expect("client handshake");
+
+        let weak = conn.weak_handle();
+        assert!(weak.is_alive());
+
+        let upgraded = weak.upgrade().expect("weak upgrade while live");
+        assert!(weak.is_same_connection(&upgraded.weak_handle()));
+        drop(upgraded);
+
+        conn.close(0u32.into(), b"x0x-0045");
+        let _ = timeout(Duration::from_secs(10), conn.on_closed())
+            .await
+            .expect("client closed");
+        assert!(!weak.is_alive());
+
+        drop(conn);
+        drop(client);
+
+        timeout(Duration::from_secs(10), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("weak handle released after strong handles dropped");
+
+        server_task.await.expect("server task");
     }
 }
 

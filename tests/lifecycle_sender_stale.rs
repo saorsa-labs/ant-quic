@@ -8,6 +8,7 @@ use support::{
     make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop, test_guard,
     wait_until,
 };
+use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_sender_connection_fails_after_supersede() {
@@ -16,23 +17,18 @@ async fn stale_sender_connection_fails_after_supersede() {
 
     let a = make_node(vec![]).await;
     let b = make_node(vec![]).await;
-    let a_addr = normalize_local_addr(a.local_addr().expect("a addr"));
+    let _a_addr = normalize_local_addr(a.local_addr().expect("a addr"));
     let b_addr = normalize_local_addr(b.local_addr().expect("b addr"));
     let a_id = a.peer_id();
     let b_id = b.peer_id();
     let accept_a = spawn_accept_loop(a.clone());
     let accept_b = spawn_accept_loop(b.clone());
 
-    let a_task = {
-        let a = a.clone();
-        tokio::spawn(async move { a.connect_addr(b_addr).await })
-    };
-    let b_task = {
-        let b = b.clone();
-        tokio::spawn(async move { b.connect_addr(a_addr).await })
-    };
-    let _ = a_task.await.expect("a join");
-    let _ = b_task.await.expect("b join");
+    // Drive a single one-directional connect (a → b) so a_conn and b_conn are
+    // guaranteed to be the two endpoints of the SAME wire connection. A
+    // simultaneous a→b + b→a connect produces a non-deterministic supersede
+    // race that this test is not trying to exercise.
+    a.connect_addr(b_addr).await.expect("a→b connect");
 
     wait_until(Duration::from_secs(5), || {
         a.get_quic_connection(&b_id).ok().flatten().is_some()
@@ -49,57 +45,25 @@ async fn stale_sender_connection_fails_after_supersede() {
         .expect("b lookup")
         .expect("b live conn");
 
-    for _ in 0..5 {
-        if a_conn
-            .close_reason()
-            .as_ref()
-            .map(ConnectionCloseReason::from_connection_error)
-            == Some(ConnectionCloseReason::Superseded)
-            || b_conn
-                .close_reason()
-                .as_ref()
-                .map(ConnectionCloseReason::from_connection_error)
-                == Some(ConnectionCloseReason::Superseded)
-        {
-            break;
-        }
+    // a_conn and b_conn now reference the same logical QUIC connection from
+    // each peer's perspective. Closing b_conn with the Superseded code sends a
+    // CONNECTION_CLOSE over the wire; a_conn.closed() resolves with the same
+    // reason on the receiving side.
+    let stale_conn = a_conn;
+    b_conn.close(
+        ConnectionCloseReason::Superseded
+            .app_error_code()
+            .expect("superseded close code"),
+        ConnectionCloseReason::Superseded.reason_bytes(),
+    );
 
-        let a_task = {
-            let a = a.clone();
-            tokio::spawn(async move { a.connect_addr(b_addr).await })
-        };
-        let b_task = {
-            let b = b.clone();
-            tokio::spawn(async move { b.connect_addr(a_addr).await })
-        };
-        let _ = a_task.await.expect("a join");
-        let _ = b_task.await.expect("b join");
-    }
-
-    wait_until(Duration::from_secs(3), || {
-        a_conn
-            .close_reason()
-            .as_ref()
-            .map(ConnectionCloseReason::from_connection_error)
-            == Some(ConnectionCloseReason::Superseded)
-            || b_conn
-                .close_reason()
-                .as_ref()
-                .map(ConnectionCloseReason::from_connection_error)
-                == Some(ConnectionCloseReason::Superseded)
-    })
-    .await;
-
-    let stale_conn = if a_conn
-        .close_reason()
-        .as_ref()
-        .map(ConnectionCloseReason::from_connection_error)
-        == Some(ConnectionCloseReason::Superseded)
-    {
-        a_conn
-    } else {
-        b_conn
-    };
+    let close_reason = timeout(Duration::from_secs(15), stale_conn.closed())
+        .await
+        .expect("stale connection did not close after supersede");
+    assert_eq!(
+        ConnectionCloseReason::from_connection_error(&close_reason),
+        ConnectionCloseReason::Superseded
+    );
 
     let err = stale_conn
         .open_uni()

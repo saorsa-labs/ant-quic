@@ -193,6 +193,8 @@ pub mod endpoint;
 pub mod frame;
 /// QUIC packet structures and processing
 pub mod packet;
+/// Read-only path handles and path identifiers
+pub mod path;
 /// Shared types and utilities
 pub mod shared;
 /// Transport error types and codes
@@ -293,8 +295,9 @@ pub mod high_level;
 // Re-export high-level API types for easier usage
 pub use high_level::{
     Accept, Connecting, Connection as HighLevelConnection, Endpoint,
-    RecvStream as HighLevelRecvStream, SendStream as HighLevelSendStream,
+    RecvStream as HighLevelRecvStream, SendStream as HighLevelSendStream, WeakConnectionHandle,
 };
+pub use path::{Path, PathId, WeakPathHandle};
 
 // Link transport abstraction layer for overlay networks
 pub mod link_transport;
@@ -339,8 +342,8 @@ pub use candidate_discovery::{
 pub use connection::nat_traversal::{CandidateSource, CandidateState};
 pub use connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, DatagramDropStats,
-    Datagrams, Event, FinishError, ReadError, ReadableError, RecvStream, SendDatagramError,
-    SendStream, StreamEvent, Streams, WriteError, Written,
+    Datagrams, Event, FinishError, PathStats, ReadError, ReadableError, RecvStream,
+    SendDatagramError, SendStream, StreamEvent, Streams, WriteError, Written,
 };
 pub use coordinator_control::RejectionReason;
 pub use endpoint::{
