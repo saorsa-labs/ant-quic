@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.15] - 2026-05-10
+
+SOTA-Borrow Phase B (X0X-0045 + X0X-0046 + X0X-0047) and X0X-0060 ACK retry
+budget fix.
+
+### Fixed
+
+- **X0X-0060:** `ACK_TIMEOUT_RETRY_TIMEOUT` raised from 2 s to 6 s. The
+  duplicate-safe ACK-v2 retry path was clipping caller WAN-class budgets
+  via `std::cmp::min(caller_budget, RETRY_CAP)`, causing ACK-v2 false
+  negatives on the longest cross-region paths under sustained load: the
+  receiver admitted the payload (X0X-0037 dedupe makes the replay safe) but
+  the ACK response write completed after the sender had reset the response
+  stream. Surfaced by the x0x 0.19.33 4 h broad-launch soak (9/16 GO; 5×
+  nuremberg→singapore + 1× helsinki→sydney ACK timeouts). The retry-budget
+  calculation is now extracted into `Self::ack_timeout_retry_timeout` with
+  unit-test coverage of the WAN-class, short-diagnostic, and very-large
+  caller-budget regimes. No wire-format change.
+
 SOTA-Borrow Phase B (X0X-0045 + X0X-0046 + X0X-0047).
 
 ### Added
