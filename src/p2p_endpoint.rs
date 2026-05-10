@@ -116,8 +116,14 @@ const ACK_RECEIVE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 /// receiver budget exposes response-write starvation directly instead of
 /// burying it inside an opaque sender timeout.
 const ACK_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
-/// Retry budget for the duplicate-safe ACK-v2 retry after sender timeout.
-const ACK_TIMEOUT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound for the duplicate-safe ACK-v2 retry after sender timeout.
+///
+/// The retry reuses the original ACK-v2 request ID, so the receiver can replay
+/// an already-accepted outcome without delivering the payload twice. This needs
+/// to be large enough for WAN tails: a 2s retry cap caused repeated false
+/// negatives on long cross-region paths where the receiver admitted the
+/// payload but the sender had already timed out and reset the response stream.
+const ACK_TIMEOUT_RETRY_TIMEOUT: Duration = Duration::from_secs(6);
 /// ACK-v2 request/response stream priority.
 const ACK_STREAM_PRIORITY: i32 = 16;
 /// Probe request/response stream priority. Probes are diagnostic traffic and
@@ -6259,7 +6265,7 @@ impl P2pEndpoint {
         }
 
         self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryAttempted);
-        let retry_timeout = std::cmp::min(timeout_duration, ACK_TIMEOUT_RETRY_TIMEOUT);
+        let retry_timeout = Self::ack_timeout_retry_timeout(timeout_duration);
         if retry_timeout.is_zero() {
             self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
             return first;
@@ -6278,6 +6284,10 @@ impl P2pEndpoint {
                 Err(error)
             }
         }
+    }
+
+    fn ack_timeout_retry_timeout(timeout_duration: Duration) -> Duration {
+        std::cmp::min(timeout_duration, ACK_TIMEOUT_RETRY_TIMEOUT)
     }
 
     fn record_ack_retry_outcome(&self, peer_id: PeerId, outcome: AckOutcome) {
@@ -8624,6 +8634,25 @@ mod tests {
     // ------------------------------------------------------------------
     // ACK request dedupe
     // ------------------------------------------------------------------
+
+    #[test]
+    fn ack_timeout_retry_budget_preserves_wan_class_caller_timeout() {
+        assert_eq!(
+            P2pEndpoint::ack_timeout_retry_timeout(Duration::from_secs(6)),
+            Duration::from_secs(6),
+            "X0X-0060: a 6s cross-region ACK budget must not be clipped to the old 2s retry cap"
+        );
+        assert_eq!(
+            P2pEndpoint::ack_timeout_retry_timeout(Duration::from_millis(750)),
+            Duration::from_millis(750),
+            "short diagnostic budgets remain caller-bounded"
+        );
+        assert_eq!(
+            P2pEndpoint::ack_timeout_retry_timeout(Duration::from_secs(30)),
+            ACK_TIMEOUT_RETRY_TIMEOUT,
+            "very large caller budgets are still capped for retry"
+        );
+    }
 
     #[test]
     fn ack_request_dedupe_replays_matching_request_id_once() {
