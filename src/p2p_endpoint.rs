@@ -1946,6 +1946,13 @@ pub enum DisconnectReason {
     ConnectionLost,
     /// Remote closed
     RemoteClosed,
+    /// X0X-0062: the application-layer liveness detector concluded the data
+    /// path is half-dead (5 consecutive ACK-v2 retry double-failures within
+    /// 60 s while QUIC keepalives still report the connection as `Live`).
+    /// Differs from `Timeout`: that's the QUIC transport idle-timer firing;
+    /// this is the application observing that nothing is getting through
+    /// despite QUIC saying everything is fine.
+    LivenessTimeout,
 }
 
 fn close_reason_from_connection(
@@ -2002,6 +2009,7 @@ fn close_reason_for_disconnect(reason: &DisconnectReason) -> ConnectionCloseReas
         DisconnectReason::AuthenticationFailed => ConnectionCloseReason::Banned,
         DisconnectReason::ConnectionLost => ConnectionCloseReason::ReaderExit,
         DisconnectReason::RemoteClosed => ConnectionCloseReason::ConnectionClosed,
+        DisconnectReason::LivenessTimeout => ConnectionCloseReason::LivenessTimeout,
     }
 }
 
@@ -6364,7 +6372,8 @@ impl P2pEndpoint {
             // Reviewer P1.1: this path previously bypassed the tracker, so
             // first-attempt successes between retry failures did not reset
             // the counter.
-            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
+            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success)
+                .await;
             return first;
         }
 
@@ -6374,7 +6383,8 @@ impl P2pEndpoint {
             self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
             // No retry was actually attempted; treat as a single timeout
             // event for liveness purposes (no remote evidence either way).
-            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout);
+            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout)
+                .await;
             return first;
         }
 
@@ -6384,7 +6394,8 @@ impl P2pEndpoint {
         match retry {
             Ok(()) => {
                 self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryAccepted);
-                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success)
+                    .await;
                 Ok(())
             }
             Err(EndpointError::AckTimeout) => {
@@ -6392,7 +6403,8 @@ impl P2pEndpoint {
                 // Reviewer P1.2: only a true AckTimeout on the retry path
                 // signals half-dead. Non-timeout retry errors (handled in
                 // the next arm) prove the remote responded.
-                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout);
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout)
+                    .await;
                 Err(EndpointError::AckTimeout)
             }
             Err(error) => {
@@ -6400,7 +6412,8 @@ impl P2pEndpoint {
                 // X0X-0062 P1.2: the remote responded on retry with a
                 // non-timeout terminal outcome (Rejected, ConnectionClosed,
                 // invalid response). Path is alive — reset the tracker.
-                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success)
+                    .await;
                 Err(error)
             }
         }
@@ -6439,7 +6452,7 @@ impl P2pEndpoint {
     /// (`ReceiveRejected`, `ConnectionClosed`, `Connection`) prove the
     /// remote responded — the data path is alive, just rejecting this send.
     /// Those outcomes reset the tracker.
-    fn record_ack_liveness_signal(&self, peer_id: PeerId, signal: AckLivenessSignal) {
+    async fn record_ack_liveness_signal(&self, peer_id: PeerId, signal: AckLivenessSignal) {
         let connection = self.inner.get_connection(&peer_id).ok().flatten();
         let stable_id = match connection.as_ref() {
             Some(connection) => connection.stable_id(),
@@ -6453,7 +6466,8 @@ impl P2pEndpoint {
                 if self.ack_liveness.record_failure(peer_id, stable_id)
                     && let Some(connection) = connection
                 {
-                    self.trigger_liveness_close(peer_id, stable_id, &connection);
+                    self.trigger_liveness_close(peer_id, stable_id, &connection)
+                        .await;
                 }
             }
         }
@@ -6461,11 +6475,31 @@ impl P2pEndpoint {
 
     /// X0X-0062: force-close a connection whose data path is half-dead.
     /// Called when `AckLivenessTracker` confirms `LIVENESS_FAILURE_THRESHOLD`
-    /// consecutive ACK retry failures within `LIVENESS_FAILURE_WINDOW`. Emits
-    /// `Closing { LivenessTimeout } + Closed { LivenessTimeout }` lifecycle
-    /// events so application-layer races (e.g. x0x's X0X-0053 mid-send race)
-    /// can detect the close and re-dial on a fresh QUIC connection.
-    fn trigger_liveness_close(
+    /// consecutive ACK retry failures within `LIVENESS_FAILURE_WINDOW`.
+    ///
+    /// Reviewer P2 (round 2): the original implementation only emitted
+    /// `Closing/Closed{LivenessTimeout}` lifecycle events and called
+    /// `Connection::close()` directly. Quinn's local close became
+    /// `ConnectionError::LocallyClosed` in the connection-state machine, and
+    /// the connection itself remained in `connected_peers` until a later
+    /// reaper run — so `is_connected()` could still return true after the
+    /// liveness close, and any later `close_reason_from_connection` query
+    /// would downgrade the diagnostic from `LivenessTimeout` to
+    /// `LocallyClosed`. Now the trigger site invokes the existing
+    /// `cleanup_connection(DisconnectReason::LivenessTimeout)` helper, which
+    /// `close_reason_for_disconnect` maps to `LivenessTimeout`. That path:
+    /// 1. emits `Closing{LivenessTimeout}`
+    /// 2. calls `remove_connection_with_reason(LivenessTimeout)` on the
+    ///    inner NAT-traversal endpoint — removing the connection from the
+    ///    state map AND tagging the inner record with LivenessTimeout
+    /// 3. emits `Closed{LivenessTimeout}`
+    /// 4. fails any in-flight ACK waiters with `LivenessTimeout` close reason
+    /// 5. tears down reader handles + removes the peer from `connected_peers`
+    ///
+    /// Result: `is_connected(peer_id)` immediately returns false after the
+    /// trigger, and the LivenessTimeout reason is preserved everywhere
+    /// downstream rather than getting downgraded to LocallyClosed.
+    async fn trigger_liveness_close(
         &self,
         peer_id: PeerId,
         stable_id: usize,
@@ -6476,20 +6510,6 @@ impl P2pEndpoint {
             self.ack_liveness.forget(peer_id, stable_id);
             return;
         }
-        let reason = ConnectionCloseReason::LivenessTimeout;
-        // LivenessTimeout is guaranteed to have a reserved app error code
-        // by ConnectionCloseReason::app_error_code; if a future refactor
-        // drops the mapping, fall back to LifecycleCleanup (also lifecycle-
-        // reserved) and if that somehow returns None too, abandon the force-
-        // close rather than panic — the caller will retry on next failure
-        // and the assertion in the unit test would catch the regression.
-        let Some(code) = reason
-            .app_error_code()
-            .or_else(|| ConnectionCloseReason::LifecycleCleanup.app_error_code())
-        else {
-            self.ack_liveness.forget(peer_id, stable_id);
-            return;
-        };
         tracing::warn!(
             peer_id = %peer_id,
             stable_id = stable_id,
@@ -6499,24 +6519,17 @@ impl P2pEndpoint {
             LIVENESS_FAILURE_THRESHOLD,
             LIVENESS_FAILURE_WINDOW.as_secs(),
         );
-
-        // Emit Closing+Closed lifecycle events before invoking the actual
-        // close so observers see the LivenessTimeout reason — the generic
-        // close paths downstream may map the application-close code back to
-        // LivenessTimeout via from_app_error_code, but emitting here keeps the
-        // signal source-of-truth at the trigger site.
-        if let Some(generation) = self.peer_event_generations.read().get(&peer_id).copied() {
-            self.emit_peer_lifecycle_event(
-                peer_id,
-                PeerLifecycleEvent::Closing { generation, reason },
-            );
-            self.emit_peer_lifecycle_event(
-                peer_id,
-                PeerLifecycleEvent::Closed { generation, reason },
-            );
-        }
-        connection.close(code, reason.reason_bytes());
+        // Drop the tracker entry FIRST so a successful re-dial that lands on
+        // the same (peer, stable_id) — vanishingly unlikely but defensive —
+        // gets a clean slate.
         self.ack_liveness.forget(peer_id, stable_id);
+        // cleanup_connection is the source-of-truth disconnect path. With
+        // DisconnectReason::LivenessTimeout it threads LivenessTimeout through
+        // every layer: lifecycle events, inner state machine, ACK waiters,
+        // reader handles, connected_peers, stats, and the user-facing event
+        // channel. After this returns, `is_connected(peer_id)` is false.
+        self.cleanup_connection(&peer_id, DisconnectReason::LivenessTimeout)
+            .await;
     }
 
     async fn send_ack_exchange_once(
@@ -9018,6 +9031,48 @@ mod tests {
         }
         // And the very next failure tips the (fresh) threshold cleanly.
         assert!(tracker.record_failure(peer, stable_id));
+    }
+
+    /// X0X-0062 P2 (round 2) reviewer regression: `DisconnectReason::LivenessTimeout`
+    /// must thread `ConnectionCloseReason::LivenessTimeout` through the
+    /// `close_reason_for_disconnect` mapping consumed by `cleanup_connection`.
+    /// Without this mapping, `trigger_liveness_close`'s call to
+    /// `cleanup_connection(DisconnectReason::LivenessTimeout)` would still
+    /// invoke the do_cleanup_connection path — but the inner
+    /// `remove_connection_with_reason(close_reason)` would tag the connection
+    /// with the wrong reason, the `Closing/Closed` lifecycle events would
+    /// emit the wrong reason, and any downstream observer would see
+    /// LocallyClosed or LifecycleCleanup instead of the actual LivenessTimeout
+    /// signal. This test pins the mapping.
+    #[test]
+    fn disconnect_reason_liveness_timeout_maps_to_close_reason_liveness_timeout() {
+        assert_eq!(
+            close_reason_for_disconnect(&DisconnectReason::LivenessTimeout),
+            ConnectionCloseReason::LivenessTimeout,
+            "DisconnectReason::LivenessTimeout (used by trigger_liveness_close \
+             when the X0X-0062 detector fires) must thread LivenessTimeout \
+             through the disconnect-reason mapping consumed by \
+             cleanup_connection — otherwise the close-reason gets downgraded \
+             to LocallyClosed or LifecycleCleanup downstream and the \
+             LivenessTimeout signal is lost (reviewer P2 round 2)"
+        );
+        // And every other variant must NOT collide on LivenessTimeout (so a
+        // future-added variant can't accidentally map to LivenessTimeout and
+        // silently force-close peers).
+        for other in [
+            DisconnectReason::Normal,
+            DisconnectReason::Timeout,
+            DisconnectReason::ProtocolError("x".to_string()),
+            DisconnectReason::AuthenticationFailed,
+            DisconnectReason::ConnectionLost,
+            DisconnectReason::RemoteClosed,
+        ] {
+            assert_ne!(
+                close_reason_for_disconnect(&other),
+                ConnectionCloseReason::LivenessTimeout,
+                "only DisconnectReason::LivenessTimeout should map to ConnectionCloseReason::LivenessTimeout"
+            );
+        }
     }
 
     /// X0X-0062 P2 reviewer regression: `LivenessTimeout` must round-trip

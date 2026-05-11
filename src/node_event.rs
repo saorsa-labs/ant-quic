@@ -399,6 +399,12 @@ impl From<P2pDisconnectReason> for DisconnectReason {
             }
             P2pDisconnectReason::ConnectionLost => Self::Reset,
             P2pDisconnectReason::RemoteClosed => Self::ApplicationClose,
+            // X0X-0062: a liveness-timeout disconnect maps to Timeout from
+            // the user-facing event surface — same shape as a transport
+            // idle-timeout. The LivenessTimeout-specific close reason is
+            // preserved at the lifecycle-event layer for observers that need
+            // to distinguish the two.
+            P2pDisconnectReason::LivenessTimeout => Self::Timeout,
         }
     }
 }

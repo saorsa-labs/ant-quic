@@ -537,6 +537,16 @@ impl P2pLinkTransport {
                                 crate::p2p_endpoint::DisconnectReason::ConnectionLost => {
                                     DisconnectReason::Reset
                                 }
+                                crate::p2p_endpoint::DisconnectReason::LivenessTimeout => {
+                                    // X0X-0062: from this transport's view a
+                                    // liveness-timeout looks the same as a
+                                    // transport timeout — the application
+                                    // concluded the path is dead. The
+                                    // distinction is preserved in lifecycle
+                                    // events; this surface is the simpler
+                                    // user-facing channel.
+                                    DisconnectReason::Timeout
+                                }
                             };
                             // Update capabilities cache
                             if let Ok(mut state) = state.write() {
