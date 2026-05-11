@@ -1324,6 +1324,22 @@ pub struct AckDiagnosticsSnapshot {
     pub peers: Vec<AckPeerDiagnosticsSnapshot>,
 }
 
+/// X0X-0062: liveness signal emitted from `send_with_receive_ack_with_timeout`
+/// after each decision point so the `AckLivenessTracker` observes every
+/// outcome, not just retry outcomes.
+///
+/// - `Success` — any outcome that proves the remote responded: first-attempt
+///   success, retry success, or any non-timeout terminal error (Rejected,
+///   ConnectionClosed, invalid response — peer answered, just not OK).
+/// - `RetryAckTimeout` — the only outcome that signals half-dead: both the
+///   initial send AND its X0X-0060 duplicate-safe retry timed out with no
+///   response from the remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckLivenessSignal {
+    Success,
+    RetryAckTimeout,
+}
+
 /// X0X-0062: tracks consecutive ACK-v2 retry failures per (peer, connection
 /// generation) so that a connection whose data path goes half-dead — sends
 /// time out and X0X-0060's duplicate-safe retry also times out, while the
@@ -6343,6 +6359,12 @@ impl P2pEndpoint {
             .send_ack_exchange_once(peer_id, data, request_id, timeout_duration)
             .await;
         if !matches!(first, Err(EndpointError::AckTimeout)) {
+            // X0X-0062: first-attempt success OR a non-timeout terminal error
+            // both prove the remote responded — reset the liveness tracker.
+            // Reviewer P1.1: this path previously bypassed the tracker, so
+            // first-attempt successes between retry failures did not reset
+            // the counter.
+            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
             return first;
         }
 
@@ -6350,6 +6372,9 @@ impl P2pEndpoint {
         let retry_timeout = Self::ack_timeout_retry_timeout(timeout_duration);
         if retry_timeout.is_zero() {
             self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
+            // No retry was actually attempted; treat as a single timeout
+            // event for liveness purposes (no remote evidence either way).
+            self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout);
             return first;
         }
 
@@ -6359,10 +6384,23 @@ impl P2pEndpoint {
         match retry {
             Ok(()) => {
                 self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryAccepted);
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
                 Ok(())
+            }
+            Err(EndpointError::AckTimeout) => {
+                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
+                // Reviewer P1.2: only a true AckTimeout on the retry path
+                // signals half-dead. Non-timeout retry errors (handled in
+                // the next arm) prove the remote responded.
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout);
+                Err(EndpointError::AckTimeout)
             }
             Err(error) => {
                 self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
+                // X0X-0062 P1.2: the remote responded on retry with a
+                // non-timeout terminal outcome (Rejected, ConnectionClosed,
+                // invalid response). Path is alive — reset the tracker.
+                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success);
                 Err(error)
             }
         }
@@ -6373,31 +6411,51 @@ impl P2pEndpoint {
     }
 
     fn record_ack_retry_outcome(&self, peer_id: PeerId, outcome: AckOutcome) {
-        let connection = self.inner.get_connection(&peer_id).ok().flatten();
-        let stable_id = connection
-            .as_ref()
+        let stable_id = self
+            .inner
+            .get_connection(&peer_id)
+            .ok()
+            .flatten()
             .map(|connection| connection.stable_id())
             .unwrap_or_default();
         self.ack_diagnostics
             .record_outcome(peer_id, stable_id, outcome);
+    }
 
-        // X0X-0062: liveness tracking. SenderRetryFailed = both the initial
-        // send_with_receive_ack AND its X0X-0060 duplicate-safe retry timed
-        // out. After LIVENESS_FAILURE_THRESHOLD consecutive such double
-        // failures within LIVENESS_FAILURE_WINDOW we conclude the connection
-        // is half-dead and force-close it so the caller can re-dial.
-        match outcome {
-            AckOutcome::SenderRetryFailed => {
+    /// X0X-0062: feed an `send_with_receive_ack` outcome (across the full
+    /// first-attempt + retry flow) into the liveness tracker. Called from
+    /// `send_with_receive_ack_with_timeout_for_test` after each decision
+    /// point so the tracker observes **every** outcome, not just retry
+    /// outcomes.
+    ///
+    /// Reviewer P1.1: previously the tracker only saw retry results, so a
+    /// peer with 4 retry double-failures + many first-attempt successes +
+    /// 1 more retry double-failure inside 60 s would tip the threshold even
+    /// though it wasn't actually 5 consecutive failures. Now any successful
+    /// outcome (first attempt OR retry) resets the counter.
+    ///
+    /// Reviewer P1.2: only true ACK timeouts on the retry path count as
+    /// liveness failures. Other terminal retry errors
+    /// (`ReceiveRejected`, `ConnectionClosed`, `Connection`) prove the
+    /// remote responded — the data path is alive, just rejecting this send.
+    /// Those outcomes reset the tracker.
+    fn record_ack_liveness_signal(&self, peer_id: PeerId, signal: AckLivenessSignal) {
+        let connection = self.inner.get_connection(&peer_id).ok().flatten();
+        let stable_id = match connection.as_ref() {
+            Some(connection) => connection.stable_id(),
+            None => return,
+        };
+        match signal {
+            AckLivenessSignal::Success => {
+                self.ack_liveness.record_success(peer_id, stable_id);
+            }
+            AckLivenessSignal::RetryAckTimeout => {
                 if self.ack_liveness.record_failure(peer_id, stable_id)
                     && let Some(connection) = connection
                 {
                     self.trigger_liveness_close(peer_id, stable_id, &connection);
                 }
             }
-            AckOutcome::SenderAccepted | AckOutcome::SenderRetryAccepted => {
-                self.ack_liveness.record_success(peer_id, stable_id);
-            }
-            _ => {}
         }
     }
 
@@ -8897,6 +8955,101 @@ mod tests {
         // Both can independently cross the threshold.
         assert!(tracker.record_failure(peer, 100));
         assert!(tracker.record_failure(peer, 200));
+    }
+
+    /// X0X-0062 P1.1 reviewer regression: the liveness tracker must observe
+    /// EVERY ack-flow outcome (first attempt OR retry), not just retry
+    /// outcomes. Previously the first-attempt success path returned early
+    /// before any tracker signal fired, so a peer hitting 4 retry-failures +
+    /// many first-attempt successes + 1 more retry-failure within 60 s would
+    /// tip the threshold even though the failures were not actually
+    /// consecutive. The `AckLivenessSignal::Success` path from a first-
+    /// attempt success must reset the counter exactly like
+    /// `SenderRetryAccepted` does.
+    #[test]
+    fn ack_liveness_tracker_first_attempt_success_resets_counter() {
+        let tracker = AckLivenessTracker::default();
+        let peer = PeerId([0xDD; 32]);
+        let stable_id = 11usize;
+
+        // Accumulate THRESHOLD-1 failures.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(!tracker.record_failure(peer, stable_id));
+        }
+        // Simulate a first-attempt success — the new
+        // `record_ack_liveness_signal(Success)` calls record_success on the
+        // tracker, the same primitive a successful retry uses.
+        tracker.record_success(peer, stable_id);
+        // After reset, four more failures must NOT tip the threshold —
+        // the counter is back at zero, so this round is independent.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(
+                !tracker.record_failure(peer, stable_id),
+                "first-attempt success must reset the counter so previously- \
+                 observed failures cannot combine with new ones across an \
+                 intervening success"
+            );
+        }
+    }
+
+    /// X0X-0062 P1.2 reviewer regression: only true ACK timeouts on the retry
+    /// path should signal half-dead. Non-timeout retry errors
+    /// (`ReceiveRejected`, `ConnectionClosed`, invalid response) prove the
+    /// remote responded — those must reset the counter, not increment it.
+    /// This is a tracker-level test; the actual signal-routing happens in
+    /// `send_with_receive_ack_with_timeout_for_test`'s match arms.
+    #[test]
+    fn ack_liveness_tracker_treats_remote_response_as_success_signal() {
+        let tracker = AckLivenessTracker::default();
+        let peer = PeerId([0xEE; 32]);
+        let stable_id = 13usize;
+
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(!tracker.record_failure(peer, stable_id));
+        }
+        // Simulating: retry returned ReceiveRejected{Backpressured} (i.e. the
+        // remote responded, not a timeout). In production the new
+        // `send_with_receive_ack` flow routes this to
+        // `AckLivenessSignal::Success`, calling record_success here.
+        tracker.record_success(peer, stable_id);
+        // Now further failures must NOT carry over the pre-success count.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(!tracker.record_failure(peer, stable_id));
+        }
+        // And the very next failure tips the (fresh) threshold cleanly.
+        assert!(tracker.record_failure(peer, stable_id));
+    }
+
+    /// X0X-0062 P2 reviewer regression: `LivenessTimeout` must round-trip
+    /// through ACK frame encode/decode. The encoder writes value 14 for
+    /// LivenessTimeout (added in 0.27.16) but the decoders for both
+    /// `decode_ack_response` and `decode_ack_control` originally fell through
+    /// to `Unknown` for value 14, losing the reason in downstream
+    /// diagnostics. The decoder match arms now include `14 => LivenessTimeout`.
+    #[test]
+    fn liveness_timeout_round_trips_through_ack_control_frame() {
+        use crate::ack_frame::{AckControlOutcome, decode_ack_control, encode_ack_control};
+
+        let tag = [0x77u8; 16];
+        let encoded = encode_ack_control(
+            tag,
+            AckControlOutcome::Closed(ConnectionCloseReason::LivenessTimeout),
+        );
+        let (decoded_tag, decoded_outcome) =
+            decode_ack_control(&encoded).expect("encoded ACK control must decode");
+        assert_eq!(decoded_tag, tag);
+        match decoded_outcome {
+            AckControlOutcome::Closed(reason) => {
+                assert_eq!(
+                    reason,
+                    ConnectionCloseReason::LivenessTimeout,
+                    "LivenessTimeout must round-trip through the ACK control frame — \
+                     previously it decoded as Unknown because the decoder match arm \
+                     was missing (reviewer P2)"
+                );
+            }
+            other => panic!("expected Closed(LivenessTimeout), got {other:?}"),
+        }
     }
 
     #[test]
