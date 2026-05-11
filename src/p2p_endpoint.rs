@@ -124,6 +124,17 @@ const ACK_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// negatives on long cross-region paths where the receiver admitted the
 /// payload but the sender had already timed out and reset the response stream.
 const ACK_TIMEOUT_RETRY_TIMEOUT: Duration = Duration::from_secs(6);
+/// X0X-0062: consecutive `SenderRetryFailed` outcomes (i.e. both the initial
+/// `send_with_receive_ack` AND its X0X-0060 duplicate-safe retry timed out)
+/// allowed within `LIVENESS_FAILURE_WINDOW` before we conclude the underlying
+/// QUIC connection's data path is half-dead and force-close it so the caller
+/// can re-dial. The X0X-0062 root cause was nyc → nuremberg producing 39-61
+/// such double-failures per minute while ant-quic still reported the
+/// connection as `Live`; emitting a `Closed { LivenessTimeout }` event here is
+/// what allows x0x's X0X-0053 mid-send race (extended to also watch for
+/// non-Replaced closes) to abandon the stuck connection.
+const LIVENESS_FAILURE_THRESHOLD: u32 = 5;
+const LIVENESS_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// ACK-v2 request/response stream priority.
 const ACK_STREAM_PRIORITY: i32 = 16;
 /// Probe request/response stream priority. Probes are diagnostic traffic and
@@ -761,6 +772,11 @@ pub struct P2pEndpoint {
     /// Stage-by-stage ACK-v2 latency and outcome diagnostics.
     ack_diagnostics: Arc<AckDiagnostics>,
 
+    /// X0X-0062: per-(peer, stable_id) consecutive `SenderRetryFailed`
+    /// tracker that force-closes a connection whose ACK-v2 retry path keeps
+    /// failing while the underlying QUIC connection still reports `Live`.
+    ack_liveness: Arc<AckLivenessTracker>,
+
     /// Receiver-side ACK-v2 request-id dedupe cache.
     ack_request_dedupe: Arc<AckRequestDedupeCache>,
 
@@ -1308,7 +1324,71 @@ pub struct AckDiagnosticsSnapshot {
     pub peers: Vec<AckPeerDiagnosticsSnapshot>,
 }
 
+/// X0X-0062: tracks consecutive ACK-v2 retry failures per (peer, connection
+/// generation) so that a connection whose data path goes half-dead — sends
+/// time out and X0X-0060's duplicate-safe retry also times out, while the
+/// underlying QUIC connection still keepalives and reports as `Live` — can be
+/// detected and force-closed at the application layer instead of leaking the
+/// stuck state indefinitely.
+///
+/// Counter increments on `SenderRetryFailed`, resets on `SenderAccepted` or
+/// `SenderRetryAccepted` (any successful send proves the path is alive). Once
+/// it reaches `LIVENESS_FAILURE_THRESHOLD` within `LIVENESS_FAILURE_WINDOW`,
+/// `record_failure` returns `true` and the caller force-closes the connection.
 #[derive(Debug, Default)]
+struct AckLivenessTracker {
+    state: ParkingMutex<HashMap<(PeerId, usize), LivenessFailureWindow>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LivenessFailureWindow {
+    consecutive_failures: u32,
+    window_started: Instant,
+}
+
+impl AckLivenessTracker {
+    /// Record a `SenderRetryFailed` outcome for the given (peer, stable_id).
+    /// Returns `true` exactly once when the failure count crosses
+    /// `LIVENESS_FAILURE_THRESHOLD` within `LIVENESS_FAILURE_WINDOW`; subsequent
+    /// failures inside the same crossed window return `false` so the caller
+    /// only triggers force-close once per stuck-state episode.
+    fn record_failure(&self, peer_id: PeerId, stable_id: usize) -> bool {
+        let mut guard = self.state.lock();
+        let now = Instant::now();
+        let entry = guard
+            .entry((peer_id, stable_id))
+            .or_insert(LivenessFailureWindow {
+                consecutive_failures: 0,
+                window_started: now,
+            });
+        if now.duration_since(entry.window_started) > LIVENESS_FAILURE_WINDOW {
+            entry.consecutive_failures = 1;
+            entry.window_started = now;
+            return false;
+        }
+        let prev = entry.consecutive_failures;
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        prev < LIVENESS_FAILURE_THRESHOLD
+            && entry.consecutive_failures >= LIVENESS_FAILURE_THRESHOLD
+    }
+
+    /// Reset the failure window for a (peer, stable_id) after a successful
+    /// send or retry — proves the path is alive.
+    fn record_success(&self, peer_id: PeerId, stable_id: usize) {
+        let mut guard = self.state.lock();
+        guard.remove(&(peer_id, stable_id));
+    }
+
+    /// Drop tracking state for a (peer, stable_id) after the connection has
+    /// closed — avoids retaining stale entries for connections that will
+    /// never reach the threshold legitimately.
+    fn forget(&self, peer_id: PeerId, stable_id: usize) {
+        let mut guard = self.state.lock();
+        guard.remove(&(peer_id, stable_id));
+    }
+}
+
+#[derive(Default)]
 struct AckDiagnostics {
     buckets: ParkingMutex<HashMap<AckDiagnosticsKey, AckMinuteDiagnostics>>,
 }
@@ -2757,6 +2837,7 @@ impl P2pEndpoint {
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
         let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
         let ack_diagnostics = Arc::new(AckDiagnostics::default());
+        let ack_liveness = Arc::new(AckLivenessTracker::default());
         let ack_request_dedupe = Arc::new(AckRequestDedupeCache::default());
         let probe_flights = Arc::new(TokioMutex::new(HashMap::new()));
         let probe_semaphore = Arc::new(Semaphore::new(PROBE_GLOBAL_CONCURRENCY));
@@ -2796,6 +2877,7 @@ impl P2pEndpoint {
             peer_activity,
             ack_waiters,
             ack_diagnostics,
+            ack_liveness,
             ack_request_dedupe,
             probe_flights,
             probe_semaphore,
@@ -6291,15 +6373,92 @@ impl P2pEndpoint {
     }
 
     fn record_ack_retry_outcome(&self, peer_id: PeerId, outcome: AckOutcome) {
-        let stable_id = self
-            .inner
-            .get_connection(&peer_id)
-            .ok()
-            .flatten()
+        let connection = self.inner.get_connection(&peer_id).ok().flatten();
+        let stable_id = connection
+            .as_ref()
             .map(|connection| connection.stable_id())
             .unwrap_or_default();
         self.ack_diagnostics
             .record_outcome(peer_id, stable_id, outcome);
+
+        // X0X-0062: liveness tracking. SenderRetryFailed = both the initial
+        // send_with_receive_ack AND its X0X-0060 duplicate-safe retry timed
+        // out. After LIVENESS_FAILURE_THRESHOLD consecutive such double
+        // failures within LIVENESS_FAILURE_WINDOW we conclude the connection
+        // is half-dead and force-close it so the caller can re-dial.
+        match outcome {
+            AckOutcome::SenderRetryFailed => {
+                if self.ack_liveness.record_failure(peer_id, stable_id)
+                    && let Some(connection) = connection
+                {
+                    self.trigger_liveness_close(peer_id, stable_id, &connection);
+                }
+            }
+            AckOutcome::SenderAccepted | AckOutcome::SenderRetryAccepted => {
+                self.ack_liveness.record_success(peer_id, stable_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// X0X-0062: force-close a connection whose data path is half-dead.
+    /// Called when `AckLivenessTracker` confirms `LIVENESS_FAILURE_THRESHOLD`
+    /// consecutive ACK retry failures within `LIVENESS_FAILURE_WINDOW`. Emits
+    /// `Closing { LivenessTimeout } + Closed { LivenessTimeout }` lifecycle
+    /// events so application-layer races (e.g. x0x's X0X-0053 mid-send race)
+    /// can detect the close and re-dial on a fresh QUIC connection.
+    fn trigger_liveness_close(
+        &self,
+        peer_id: PeerId,
+        stable_id: usize,
+        connection: &crate::high_level::Connection,
+    ) {
+        if connection.stable_id() != stable_id {
+            // Connection was already replaced; the tracker is stale.
+            self.ack_liveness.forget(peer_id, stable_id);
+            return;
+        }
+        let reason = ConnectionCloseReason::LivenessTimeout;
+        // LivenessTimeout is guaranteed to have a reserved app error code
+        // by ConnectionCloseReason::app_error_code; if a future refactor
+        // drops the mapping, fall back to LifecycleCleanup (also lifecycle-
+        // reserved) and if that somehow returns None too, abandon the force-
+        // close rather than panic — the caller will retry on next failure
+        // and the assertion in the unit test would catch the regression.
+        let Some(code) = reason
+            .app_error_code()
+            .or_else(|| ConnectionCloseReason::LifecycleCleanup.app_error_code())
+        else {
+            self.ack_liveness.forget(peer_id, stable_id);
+            return;
+        };
+        tracing::warn!(
+            peer_id = %peer_id,
+            stable_id = stable_id,
+            threshold = LIVENESS_FAILURE_THRESHOLD,
+            window_secs = LIVENESS_FAILURE_WINDOW.as_secs(),
+            "X0X-0062: force-closing half-dead connection — {} consecutive ACK retry failures within {}s while QUIC reports Live",
+            LIVENESS_FAILURE_THRESHOLD,
+            LIVENESS_FAILURE_WINDOW.as_secs(),
+        );
+
+        // Emit Closing+Closed lifecycle events before invoking the actual
+        // close so observers see the LivenessTimeout reason — the generic
+        // close paths downstream may map the application-close code back to
+        // LivenessTimeout via from_app_error_code, but emitting here keeps the
+        // signal source-of-truth at the trigger site.
+        if let Some(generation) = self.peer_event_generations.read().get(&peer_id).copied() {
+            self.emit_peer_lifecycle_event(
+                peer_id,
+                PeerLifecycleEvent::Closing { generation, reason },
+            );
+            self.emit_peer_lifecycle_event(
+                peer_id,
+                PeerLifecycleEvent::Closed { generation, reason },
+            );
+        }
+        connection.close(code, reason.reason_bytes());
+        self.ack_liveness.forget(peer_id, stable_id);
     }
 
     async fn send_ack_exchange_once(
@@ -8516,6 +8675,7 @@ impl Clone for P2pEndpoint {
             peer_activity: Arc::clone(&self.peer_activity),
             ack_waiters: Arc::clone(&self.ack_waiters),
             ack_diagnostics: Arc::clone(&self.ack_diagnostics),
+            ack_liveness: Arc::clone(&self.ack_liveness),
             ack_request_dedupe: Arc::clone(&self.ack_request_dedupe),
             probe_flights: Arc::clone(&self.probe_flights),
             probe_semaphore: Arc::clone(&self.probe_semaphore),
@@ -8652,6 +8812,91 @@ mod tests {
             ACK_TIMEOUT_RETRY_TIMEOUT,
             "very large caller budgets are still capped for retry"
         );
+    }
+
+    /// X0X-0062: regression guard for `trigger_liveness_close`'s assumption
+    /// that `LivenessTimeout` has a reserved app error code. If this fails,
+    /// `connection_lifecycle.rs` lost the mapping and the production fallback
+    /// would degrade to `LifecycleCleanup` — still safe, but the X0X-0062
+    /// signal would be confused with generic lifecycle cleanup at the peer.
+    #[test]
+    fn liveness_timeout_close_reason_has_reserved_app_error_code() {
+        assert!(
+            ConnectionCloseReason::LivenessTimeout
+                .app_error_code()
+                .is_some(),
+            "ConnectionCloseReason::LivenessTimeout must have a reserved app error code so the X0X-0062 force-close signal is distinguishable from generic LifecycleCleanup at the peer"
+        );
+    }
+
+    /// X0X-0062: AckLivenessTracker contract — accumulates consecutive
+    /// SenderRetryFailed events per (peer, stable_id) and signals once when
+    /// the threshold is crossed within the window. Reset on any successful
+    /// outcome. Tests pin the contract so future tuning is intentional.
+    #[test]
+    fn ack_liveness_tracker_signals_force_close_on_threshold_breach() {
+        let tracker = AckLivenessTracker::default();
+        let peer = PeerId([0xAA; 32]);
+        let stable_id = 42usize;
+
+        // First THRESHOLD-1 failures don't trigger.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(
+                !tracker.record_failure(peer, stable_id),
+                "sub-threshold failures must not signal force-close"
+            );
+        }
+        // Threshold-th failure signals once.
+        assert!(
+            tracker.record_failure(peer, stable_id),
+            "exactly at the threshold the tracker must signal force-close"
+        );
+        // Further failures inside the same crossed window do NOT signal again
+        // — caller already triggered close on the first signal.
+        assert!(
+            !tracker.record_failure(peer, stable_id),
+            "post-threshold failures must not re-signal — would cause duplicate force-close"
+        );
+    }
+
+    #[test]
+    fn ack_liveness_tracker_resets_on_success() {
+        let tracker = AckLivenessTracker::default();
+        let peer = PeerId([0xBB; 32]);
+        let stable_id = 7usize;
+
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(!tracker.record_failure(peer, stable_id));
+        }
+        // A success at sub-threshold clears the counter.
+        tracker.record_success(peer, stable_id);
+        // After reset, a single new failure must not signal.
+        assert!(
+            !tracker.record_failure(peer, stable_id),
+            "after success-reset, a fresh failure window must start from zero"
+        );
+    }
+
+    #[test]
+    fn ack_liveness_tracker_separate_state_per_connection_generation() {
+        let tracker = AckLivenessTracker::default();
+        let peer = PeerId([0xCC; 32]);
+        // Same peer, two different connection generations (stable_ids) — the
+        // old connection's failures must not poison the new connection's
+        // counter.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(!tracker.record_failure(peer, 100));
+        }
+        // New generation starts with a clean slate.
+        for _ in 0..(LIVENESS_FAILURE_THRESHOLD - 1) {
+            assert!(
+                !tracker.record_failure(peer, 200),
+                "new connection generation must not inherit the old generation's failure count"
+            );
+        }
+        // Both can independently cross the threshold.
+        assert!(tracker.record_failure(peer, 100));
+        assert!(tracker.record_failure(peer, 200));
     }
 
     #[test]
