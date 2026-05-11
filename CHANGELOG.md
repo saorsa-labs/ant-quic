@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.17] - 2026-05-11
+
+X0X-0062 reviewer-finding fixes for the 0.27.16 liveness-timeout shipment.
+
+### Fixed
+
+- **Reviewer P1.1:** liveness-tracker failures are now actually consecutive.
+  Previously the tracker only saw retry outcomes (via
+  `record_ack_retry_outcome`), so a peer with 4 retry double-failures + many
+  first-attempt successes + 1 more retry double-failure inside 60 s would
+  tip the threshold even though the failures were not consecutive — first-
+  attempt successes were invisible to the tracker. Now the
+  `send_with_receive_ack_with_timeout` flow emits an `AckLivenessSignal`
+  after every decision point so the tracker observes every outcome.
+  `Success` (first attempt OR retry) resets the counter; `RetryAckTimeout`
+  is the only signal that increments it.
+- **Reviewer P1.2:** non-timeout retry errors (`ReceiveRejected`,
+  `ConnectionClosed`, invalid response) no longer count as liveness
+  failures. They prove the remote responded — the data path is alive,
+  the send just got a non-OK answer. Those outcomes now emit
+  `AckLivenessSignal::Success`, resetting the tracker. Only a true
+  `EndpointError::AckTimeout` on the retry path increments the failure
+  counter.
+- **Reviewer P2:** `LivenessTimeout` now round-trips through ACK frame
+  encode/decode. The 0.27.16 encoder wrote value `14` for `LivenessTimeout`
+  (in both `encode_ack_response` and `encode_ack_control`), but the
+  matching decoder match arms in `decode_ack_response` and
+  `decode_ack_control` fell through to `Unknown` for value `14`, losing
+  the new reason in downstream diagnostics and any handler dispatching on
+  `Closed(LivenessTimeout)`. Both decoders now include
+  `14 => ConnectionCloseReason::LivenessTimeout`.
+
+### Tested
+
+3 new unit tests pin the corrected contracts:
+- `ack_liveness_tracker_first_attempt_success_resets_counter` (P1.1)
+- `ack_liveness_tracker_treats_remote_response_as_success_signal` (P1.2)
+- `liveness_timeout_round_trips_through_ack_control_frame` (P2)
+
+Full workspace: 2389 passed, 0 failed (up from 2386 in 0.27.16).
+
 ## [0.27.16] - 2026-05-11
 
 X0X-0062 application-layer liveness timeout detection.
