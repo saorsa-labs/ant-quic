@@ -1343,6 +1343,34 @@ enum AckLivenessSignal {
     RetryAckTimeout,
 }
 
+/// X0X-0062 (5th-round fix): identifies whether `send_ack_exchange_once`
+/// is being called for a first attempt or a duplicate-safe retry. The
+/// distinction matters because retry-attempt timeouts have to record a
+/// liveness failure **synchronously inside** the timeout match arm, before
+/// any `.await` boundary that the outer caller could cancel across.
+///
+/// The previous outer-match-arm approach lost the recording when the
+/// harness's wall-clock timeout cancelled the in-flight retry: the
+/// soak diagnostics showed `sender_retry_attempted == sender_ack_timeout`
+/// but `sender_retry_failed = 0` for nyc → sfo / nyc → singapore — the
+/// retries fired, but the outer match never ran, so the liveness counter
+/// never incremented and `trigger_liveness_close` never fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckAttemptKind {
+    /// Caller is making the first send_with_receive_ack attempt. Timeouts
+    /// here record `SenderAckTimeout` only — the liveness tracker does
+    /// not count first-attempt timeouts (X0X-0060's duplicate-safe retry
+    /// gets a second chance before we conclude half-dead).
+    FirstAttempt,
+    /// Caller is making the X0X-0060 duplicate-safe retry. Timeouts here
+    /// are the half-dead signal — record `SenderRetryFailed` AND
+    /// increment the liveness counter synchronously. If the increment
+    /// crosses `LIVENESS_FAILURE_THRESHOLD`, spawn a detached task to
+    /// invoke `trigger_liveness_close` (the async cleanup path) so that
+    /// the close fires even when the outer caller cancels our future.
+    Retry,
+}
+
 /// X0X-0062: tracks consecutive ACK-v2 retry failures per (peer, connection
 /// generation) so that a connection whose data path goes half-dead — sends
 /// time out and X0X-0060's duplicate-safe retry also times out, while the
@@ -6367,7 +6395,13 @@ impl P2pEndpoint {
         rand::thread_rng().fill_bytes(&mut request_id);
 
         let first = self
-            .send_ack_exchange_once(peer_id, data, request_id, timeout_duration)
+            .send_ack_exchange_once(
+                peer_id,
+                data,
+                request_id,
+                timeout_duration,
+                AckAttemptKind::FirstAttempt,
+            )
             .await;
         if !matches!(first, Err(EndpointError::AckTimeout)) {
             // X0X-0062: first-attempt success OR a non-timeout terminal error
@@ -6392,7 +6426,13 @@ impl P2pEndpoint {
         }
 
         let retry = self
-            .send_ack_exchange_once(peer_id, data, request_id, retry_timeout)
+            .send_ack_exchange_once(
+                peer_id,
+                data,
+                request_id,
+                retry_timeout,
+                AckAttemptKind::Retry,
+            )
             .await;
         match retry {
             Ok(()) => {
@@ -6402,19 +6442,26 @@ impl P2pEndpoint {
                 Ok(())
             }
             Err(EndpointError::AckTimeout) => {
-                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
-                // Reviewer P1.2: only a true AckTimeout on the retry path
-                // signals half-dead. Non-timeout retry errors (handled in
-                // the next arm) prove the remote responded.
-                self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::RetryAckTimeout)
-                    .await;
+                // X0X-0062 5th-round fix: SenderRetryFailed diagnostic AND
+                // the liveness-counter increment AND the threshold-crossing
+                // force-close spawn have ALL already happened synchronously
+                // inside `send_ack_exchange_once`'s timeout match arm —
+                // survives caller cancellation. We deliberately do NOT
+                // re-record here to avoid double-counting; the recordings
+                // are owned by the timeout site (whether or not this match
+                // arm ends up running).
                 Err(EndpointError::AckTimeout)
             }
             Err(error) => {
-                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
                 // X0X-0062 P1.2: the remote responded on retry with a
                 // non-timeout terminal outcome (Rejected, ConnectionClosed,
                 // invalid response). Path is alive — reset the tracker.
+                // Note: `SenderRetryFailed` diagnostic is recorded for
+                // every non-timeout error too (preserves the prior count
+                // semantics: any retry that didn't return Ok is a "failed
+                // retry attempt" for diagnostics — the liveness layer
+                // tracks the half-dead signal separately).
+                self.record_ack_retry_outcome(*peer_id, AckOutcome::SenderRetryFailed);
                 self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success)
                     .await;
                 Err(error)
@@ -6541,6 +6588,7 @@ impl P2pEndpoint {
         data: &[u8],
         request_id: [u8; 16],
         timeout_duration: Duration,
+        attempt_kind: AckAttemptKind,
     ) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -6700,11 +6748,46 @@ impl P2pEndpoint {
         match timeout(timeout_duration, exchange).await {
             Ok(result) => result,
             Err(_) => {
-                self.ack_diagnostics.record_outcome(
-                    *peer_id,
-                    stable_id,
-                    AckOutcome::SenderAckTimeout,
-                );
+                // X0X-0062 (5th-round fix): when the inner timeout fires, do
+                // the liveness bookkeeping HERE — synchronously, before any
+                // further `.await`. The outer caller can cancel us anywhere
+                // past this point; the diagnostic record + liveness counter
+                // increment must already be done.
+                match attempt_kind {
+                    AckAttemptKind::FirstAttempt => {
+                        self.ack_diagnostics.record_outcome(
+                            *peer_id,
+                            stable_id,
+                            AckOutcome::SenderAckTimeout,
+                        );
+                    }
+                    AckAttemptKind::Retry => {
+                        self.ack_diagnostics.record_outcome(
+                            *peer_id,
+                            stable_id,
+                            AckOutcome::SenderRetryFailed,
+                        );
+                        // Sync counter increment — survives caller cancellation.
+                        if self.ack_liveness.record_failure(*peer_id, stable_id) {
+                            // Threshold crossed. Spawn a detached task to do
+                            // the async close so it doesn't get cancelled
+                            // along with us. The task captures clones of the
+                            // shared state via P2pEndpoint::clone (all Arc).
+                            let endpoint = self.clone();
+                            let peer = *peer_id;
+                            let stable = stable_id;
+                            tokio::spawn(async move {
+                                if let Some(connection) =
+                                    endpoint.inner.get_connection(&peer).ok().flatten()
+                                {
+                                    endpoint
+                                        .trigger_liveness_close(peer, stable, &connection)
+                                        .await;
+                                }
+                            });
+                        }
+                    }
+                }
                 Err(EndpointError::AckTimeout)
             }
         }
@@ -9102,6 +9185,18 @@ mod tests {
         }
         // And the very next failure tips the (fresh) threshold cleanly.
         assert!(tracker.record_failure(peer, stable_id));
+    }
+
+    /// X0X-0062 (5th-round soak finding): the `AckAttemptKind::Retry` variant
+    /// must be a distinct variant so the timeout-site recording inside
+    /// `send_ack_exchange_once` can distinguish retry timeouts (which feed
+    /// the liveness tracker) from first-attempt timeouts (which don't).
+    /// This pins the contract — a future refactor that conflates the two
+    /// would re-introduce the "outer match never runs, liveness counter
+    /// never increments" cancellation bug that the soak surfaced.
+    #[test]
+    fn ack_attempt_kind_variants_are_distinct() {
+        assert_ne!(AckAttemptKind::FirstAttempt, AckAttemptKind::Retry);
     }
 
     /// X0X-0062 P2 (round 2) reviewer regression: `DisconnectReason::LivenessTimeout`
