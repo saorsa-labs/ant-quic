@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.20] - 2026-05-11
+
+X0X-0062 5th-round fix: liveness recording is now cancellation-safe.
+
+### Fixed
+
+- **5th-round soak finding:** The 0.27.18 X0X-0062 liveness detection
+  recorded `SenderRetryFailed` / liveness-counter-increment / force-close
+  trigger in the outer `send_with_receive_ack` match arm, AFTER the
+  retry's `.await`. When the outer caller (e.g. x0x test harness's
+  wall-clock timeout) cancelled our future mid-retry, the match arms
+  never ran. The 1 h v0.19.40 soak captured this: nyc → sfo / nyc →
+  singapore showed `sender_retry_attempted = sender_ack_timeout` (every
+  ack timeout fired a retry attempt) but `sender_retry_failed = 0`
+  (none of the retries ever reached the match arm to be recorded).
+  The liveness counter never incremented, `trigger_liveness_close`
+  never fired, and the half-dead connection persisted across all 4
+  soak windows.
+- Fix: introduce `AckAttemptKind::{FirstAttempt, Retry}` parameter on
+  `send_ack_exchange_once`. The timeout match arm inside that function
+  now records the diagnostic outcome AND increments the liveness
+  counter AND (if the increment crosses the threshold) spawns a
+  detached task to invoke `trigger_liveness_close`. All this happens
+  **synchronously** inside the timeout site, before any further
+  `.await` boundary the outer caller could cancel across. The
+  detached task captures clones of the shared state via
+  `P2pEndpoint::clone` (all `Arc`), so the async cleanup completes
+  even after our future is dropped.
+- The outer match arm for `Err(EndpointError::AckTimeout)` is now a
+  no-op for diagnostics + liveness — recording is owned by the timeout
+  site. The outer `Err(other)` (non-timeout retry error) and `Ok(())`
+  (retry success) arms still record from the outer flow (those paths
+  can safely depend on the caller not having cancelled, because the
+  remote responded).
+
+### Tested
+
+- New unit test `ack_attempt_kind_variants_are_distinct` pins the
+  contract that `FirstAttempt` and `Retry` are different variants —
+  a future refactor that conflates them would re-introduce the bug.
+- `cargo clippy --all-features --all-targets -- -D warnings` clean.
+- `cargo test --all-features --workspace`: 2394 passed, 0 failed.
+
 ## [0.27.19] - 2026-05-11
 
 UPnP port-mapping safety hardening — four reviewer findings.
