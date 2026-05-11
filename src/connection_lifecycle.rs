@@ -11,6 +11,7 @@ const CLOSE_CODE_READER_EXIT: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x01;
 const CLOSE_CODE_PEER_SHUTDOWN: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x02;
 const CLOSE_CODE_BANNED: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x03;
 const CLOSE_CODE_LIFECYCLE_CLEANUP: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x04;
+const CLOSE_CODE_LIVENESS_TIMEOUT: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x05;
 
 /// ant-quic lifecycle-aware connection close reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +26,11 @@ pub enum ConnectionCloseReason {
     Banned,
     /// Generic lifecycle cleanup.
     LifecycleCleanup,
+    /// X0X-0062: the local endpoint detected the application data path is
+    /// dead (repeated `send_with_receive_ack` retries failed within a short
+    /// window) while the underlying QUIC connection still reports as `Live`.
+    /// Used to force-close half-dead connections so callers can re-dial.
+    LivenessTimeout,
     /// The peer sent a non-lifecycle application close.
     ApplicationClosed,
     /// The peer or transport closed the connection without an application code.
@@ -54,6 +60,7 @@ impl ConnectionCloseReason {
             Self::PeerShutdown => CLOSE_CODE_PEER_SHUTDOWN,
             Self::Banned => CLOSE_CODE_BANNED,
             Self::LifecycleCleanup => CLOSE_CODE_LIFECYCLE_CLEANUP,
+            Self::LivenessTimeout => CLOSE_CODE_LIVENESS_TIMEOUT,
             Self::ApplicationClosed
             | Self::ConnectionClosed
             | Self::TimedOut
@@ -75,6 +82,7 @@ impl ConnectionCloseReason {
             Self::PeerShutdown => "PeerShutdown",
             Self::Banned => "Banned",
             Self::LifecycleCleanup => "LifecycleCleanup",
+            Self::LivenessTimeout => "LivenessTimeout",
             Self::ApplicationClosed => "ApplicationClosed",
             Self::ConnectionClosed => "ConnectionClosed",
             Self::TimedOut => "TimedOut",
@@ -100,6 +108,7 @@ impl ConnectionCloseReason {
             CLOSE_CODE_PEER_SHUTDOWN => Some(Self::PeerShutdown),
             CLOSE_CODE_BANNED => Some(Self::Banned),
             CLOSE_CODE_LIFECYCLE_CLEANUP => Some(Self::LifecycleCleanup),
+            CLOSE_CODE_LIVENESS_TIMEOUT => Some(Self::LivenessTimeout),
             _ => None,
         }
     }

@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.16] - 2026-05-11
+
+X0X-0062 application-layer liveness timeout detection.
+
+### Added
+
+- **X0X-0062:** application-layer half-dead-connection detection. ant-quic's
+  high-level `Connection` cannot self-detect a connection state where QUIC
+  keepalives still succeed (RTT calculations, ACK frames flowing) but the
+  actual stream-level data path is dead (sends timing out at 31 % bidirectional
+  rate, zero application bytes arriving at the receiver). The x0x 0.19.36 4 h
+  confirmatory soak demonstrated this in nyc → nuremberg, with nuremberg's
+  `last_recv_ms_ago` from nyc reaching 9.1 hours despite zero
+  `Replaced`/`Closed`/`Closing`/`path_validation` events firing in 8 h of
+  daemon journal.
+- New `ConnectionCloseReason::LivenessTimeout` variant with reserved app
+  error code `0x4E5B05`.
+- New `AckLivenessTracker` keyed on `(PeerId, stable_id)` that counts
+  consecutive `SenderRetryFailed` outcomes from the X0X-0060 duplicate-safe
+  ACK retry path. After `LIVENESS_FAILURE_THRESHOLD = 5` consecutive double-
+  failures within `LIVENESS_FAILURE_WINDOW = 60 s`, `record_ack_retry_outcome`
+  invokes `trigger_liveness_close`, which:
+  1. emits `Closing { LivenessTimeout }` then `Closed { LivenessTimeout }`
+     lifecycle events so application-layer races (e.g. x0x's X0X-0053
+     mid-send race, extended to watch non-`Replaced` closes) can detect the
+     close and re-dial on a fresh QUIC connection
+  2. calls `Connection::close(LIVENESS_TIMEOUT_CODE, "LivenessTimeout")` to
+     force the QUIC transport to actually tear the half-dead connection down
+- Tracker resets on any `SenderAccepted` or `SenderRetryAccepted` outcome
+  (any successful send proves the path is alive). Tracker state is scoped
+  per `(PeerId, stable_id)` so a fresh connection's failure count starts
+  from zero — an old generation's failures cannot poison the new one.
+
+### Tested
+
+- 4 new unit tests pin the contract:
+  - `liveness_timeout_close_reason_has_reserved_app_error_code`
+  - `ack_liveness_tracker_signals_force_close_on_threshold_breach`
+  - `ack_liveness_tracker_resets_on_success`
+  - `ack_liveness_tracker_separate_state_per_connection_generation`
+- Full workspace: 2386 passed, 0 failed.
+
+### Note
+
+Pairs with x0x's forthcoming X0X-0053-extension that races against
+`Closed`/`Closing` (not just `Replaced`). Without that extension, the
+liveness-timeout close still benefits ant-quic consumers — it forces the
+broken connection to die quickly so the next outbound DM attempt re-dials —
+but the existing in-flight send doesn't get the retry boost.
+
 ## [0.27.15] - 2026-05-10
 
 SOTA-Borrow Phase B (X0X-0045 + X0X-0046 + X0X-0047) and X0X-0060 ACK retry
