@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.18] - 2026-05-11
+
+X0X-0062 reviewer P2 (round 2) fix: lifecycle state now authoritative.
+
+### Fixed
+
+- **Reviewer P2 (round 2):** `trigger_liveness_close` previously emitted
+  `Closing/Closed{LivenessTimeout}` lifecycle events and called
+  `Connection::close()` directly. Quinn's local close became
+  `ConnectionError::LocallyClosed` in the inner state machine, and the
+  connection remained in `connected_peers` until a later reaper run — so
+  `is_connected(peer_id)` could still return true after the liveness close,
+  and `close_reason_from_connection` would downgrade the diagnostic from
+  `LivenessTimeout` to `LocallyClosed`. Lifecycle state was emitted but not
+  authoritative; the connection survived in a zombie form until the reaper
+  caught it.
+- Fix: trigger site now invokes the existing
+  `cleanup_connection(DisconnectReason::LivenessTimeout)` helper, which
+  threads `LivenessTimeout` through every layer:
+  1. emits `Closing { LivenessTimeout }`
+  2. calls `remove_connection_with_reason(LivenessTimeout)` on the inner
+     NAT-traversal endpoint — removing the connection from the state map
+     AND tagging the inner record
+  3. emits `Closed { LivenessTimeout }`
+  4. fails any in-flight ACK waiters with `LivenessTimeout` close reason
+  5. tears down reader handles + removes the peer from `connected_peers`
+- Added `DisconnectReason::LivenessTimeout` variant and wired it through
+  `close_reason_for_disconnect`, `link_transport_impl`, and `node_event`.
+- New unit test
+  `disconnect_reason_liveness_timeout_maps_to_close_reason_liveness_timeout`
+  pins the mapping that makes the cleanup path's `close_reason` actually
+  carry `LivenessTimeout` through to all observers.
+
+### Tested
+
+- `cargo test --all-features --workspace`: **2390 passed, 0 failed** (up
+  from 2389 in 0.27.17; one new test).
+- `cargo clippy --all-features --all-targets -- -D warnings` clean.
+
 ## [0.27.17] - 2026-05-11
 
 X0X-0062 reviewer-finding fixes for the 0.27.16 liveness-timeout shipment.
