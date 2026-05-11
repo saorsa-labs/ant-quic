@@ -92,7 +92,10 @@ use crate::nat_traversal_api::{
     TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
-use crate::port_mapping::{PortMappingEvent, PortMappingSnapshot, spawn_best_effort_port_mapping};
+use crate::port_mapping::{
+    PortMappingEvent, PortMappingSnapshot, is_globally_routable_advertise_address,
+    spawn_best_effort_port_mapping,
+};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::{AutoConnectPolicy, P2pConfig, TrustPolicy};
@@ -7535,6 +7538,38 @@ impl P2pEndpoint {
             return;
         };
 
+        // Reviewer P1 #1: UPnP IGD is IPv4-only, and a loopback or IPv6-only
+        // bind cannot legitimately receive the LAN_IP:PORT traffic that the
+        // gateway-selected mapping would direct to it. Mirror the mDNS
+        // loopback guard plus an IPv6-only check so we never expose the wrong
+        // listener via a router port mapping.
+        let configured_loopback_only = self
+            .config
+            .bind_addr
+            .as_ref()
+            .and_then(TransportAddr::as_socket_addr)
+            .is_some_and(|configured| configured.ip().is_loopback());
+        if configured_loopback_only || local_addr.ip().is_loopback() {
+            info!(
+                configured_loopback_only,
+                local_addr = %local_addr,
+                "Skipping best-effort router port mapping for a loopback-only endpoint"
+            );
+            return;
+        }
+        // IPv6-only bind: an IPv6 unspecified or specific IPv6 address means
+        // there's no IPv4 listener for UPnP IGD to map traffic to. We allow
+        // dual-stack binds (IPv4-mapped IPv6, or v4-unspecified `0.0.0.0`)
+        // because the OS still accepts the v4 traffic the mapping would
+        // direct to LAN_IPv4:PORT.
+        if local_addr.is_ipv6() {
+            info!(
+                local_addr = %local_addr,
+                "Skipping best-effort router port mapping for an IPv6-only endpoint (UPnP IGD is IPv4-only)"
+            );
+            return;
+        }
+
         let endpoint = self.clone();
         spawn_best_effort_port_mapping(
             self.config.nat.port_mapping,
@@ -7762,7 +7797,14 @@ impl P2pEndpoint {
         match event {
             PortMappingEvent::Established { snapshot } => {
                 self.apply_port_mapping_snapshot(snapshot);
-                if let Some(mapped_addr) = snapshot.external_addr {
+                // Reviewer P1 #2: also filter the user-facing event surface
+                // so a non-routable mapped address (CGNAT/RFC1918/etc) is
+                // not surfaced as ExternalAddressDiscovered to consumers
+                // that would advertise it.
+                if let Some(mapped_addr) = snapshot
+                    .external_addr
+                    .filter(|addr| is_globally_routable_advertise_address(*addr))
+                {
                     if let Err(e) = self.event_tx.send(P2pEvent::PortMappingEstablished {
                         external_addr: mapped_addr,
                     }) {
@@ -7777,7 +7819,10 @@ impl P2pEndpoint {
             }
             PortMappingEvent::Renewed { snapshot } => {
                 self.apply_port_mapping_snapshot(snapshot);
-                if let Some(mapped_addr) = snapshot.external_addr {
+                if let Some(mapped_addr) = snapshot
+                    .external_addr
+                    .filter(|addr| is_globally_routable_advertise_address(*addr))
+                {
                     if let Err(e) = self.event_tx.send(P2pEvent::PortMappingRenewed {
                         external_addr: mapped_addr,
                     }) {
@@ -7808,21 +7853,47 @@ impl P2pEndpoint {
     }
 
     fn apply_port_mapping_snapshot(&self, snapshot: PortMappingSnapshot) {
+        // Reviewer P1 #2: filter UPnP-reported external addresses for global
+        // routability before feeding them to relay advertisement and the
+        // local NAT candidate set. On CGNAT/double-NAT networks the
+        // gateway's get_external_ip() returns the inner-NAT's WAN address
+        // (e.g. 100.64.x.x or 192.168.x.x) — those are not globally
+        // routable and publishing them weakens MASQUE fallback because
+        // peers will try to dial an address that doesn't route from the
+        // public internet. We keep the snapshot's `active` bit (so the
+        // mapping still renews on the gateway — that has positive side
+        // effects for return-path traversal even if the address isn't
+        // advertisable) but drop the `external_addr` from the advertised
+        // surfaces.
+        let advertisable = snapshot.external_addr.filter(|addr| {
+            let ok = is_globally_routable_advertise_address(*addr);
+            if !ok {
+                warn!(
+                    mapped_addr = %addr,
+                    "UPnP-reported external address is not globally routable (CGNAT/RFC1918/loopback/etc) — not advertising as relay/NAT candidate"
+                );
+            }
+            ok
+        });
+        let effective = PortMappingSnapshot {
+            active: snapshot.active,
+            external_addr: advertisable,
+        };
         let previous_addr = {
             let mut current = self.port_mapping_state.write();
             let previous = current.external_addr;
-            *current = snapshot;
+            *current = effective;
             previous
         };
 
         self.inner
-            .reconcile_relay_server_public_addresses(snapshot.external_addr);
+            .reconcile_relay_server_public_addresses(effective.external_addr);
 
         if let Some(previous_addr) = previous_addr
-            && snapshot.external_addr != Some(previous_addr)
+            && effective.external_addr != Some(previous_addr)
         {
             let _ = self.inner.remove_local_external_candidate(previous_addr);
-            if let Some(mapped_addr) = snapshot.external_addr {
+            if let Some(mapped_addr) = effective.external_addr {
                 if let Err(e) = self.event_tx.send(P2pEvent::PortMappingAddressChanged {
                     previous_addr,
                     external_addr: mapped_addr,
@@ -7832,8 +7903,8 @@ impl P2pEndpoint {
             }
         }
 
-        if snapshot.active
-            && let Some(mapped_addr) = snapshot.external_addr
+        if effective.active
+            && let Some(mapped_addr) = effective.external_addr
             && let Err(error) = self.inner.add_local_external_candidate(mapped_addr)
         {
             warn!(
@@ -10320,7 +10391,7 @@ mod tests {
             .expect("valid config");
 
         if let Ok(endpoint) = P2pEndpoint::new(config).await {
-            let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
+            let mapped_addr: SocketAddr = "65.21.157.229:41000".parse().expect("valid addr");
             endpoint.apply_port_mapping_snapshot(PortMappingSnapshot {
                 active: true,
                 external_addr: Some(mapped_addr),
@@ -10347,7 +10418,7 @@ mod tests {
 
         if let Ok(endpoint) = P2pEndpoint::new(config).await {
             let mut events = endpoint.subscribe();
-            let mapped_addr: SocketAddr = "198.51.100.88:42000".parse().expect("valid addr");
+            let mapped_addr: SocketAddr = "65.21.157.229:42000".parse().expect("valid addr");
 
             endpoint.apply_port_mapping_event(PortMappingEvent::Established {
                 snapshot: PortMappingSnapshot {
@@ -10396,8 +10467,8 @@ mod tests {
 
         if let Ok(endpoint) = P2pEndpoint::new(config).await {
             let mut events = endpoint.subscribe();
-            let first_addr: SocketAddr = "198.51.100.90:42000".parse().expect("valid addr");
-            let second_addr: SocketAddr = "198.51.100.91:42000".parse().expect("valid addr");
+            let first_addr: SocketAddr = "65.21.157.230:42000".parse().expect("valid addr");
+            let second_addr: SocketAddr = "65.21.157.231:42000".parse().expect("valid addr");
 
             endpoint.apply_port_mapping_snapshot(PortMappingSnapshot {
                 active: true,
@@ -10506,7 +10577,7 @@ mod tests {
         listener
             .inner
             .set_test_observed_external_addrs(vec![private_observed_addr, observed_addr]);
-        let mapped_addr: SocketAddr = "198.51.100.55:41000".parse().expect("valid addr");
+        let mapped_addr: SocketAddr = "65.21.157.229:41000".parse().expect("valid addr");
         listener.apply_port_mapping_snapshot(PortMappingSnapshot {
             active: true,
             external_addr: Some(mapped_addr),

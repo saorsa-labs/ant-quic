@@ -96,6 +96,13 @@ pub struct NodeConfig {
     /// Maximum concurrent unidirectional QUIC streams per connection.
     /// Default: 100.
     pub max_concurrent_uni_streams: Option<u32>,
+
+    /// Reviewer P2 #2: surface ant-quic's best-effort UPnP IGD port-mapping
+    /// toggle at the simpler `NodeConfig` builder layer (the existing knob
+    /// is only on `P2pConfigBuilder`). When `Some(false)`, the UPnP
+    /// discovery + port-mapping task is skipped. When `None`, the ant-quic
+    /// default applies (currently enabled).
+    pub port_mapping_enabled: Option<bool>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -154,6 +161,7 @@ pub struct NodeConfigBuilder {
     transport_providers: Vec<Arc<dyn TransportProvider>>,
     data_channel_capacity: Option<usize>,
     max_concurrent_uni_streams: Option<u32>,
+    port_mapping_enabled: Option<bool>,
 }
 
 impl NodeConfigBuilder {
@@ -337,6 +345,16 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Reviewer P2 #2: enable or disable the best-effort UPnP IGD
+    /// port-mapping task. Default (when not called) follows the global
+    /// ant-quic default — currently enabled. Use `false` on networks
+    /// without IGD support, or where operator policy prohibits unsolicited
+    /// router port mappings.
+    pub fn port_mapping_enabled(mut self, enabled: bool) -> Self {
+        self.port_mapping_enabled = Some(enabled);
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> NodeConfig {
         NodeConfig {
@@ -346,6 +364,7 @@ impl NodeConfigBuilder {
             transport_providers: self.transport_providers,
             data_channel_capacity: self.data_channel_capacity,
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
+            port_mapping_enabled: self.port_mapping_enabled,
         }
     }
 }

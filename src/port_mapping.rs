@@ -10,9 +10,96 @@ use tracing::{debug, info, warn};
 
 use crate::unified_config::PortMappingConfig;
 
-const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DISCOVERY_RETRY_DELAY_INITIAL: Duration = Duration::from_secs(2);
+/// Reviewer P2 #1: cap the exponential backoff at 5 minutes so we still
+/// retry occasionally on a long-running daemon (e.g. user moves to a
+/// network that does have IGD) without continuously hammering the network
+/// when no gateway is present.
+const DISCOVERY_RETRY_DELAY_MAX: Duration = Duration::from_secs(300);
+/// After this many consecutive no-gateway failures, cap the retry interval
+/// at `DISCOVERY_RETRY_DELAY_MAX` rather than continuing to double.
+const DISCOVERY_RETRY_BACKOFF_DOUBLINGS: u32 = 7; // 2 → 4 → 8 → 16 → 32 → 64 → 128 → 256 → cap
 const ZERO_LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const PORT_MAPPING_DESCRIPTION: &str = "ant-quic";
+
+/// Reviewer P1 #2: filter UPnP-reported external addresses to those that
+/// can plausibly serve as a globally-routable relay/candidate address.
+/// Rejects:
+/// - IPv4 private ranges (RFC 1918): 10/8, 172.16/12, 192.168/16
+/// - IPv4 CGNAT (RFC 6598): 100.64.0.0/10 — common on cellular and
+///   double-NAT residential setups; not globally routable
+/// - IPv4 loopback (127/8), link-local (169.254/16), broadcast,
+///   multicast (224/4), and reserved (240/4)
+/// - IPv4 documentation/test ranges
+/// - IPv6 anything non-global (loopback, link-local, ULA, multicast,
+///   unspecified, IPv4-mapped)
+///
+/// On a CGNAT/double-NAT network the gateway's `get_external_ip()` returns
+/// the inner-NAT's WAN address (e.g. 100.64.x.x or 192.168.x.x), not the
+/// real internet address. Publishing such an address weakens MASQUE
+/// fallback because peers will try to dial an address that doesn't route
+/// from the public internet.
+pub(crate) fn is_globally_routable_advertise_address(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            // RFC 1918 private ranges
+            if v4.is_private() {
+                return false;
+            }
+            // RFC 6598 CGNAT — 100.64.0.0/10. `Ipv4Addr::is_shared` is
+            // unstable on stable Rust as of 1.95, so test the range manually.
+            let octets = v4.octets();
+            if octets[0] == 100 && (octets[1] & 0xC0) == 0x40 {
+                return false;
+            }
+            // Loopback / link-local / broadcast / multicast / unspecified /
+            // documentation. `is_documentation` is unstable; covers 192.0.2/24,
+            // 198.51.100/24, 203.0.113/24 — test manually.
+            if v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+            {
+                return false;
+            }
+            let is_documentation = matches!(
+                (octets[0], octets[1], octets[2]),
+                (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+            );
+            if is_documentation {
+                return false;
+            }
+            // 240.0.0.0/4 reserved for future use
+            if octets[0] >= 240 {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            // UPnP IGD is IPv4-only, but the trait surface allows v6.
+            // Be conservative: only accept truly-global v6.
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // ULA fc00::/7
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // Link-local fe80::/10
+            if (seg0 & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // IPv4-mapped ::ffff:0:0/96 — reject; would be smuggling a v4
+            // address through a v6 surface, route via v4 checks instead.
+            if matches!(v6.segments(), [0, 0, 0, 0, 0, 0xffff, _, _]) {
+                return false;
+            }
+            true
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PortMappingSnapshot {
@@ -182,6 +269,31 @@ pub(crate) fn spawn_best_effort_port_mapping<F>(
     });
 }
 
+/// Reviewer P2 #1: exponential backoff with jitter for UPnP discovery
+/// retries. Returns the delay before the next discovery attempt given a
+/// count of consecutive failures so far. Doubles from
+/// `DISCOVERY_RETRY_DELAY_INITIAL` (2 s) up to `DISCOVERY_RETRY_DELAY_MAX`
+/// (5 min), with ±25% jitter to avoid synchronised retries across many
+/// daemons on the same LAN.
+fn discovery_retry_delay(consecutive_failures: u32) -> Duration {
+    let base = DISCOVERY_RETRY_DELAY_INITIAL.as_secs();
+    let exponent = consecutive_failures.min(DISCOVERY_RETRY_BACKOFF_DOUBLINGS);
+    let doubled = base.saturating_mul(1u64 << exponent);
+    let capped = doubled.min(DISCOVERY_RETRY_DELAY_MAX.as_secs());
+    // ±25% jitter. We use a coarse pseudo-random source seeded from the
+    // failure count + system time low bits — adequate for desync, no need
+    // for crypto quality.
+    let jitter_range = capped.max(1) / 4;
+    let seed_bits = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        .wrapping_add(consecutive_failures);
+    let jitter = (seed_bits as u64 % (2 * jitter_range + 1)) as i64 - jitter_range as i64;
+    let delay_secs = (capped as i64 + jitter).max(1) as u64;
+    Duration::from_secs(delay_secs)
+}
+
 async fn run_port_mapping_lifecycle<D, F>(
     discoverer: D,
     config: PortMappingConfig,
@@ -195,6 +307,13 @@ async fn run_port_mapping_lifecycle<D, F>(
     let mut published_snapshot = PortMappingSnapshot::default();
     let mut active_mapping: Option<ActivePortMapping> = None;
     let mut last_failure: Option<String> = None;
+    // Reviewer P2 #1: exponential backoff for discovery retries. Networks
+    // without IGD support previously got a fixed 2s retry forever, which is
+    // not quiet enough for "doesn't interrupt normal users". Each
+    // consecutive failure doubles the delay up to a 5 min cap; success
+    // resets to the initial 2s delay so a transient discovery failure
+    // recovers quickly.
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         if shutdown.is_cancelled() {
@@ -205,6 +324,7 @@ async fn run_port_mapping_lifecycle<D, F>(
             match establish_mapping(&discoverer, config, internal_port).await {
                 Ok(mapping) => {
                     last_failure = None;
+                    consecutive_failures = 0;
                     let snapshot = PortMappingSnapshot {
                         active: true,
                         external_addr: Some(mapping.external_addr),
@@ -232,9 +352,11 @@ async fn run_port_mapping_lifecycle<D, F>(
                         PortMappingSnapshot::default(),
                         &mut on_update,
                     );
+                    let retry_delay = discovery_retry_delay(consecutive_failures);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(DISCOVERY_RETRY_DELAY) => {}
+                        _ = tokio::time::sleep(retry_delay) => {}
                     }
                 }
             }
@@ -458,10 +580,140 @@ mod tests {
     use super::*;
 
     use std::collections::{HashMap, VecDeque};
+    use std::net::Ipv6Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use mock_igd::{Action, MockIgdServer, Protocol, Responder};
+
+    fn s4(octets: [u8; 4]) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), 5483)
+    }
+
+    fn s6(seg: [u16; 8]) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+            )),
+            5483,
+        )
+    }
+
+    /// Reviewer P1 #2: UPnP-reported external addresses that look private
+    /// or non-routable must NOT be advertised as relay/NAT candidates. The
+    /// soak failure modes the reviewer cited (CGNAT publishing 100.64/10,
+    /// double-NAT publishing 192.168/x) would weaken MASQUE fallback because
+    /// peers dial addresses that don't route from the public internet.
+    #[test]
+    fn is_globally_routable_advertise_address_rejects_non_global_v4() {
+        // RFC 1918 private
+        assert!(!is_globally_routable_advertise_address(s4([10, 0, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([172, 16, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            172, 31, 255, 254
+        ])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            192, 168, 1, 1
+        ])));
+
+        // RFC 6598 CGNAT 100.64.0.0/10
+        assert!(!is_globally_routable_advertise_address(s4([100, 64, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            100, 127, 255, 254
+        ])));
+        // 100.63.x and 100.128.x are NOT in the CGNAT range — should be accepted
+        assert!(is_globally_routable_advertise_address(s4([100, 63, 0, 1])));
+        assert!(is_globally_routable_advertise_address(s4([100, 128, 0, 1])));
+
+        // Loopback / link-local / broadcast / multicast / reserved
+        assert!(!is_globally_routable_advertise_address(s4([127, 0, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            169, 254, 1, 1
+        ])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            255, 255, 255, 255
+        ])));
+        assert!(!is_globally_routable_advertise_address(s4([224, 0, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([240, 0, 0, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([0, 0, 0, 0])));
+
+        // Documentation ranges
+        assert!(!is_globally_routable_advertise_address(s4([192, 0, 2, 1])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            198, 51, 100, 1
+        ])));
+        assert!(!is_globally_routable_advertise_address(s4([
+            203, 0, 113, 1
+        ])));
+    }
+
+    #[test]
+    fn is_globally_routable_advertise_address_accepts_global_v4() {
+        // Examples of globally-routable IPv4 addresses
+        assert!(is_globally_routable_advertise_address(s4([8, 8, 8, 8]))); // Google DNS
+        assert!(is_globally_routable_advertise_address(s4([1, 1, 1, 1]))); // Cloudflare
+        assert!(is_globally_routable_advertise_address(s4([
+            142, 93, 199, 50
+        ]))); // nyc VPS
+        assert!(is_globally_routable_advertise_address(s4([
+            170, 64, 176, 102
+        ]))); // sydney VPS
+    }
+
+    #[test]
+    fn is_globally_routable_advertise_address_rejects_non_global_v6() {
+        assert!(!is_globally_routable_advertise_address(s6([0; 8]))); // unspecified
+        assert!(!is_globally_routable_advertise_address(s6([
+            0, 0, 0, 0, 0, 0, 0, 1
+        ]))); // loopback
+        assert!(!is_globally_routable_advertise_address(s6([
+            0xff00, 0, 0, 0, 0, 0, 0, 1
+        ]))); // multicast
+        assert!(!is_globally_routable_advertise_address(s6([
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ]))); // link-local
+        assert!(!is_globally_routable_advertise_address(s6([
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ]))); // ULA
+        assert!(!is_globally_routable_advertise_address(s6([
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ]))); // ULA
+        // IPv4-mapped — should be rejected; route via v4 check
+        assert!(!is_globally_routable_advertise_address(s6([
+            0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808
+        ])));
+    }
+
+    /// Reviewer P2 #1: UPnP discovery retry must back off exponentially
+    /// rather than hammering every 2 s forever. Networks without IGD
+    /// support should reach the 5 min cap within ~8 failures.
+    #[test]
+    fn discovery_retry_delay_exponential_backoff() {
+        // First failure → ~2s (with ±25% jitter, so 1s-3s)
+        let d0 = discovery_retry_delay(0).as_secs();
+        assert!(
+            (1..=3).contains(&d0),
+            "first retry should be ~2s, got {}s",
+            d0
+        );
+
+        // After 7 doublings: 2 → 4 → 8 → 16 → 32 → 64 → 128 → 256 → capped
+        // at 300s. With jitter, 225s-375s but capped at the 25% jitter
+        // *of the cap*, so 225-375. Just verify it's substantially larger
+        // than the initial delay.
+        let d_many = discovery_retry_delay(20).as_secs();
+        assert!(
+            d_many >= 100,
+            "after many failures, retry delay should be substantially larger than initial; got {}s",
+            d_many
+        );
+        // And capped — never above max + max/4 jitter (375s)
+        assert!(
+            d_many <= 400,
+            "retry delay must be capped near DISCOVERY_RETRY_DELAY_MAX; got {}s",
+            d_many
+        );
+    }
 
     struct TestGateway {
         gateway_addr: SocketAddr,
