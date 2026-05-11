@@ -285,6 +285,13 @@ impl Node {
         if let Some(streams) = config.max_concurrent_uni_streams {
             p2p_config.max_concurrent_uni_streams = streams;
         }
+        // Reviewer P2 #2: pipe NodeConfig::port_mapping_enabled into the
+        // underlying P2pConfig's NAT port-mapping toggle so app-level
+        // opt-out (e.g. x0x daemon config / CLI flag) actually disables
+        // the UPnP discovery task.
+        if let Some(enabled) = config.port_mapping_enabled {
+            p2p_config.nat.port_mapping.enabled = enabled;
+        }
 
         // Create event channel
         let (event_tx, _) = broadcast::channel(256);

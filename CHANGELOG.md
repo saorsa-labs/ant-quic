@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.19] - 2026-05-11
+
+UPnP port-mapping safety hardening — four reviewer findings.
+
+### Fixed
+
+- **Reviewer P1 #1 (loopback/IPv6-only guard):** `spawn_port_mapping_task`
+  previously fired UPnP IGD discovery + LAN-IP mapping even for a
+  loopback or IPv6-only bind. UPnP IGD is IPv4-only and a LAN_IP:PORT
+  mapping cannot legitimately reach a loopback listener — the router
+  would direct external traffic to the wrong listener. Now mirrors the
+  mDNS loopback guard plus skips IPv6-only binds.
+- **Reviewer P1 #2 (routability filter on advertised addresses):** UPnP
+  gateway `get_external_ip()` returns the inner-NAT WAN address on
+  CGNAT / double-NAT networks (e.g. `100.64.x.x` RFC 6598, or
+  `192.168.x.x` RFC 1918). The 0.27.18 code fed these straight to relay
+  advertisement and the NAT candidate set without routability checks,
+  weakening MASQUE fallback. New `is_globally_routable_advertise_address`
+  filter rejects RFC 1918 private, RFC 6598 CGNAT, loopback, link-local,
+  broadcast, multicast, reserved, and documentation ranges (v4); plus
+  loopback, multicast, link-local, ULA, and IPv4-mapped (v6). Applied
+  in both `apply_port_mapping_snapshot` (for relay/candidate consumers)
+  AND `apply_port_mapping_event` (for `ExternalAddressDiscovered` event
+  surface) so downstream consumers never see a non-routable mapped
+  address.
+- **Reviewer P2 #1 (exponential backoff + jitter):** UPnP discovery
+  retry was a fixed 2 s forever — networks without IGD support
+  hammered the LAN continuously. New `discovery_retry_delay` doubles
+  from 2 s up to a 5 min cap (7 doublings) with ±25 % jitter, reset on
+  any successful establish. Failure cap is reached at ~8 consecutive
+  failures (~10 min). Operators who genuinely have no IGD won't notice
+  the difference, but the LAN noise drops dramatically.
+- **Reviewer P2 #2 (app-level opt-out for NodeConfig consumers):**
+  `NodeConfig::builder().port_mapping_enabled(false)` is now a public
+  builder method on the simpler config layer (the existing knob was only
+  on `P2pConfigBuilder`). Threads through `node.rs` to
+  `P2pConfig.nat.port_mapping.enabled`.
+
+### Tested
+
+- 4 new unit tests in `port_mapping::tests`:
+  - `is_globally_routable_advertise_address_rejects_non_global_v4`
+    (private, CGNAT, loopback, link-local, broadcast, multicast,
+    documentation, reserved)
+  - `is_globally_routable_advertise_address_accepts_global_v4`
+  - `is_globally_routable_advertise_address_rejects_non_global_v6`
+  - `discovery_retry_delay_exponential_backoff` (verifies 2 s initial,
+    300 s cap)
+- `cargo test --all-features --workspace`: **2394 passed, 0 failed**
+  (up from 2390 in 0.27.18; 4 new tests).
+- `cargo clippy --all-features --all-targets -- -D warnings` clean.
+
 ## [0.27.18] - 2026-05-11
 
 X0X-0062 reviewer P2 (round 2) fix: lifecycle state now authoritative.
