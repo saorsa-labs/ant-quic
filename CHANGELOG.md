@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.21] - 2026-05-11
+
+X0X-0066 enablement: expose a caller-supplied ACK-v2 request id so
+application-level request hedging can rely on the receiver-side
+`AckRequestDedupeCache` to drop duplicate sends.
+
+### Added
+
+- `Node::send_with_receive_ack_with_request_id(peer_id, request_id, data, timeout)`
+  — same contract as `send_with_receive_ack`, but the caller supplies
+  the ACK-v2 request id. Two calls with the same
+  `(peer_id, request_id, data)` are duplicate-safe at the receiver: the
+  second arrival is replayed from the receiver-side
+  `AckRequestDedupeCache`, the cached ACK is returned on the wire, and
+  the payload is **not** redelivered to `recv()`.
+- New regression test
+  `tests/b_send_with_receive_ack.rs::send_with_receive_ack_with_request_id_dedupes_duplicate_sends`
+  proves the receiver-side dedupe contract: two calls with the same
+  `(peer_id, request_id, payload)` both return `Ok(())` but `recv()`
+  yields the payload exactly once.
+
+### Changed
+
+- `Node::send_with_receive_ack` now delegates to the new variant after
+  generating a fresh request id. Behaviour is unchanged for existing
+  callers (still single-call, single-delivery).
+
+### Notes for downstream consumers
+
+This is the API that x0x X0X-0066 request hedging consumes. Existing
+code paths that only need the single-call semantics need no changes.
+Callers that issue more than one `send_with_receive_ack` for the same
+logical payload (request hedging, parallel races, etc.) should use the
+`_with_request_id` variant with one stable id per logical request so
+the receiver dedupes the duplicates instead of delivering them twice.
+
 ## [0.27.20] - 2026-05-11
 
 X0X-0062 5th-round fix: liveness recording is now cancellation-safe.

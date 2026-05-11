@@ -667,6 +667,25 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Same as [`send_with_receive_ack`] but the caller supplies the ACK-v2
+    /// request id. Repeated calls with the same `(peer_id, request_id, data)`
+    /// are duplicate-safe at the receiver — the second arrival is replayed
+    /// from the receiver-side ACK dedupe cache and the payload is not
+    /// redelivered to `recv()`. Intended for application-level request
+    /// hedging (x0x X0X-0066).
+    pub async fn send_with_receive_ack_with_request_id(
+        &self,
+        peer_id: &PeerId,
+        request_id: [u8; 16],
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), NodeError> {
+        self.inner
+            .send_with_receive_ack_with_request_id(peer_id, request_id, data, timeout)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Actively probe peer liveness and measure round-trip time.
     ///
     /// Sends a lightweight probe envelope and waits for the peer's reader task

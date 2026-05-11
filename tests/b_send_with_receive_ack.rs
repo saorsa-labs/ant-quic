@@ -207,3 +207,81 @@ async fn send_with_receive_ack_rejects_when_remote_pipeline_is_backpressured() {
     accept_sender.abort();
     accept_receiver.abort();
 }
+
+/// X0X-0066 hedging acceptance — two `send_with_receive_ack_with_request_id`
+/// calls with the same `(peer_id, request_id, payload)` must:
+///
+/// 1. Both return `Ok(())` (the second is replayed from the receiver-side
+///    `AckRequestDedupeCache`).
+/// 2. Deliver the payload to `recv()` **exactly once**.
+///
+/// This is the receiver-side dedupe contract that x0x's hedge relies on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_with_receive_ack_with_request_id_dedupes_duplicate_sends() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    // One stable request id reused for both sends, mirroring the x0x hedge
+    // path: same wire bytes + same request_id ⇒ receiver dedupes.
+    let request_id: [u8; 16] = [
+        0xc0, 0xff, 0xee, 0x42, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    let payload = b"x0x-0066 hedge payload";
+
+    sender
+        .send_with_receive_ack_with_request_id(
+            &receiver_id,
+            request_id,
+            payload,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("first send_with_receive_ack_with_request_id");
+
+    sender
+        .send_with_receive_ack_with_request_id(
+            &receiver_id,
+            request_id,
+            payload,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("second send_with_receive_ack_with_request_id (hedge replay)");
+
+    // First call must deliver the payload.
+    let (peer_id, delivered) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout on first delivery")
+        .expect("recv result on first delivery");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(delivered, payload);
+
+    // Hedge (second call) must NOT redeliver — the receiver's
+    // AckRequestDedupeCache replays the cached ACK on the wire but skips
+    // the recv pipeline.
+    let no_redelivery = timeout(Duration::from_millis(500), receiver.recv()).await;
+    assert!(
+        no_redelivery.is_err(),
+        "duplicate request_id must not trigger a second recv() delivery, got {no_redelivery:?}"
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}

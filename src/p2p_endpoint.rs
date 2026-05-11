@@ -6381,18 +6381,45 @@ impl P2pEndpoint {
     /// On ACK timeout this performs one duplicate-safe retry with the same
     /// ACK-v2 request ID. The receiver deduplicates accepted payloads, so the
     /// retry can recover a late/lost ACK response without double-delivering.
+    ///
+    /// Generates a fresh request id and delegates to
+    /// [`P2pEndpoint::send_with_receive_ack_with_request_id`]. Callers that need
+    /// to issue more than one [`send_with_receive_ack`] for the same logical
+    /// payload — e.g. application-level request hedging — should use the
+    /// `_with_request_id` variant directly and supply the same id to every call
+    /// so the receiver dedupes the duplicates instead of delivering them twice.
     pub async fn send_with_receive_ack(
         &self,
         peer_id: &PeerId,
         data: &[u8],
         timeout_duration: Duration,
     ) -> Result<(), EndpointError> {
+        let mut request_id = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut request_id);
+        self.send_with_receive_ack_with_request_id(peer_id, request_id, data, timeout_duration)
+            .await
+    }
+
+    /// Same contract as [`send_with_receive_ack`] but the caller supplies the
+    /// ACK-v2 request id. Two calls with the same `(peer_id, request_id, data)`
+    /// are duplicate-safe at the receiver: the second arrival is replayed from
+    /// the receiver-side [`AckRequestDedupeCache`], the cached ACK is returned
+    /// on the wire, and the payload is **not** redelivered to `recv()`.
+    ///
+    /// Intended for application-level request hedging (x0x X0X-0066): the caller
+    /// issues an original send, then issues a hedge with the same id after a
+    /// per-peer p95 timer fires. Whichever ACK lands first wins; the loser's
+    /// future is dropped (streams are drop-safe).
+    pub async fn send_with_receive_ack_with_request_id(
+        &self,
+        peer_id: &PeerId,
+        request_id: [u8; 16],
+        data: &[u8],
+        timeout_duration: Duration,
+    ) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
-
-        let mut request_id = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut request_id);
 
         let first = self
             .send_ack_exchange_once(
