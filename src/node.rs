@@ -59,8 +59,9 @@ use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
 use crate::p2p_endpoint::{
-    AckDiagnosticsSnapshot, ConnectionHealth, DataChannelDiagnosticsSnapshot, EndpointError,
-    P2pEndpoint, P2pEvent, PeerConnection, PeerLifecycleEvent,
+    AckDiagnosticsSnapshot, ConnectionHealth, ConnectionTransportStats,
+    DataChannelDiagnosticsSnapshot, EndpointError, P2pEndpoint, P2pEvent, PeerConnection,
+    PeerLifecycleEvent,
 };
 use crate::reachability::{DIRECT_REACHABILITY_TTL, socket_addr_scope};
 use crate::unified_config::P2pConfig;
@@ -629,6 +630,14 @@ impl Node {
     /// Get a best-effort connection health snapshot for a peer.
     pub async fn connection_health(&self, peer_id: &PeerId) -> ConnectionHealth {
         self.inner.connection_health(peer_id).await
+    }
+
+    /// Get qlog-style transport path telemetry for a connected peer.
+    pub async fn connection_transport_stats(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<ConnectionTransportStats> {
+        self.inner.connection_transport_stats(peer_id).await
     }
 
     /// Subscribe to lifecycle events for a specific peer.

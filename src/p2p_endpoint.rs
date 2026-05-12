@@ -855,6 +855,57 @@ pub struct ConnectionMetrics {
     pub last_activity: Option<Instant>,
 }
 
+/// JSON-friendly QUIC path and congestion telemetry for one connected peer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConnectionTransportStats {
+    /// Whether the peer currently has a live transport connection.
+    pub connected: bool,
+    /// Current local lifecycle generation for the live QUIC connection.
+    pub generation: Option<u64>,
+    /// Current best RTT sample exposed by Quinn.
+    pub rtt_ms: Option<u64>,
+    /// UDP bytes transmitted on this connection.
+    pub udp_tx_bytes: u64,
+    /// UDP bytes received on this connection.
+    pub udp_rx_bytes: u64,
+    /// UDP datagrams transmitted on this connection.
+    pub udp_tx_datagrams: u64,
+    /// UDP datagrams received on this connection.
+    pub udp_rx_datagrams: u64,
+    /// Current congestion window in bytes.
+    pub congestion_window: Option<u64>,
+    /// Cumulative congestion events observed on the current path.
+    pub congestion_events: u64,
+    /// Cumulative lost packets observed on the current path.
+    pub lost_packets: u64,
+    /// Cumulative lost bytes observed on the current path.
+    pub lost_bytes: u64,
+    /// Cumulative packets sent on the current path.
+    pub sent_packets: u64,
+    /// Cumulative PLPMTUD probe packets sent on the current path.
+    pub sent_plpmtud_probes: u64,
+    /// Cumulative PLPMTUD probe packets lost on the current path.
+    pub lost_plpmtud_probes: u64,
+    /// Cumulative path black-hole detections.
+    pub black_holes_detected: u64,
+    /// Lost packets divided by sent+lost packets.
+    pub packet_loss_rate: f64,
+    /// Current path MTU.
+    pub current_mtu: Option<u16>,
+    /// TX STREAMS_BLOCKED frames; proxy for stream-open blocking pressure.
+    pub stream_open_blocked_events: u64,
+    /// TX DATA_BLOCKED frames.
+    pub data_blocked_events: u64,
+    /// TX STREAM_DATA_BLOCKED frames.
+    pub stream_data_blocked_events: u64,
+    /// Last application send activity, relative to this snapshot.
+    pub last_sent_ago_ms: Option<u64>,
+    /// Last application receive activity, relative to this snapshot.
+    pub last_received_ago_ms: Option<u64>,
+    /// Time since any live send/receive activity.
+    pub idle_for_ms: Option<u64>,
+}
+
 /// Best-effort connection health snapshot for a peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectionHealth {
@@ -7211,6 +7262,73 @@ impl P2pEndpoint {
         })
     }
 
+    /// Get qlog-style transport telemetry for a specific live connection.
+    ///
+    /// This is intentionally additive to [`Self::connection_health`]: health
+    /// answers "is the lifecycle live?", while this snapshot exposes the
+    /// current Quinn path counters needed to diagnose congestion, loss, and
+    /// stream-open blocking pressure.
+    pub async fn connection_transport_stats(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<ConnectionTransportStats> {
+        let connection = self.inner.get_connection(peer_id).ok()??;
+        let stats = connection.stats();
+        let rtt = connection.rtt();
+        let live_snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        let now = Instant::now();
+        let activity = self
+            .peer_activity
+            .read()
+            .await
+            .get(peer_id)
+            .copied()
+            .unwrap_or_default();
+        let last_live_activity = match (activity.last_sent_at, activity.last_received_at) {
+            (Some(sent), Some(received)) => Some(sent.max(received)),
+            (Some(sent), None) => Some(sent),
+            (None, Some(received)) => Some(received),
+            (None, None) => None,
+        };
+        let total_loss_denominator =
+            (stats.path.sent_packets + stats.path.lost_packets).max(1) as f64;
+        let stream_open_blocked_events =
+            stats.frame_tx.streams_blocked_bidi + stats.frame_tx.streams_blocked_uni;
+
+        Some(ConnectionTransportStats {
+            connected: live_snapshot.is_some(),
+            generation: live_snapshot.map(|snapshot| snapshot.generation),
+            rtt_ms: Some(duration_millis_saturating(rtt)),
+            udp_tx_bytes: stats.udp_tx.bytes,
+            udp_rx_bytes: stats.udp_rx.bytes,
+            udp_tx_datagrams: stats.udp_tx.datagrams,
+            udp_rx_datagrams: stats.udp_rx.datagrams,
+            congestion_window: Some(stats.path.cwnd),
+            congestion_events: stats.path.congestion_events,
+            lost_packets: stats.path.lost_packets,
+            lost_bytes: stats.path.lost_bytes,
+            sent_packets: stats.path.sent_packets,
+            sent_plpmtud_probes: stats.path.sent_plpmtud_probes,
+            lost_plpmtud_probes: stats.path.lost_plpmtud_probes,
+            black_holes_detected: stats.path.black_holes_detected,
+            packet_loss_rate: stats.path.lost_packets as f64 / total_loss_denominator,
+            current_mtu: Some(stats.path.current_mtu),
+            stream_open_blocked_events,
+            data_blocked_events: stats.frame_tx.data_blocked,
+            stream_data_blocked_events: stats.frame_tx.stream_data_blocked,
+            last_sent_ago_ms: activity
+                .last_sent_at
+                .map(|instant| duration_millis_saturating(now.saturating_duration_since(instant))),
+            last_received_ago_ms: activity
+                .last_received_at
+                .map(|instant| duration_millis_saturating(now.saturating_duration_since(instant))),
+            idle_for_ms: last_live_activity
+                .map(|instant| duration_millis_saturating(now.saturating_duration_since(instant))),
+        })
+    }
+
     /// Get a best-effort snapshot of connection health for a peer.
     ///
     /// This is an additive observability surface intended for subscribers and
@@ -10382,6 +10500,19 @@ mod tests {
         assert_eq!(metrics.bytes_received, 0);
         assert!(metrics.rtt.is_none());
         assert_eq!(metrics.packet_loss, 0.0);
+    }
+
+    #[test]
+    fn test_connection_transport_stats_default() {
+        let stats = ConnectionTransportStats::default();
+        assert!(!stats.connected);
+        assert!(stats.generation.is_none());
+        assert!(stats.rtt_ms.is_none());
+        assert_eq!(stats.udp_tx_bytes, 0);
+        assert_eq!(stats.udp_rx_bytes, 0);
+        assert_eq!(stats.packet_loss_rate, 0.0);
+        assert!(stats.current_mtu.is_none());
+        assert!(stats.idle_for_ms.is_none());
     }
 
     #[test]

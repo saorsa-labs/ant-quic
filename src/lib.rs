@@ -384,9 +384,9 @@ pub use diagnostics::{GsoDiagnostics, GsoDiagnosticsSnapshot};
 pub use p2p_endpoint::{
     AckDiagnosticsSnapshot, AckOutcomeCounters, AckPeerDiagnosticsSnapshot,
     AckStageDiagnosticsSnapshot, AckStageLatencySnapshot, ConnectionHealth, ConnectionMetrics,
-    DataChannelDiagnosticsSnapshot, DirectPathStatus, DirectPathUnavailableReason,
-    DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent, PeerConnection,
-    PeerLifecycleEvent, TraversalPhase,
+    ConnectionTransportStats, DataChannelDiagnosticsSnapshot, DirectPathStatus,
+    DirectPathUnavailableReason, DisconnectReason, EndpointError, EndpointStats, P2pEndpoint,
+    P2pEvent, PeerConnection, PeerLifecycleEvent, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern
