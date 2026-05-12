@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.22] - 2026-05-12
+
+X0X-0075 Part B — qlog-style transport telemetry for live peer
+connections. Adds a public `ConnectionTransportStats` snapshot
+exposing Quinn `PathStats`, `FrameStats`, and `UdpStats` so
+downstream consumers (saorsa-gossip diagnostics, x0x
+`/diagnostics/connectivity`) can attribute congestion, loss, and
+stream-open blocking pressure to specific peers under load.
+
+### Added
+
+- `ConnectionTransportStats` (in `p2p_endpoint`) — connected,
+  generation, `rtt_ms`, UDP rx/tx bytes + datagrams, `congestion_window`,
+  `congestion_events`, `lost_packets`, `lost_bytes`, `sent_packets`,
+  `packet_loss_rate`, PLPMTUD probe counters, `black_holes_detected`,
+  `current_mtu`, stream-open/data/stream-data blocked event counts,
+  `last_sent_ago_ms` / `last_received_ago_ms` / `idle_for_ms`.
+- `P2pEndpoint::connection_transport_stats(peer_id)` async accessor.
+  Returns `None` when the peer has no live connection.
+- `Node::connection_transport_stats(peer_id)` thin async forwarder.
+- Public re-export in `lib.rs`.
+- `test_connection_transport_stats_default` unit test.
+
+### Notes
+
+- Companion to `connection_health()` (which answers "is the lifecycle
+  live?"). The two surfaces are intentionally independent so callers
+  can compose them.
+- Frame-tx `STREAMS_BLOCKED` / `DATA_BLOCKED` / `STREAM_DATA_BLOCKED`
+  counters expose flow-control pressure that previously was visible
+  only through Quinn-internal counters.
+
 ## [0.27.21] - 2026-05-11
 
 X0X-0066 enablement: expose a caller-supplied ACK-v2 request id so
