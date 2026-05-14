@@ -195,21 +195,151 @@ mod tests {
         Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
     }
 
+    // CacheEntry tests
+
+    #[test]
+    fn cache_entry_new_has_one_token() {
+        let entry = CacheEntry::new(Arc::from("test.com"), Bytes::from("token1"));
+        assert_eq!(entry.server_name.as_ref(), "test.com");
+        assert_eq!(entry.tokens.len(), 1);
+    }
+
+    // State tests
+
+    #[test]
+    fn state_store_new_server_creates_entry() {
+        let mut state = State::new(10, 3);
+        state.store("example.com", Bytes::from("abc"));
+        assert!(state.lookup.contains_key("example.com"));
+        let token = state.take("example.com");
+        assert_eq!(token, Some(Bytes::from("abc")));
+    }
+
+    #[test]
+    fn state_store_multiple_tokens_per_server() {
+        let mut state = State::new(10, 3);
+        state.store("srv", Bytes::from("t1"));
+        state.store("srv", Bytes::from("t2"));
+        state.store("srv", Bytes::from("t3"));
+        assert_eq!(state.take("srv"), Some(Bytes::from("t1")));
+        assert_eq!(state.take("srv"), Some(Bytes::from("t2")));
+        assert_eq!(state.take("srv"), Some(Bytes::from("t3")));
+        assert_eq!(state.take("srv"), None);
+    }
+
+    #[test]
+    fn state_store_evicts_oldest_token_when_queue_full() {
+        let mut state = State::new(10, 2);
+        state.store("srv", Bytes::from("t1"));
+        state.store("srv", Bytes::from("t2"));
+        state.store("srv", Bytes::from("t3"));
+        // t1 should be evicted, only t2 and t3 remain
+        assert_eq!(state.take("srv"), Some(Bytes::from("t2")));
+        assert_eq!(state.take("srv"), Some(Bytes::from("t3")));
+        assert_eq!(state.take("srv"), None);
+    }
+
+    #[test]
+    fn state_store_evicts_lru_server_when_max_servers_reached() {
+        let mut state = State::new(2, 2);
+        state.store("srv1", Bytes::from("a"));
+        state.store("srv2", Bytes::from("b"));
+        state.store("srv3", Bytes::from("c"));
+        // srv1 should be evicted (LRU), srv2 and srv3 remain
+        assert_eq!(state.take("srv1"), None);
+        assert_eq!(state.take("srv2"), Some(Bytes::from("b")));
+        assert_eq!(state.take("srv3"), Some(Bytes::from("c")));
+    }
+
+    #[test]
+    fn state_store_zero_max_servers_does_nothing() {
+        let mut state = State::new(0, 2);
+        state.store("srv", Bytes::from("token"));
+        assert!(state.lookup.is_empty());
+        assert_eq!(state.take("srv"), None);
+    }
+
+    #[test]
+    fn state_store_zero_queue_length_does_nothing() {
+        let mut state = State::new(10, 0);
+        state.store("srv", Bytes::from("token"));
+        assert_eq!(state.take("srv"), None);
+    }
+
+    #[test]
+    fn state_take_unknown_server_returns_none() {
+        let mut state = State::new(10, 2);
+        assert_eq!(state.take("unknown"), None);
+    }
+
+    #[test]
+    fn state_take_removes_server_when_queue_emptied() {
+        let mut state = State::new(10, 2);
+        state.store("srv", Bytes::from("only"));
+        assert!(state.lookup.contains_key("srv"));
+        assert_eq!(state.take("srv"), Some(Bytes::from("only")));
+        assert!(!state.lookup.contains_key("srv"));
+    }
+
+    #[test]
+    fn state_store_updates_lru_order_on_existing_server() {
+        let mut state = State::new(2, 2);
+        state.store("srv1", Bytes::from("a"));
+        state.store("srv2", Bytes::from("b"));
+        // Access srv1 by storing another token (makes it recently used)
+        state.store("srv1", Bytes::from("a2"));
+        // Now store srv3 — should evict srv2 (oldest LRU), not srv1
+        state.store("srv3", Bytes::from("c"));
+        assert_eq!(state.take("srv1"), Some(Bytes::from("a")));
+        assert_eq!(state.take("srv2"), None);
+        assert_eq!(state.take("srv3"), Some(Bytes::from("c")));
+    }
+
+    #[test]
+    fn state_multiple_servers_independent_queues() {
+        let mut state = State::new(10, 3);
+        state.store("srv1", Bytes::from("1a"));
+        state.store("srv2", Bytes::from("2a"));
+        state.store("srv1", Bytes::from("1b"));
+        assert_eq!(state.take("srv1"), Some(Bytes::from("1a")));
+        assert_eq!(state.take("srv2"), Some(Bytes::from("2a")));
+        assert_eq!(state.take("srv1"), Some(Bytes::from("1b")));
+    }
+
+    #[test]
+    fn state_store_different_tokens_same_server_fifo() {
+        let mut state = State::new(10, 5);
+        for i in 0..5 {
+            state.store("srv", Bytes::from(vec![i]));
+        }
+        for i in 0..5 {
+            let token = state.take("srv").unwrap();
+            assert_eq!(token[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn cache_entry_clone_arc() {
+        let name = Arc::<str>::from("server.example.com");
+        let entry = CacheEntry::new(name.clone(), Bytes::from("tok"));
+        assert!(Arc::ptr_eq(&entry.server_name, &name));
+    }
+
+    // Existing integration tests preserved below
+
     #[test]
     fn cache_test() {
         let mut rng = new_rng();
         const N: usize = 2;
 
         for _ in 0..10 {
-            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
+            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new();
             let cache_2 = TokenMemoryCache::new(20, 2);
 
             for i in 0..200 {
                 let server_name = rng.r#gen::<u32>() % 10;
                 if rng.gen_bool(0.666) {
-                    // store
                     let token = Bytes::from(vec![i]);
-                    println!("STORE {server_name} {token:?}");
                     if let Some((j, _)) = cache_1
                         .iter()
                         .enumerate()
@@ -231,8 +361,6 @@ mod tests {
                     }
                     cache_2.insert(&server_name.to_string(), token);
                 } else {
-                    // take
-                    println!("TAKE {server_name}");
                     let expecting = cache_1
                         .iter()
                         .enumerate()
@@ -246,7 +374,6 @@ mod tests {
                             }
                             token
                         });
-                    println!("EXPECTING {expecting:?}");
                     assert_eq!(cache_2.take(&server_name.to_string()), expecting);
                 }
             }
@@ -255,7 +382,6 @@ mod tests {
 
     #[test]
     fn zero_max_server_names() {
-        // test that this edge case doesn't panic
         let cache = TokenMemoryCache::new(0, 2);
         for i in 0..10 {
             cache.insert(&i.to_string(), Bytes::from(vec![i]));
@@ -267,7 +393,6 @@ mod tests {
 
     #[test]
     fn zero_queue_length() {
-        // test that this edge case doesn't panic
         let cache = TokenMemoryCache::new(256, 0);
         for i in 0..10 {
             cache.insert(&i.to_string(), Bytes::from(vec![i]));

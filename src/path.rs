@@ -50,6 +50,198 @@ impl fmt::Display for PathId {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::PathStats;
+
+    // ── PathId tests ──
+
+    #[test]
+    fn path_id_primary_is_zero() {
+        assert_eq!(PathId::PRIMARY.get(), 0);
+    }
+
+    #[test]
+    fn path_id_from_u64() {
+        let id: PathId = 42u64.into();
+        assert_eq!(id.get(), 42);
+    }
+
+    #[test]
+    fn path_id_into_u64() {
+        let id = PathId::PRIMARY;
+        let val: u64 = id.into();
+        assert_eq!(val, 0);
+    }
+
+    #[test]
+    fn path_id_default_is_zero() {
+        let id = PathId::default();
+        assert_eq!(id.get(), 0);
+        assert_eq!(id, PathId::PRIMARY);
+    }
+
+    #[test]
+    fn path_id_equality() {
+        assert_eq!(PathId::from(1u64), PathId::from(1u64));
+        assert_ne!(PathId::from(1u64), PathId::from(2u64));
+    }
+
+    #[test]
+    fn path_id_ordering() {
+        assert!(PathId::from(0u64) < PathId::from(1u64));
+        assert!(PathId::from(1u64) > PathId::from(0u64));
+    }
+
+    #[test]
+    fn path_id_display() {
+        assert_eq!(format!("{}", PathId::PRIMARY), "0");
+        assert_eq!(format!("{}", PathId::from(42u64)), "42");
+    }
+
+    #[test]
+    fn path_id_debug() {
+        let debug = format!("{:?}", PathId::from(42u64));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn path_id_clone() {
+        let a = PathId::from(5u64);
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn path_id_hash() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = PathId::from(10u64);
+        let b = PathId::from(10u64);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    // ── PathSnapshot tests ──
+
+    #[test]
+    fn path_snapshot_default() {
+        let stats = PathStats::default();
+        // PathSnapshot is pub(crate), test via construction
+        let snapshot = PathSnapshot {
+            stats,
+            remote_address: "127.0.0.1:9000".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        assert_eq!(snapshot.remote_address.port(), 9000);
+        assert!(snapshot.observed_external_addr.is_none());
+    }
+
+    #[test]
+    fn path_snapshot_with_external_addr() {
+        let stats = PathStats::default();
+        let snapshot = PathSnapshot {
+            stats,
+            remote_address: "192.168.1.1:9000".parse().unwrap(),
+            observed_external_addr: Some("10.0.0.1:9001".parse().unwrap()),
+        };
+        assert!(snapshot.observed_external_addr.is_some());
+        assert_eq!(
+            snapshot.observed_external_addr.unwrap().to_string(),
+            "10.0.0.1:9001"
+        );
+    }
+
+    #[test]
+    fn path_snapshot_clone_copy() {
+        let stats = PathStats::default();
+        let s1 = PathSnapshot {
+            stats,
+            remote_address: "127.0.0.1:80".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        let s2 = s1;
+        assert_eq!(s1.remote_address, s2.remote_address);
+    }
+
+    // ── RetainedPathSnapshot tests ──
+
+    #[test]
+    fn retained_path_snapshot_store_and_load() {
+        let stats = PathStats::default();
+        let snapshot = PathSnapshot {
+            stats,
+            remote_address: "127.0.0.1:9000".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        let retained = RetainedPathSnapshot::new(snapshot);
+        let loaded = retained.load();
+        assert_eq!(loaded.remote_address.port(), 9000);
+    }
+
+    #[test]
+    fn retained_path_snapshot_overwrite() {
+        let stats = PathStats::default();
+        let snapshot1 = PathSnapshot {
+            stats,
+            remote_address: "127.0.0.1:1".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        let retained = RetainedPathSnapshot::new(snapshot1);
+
+        let snapshot2 = PathSnapshot {
+            stats: PathStats::default(),
+            remote_address: "127.0.0.1:2".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        retained.store(snapshot2);
+
+        let loaded = retained.load();
+        assert_eq!(loaded.remote_address.port(), 2);
+    }
+
+    #[test]
+    fn retained_path_snapshot_clone() {
+        let stats = PathStats::default();
+        let snapshot = PathSnapshot {
+            stats,
+            remote_address: "10.0.0.1:8000".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        let retained = RetainedPathSnapshot::new(snapshot);
+        let cloned = retained.clone();
+        assert_eq!(retained.load().remote_address, cloned.load().remote_address);
+    }
+
+    #[test]
+    fn retained_path_snapshot_concurrent_independence() {
+        let stats = PathStats::default();
+        let snapshot = PathSnapshot {
+            stats,
+            remote_address: "127.0.0.1:9000".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        let retained = RetainedPathSnapshot::new(snapshot);
+        let cloned = retained.clone();
+
+        // Update one, the other should still see the old value
+        let new_snapshot = PathSnapshot {
+            stats: PathStats::default(),
+            remote_address: "127.0.0.1:9999".parse().unwrap(),
+            observed_external_addr: None,
+        };
+        retained.store(new_snapshot);
+
+        assert_eq!(retained.load().remote_address.port(), 9999);
+        assert_eq!(cloned.load().remote_address.port(), 9999); // shared Arc
+    }
+}
+
 /// Snapshot of read-only path state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PathSnapshot {

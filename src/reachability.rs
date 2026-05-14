@@ -119,58 +119,272 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    // Constants
+
     #[test]
-    fn test_socket_addr_scope_ipv4() {
+    fn direct_reachability_ttl_is_15_minutes() {
+        assert_eq!(DIRECT_REACHABILITY_TTL, Duration::from_secs(900));
+    }
+
+    // ReachabilityScope tests
+
+    #[test]
+    fn scope_loopback_display() {
+        assert_eq!(ReachabilityScope::Loopback.to_string(), "loopback");
+    }
+
+    #[test]
+    fn scope_local_network_display() {
+        assert_eq!(ReachabilityScope::LocalNetwork.to_string(), "local-network");
+    }
+
+    #[test]
+    fn scope_global_display() {
+        assert_eq!(ReachabilityScope::Global.to_string(), "global");
+    }
+
+    #[test]
+    fn scope_ordering_loopback_lt_local_lt_global() {
+        assert!(ReachabilityScope::Loopback < ReachabilityScope::LocalNetwork);
+        assert!(ReachabilityScope::LocalNetwork < ReachabilityScope::Global);
+    }
+
+    #[test]
+    fn scope_broaden_same() {
+        assert_eq!(
+            ReachabilityScope::Loopback.broaden(ReachabilityScope::Loopback),
+            ReachabilityScope::Loopback
+        );
+    }
+
+    #[test]
+    fn scope_broaden_loopback_to_local() {
+        assert_eq!(
+            ReachabilityScope::Loopback.broaden(ReachabilityScope::LocalNetwork),
+            ReachabilityScope::LocalNetwork
+        );
+    }
+
+    #[test]
+    fn scope_broaden_local_to_global() {
+        assert_eq!(
+            ReachabilityScope::LocalNetwork.broaden(ReachabilityScope::Global),
+            ReachabilityScope::Global
+        );
+    }
+
+    #[test]
+    fn scope_broaden_global_to_loopback() {
+        assert_eq!(
+            ReachabilityScope::Global.broaden(ReachabilityScope::Loopback),
+            ReachabilityScope::Global
+        );
+    }
+
+    #[test]
+    fn scope_clone_copy() {
+        let a = ReachabilityScope::Global;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn scope_equality() {
+        assert_eq!(ReachabilityScope::Loopback, ReachabilityScope::Loopback);
+        assert_ne!(ReachabilityScope::Loopback, ReachabilityScope::Global);
+    }
+
+    // socket_addr_scope IPv4 tests
+
+    #[test]
+    fn scope_ipv4_loopback() {
         assert_eq!(
             socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)),
             Some(ReachabilityScope::Loopback)
         );
+    }
+
+    #[test]
+    fn scope_ipv4_private_rfc1918_10() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-                9000
-            )),
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9000)),
             Some(ReachabilityScope::LocalNetwork)
         );
+    }
+
+    #[test]
+    fn scope_ipv4_private_rfc1918_172() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
-                9000
-            )),
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 9000)),
+            Some(ReachabilityScope::LocalNetwork)
+        );
+    }
+
+    #[test]
+    fn scope_ipv4_private_rfc1918_192() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 9000)),
+            Some(ReachabilityScope::LocalNetwork)
+        );
+    }
+
+    #[test]
+    fn scope_ipv4_link_local() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 9000)),
+            Some(ReachabilityScope::LocalNetwork)
+        );
+    }
+
+    #[test]
+    fn scope_ipv4_global() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 9000)),
             Some(ReachabilityScope::Global)
         );
+    }
+
+    #[test]
+    fn scope_ipv4_multicast() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 9000)),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_ipv4_unspecified() {
         assert_eq!(
             socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000)),
             None
         );
     }
 
+    // socket_addr_scope IPv6 tests
+
     #[test]
-    fn test_socket_addr_scope_ipv6() {
+    fn scope_ipv6_loopback() {
         assert_eq!(
             socket_addr_scope(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9000)),
             Some(ReachabilityScope::Loopback)
         );
+    }
+
+    #[test]
+    fn scope_ipv6_unique_local() {
         assert_eq!(
             socket_addr_scope(SocketAddr::new(
-                IpAddr::V6("fd00::1".parse::<Ipv6Addr>().expect("valid ULA")),
-                9000,
+                IpAddr::V6("fd00::1".parse().unwrap()),
+                9000
             )),
             Some(ReachabilityScope::LocalNetwork)
         );
+    }
+
+    #[test]
+    fn scope_ipv6_link_local() {
         assert_eq!(
             socket_addr_scope(SocketAddr::new(
-                IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().expect("valid global v6")),
-                9000,
+                IpAddr::V6("fe80::1".parse().unwrap()),
+                9000
+            )),
+            Some(ReachabilityScope::LocalNetwork)
+        );
+    }
+
+    #[test]
+    fn scope_ipv6_global() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V6("2001:db8::1".parse().unwrap()),
+                9000
             )),
             Some(ReachabilityScope::Global)
         );
     }
 
     #[test]
-    fn test_traversal_method_direct_flag() {
+    fn scope_ipv6_multicast() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V6("ff02::1".parse().unwrap()),
+                9000
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_ipv6_unspecified() {
+        assert_eq!(
+            socket_addr_scope(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9000)),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_ipv4_mapped_ipv6_is_ipv6() {
+        // IPv4-mapped IPv6 addresses like ::ffff:192.168.1.1
+        // Are treated as IPv6 addresses by the IpAddr type
+        let mapped: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(mapped.is_ipv6());
+        // ::ffff:8.8.8.8 is a global IPv4 mapped as IPv6
+        let result = socket_addr_scope(SocketAddr::new(mapped, 9000));
+        assert_eq!(result, Some(ReachabilityScope::Global));
+    }
+
+    // TraversalMethod tests
+
+    #[test]
+    fn traversal_direct_is_direct() {
         assert!(TraversalMethod::Direct.is_direct());
+    }
+
+    #[test]
+    fn traversal_hole_punch_is_not_direct() {
         assert!(!TraversalMethod::HolePunch.is_direct());
+    }
+
+    #[test]
+    fn traversal_relay_is_not_direct() {
         assert!(!TraversalMethod::Relay.is_direct());
+    }
+
+    #[test]
+    fn traversal_port_prediction_is_not_direct() {
+        assert!(!TraversalMethod::PortPrediction.is_direct());
+    }
+
+    #[test]
+    fn traversal_display_direct() {
+        assert_eq!(TraversalMethod::Direct.to_string(), "direct");
+    }
+
+    #[test]
+    fn traversal_display_hole_punch() {
+        assert_eq!(TraversalMethod::HolePunch.to_string(), "hole punch");
+    }
+
+    #[test]
+    fn traversal_display_relay() {
+        assert_eq!(TraversalMethod::Relay.to_string(), "relay");
+    }
+
+    #[test]
+    fn traversal_display_port_prediction() {
+        assert_eq!(TraversalMethod::PortPrediction.to_string(), "port prediction");
+    }
+
+    #[test]
+    fn traversal_equality() {
+        assert_eq!(TraversalMethod::Direct, TraversalMethod::Direct);
+        assert_ne!(TraversalMethod::Direct, TraversalMethod::Relay);
+    }
+
+    #[test]
+    fn traversal_clone_copy() {
+        let a = TraversalMethod::Direct;
+        let b = a;
+        assert_eq!(a, b);
     }
 }

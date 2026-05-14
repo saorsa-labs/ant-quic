@@ -11,7 +11,6 @@
 //! This module provides consistent error handling patterns and utilities
 //! to ensure uniform error propagation and handling across the codebase.
 
-use std::fmt;
 use thiserror::Error;
 
 /// Comprehensive error type for ant-quic operations
@@ -75,7 +74,7 @@ pub mod utils {
     use tracing::{error, warn, info, debug};
 
     /// Log an error with appropriate level based on severity
-    pub fn log_error<E: std::error::Error>(error: &E, context: &str) {
+    pub fn log_error(error: &(dyn std::error::Error + 'static), context: &str) {
         let error_msg = format!("{}: {}", context, error);
         match error.downcast_ref::<AntQuicError>() {
             Some(AntQuicError::Internal(_)) => error!("{}", error_msg),
@@ -88,7 +87,7 @@ pub mod utils {
     }
 
     /// Convert an error to a user-friendly message
-    pub fn to_user_message<E: std::error::Error>(error: &E) -> String {
+    pub fn to_user_message(error: &(dyn std::error::Error + 'static)) -> String {
         match error.downcast_ref::<AntQuicError>() {
             Some(AntQuicError::Transport(_)) => "Network connection error. Please check your internet connection.".to_string(),
             Some(AntQuicError::Connection(_)) => "Failed to establish connection. The remote peer may be unreachable.".to_string(),
@@ -107,7 +106,7 @@ pub mod utils {
     }
 
     /// Check if an error is recoverable
-    pub fn is_recoverable<E: std::error::Error>(error: &E) -> bool {
+    pub fn is_recoverable(error: &(dyn std::error::Error + 'static)) -> bool {
         match error.downcast_ref::<AntQuicError>() {
             Some(AntQuicError::Timeout(_)) => true,
             Some(AntQuicError::Connection(_)) => true,
@@ -122,7 +121,7 @@ pub mod utils {
     }
 
     /// Get recommended retry delay for an error
-    pub fn get_retry_delay<E: std::error::Error>(error: &E) -> Option<std::time::Duration> {
+    pub fn get_retry_delay(error: &(dyn std::error::Error + 'static)) -> Option<std::time::Duration> {
         match error.downcast_ref::<AntQuicError>() {
             Some(AntQuicError::Timeout(_)) => Some(std::time::Duration::from_millis(100)),
             Some(AntQuicError::Connection(_)) => Some(std::time::Duration::from_millis(500)),
@@ -140,7 +139,7 @@ pub mod utils {
     }
 }
 
-/// Error handling macros for consistent error propagation
+/// Checks a condition and returns an error (converted via `.into()`) if it's false.
 #[macro_export]
 macro_rules! ensure {
     ($condition:expr, $error:expr) => {
@@ -150,6 +149,8 @@ macro_rules! ensure {
     };
 }
 
+/// Returns an error immediately, converting via .
+/// Returns an error immediately, converting via `.into()`.
 #[macro_export]
 macro_rules! bail {
     ($error:expr) => {
@@ -157,6 +158,8 @@ macro_rules! bail {
     };
 }
 
+/// Wraps a Result's error with additional context, converting to [].
+/// Wraps a Result's error with additional context, converting to [`AntQuicError::Internal`].
 #[macro_export]
 macro_rules! context {
     ($result:expr, $context:expr) => {
@@ -176,29 +179,357 @@ macro_rules! context {
 /// 8. **Document error conditions**: Document when and why errors can occur
 /// 9. **Test error paths**: Ensure error conditions are tested
 /// 10. **Fail securely**: Don't leak sensitive information in error messages
-///
-/// Example usage:
-///
-/// ```rust
-/// use crate::error_handling::{AntQuicError, Result, utils::*};
-///
-/// fn connect_peer(peer_id: &str) -> Result<()> {
-///     // Validate input
-///     ensure!(!peer_id.is_empty(), AntQuicError::InvalidParameter("peer_id cannot be empty".to_string()));
-///
-///     // Attempt connection
-///     match do_connection_attempt(peer_id) {
-///         Ok(()) => Ok(()),
-///         Err(e) => {
-///             log_error(&e, "Failed to connect peer through unified connectivity path");
-///             if is_recoverable(&e) {
-///                 if let Some(delay) = get_retry_delay(&e) {
-///                     std::thread::sleep(delay);
-///                     // Retry logic here
-///                 }
-///             }
-///             Err(e)
-///         }
-///     }
-/// }
-/// ```
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── AntQuicError construction and display ──
+
+    #[test]
+    fn error_transport_display() {
+        let err = AntQuicError::Transport(crate::transport_error::Error::INTERNAL_ERROR("test"));
+        let display = format!("{err}");
+        assert!(display.contains("Transport error"));
+    }
+
+    #[test]
+    fn error_connection_display() {
+        let err = AntQuicError::Connection(crate::connection::ConnectionError::LocallyClosed);
+        let display = format!("{err}");
+        assert!(display.contains("Connection error"));
+    }
+
+    #[test]
+    fn error_config_display() {
+        let err = AntQuicError::Config("bad config".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Configuration error"));
+        assert!(display.contains("bad config"));
+    }
+
+    #[test]
+    fn error_crypto_display() {
+        let err = AntQuicError::Crypto("key error".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Crypto error"));
+    }
+
+    #[test]
+    fn error_timeout_display() {
+        let err = AntQuicError::Timeout("timed out".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("timed out"));
+    }
+
+    #[test]
+    fn error_resource_exhausted_display() {
+        let err = AntQuicError::ResourceExhausted("no mem".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Resource exhausted"));
+    }
+
+    #[test]
+    fn error_invalid_parameter_display() {
+        let err = AntQuicError::InvalidParameter("bad param".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Invalid parameter"));
+    }
+
+    #[test]
+    fn error_internal_display() {
+        let err = AntQuicError::Internal("bug".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Internal error"));
+    }
+
+    #[test]
+    fn error_debug_format() {
+        let err = AntQuicError::Internal("test".to_string());
+        let debug = format!("{err:?}");
+        assert!(debug.contains("Internal"));
+    }
+
+    #[test]
+    fn error_from_invalid_parameter() {
+        let s = "bad".to_string();
+        let err: AntQuicError = AntQuicError::InvalidParameter(s);
+        assert!(format!("{err}").contains("Invalid parameter"));
+    }
+
+    #[test]
+    fn error_io_into() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: AntQuicError = io_err.into();
+        assert!(matches!(err, AntQuicError::Io(_)));
+    }
+
+    // ── utils::log_error tests ──
+
+    #[test]
+    fn log_error_internal() {
+        let err = AntQuicError::Internal("test internal".to_string());
+        // Should not panic
+        utils::log_error(&err, "test context");
+    }
+
+    #[test]
+    fn log_error_transport() {
+        let err = AntQuicError::Transport(crate::transport_error::Error::INTERNAL_ERROR("x"));
+        utils::log_error(&err, "transport");
+    }
+
+    #[test]
+    fn log_error_generic() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "generic");
+        utils::log_error(&err, "generic context");
+    }
+
+    // ── utils::to_user_message tests ──
+
+    #[test]
+    fn user_message_transport() {
+        let err = AntQuicError::Transport(crate::transport_error::Error::INTERNAL_ERROR(""));
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Network connection error"));
+    }
+
+    #[test]
+    fn user_message_connection() {
+        let err = AntQuicError::Connection(crate::connection::ConnectionError::LocallyClosed);
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Failed to establish connection"));
+    }
+
+    #[test]
+    fn user_message_timeout() {
+        let err = AntQuicError::Timeout("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("timed out"));
+    }
+
+    #[test]
+    fn user_message_crypto() {
+        let err = AntQuicError::Crypto("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Cryptographic operation failed"));
+    }
+
+    #[test]
+    fn user_message_internal() {
+        let err = AntQuicError::Internal("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("internal error"));
+    }
+
+    #[test]
+    fn user_message_config() {
+        let err = AntQuicError::Config("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Configuration error"));
+    }
+
+    #[test]
+    fn user_message_discovery() {
+        // DiscoveryError is in candidate_discovery module — use a generic fallback
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "weird");
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("unexpected error"));
+    }
+
+    #[test]
+    fn user_message_io() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("I/O error"));
+    }
+
+    #[test]
+    fn user_message_invalid_parameter() {
+        let err = AntQuicError::InvalidParameter("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Invalid input"));
+    }
+
+    #[test]
+    fn user_message_resource_exhausted() {
+        let err = AntQuicError::ResourceExhausted("x".to_string());
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("resources exhausted"));
+    }
+
+    #[test]
+    fn user_message_pqc() {
+        use crate::crypto::pqc::types::PqcError;
+        let err = AntQuicError::Pqc(PqcError::KeyGenerationFailed("test".to_string()));
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("Post-quantum"));
+    }
+
+    #[test]
+    fn user_message_nat_traversal() {
+        use crate::nat_traversal_api::NatTraversalError;
+        let err = AntQuicError::NatTraversal(NatTraversalError::HolePunchingFailed);
+        let msg = utils::to_user_message(&err);
+        assert!(msg.contains("NAT traversal failed"));
+    }
+
+    // ── utils::is_recoverable tests ──
+
+    #[test]
+    fn timeout_is_recoverable() {
+        let err = AntQuicError::Timeout("x".to_string());
+        assert!(utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn connection_error_is_recoverable() {
+        let err = AntQuicError::Connection(crate::connection::ConnectionError::LocallyClosed);
+        assert!(utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn internal_error_is_not_recoverable() {
+        let err = AntQuicError::Internal("x".to_string());
+        assert!(!utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn config_error_is_not_recoverable() {
+        let err = AntQuicError::Config("x".to_string());
+        assert!(!utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn io_timeout_is_recoverable() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        assert!(utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn io_interrupted_is_recoverable() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"));
+        assert!(utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn io_permission_denied_is_not_recoverable() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        assert!(!utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn generic_error_is_not_recoverable() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        assert!(!utils::is_recoverable(&err));
+    }
+
+    #[test]
+    fn crypto_error_is_not_recoverable() {
+        let err = AntQuicError::Crypto("x".to_string());
+        assert!(!utils::is_recoverable(&err));
+    }
+
+    // ── utils::get_retry_delay tests ──
+
+    #[test]
+    fn timeout_has_retry_delay() {
+        let err = AntQuicError::Timeout("x".to_string());
+        let delay = utils::get_retry_delay(&err);
+        assert!(delay.is_some());
+        assert_eq!(delay.unwrap(), std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn connection_has_retry_delay() {
+        let err = AntQuicError::Connection(crate::connection::ConnectionError::LocallyClosed);
+        let delay = utils::get_retry_delay(&err);
+        assert!(delay.is_some());
+        assert_eq!(delay.unwrap(), std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn discovery_has_retry_delay() {
+        use crate::candidate_discovery::DiscoveryError;
+        let err = AntQuicError::Discovery(DiscoveryError::NoLocalInterfaces);
+        let delay = utils::get_retry_delay(&err);
+        assert!(delay.is_some());
+    }
+
+    #[test]
+    fn internal_has_no_retry_delay() {
+        let err = AntQuicError::Internal("x".to_string());
+        assert!(utils::get_retry_delay(&err).is_none());
+    }
+
+    #[test]
+    fn generic_error_has_no_retry_delay() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        assert!(utils::get_retry_delay(&err).is_none());
+    }
+
+    #[test]
+    fn io_timeout_has_retry_delay() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        let delay = utils::get_retry_delay(&err);
+        assert!(delay.is_some());
+        assert_eq!(delay.unwrap(), std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn io_interrupted_has_retry_delay() {
+        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "int"));
+        let delay = utils::get_retry_delay(&err);
+        assert!(delay.is_some());
+        assert_eq!(delay.unwrap(), std::time::Duration::from_millis(10));
+    }
+
+    // ── Macro tests ──
+
+    #[test]
+    fn ensure_passes_when_true() {
+        let result: Result<()> = (|| {
+            ensure!(true, AntQuicError::Internal("should not happen".to_string()));
+            Ok(())
+        })();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ensure_fails_when_false() {
+        let result: Result<()> = (|| {
+            ensure!(false, AntQuicError::InvalidParameter("bad".to_string()));
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AntQuicError::InvalidParameter(_)));
+    }
+
+    #[test]
+    fn bail_returns_error() {
+        let result: Result<()> = (|| {
+            bail!(AntQuicError::Internal("bailed".to_string()));
+        })();
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("bailed"));
+    }
+
+    #[test]
+    fn bail_with_type_conversion() {
+        // bail! can convert via .into()
+        let result: Result<()> = (|| {
+            let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+            bail!(io_err);
+        })();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AntQuicError::Io(_)));
+    }
+
+    // ── Error source chain ──
+
+    #[test]
+    fn error_source_chain_transport() {
+        let err = AntQuicError::Transport(crate::transport_error::Error::INTERNAL_ERROR("chain"));
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some());
+    }
+}

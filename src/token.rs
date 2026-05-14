@@ -248,6 +248,184 @@ impl fmt::Display for ResetToken {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // ── ResetToken tests ──
+
+    #[test]
+    fn reset_token_from_array() {
+        let arr = [0xABu8; RESET_TOKEN_SIZE];
+        let token: ResetToken = arr.into();
+        assert_eq!(&token.0[..], &arr[..]);
+    }
+
+    #[test]
+    fn reset_token_deref() {
+        let arr = [0xABu8; RESET_TOKEN_SIZE];
+        let token: ResetToken = arr.into();
+        let slice: &[u8] = &token;
+        assert_eq!(slice.len(), RESET_TOKEN_SIZE);
+        assert_eq!(slice, &arr[..]);
+    }
+
+    #[test]
+    fn reset_token_display_hex() {
+        let arr = [0xDEu8; RESET_TOKEN_SIZE];
+        let token: ResetToken = arr.into();
+        let display = format!("{token}");
+        assert_eq!(display.len(), RESET_TOKEN_SIZE * 2);
+        assert!(display.starts_with("de"));
+    }
+
+    #[test]
+    fn reset_token_equality_identical() {
+        let arr = [0xABu8; RESET_TOKEN_SIZE];
+        let a: ResetToken = arr.into();
+        let b: ResetToken = arr.into();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reset_token_equality_different() {
+        let a: ResetToken = [0xABu8; RESET_TOKEN_SIZE].into();
+        let b: ResetToken = [0xBAu8; RESET_TOKEN_SIZE].into();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reset_token_clone() {
+        let a: ResetToken = [0xABu8; RESET_TOKEN_SIZE].into();
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reset_token_hash_consistent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a: ResetToken = [0xABu8; RESET_TOKEN_SIZE].into();
+        let b: ResetToken = [0xABu8; RESET_TOKEN_SIZE].into();
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn reset_token_debug() {
+        let token: ResetToken = [0xABu8; RESET_TOKEN_SIZE].into();
+        let debug = format!("{token:?}");
+        assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn reset_token_copy_semantics() {
+        let a: ResetToken = [0x01u8; RESET_TOKEN_SIZE].into();
+        let b = a; // Copy, not move
+        assert_eq!(a, b); // Both usable
+    }
+
+    // ── NoneTokenLog tests ──
+
+    #[test]
+    fn none_token_log_always_rejects() {
+        let log = NoneTokenLog;
+        let result = log.check_and_insert(42, std::time::UNIX_EPOCH, Duration::from_secs(60));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn none_token_log_rejects_all_nonces() {
+        let log = NoneTokenLog;
+        assert!(log.check_and_insert(0, std::time::UNIX_EPOCH, Duration::from_secs(1)).is_err());
+        assert!(log.check_and_insert(u128::MAX, std::time::UNIX_EPOCH, Duration::from_secs(300)).is_err());
+    }
+
+    // ── NoneTokenStore tests ──
+
+    #[test]
+    fn none_token_store_insert_and_take_returns_none() {
+        let store = NoneTokenStore;
+        store.insert("server.com", Bytes::from("token"));
+        assert!(store.take("server.com").is_none());
+    }
+
+    #[test]
+    fn none_token_store_take_empty_returns_none() {
+        let store = NoneTokenStore;
+        assert!(store.take("unknown").is_none());
+    }
+
+    // ── TokenReuseError tests ──
+
+    #[test]
+    fn token_reuse_error_type() {
+        let _err = TokenReuseError;
+        // Verify it's a zero-sized type
+        assert_eq!(std::mem::size_of::<TokenReuseError>(), 0);
+    }
+
+    // ── IncomingToken tests ──
+
+    #[test]
+    fn incoming_token_unvalidated_when_empty_token() {
+        // We can't construct a real InitialHeader + ServerConfig easily here,
+        // but we can test that IncomingToken fields work correctly
+        let token = IncomingToken {
+            retry_src_cid: None,
+            orig_dst_cid: ConnectionId::new(&[0x01, 0x02]),
+            validated: false,
+        };
+        assert!(!token.validated);
+        assert!(token.retry_src_cid.is_none());
+        assert_eq!(token.orig_dst_cid.len(), 2);
+    }
+
+    #[test]
+    fn incoming_token_validated_via_retry() {
+        let cid = ConnectionId::new(&[0xAA, 0xBB, 0xCC]);
+        let token = IncomingToken {
+            retry_src_cid: Some(cid),
+            orig_dst_cid: cid,
+            validated: true,
+        };
+        assert!(token.validated);
+        assert_eq!(token.retry_src_cid, Some(cid));
+    }
+
+    #[test]
+    fn incoming_token_debug() {
+        let token = IncomingToken {
+            retry_src_cid: None,
+            orig_dst_cid: ConnectionId::new(&[0x01]),
+            validated: false,
+        };
+        let debug = format!("{token:?}");
+        assert!(debug.contains("validated"));
+    }
+
+    #[test]
+    fn incoming_token_clone_via_debug() {
+        // IncomingToken doesn't implement Clone, but can be manually reconstructed
+        let token = IncomingToken {
+            retry_src_cid: None,
+            orig_dst_cid: ConnectionId::new(&[0x01]),
+            validated: true,
+        };
+        let token2 = IncomingToken {
+            retry_src_cid: token.retry_src_cid,
+            orig_dst_cid: token.orig_dst_cid,
+            validated: token.validated,
+        };
+        assert_eq!(token.validated, token2.validated);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use super::*;
 

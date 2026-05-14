@@ -178,10 +178,186 @@ const SIGNATURE_LEN: usize = 8 - NONCE_LEN; // 8-byte total CID length
 mod tests {
     use super::*;
 
+    // RandomConnectionIdGenerator tests
+
     #[test]
-    fn validate_keyed_cid() {
-        let mut generator = HashedConnectionIdGenerator::new();
-        let cid = generator.generate_cid();
-        generator.validate(&cid).unwrap();
+    fn random_default_len() {
+        let mut g = RandomConnectionIdGenerator::default();
+        assert_eq!(g.cid_len(), 8);
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), 8);
+    }
+
+    #[test]
+    fn random_custom_len() {
+        let mut g = RandomConnectionIdGenerator::new(4);
+        assert_eq!(g.cid_len(), 4);
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), 4);
+    }
+
+    #[test]
+    fn random_max_len() {
+        let mut g = RandomConnectionIdGenerator::new(MAX_CID_SIZE);
+        assert_eq!(g.cid_len(), MAX_CID_SIZE);
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), MAX_CID_SIZE);
+    }
+
+    #[test]
+    fn random_min_zero_len() {
+        let mut g = RandomConnectionIdGenerator::new(0);
+        assert_eq!(g.cid_len(), 0);
+        let cid = g.generate_cid();
+        assert!(cid.is_empty());
+    }
+
+    #[test]
+    fn random_cids_differ() {
+        let mut g = RandomConnectionIdGenerator::new(8);
+        let a = g.generate_cid();
+        let b = g.generate_cid();
+        assert_ne!(a, b, "random CIDs should almost never collide");
+    }
+
+    #[test]
+    fn random_no_lifetime_by_default() {
+        let g = RandomConnectionIdGenerator::default();
+        assert!(g.cid_lifetime().is_none());
+    }
+
+    #[test]
+    fn random_with_lifetime() {
+        let mut g = RandomConnectionIdGenerator::new(8);
+        g.set_lifetime(Duration::from_secs(60));
+        assert_eq!(g.cid_lifetime(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn random_not_all_zeros() {
+        let mut g = RandomConnectionIdGenerator::new(8);
+        let cid = g.generate_cid();
+        assert!(cid.iter().any(|&b| b != 0), "CID should not be all zeros");
+    }
+
+    #[test]
+    fn random_validate_always_ok() {
+        let g = RandomConnectionIdGenerator::default();
+        let arbitrary = ConnectionId::new(&[0xAB, 0xCD]);
+        assert!(g.validate(&arbitrary).is_ok());
+    }
+
+    // HashedConnectionIdGenerator tests
+
+    #[test]
+    fn hashed_default_len() {
+        let mut g = HashedConnectionIdGenerator::new();
+        assert_eq!(g.cid_len(), 8);
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), 8);
+    }
+
+    #[test]
+    fn hashed_validate_own_cid() {
+        let mut g = HashedConnectionIdGenerator::new();
+        let cid = g.generate_cid();
+        assert!(g.validate(&cid).is_ok());
+    }
+
+    #[test]
+    fn hashed_validates_from_key() {
+        let mut g = HashedConnectionIdGenerator::from_key(0xDEAD_BEEF_CAFE_BABE);
+        let cid = g.generate_cid();
+        assert!(g.validate(&cid).is_ok());
+    }
+
+    #[test]
+    fn hashed_rejects_other_key() {
+        let mut g1 = HashedConnectionIdGenerator::from_key(1);
+        let cid_from_1 = g1.generate_cid();
+        let g2 = HashedConnectionIdGenerator::from_key(2);
+        assert!(g2.validate(&cid_from_1).is_err());
+    }
+
+    #[test]
+    fn hashed_deterministic_key_still_random_nonce() {
+        let mut g = HashedConnectionIdGenerator::from_key(42);
+        let cid1 = g.generate_cid();
+        let cid2 = g.generate_cid();
+        assert_ne!(cid1, cid2);
+        assert!(g.validate(&cid1).is_ok());
+        assert!(g.validate(&cid2).is_ok());
+    }
+
+    #[test]
+    fn hashed_rejects_random_cid() {
+        let g = HashedConnectionIdGenerator::from_key(42);
+        let random_cid = ConnectionId::new(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert!(g.validate(&random_cid).is_err());
+    }
+
+    #[test]
+    fn hashed_rejects_wrong_length() {
+        let g = HashedConnectionIdGenerator::from_key(42);
+        let short_cid = ConnectionId::new(&[0x01, 0x02, 0x03]);
+        assert!(g.validate(&short_cid).is_err());
+    }
+
+    #[test]
+    fn hashed_lifetime() {
+        let mut g = HashedConnectionIdGenerator::new();
+        assert!(g.cid_lifetime().is_none());
+        g.set_lifetime(Duration::from_secs(300));
+        assert_eq!(g.cid_lifetime(), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn hashed_validate_twice() {
+        let mut g = HashedConnectionIdGenerator::from_key(123);
+        let cid = g.generate_cid();
+        assert!(g.validate(&cid).is_ok());
+        assert!(g.validate(&cid).is_ok());
+    }
+
+    #[test]
+    fn hashed_cid_always_8_bytes() {
+        let mut g = HashedConnectionIdGenerator::new();
+        for _ in 0..10 {
+            let cid = g.generate_cid();
+            assert_eq!(cid.len(), 8);
+        }
+    }
+
+    #[test]
+    fn hashed_default_is_new() {
+        let g = HashedConnectionIdGenerator::default();
+        assert_eq!(g.cid_len(), 8);
+    }
+
+    // InvalidCid tests
+
+    #[test]
+    fn invalid_cid_debug_and_copy() {
+        let a = InvalidCid;
+        let b = a;
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    // Trait object tests
+
+    #[test]
+    fn trait_random_generator() {
+        let mut g: Box<dyn ConnectionIdGenerator> = Box::new(RandomConnectionIdGenerator::new(4));
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), 4);
+        assert_eq!(g.cid_len(), 4);
+    }
+
+    #[test]
+    fn trait_hashed_generator() {
+        let mut g: Box<dyn ConnectionIdGenerator> = Box::new(HashedConnectionIdGenerator::new());
+        let cid = g.generate_cid();
+        assert_eq!(cid.len(), 8);
+        assert!(g.validate(&cid).is_ok());
     }
 }

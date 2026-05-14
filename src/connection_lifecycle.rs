@@ -161,3 +161,265 @@ impl ConnectionLifecycleState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    // ── ConnectionCloseReason tests ──
+
+    #[test]
+    fn reason_as_str_all_variants() {
+        let cases = [
+            (ConnectionCloseReason::Superseded, "Superseded"),
+            (ConnectionCloseReason::ReaderExit, "ReaderExit"),
+            (ConnectionCloseReason::PeerShutdown, "PeerShutdown"),
+            (ConnectionCloseReason::Banned, "Banned"),
+            (ConnectionCloseReason::LifecycleCleanup, "LifecycleCleanup"),
+            (ConnectionCloseReason::LivenessTimeout, "LivenessTimeout"),
+            (ConnectionCloseReason::ApplicationClosed, "ApplicationClosed"),
+            (ConnectionCloseReason::ConnectionClosed, "ConnectionClosed"),
+            (ConnectionCloseReason::TimedOut, "TimedOut"),
+            (ConnectionCloseReason::Reset, "Reset"),
+            (ConnectionCloseReason::TransportError, "TransportError"),
+            (ConnectionCloseReason::LocallyClosed, "LocallyClosed"),
+            (ConnectionCloseReason::VersionMismatch, "VersionMismatch"),
+            (ConnectionCloseReason::CidsExhausted, "CidsExhausted"),
+            (ConnectionCloseReason::Unknown, "Unknown"),
+        ];
+
+        for (reason, expected) in &cases {
+            assert_eq!(reason.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn reason_display_matches_as_str() {
+        let reasons = [
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::ReaderExit,
+            ConnectionCloseReason::PeerShutdown,
+            ConnectionCloseReason::Banned,
+            ConnectionCloseReason::LifecycleCleanup,
+            ConnectionCloseReason::LivenessTimeout,
+            ConnectionCloseReason::ApplicationClosed,
+            ConnectionCloseReason::ConnectionClosed,
+            ConnectionCloseReason::TimedOut,
+            ConnectionCloseReason::Reset,
+            ConnectionCloseReason::TransportError,
+            ConnectionCloseReason::LocallyClosed,
+            ConnectionCloseReason::VersionMismatch,
+            ConnectionCloseReason::CidsExhausted,
+            ConnectionCloseReason::Unknown,
+        ];
+
+        for reason in &reasons {
+            assert_eq!(format!("{reason}"), reason.as_str());
+        }
+    }
+
+    #[test]
+    fn reason_reason_bytes_equals_as_str_bytes() {
+        let reasons = [
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::ReaderExit,
+            ConnectionCloseReason::LivenessTimeout,
+            ConnectionCloseReason::Unknown,
+        ];
+
+        for reason in &reasons {
+            assert_eq!(reason.reason_bytes(), reason.as_str().as_bytes());
+        }
+    }
+
+    #[test]
+    fn reason_equality() {
+        assert_eq!(
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::Superseded
+        );
+        assert_ne!(
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::ReaderExit
+        );
+    }
+
+    #[test]
+    fn reason_clone() {
+        let r = ConnectionCloseReason::Superseded;
+        assert_eq!(r.clone(), r);
+    }
+
+    // ── app_error_code tests ──
+
+    #[test]
+    fn lifecycle_reasons_have_app_error_codes() {
+        let has_code = [
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::ReaderExit,
+            ConnectionCloseReason::PeerShutdown,
+            ConnectionCloseReason::Banned,
+            ConnectionCloseReason::LifecycleCleanup,
+            ConnectionCloseReason::LivenessTimeout,
+        ];
+
+        for reason in &has_code {
+            assert!(
+                reason.app_error_code().is_some(),
+                "{reason:?} should have an app_error_code"
+            );
+        }
+    }
+
+    #[test]
+    fn non_lifecycle_reasons_have_no_app_error_code() {
+        let no_code = [
+            ConnectionCloseReason::ApplicationClosed,
+            ConnectionCloseReason::ConnectionClosed,
+            ConnectionCloseReason::TimedOut,
+            ConnectionCloseReason::Reset,
+            ConnectionCloseReason::TransportError,
+            ConnectionCloseReason::LocallyClosed,
+            ConnectionCloseReason::VersionMismatch,
+            ConnectionCloseReason::CidsExhausted,
+            ConnectionCloseReason::Unknown,
+        ];
+
+        for reason in &no_code {
+            assert!(
+                reason.app_error_code().is_none(),
+                "{reason:?} should NOT have an app_error_code"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_error_codes_start_at_base() {
+        let superseded_code = ConnectionCloseReason::Superseded
+            .app_error_code()
+            .unwrap()
+            .into_inner() as u32;
+        assert_eq!(superseded_code, ANT_QUIC_CLOSE_CODE_BASE);
+
+        let liveness_code = ConnectionCloseReason::LivenessTimeout
+            .app_error_code()
+            .unwrap()
+            .into_inner() as u32;
+        assert_eq!(liveness_code, ANT_QUIC_CLOSE_CODE_BASE + 5);
+    }
+
+    // ── from_app_error_code tests ──
+
+    #[test]
+    fn from_app_error_code_roundtrip() {
+        let lifecycle_reasons = [
+            ConnectionCloseReason::Superseded,
+            ConnectionCloseReason::ReaderExit,
+            ConnectionCloseReason::PeerShutdown,
+            ConnectionCloseReason::Banned,
+            ConnectionCloseReason::LifecycleCleanup,
+            ConnectionCloseReason::LivenessTimeout,
+        ];
+
+        for reason in &lifecycle_reasons {
+            let code = reason.app_error_code().unwrap();
+            let mapped = ConnectionCloseReason::from_app_error_code(code);
+            assert_eq!(mapped, Some(*reason));
+        }
+    }
+
+    #[test]
+    fn from_app_error_code_unknown_code() {
+        let code = VarInt::from_u32(0x1234);
+        let result = ConnectionCloseReason::from_app_error_code(code);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn from_app_error_code_zero() {
+        // Standard QUIC no-error should not map to a lifecycle reason
+        let code = VarInt::from_u32(0);
+        let result = ConnectionCloseReason::from_app_error_code(code);
+        assert_eq!(result, None);
+    }
+
+    // ── from_connection_error tests ──
+
+    #[test]
+    fn from_connection_error_application_closed_maps_to_lifecycle() {
+        let code = VarInt::from_u32(CLOSE_CODE_SUPERSEDED);
+        let app_close = crate::frame::ApplicationClose {
+            error_code: code,
+            reason: Bytes::new(),
+        };
+        let frame = crate::ConnectionError::ApplicationClosed(app_close);
+        let reason = ConnectionCloseReason::from_connection_error(&frame);
+        assert_eq!(reason, ConnectionCloseReason::Superseded);
+    }
+
+    #[test]
+    fn from_connection_error_application_closed_falls_back() {
+        let code = VarInt::from_u32(0x1234);
+        let app_close = crate::frame::ApplicationClose {
+            error_code: code,
+            reason: Bytes::new(),
+        };
+        let frame = crate::ConnectionError::ApplicationClosed(app_close);
+        let reason = ConnectionCloseReason::from_connection_error(&frame);
+        assert_eq!(reason, ConnectionCloseReason::ApplicationClosed);
+    }
+
+    // ── ConnectionLifecycleState tests ──
+
+    #[test]
+    fn lifecycle_state_name_live() {
+        assert_eq!(ConnectionLifecycleState::Live.name(), "Live");
+    }
+
+    #[test]
+    fn lifecycle_state_name_superseded() {
+        let state = ConnectionLifecycleState::Superseded {
+            replaced_by_generation: 42,
+        };
+        assert_eq!(state.name(), "Superseded");
+    }
+
+    #[test]
+    fn lifecycle_state_name_closing() {
+        let state = ConnectionLifecycleState::Closing {
+            reason: ConnectionCloseReason::PeerShutdown,
+        };
+        assert_eq!(state.name(), "Closing");
+    }
+
+    #[test]
+    fn lifecycle_state_name_closed() {
+        let state = ConnectionLifecycleState::Closed {
+            reason: ConnectionCloseReason::LivenessTimeout,
+            closed_at_unix_ms: 1000,
+        };
+        assert_eq!(state.name(), "Closed");
+    }
+
+    #[test]
+    fn lifecycle_state_equality() {
+        assert_eq!(
+            ConnectionLifecycleState::Live,
+            ConnectionLifecycleState::Live
+        );
+        assert_ne!(
+            ConnectionLifecycleState::Live,
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_state_debug() {
+        let state = ConnectionLifecycleState::Live;
+        let debug = format!("{state:?}");
+        assert!(debug.contains("Live"));
+    }
+}

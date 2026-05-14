@@ -145,6 +145,9 @@ pub mod connection_strategy;
 /// RFC 8305 Happy Eyeballs v2 for parallel IPv4/IPv6 connection racing
 pub mod happy_eyeballs;
 
+/// Standardized error handling patterns
+pub mod error_handling;
+
 /// Discovery trait for stream composition
 pub mod discovery_trait;
 
