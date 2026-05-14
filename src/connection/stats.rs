@@ -212,3 +212,186 @@ impl DatagramDropStats {
         self.bytes = self.bytes.saturating_add(bytes);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Frame;
+
+    // UdpStats tests
+
+    #[test]
+    fn udp_stats_default() {
+        let s = UdpStats::default();
+        assert_eq!(s.datagrams, 0);
+        assert_eq!(s.bytes, 0);
+        assert_eq!(s.ios, 0);
+    }
+
+    #[test]
+    fn udp_stats_on_sent_increments() {
+        let mut s = UdpStats::default();
+        s.on_sent(5, 1200);
+        assert_eq!(s.datagrams, 5);
+        assert_eq!(s.bytes, 1200);
+        assert_eq!(s.ios, 1);
+    }
+
+    #[test]
+    fn udp_stats_on_sent_accumulates() {
+        let mut s = UdpStats::default();
+        s.on_sent(1, 100);
+        s.on_sent(2, 200);
+        assert_eq!(s.datagrams, 3);
+        assert_eq!(s.bytes, 300);
+        assert_eq!(s.ios, 2);
+    }
+
+    #[test]
+    fn udp_stats_clone_copy() {
+        let mut a = UdpStats::default();
+        a.on_sent(10, 500);
+        let b = a;
+        assert_eq!(b.datagrams, 10);
+    }
+
+    // FrameStats tests
+
+    #[test]
+    fn frame_stats_default() {
+        let s = FrameStats::default();
+        assert_eq!(s.ping, 0);
+        assert_eq!(s.acks, 0);
+        assert_eq!(s.crypto, 0);
+    }
+
+    #[test]
+    fn frame_stats_padding_record() {
+        let mut s = FrameStats::default();
+        s.record(&Frame::Padding);
+        assert_eq!(s.ping, 0); // Padding doesn't increment anything
+    }
+
+    #[test]
+    fn frame_stats_ping_record() {
+        let mut s = FrameStats::default();
+        s.record(&Frame::Ping);
+        assert_eq!(s.ping, 1);
+    }
+
+    #[test]
+    fn frame_stats_immediate_ack_record() {
+        let mut s = FrameStats::default();
+        s.record(&Frame::ImmediateAck);
+        assert_eq!(s.immediate_ack, 1);
+    }
+
+    #[test]
+    fn frame_stats_handshake_done_record() {
+        let mut s = FrameStats::default();
+        s.record(&Frame::HandshakeDone);
+        assert_eq!(s.handshake_done, 1);
+        s.record(&Frame::HandshakeDone);
+        assert_eq!(s.handshake_done, 2); // uses saturating_add
+    }
+
+    #[test]
+    fn frame_stats_increments_separate_counters() {
+        let mut s = FrameStats::default();
+        s.record(&Frame::Ping);
+        s.record(&Frame::ImmediateAck);
+        s.record(&Frame::HandshakeDone);
+        assert_eq!(s.ping, 1);
+        assert_eq!(s.immediate_ack, 1);
+        assert_eq!(s.handshake_done, 1);
+    }
+
+    #[test]
+    fn frame_stats_debug_format() {
+        let s = FrameStats::default();
+        let debug = format!("{s:?}");
+        assert!(debug.contains("PING"));
+        assert!(debug.contains("ACK"));
+    }
+
+    // DatagramDropStats tests
+
+    #[test]
+    fn datagram_drop_default_zero() {
+        let d = DatagramDropStats::default();
+        assert_eq!(d.datagrams, 0);
+        assert_eq!(d.bytes, 0);
+    }
+
+    #[test]
+    fn datagram_drop_record() {
+        let mut d = DatagramDropStats::default();
+        d.record(5, 1000);
+        assert_eq!(d.datagrams, 5);
+        assert_eq!(d.bytes, 1000);
+    }
+
+    #[test]
+    fn datagram_drop_accumulates() {
+        let mut d = DatagramDropStats::default();
+        d.record(3, 300);
+        d.record(2, 200);
+        assert_eq!(d.datagrams, 5);
+        assert_eq!(d.bytes, 500);
+    }
+
+    #[test]
+    fn datagram_drop_saturating_add() {
+        let mut d = DatagramDropStats::default();
+        d.datagrams = u64::MAX;
+        d.record(1, 0);
+        // Should not overflow
+        assert_eq!(d.datagrams, u64::MAX);
+    }
+
+    #[test]
+    fn datagram_drop_equality() {
+        let mut a = DatagramDropStats::default();
+        a.record(10, 100);
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // PathStats tests
+
+    #[test]
+    fn path_stats_default() {
+        let p = PathStats::default();
+        assert_eq!(p.rtt, Duration::default());
+        assert_eq!(p.cwnd, 0);
+        assert_eq!(p.lost_packets, 0);
+        assert_eq!(p.current_mtu, 0);
+    }
+
+    #[test]
+    fn path_stats_clone_copy() {
+        let a = PathStats::default();
+        let b = a;
+        assert_eq!(a.rtt, b.rtt);
+    }
+
+    // ConnectionStats tests
+
+    #[test]
+    fn connection_stats_default() {
+        let c = ConnectionStats::default();
+        assert_eq!(c.udp_tx.datagrams, 0);
+        assert_eq!(c.udp_rx.datagrams, 0);
+        assert_eq!(c.frame_tx.ping, 0);
+        assert_eq!(c.frame_rx.ping, 0);
+        assert_eq!(c.path.cwnd, 0);
+        assert_eq!(c.datagram_drops.datagrams, 0);
+    }
+
+    #[test]
+    fn connection_stats_clone_copy() {
+        let a = ConnectionStats::default();
+        let b = a;
+        assert_eq!(a.udp_tx.ios, b.udp_tx.ios);
+    }
+}

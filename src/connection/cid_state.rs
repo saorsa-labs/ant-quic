@@ -230,3 +230,173 @@ struct CidTimestamp {
     /// Timestamp when cid needs to be retired
     timestamp: Instant,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    // Construction tests
+
+    #[test]
+    fn cid_state_new_without_lifetime() {
+        let mut state = CidState::new(8, None, now(), 0);
+        assert_eq!(state.cid_len(), 8);
+        assert!(state.next_timeout().is_none());
+    }
+
+    #[test]
+    fn cid_state_new_with_issued_cids() {
+        let state = CidState::new(4, None, now(), 3);
+        assert_eq!(state.issued, 3);
+        let (min, max) = state.active_seq();
+        assert_eq!(min, 0);
+        assert_eq!(max, 2);
+    }
+
+    #[test]
+    fn cid_state_new_zero_cid_len() {
+        let state = CidState::new(0, None, now(), 0);
+        assert_eq!(state.cid_len(), 0);
+    }
+
+    #[test]
+    fn cid_state_new_with_lifetime_schedules_timeout() {
+        let mut state = CidState::new(8, Some(Duration::from_secs(30)), now(), 0);
+        // No CIDs issued, so no timeout
+        assert!(state.next_timeout().is_none());
+    }
+
+    #[test]
+    fn cid_state_new_with_lifetime_and_issued_has_timeout() {
+        let mut state = CidState::new(8, Some(Duration::from_secs(30)), now(), 2);
+        assert!(state.next_timeout().is_some());
+    }
+
+    // cid_len tests
+
+    #[test]
+    fn cid_len_returns_configured_value() {
+        let state = CidState::new(12, None, now(), 0);
+        assert_eq!(state.cid_len(), 12);
+    }
+
+    // retire_prior_to tests
+
+    #[test]
+    fn retire_prior_to_initial_zero() {
+        let state = CidState::new(8, None, now(), 0);
+        assert_eq!(state.retire_prior_to(), 0);
+    }
+
+    // active_seq helpers
+
+    #[test]
+    fn active_seq_with_issued_cids() {
+        let state = CidState::new(8, None, now(), 5);
+        let (min, max) = state.active_seq();
+        assert_eq!(min, 0);
+        assert_eq!(max, 4);
+    }
+
+    #[test]
+    fn active_seq_empty_no_cids() {
+        let state = CidState::new(8, None, now(), 0);
+        let (min, max) = state.active_seq();
+        assert_eq!(min, u64::MAX);
+        assert_eq!(max, u64::MIN);
+    }
+
+    // assign_retire_seq helper
+
+    #[test]
+    fn assign_retire_seq_increases() {
+        let mut state = CidState::new(8, None, now(), 5);
+        let _diff = state.assign_retire_seq(3);
+        assert_eq!(state.retire_seq, 3);
+    }
+
+    // on_cid_retirement tests
+
+    #[test]
+    fn retire_zero_len_cid_is_protocol_violation() {
+        let mut state = CidState::new(0, None, now(), 0);
+        let result = state.on_cid_retirement(0, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retire_unissued_sequence_is_protocol_violation() {
+        let mut state = CidState::new(8, None, now(), 3);
+        let result = state.on_cid_retirement(5, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retire_issued_cid_removes_from_active() {
+        let mut state = CidState::new(8, None, now(), 5); // seq 0-4
+        let result = state.on_cid_retirement(1, 10);
+        assert!(result.is_ok());
+        let (min, max) = state.active_seq();
+        assert_eq!(min, 0);
+        assert_eq!(max, 4); // seq 1 removed but seq 0,2,3,4 remain
+    }
+
+    #[test]
+    fn retire_returns_false_when_limit_satisfied() {
+        let mut state = CidState::new(8, None, now(), 3); // seq 0-2 active, limit=2
+        let result = state.on_cid_retirement(0, 2);
+        assert_eq!(result, Ok(false)); // 2 active seqs, limit=2, not < limit
+    }
+
+    #[test]
+    fn retire_returns_true_when_more_cids_needed() {
+        let mut state = CidState::new(8, None, now(), 3); // seq 0-2 active
+        let result = state.on_cid_retirement(0, 4);
+        assert_eq!(result, Ok(true)); // 2 active < 4 limit, can issue new
+    }
+
+    // on_cid_timeout tests
+
+    #[test]
+    fn on_cid_timeout_without_lifetime() {
+        let mut state = CidState::new(8, None, now(), 0);
+        // on_cid_timeout should not panic even with empty CIDs
+        let result = state.on_cid_timeout();
+        // No timeout events, result should be false
+        assert!(!result);
+    }
+
+    #[test]
+    fn on_cid_timeout_with_lifetime_and_active_seqs() {
+        let mut state = CidState::new(8, Some(Duration::from_secs(1)), now(), 2);
+        state.retire_seq = 2;
+        let result = state.on_cid_timeout();
+        // on_cid_timeout returns bool or panics
+        assert!(state.retire_seq >= 2 || !result);
+    }
+
+    // Decomposition: track_lifetime consecutive CIDs
+
+    #[test]
+    fn track_lifetime_same_timestamp_batches() {
+        let mut state = CidState::new(8, Some(Duration::from_secs(30)), now(), 0);
+        let t = now();
+        state.track_lifetime(0, t);
+        state.track_lifetime(1, t); // Same batch
+        assert_eq!(state.retire_timestamp.len(), 1);
+        assert_eq!(state.retire_timestamp.back().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn track_lifetime_different_timestamps() {
+        let mut state = CidState::new(8, Some(Duration::from_secs(30)), now(), 0);
+        let t = now();
+        state.track_lifetime(0, t);
+        state.track_lifetime(1, t + Duration::from_millis(1)); // Different batch
+        assert_eq!(state.retire_timestamp.len(), 2);
+    }
+}

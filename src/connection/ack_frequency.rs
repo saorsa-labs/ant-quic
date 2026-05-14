@@ -160,3 +160,146 @@ const MAX_RTT_ERROR: f32 = 0.2;
 /// extension and an explicit max ACK delay is not configured.
 // Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
 const MIN_AUTOMATIC_ACK_DELAY: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack_state() -> AckFrequencyState {
+        AckFrequencyState::new(Duration::from_millis(25))
+    }
+
+    fn default_config() -> AckFrequencyConfig {
+        AckFrequencyConfig::default()
+    }
+
+    fn default_params() -> TransportParameters {
+        TransportParameters::default()
+    }
+
+    // Construction tests
+
+    #[test]
+    fn new_default_max_ack_delay() {
+        let state = AckFrequencyState::new(Duration::from_millis(25));
+        assert_eq!(state.max_ack_delay, Duration::from_millis(25));
+        assert_eq!(state.peer_max_ack_delay, Duration::from_millis(25));
+        assert!(state.in_flight_ack_frequency_frame.is_none());
+    }
+
+    #[test]
+    fn new_sequence_starts_at_zero() {
+        let state = AckFrequencyState::new(Duration::from_millis(25));
+        assert_eq!(state.next_outgoing_sequence_number.0, 0);
+    }
+
+    // next_sequence_number tests
+
+    #[test]
+    fn next_sequence_increments() {
+        let mut state = ack_state();
+        assert_eq!(state.next_sequence_number().into_inner(), 0);
+        assert_eq!(state.next_sequence_number().into_inner(), 1);
+        assert_eq!(state.next_sequence_number().into_inner(), 2);
+    }
+
+    // should_send_ack_frequency tests
+
+    #[test]
+    fn should_send_at_startup() {
+        let state = ack_state();
+        let rtt = Duration::from_millis(100);
+        assert!(state.should_send_ack_frequency(rtt, &default_config(), &default_params()));
+    }
+
+    #[test]
+    fn should_not_send_after_sending_without_significant_change() {
+        let mut state = ack_state();
+        let rtt = Duration::from_millis(100);
+        state.ack_frequency_sent(1, Duration::from_millis(25));
+        // First send already happened (seq 0), so next_outgoing > 0
+        state.next_outgoing_sequence_number.0 = 1;
+        // Same RTT, same config should not trigger another send
+        assert!(!state.should_send_ack_frequency(rtt, &default_config(), &default_params()));
+    }
+
+    // candidate_max_ack_delay tests
+
+    #[test]
+    fn candidate_uses_peer_delay_when_no_config() {
+        let state = ack_state();
+        let rtt = Duration::from_millis(100);
+        let delay = state.candidate_max_ack_delay(rtt, &default_config(), &default_params());
+        // Peer max_ack_delay is 25ms, rtt is 100ms, min is 25ms
+        // clamp(25, max(100, 25)) = 25
+        assert_eq!(delay, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn candidate_uses_config_when_set() {
+        let state = ack_state();
+        let mut config = default_config();
+        config.max_ack_delay = Some(Duration::from_millis(50));
+        let rtt = Duration::from_millis(100);
+        let delay = state.candidate_max_ack_delay(rtt, &config, &default_params());
+        assert_eq!(delay, Duration::from_millis(50));
+    }
+
+    // max_ack_delay_for_pto tests
+
+    #[test]
+    fn pto_delay_equals_peer_delay_when_no_in_flight() {
+        let state = ack_state();
+        assert_eq!(state.max_ack_delay_for_pto(), Duration::from_millis(25));
+    }
+
+    #[test]
+    fn pto_delay_takes_max_when_in_flight() {
+        let mut state = ack_state();
+        state.ack_frequency_sent(1, Duration::from_millis(100));
+        // peer=25ms, in-flight=100ms -> max=100ms
+        assert_eq!(state.max_ack_delay_for_pto(), Duration::from_millis(100));
+    }
+
+    // on_acked tests
+
+    #[test]
+    fn on_acked_matching_pn_updates_peer_delay() {
+        let mut state = ack_state();
+        state.ack_frequency_sent(42, Duration::from_millis(100));
+        assert!(state.in_flight_ack_frequency_frame.is_some());
+        state.on_acked(42);
+        assert!(state.in_flight_ack_frequency_frame.is_none());
+        assert_eq!(state.peer_max_ack_delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn on_acked_non_matching_pn_noop() {
+        let mut state = ack_state();
+        state.ack_frequency_sent(42, Duration::from_millis(100));
+        state.on_acked(99);
+        assert!(state.in_flight_ack_frequency_frame.is_some());
+        assert_eq!(state.peer_max_ack_delay, Duration::from_millis(25));
+    }
+
+    // ack_frequency_sent tests
+
+    #[test]
+    fn sent_tracks_pn_and_delay() {
+        let mut state = ack_state();
+        state.ack_frequency_sent(10, Duration::from_millis(50));
+        assert_eq!(state.in_flight_ack_frequency_frame, Some((10, Duration::from_millis(50))));
+    }
+
+    // Constants test
+
+    #[test]
+    fn min_automatic_ack_delay_is_25ms() {
+        assert_eq!(MIN_AUTOMATIC_ACK_DELAY, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn max_rtt_error_is_20_percent() {
+        assert!((MAX_RTT_ERROR - 0.2).abs() < f32::EPSILON);
+    }
+}
