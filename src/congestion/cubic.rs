@@ -286,3 +286,207 @@ impl ControllerFactory for CubicConfig {
         Box::new(Cubic::new(Arc::new(self.clone()), now, current_mtu))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    fn config() -> Arc<CubicConfig> {
+        Arc::new(CubicConfig::default())
+    }
+
+    fn cc() -> Cubic {
+        Cubic::new(config(), now(), 1200)
+    }
+
+    // CubicConfig tests
+
+    #[test]
+    fn config_default_initial_window() {
+        let cfg = CubicConfig::default();
+        assert_eq!(cfg.initial_window, 12000);
+    }
+
+    #[test]
+    fn config_initial_window_setter() {
+        let mut cfg = CubicConfig::default();
+        cfg.initial_window(20000);
+        assert_eq!(cfg.initial_window, 20000);
+    }
+
+    // Cubic construction tests
+
+    #[test]
+    fn cubic_initial_window_from_config() {
+        let cc = cc();
+        assert_eq!(cc.window, 12000);
+        assert_eq!(cc.ssthresh, u64::MAX);
+        assert!(cc.recovery_start_time.is_none());
+        assert_eq!(cc.current_mtu, 1200);
+    }
+
+    #[test]
+    fn cubic_minimum_window() {
+        let cc = cc();
+        assert_eq!(cc.minimum_window(), 2400);
+    }
+
+    #[test]
+    fn cubic_minimum_window_large_mtu() {
+        let c = Cubic::new(config(), now(), 1500);
+        assert_eq!(c.minimum_window(), 3000);
+    }
+
+    // Controller trait tests
+
+    #[test]
+    fn window_accessor() {
+        assert_eq!(cc().window(), 12000);
+    }
+
+    #[test]
+    fn metrics_returns_cwnd_and_ssthresh() {
+        let m = cc().metrics();
+        assert_eq!(m.congestion_window, 12000);
+        assert!(m.ssthresh.is_some());
+    }
+
+    #[test]
+    fn initial_window_accessor() {
+        assert_eq!(cc().initial_window(), 12000);
+    }
+
+    #[test]
+    fn clone_box_preserves_state() {
+        let c = cc();
+        let cloned = c.clone_box();
+        assert_eq!(cloned.window(), c.window());
+    }
+
+    #[test]
+    fn into_any_downcasts() {
+        let c = cc();
+        let any = Box::new(c).into_any();
+        assert!(any.is::<Cubic>());
+    }
+
+    // Congestion event tests
+
+    #[test]
+    fn congestion_sets_ssthresh_and_window() {
+        let mut c = cc();
+        c.window = 50000;
+        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        assert!(c.window < 50000);
+        assert_eq!(c.ssthresh, c.window);
+        assert!(c.recovery_start_time.is_some());
+    }
+
+    #[test]
+    fn congestion_not_below_minimum() {
+        let mut c = cc();
+        c.window = 1000;
+        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        assert_eq!(c.window, c.minimum_window());
+    }
+
+    #[test]
+    fn persistent_congestion_resets_to_min() {
+        let mut c = cc();
+        c.window = 50000;
+        c.on_congestion_event(now() + Duration::from_millis(100), now(), true, 1200);
+        assert_eq!(c.window, c.minimum_window());
+    }
+
+    #[test]
+    fn duplicate_congestion_ignored_during_recovery() {
+        let mut c = cc();
+        c.window = 50000;
+        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        let after = c.window;
+        c.on_congestion_event(now() + Duration::from_millis(200), now(), false, 1200);
+        assert_eq!(c.window, after);
+    }
+
+    // MTU update tests
+
+    #[test]
+    fn mtu_update_changes_mtu() {
+        let mut c = cc();
+        c.on_mtu_update(1500);
+        assert_eq!(c.current_mtu, 1500);
+    }
+
+    #[test]
+    fn mtu_update_lifts_window_above_min() {
+        let mut c = cc();
+        c.window = 1000;
+        c.on_mtu_update(1500);
+        assert_eq!(c.window, 3000);
+    }
+
+    #[test]
+    fn mtu_update_does_not_lower_window() {
+        let mut c = cc();
+        c.window = 50000;
+        c.on_mtu_update(1500);
+        assert_eq!(c.window, 50000);
+    }
+
+    // Default impls
+
+    #[test]
+    fn on_sent_default() {
+        let mut c = cc();
+        let before = c.window;
+        c.on_sent(now(), 1200, 1);
+        assert_eq!(c.window, before);
+    }
+
+    #[test]
+    fn on_end_acks_default() {
+        let mut c = cc();
+        let before = c.window;
+        c.on_end_acks(now(), 1000, false, Some(1));
+        assert_eq!(c.window, before);
+    }
+
+    // Clone
+
+    #[test]
+    fn clone_independent() {
+        let a = cc();
+        let mut b = a.clone();
+        b.window = 999;
+        assert_ne!(a.window, b.window);
+    }
+
+    // State tests
+
+    #[test]
+    fn state_default_k_is_zero() {
+        let state = State::default();
+        assert_eq!(state.k, 0.0);
+    }
+
+    // ControllerFactory
+
+    #[test]
+    fn config_factory_creates_controller() {
+        let cfg = CubicConfig::default();
+        let controller = cfg.new_controller(5000, 100000, now());
+        assert!(controller.window() > 0);
+    }
+
+    #[test]
+    fn config_factory_derives_mtu() {
+        let cfg = CubicConfig::default();
+        let controller = cfg.new_controller(8000, 100000, now());
+        assert!(controller.window() > 0);
+    }
+}

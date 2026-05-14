@@ -106,3 +106,180 @@ impl Display for BandwidthEstimation {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    // bw_from_delta tests
+
+    #[test]
+    fn bw_from_delta_basic() {
+        // 1000 bytes in 1 second = 1000 B/s
+        let bw = BandwidthEstimation::bw_from_delta(1000, Duration::from_secs(1)).unwrap();
+        assert_eq!(bw, 1000);
+    }
+
+    #[test]
+    fn bw_from_delta_zero_delta() {
+        let bw = BandwidthEstimation::bw_from_delta(1000, Duration::ZERO);
+        assert!(bw.is_none());
+    }
+
+    #[test]
+    fn bw_from_delta_half_second() {
+        // 1000 bytes in 500ms = 2000 B/s
+        let bw = BandwidthEstimation::bw_from_delta(1000, Duration::from_millis(500)).unwrap();
+        assert_eq!(bw, 2000);
+    }
+
+    #[test]
+    fn bw_from_delta_zero_bytes() {
+        let bw = BandwidthEstimation::bw_from_delta(0, Duration::from_secs(1)).unwrap();
+        assert_eq!(bw, 0);
+    }
+
+    #[test]
+    fn bw_from_delta_large_value() {
+        // 1MB in 1 second = 1_000_000 B/s
+        let bw = BandwidthEstimation::bw_from_delta(1_000_000, Duration::from_secs(1)).unwrap();
+        assert_eq!(bw, 1_000_000);
+    }
+
+    #[test]
+    fn bw_from_delta_microseconds() {
+        // 1000 bytes in 1 microsecond = 1_000_000_000_000 B/s
+        let bw = BandwidthEstimation::bw_from_delta(1000, Duration::from_micros(1)).unwrap();
+        assert_eq!(bw, 1_000_000_000);
+    }
+
+    // Default state tests
+
+    #[test]
+    fn default_estimate_is_zero() {
+        let bw = BandwidthEstimation::default();
+        assert_eq!(bw.get_estimate(), 0);
+    }
+
+    #[test]
+    fn default_no_bytes_acked() {
+        let bw = BandwidthEstimation::default();
+        assert_eq!(bw.bytes_acked_this_window(), 0);
+    }
+
+    // on_sent tests
+
+    #[test]
+    fn on_sent_records_bytes() {
+        let mut bw = BandwidthEstimation::default();
+        bw.on_sent(now(), 1000);
+        assert!(bw.sent_time.is_some());
+        assert_eq!(bw.total_sent, 1000);
+    }
+
+    #[test]
+    fn on_sent_accumulates() {
+        let mut bw = BandwidthEstimation::default();
+        bw.on_sent(now(), 500);
+        bw.on_sent(now() + Duration::from_millis(10), 300);
+        assert_eq!(bw.total_sent, 800);
+    }
+
+    // on_ack with app_limited
+
+    #[test]
+    fn app_limited_ack_does_not_update_max() {
+        let mut bw = BandwidthEstimation::default();
+        let start = now();
+
+        // Send data
+        bw.on_sent(start, 10000);
+        bw.on_sent(start + Duration::from_millis(10), 10000);
+
+        // Ack with app_limited=true should not update max_filter
+        bw.on_ack(start + Duration::from_millis(100), start, 10000, 1, true);
+        assert_eq!(bw.get_estimate(), 0);
+    }
+
+    // on_ack normal path
+
+    #[test]
+    fn on_ack_updates_bandwidth_estimate() {
+        let mut bw = BandwidthEstimation::default();
+        let start = now();
+
+        // Send data in bursts to build up prev_sent_time and prev_total_sent
+        bw.on_sent(start, 1000);                       // first send
+        bw.on_sent(start + Duration::from_millis(10), 2000);   // second send (prev_sent_time set)
+        bw.on_sent(start + Duration::from_millis(20), 3000);   // third send (prev_sent_time from second)
+
+        // First ack establishes prev_acked_time
+        bw.on_ack(start + Duration::from_millis(10), start, 1000, 1, false);
+        // Second ack can compute ack_rate from prev_acked_time
+        bw.on_ack(start + Duration::from_millis(100), start + Duration::from_millis(10), 5000, 1, false);
+        assert!(
+            bw.get_estimate() > 0,
+            "bandwidth estimate should be positive after ack"
+        );
+    }
+
+    // end_acks tests
+
+    #[test]
+    fn end_acks_updates_window_boundary() {
+        let mut bw = BandwidthEstimation::default();
+        let start = now();
+
+        bw.on_sent(start, 10000);
+        bw.on_sent(start + Duration::from_millis(100), 10000);
+
+        bw.on_ack(start + Duration::from_millis(100), start, 10000, 1, false);
+        bw.end_acks(1, false);
+
+        // bytes_acked_this_window should be 0 after end_acks
+        assert_eq!(bw.bytes_acked_this_window(), 0);
+    }
+
+    // Display tests
+
+    #[test]
+    fn display_zero() {
+        let bw = BandwidthEstimation::default();
+        let display = format!("{bw}");
+        assert!(display.contains("MB/s"));
+    }
+
+    // Max filter tracking
+
+    #[test]
+    fn max_filter_is_updated_by_ack() {
+        let mut bw = BandwidthEstimation::default();
+        let start = now();
+
+        // Need multiple sends + acks to compute send_rate and ack_rate
+        bw.on_sent(start, 1000);
+        bw.on_sent(start + Duration::from_millis(10), 2000);
+        bw.on_sent(start + Duration::from_millis(20), 3000);
+
+        // First ack to establish prev_acked_time
+        bw.on_ack(start + Duration::from_millis(10), start, 1000, 1, false);
+        // Second ack with enough data to compute meaningful bandwidth
+        bw.on_ack(start + Duration::from_millis(100), start + Duration::from_millis(10), 5000, 1, false);
+        assert!(bw.get_estimate() > 0, "bandwidth estimate should be positive");
+    }
+
+    // Clone + Default consistency
+
+    #[test]
+    fn default_all_fields_zero() {
+        let bw = BandwidthEstimation::default();
+        assert_eq!(bw.total_acked, 0);
+        assert_eq!(bw.prev_total_acked, 0);
+        assert!(bw.acked_time.is_none());
+        assert!(bw.prev_acked_time.is_none());
+    }
+}
