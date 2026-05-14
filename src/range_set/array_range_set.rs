@@ -217,3 +217,417 @@ impl ArrayRangeSet {
         self.iter().next_back().and_then(|x| x.end.checked_sub(1))
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty() -> ArrayRangeSet {
+        ArrayRangeSet::new()
+    }
+
+    fn single(start: u64, end: u64) -> ArrayRangeSet {
+        let mut s = ArrayRangeSet::new();
+        s.insert(start..end);
+        s
+    }
+
+    // Basic construction tests
+
+    #[test]
+    fn new_is_empty() {
+        let s = empty();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(s.iter().next().is_none());
+    }
+
+    #[test]
+    fn default_is_empty() {
+        let s = ArrayRangeSet::default();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn clone_empty() {
+        let s = empty();
+        let c = s.clone();
+        assert!(c.is_empty());
+    }
+
+    // Insert single range tests
+
+    #[test]
+    fn insert_single_range() {
+        let mut s = empty();
+        assert!(s.insert(10..20));
+        assert!(!s.is_empty());
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn insert_empty_range_is_noop() {
+        let mut s = empty();
+        assert!(!s.insert(10..10));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn insert_reverse_range_is_noop() {
+        let mut s = empty();
+        assert!(!s.insert(20..10));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn insert_one_then_get() {
+        let mut s = empty();
+        s.insert_one(42);
+        assert!(s.contains(42));
+        assert!(!s.contains(41));
+        assert!(!s.contains(43));
+    }
+
+    // Contains tests
+
+    #[test]
+    fn contains_single_value() {
+        let s = single(5, 10);
+        assert!(s.contains(5));
+        assert!(s.contains(7));
+        assert!(s.contains(9));
+        assert!(!s.contains(4));
+        assert!(!s.contains(10));
+    }
+
+    #[test]
+    fn contains_empty_set() {
+        let s = empty();
+        assert!(!s.contains(0));
+        assert!(!s.contains(u64::MAX));
+    }
+
+    #[test]
+    fn contains_multiple_ranges() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        assert!(s.contains(15));
+        assert!(s.contains(35));
+        assert!(!s.contains(25));
+        assert!(!s.contains(20));
+        assert!(s.contains(30));
+    }
+
+    // Insert adjacent ranges merge
+
+    #[test]
+    fn insert_adjacent_ranges_merge() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(20..30);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(19));
+        assert!(s.contains(20));
+    }
+
+    #[test]
+    fn insert_overlapping_ranges_merge() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(15..25);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(24));
+        assert!(!s.contains(25));
+    }
+
+    #[test]
+    fn insert_contained_range_no_change() {
+        let mut s = single(10, 30);
+        assert!(!s.insert(15..20));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn insert_extending_left_merges_with_adjacent() {
+        let mut s = empty();
+        s.insert(20..30);
+        s.insert(15..25);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(15));
+        assert!(s.contains(25));
+        assert!(!s.contains(30));
+    }
+
+    #[test]
+    fn insert_extending_right_merges_with_adjacent() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(15..30);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(10));
+        assert!(s.contains(29));
+    }
+
+    #[test]
+    fn insert_between_two_ranges_merges_all() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        s.insert(20..30);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(10));
+        assert!(s.contains(39));
+    }
+
+    #[test]
+    fn insert_separate_ranges_no_merge() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        assert_eq!(s.len(), 2);
+        assert!(s.contains(15));
+        assert!(s.contains(35));
+    }
+
+    // Remove tests
+
+    #[test]
+    fn remove_from_middle_splits_range() {
+        let mut s = single(10, 30);
+        assert!(s.remove(15..20));
+        assert_eq!(s.len(), 2);
+        assert!(s.contains(14));
+        assert!(!s.contains(15));
+        assert!(!s.contains(19));
+        assert!(s.contains(20));
+    }
+
+    #[test]
+    fn remove_from_start_truncates() {
+        let mut s = single(10, 30);
+        assert!(s.remove(10..15));
+        assert_eq!(s.len(), 1);
+        assert!(!s.contains(10));
+        assert!(!s.contains(14));
+        assert!(s.contains(15));
+    }
+
+    #[test]
+    fn remove_from_end_truncates() {
+        let mut s = single(10, 30);
+        assert!(s.remove(25..30));
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(24));
+        assert!(!s.contains(25));
+    }
+
+    #[test]
+    fn remove_entire_range_empties() {
+        let mut s = single(10, 30);
+        assert!(s.remove(10..30));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn remove_empty_range_is_noop() {
+        let mut s = single(10, 30);
+        assert!(!s.remove(15..15));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn remove_non_overlapping_is_noop() {
+        let mut s = single(10, 20);
+        assert!(!s.remove(30..40));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn remove_multiple_ranges() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        assert!(s.remove(10..40));
+        assert!(s.is_empty());
+    }
+
+    // pop_min tests
+
+    #[test]
+    fn pop_min_empty() {
+        let mut s = empty();
+        assert!(s.pop_min().is_none());
+    }
+
+    #[test]
+    fn pop_min_returns_first_range() {
+        let mut s = empty();
+        s.insert(10..20);
+        let r = s.pop_min().unwrap();
+        assert_eq!(r, 10..20);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn pop_min_multiple() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        assert_eq!(s.pop_min().unwrap(), 10..20);
+        assert_eq!(s.pop_min().unwrap(), 30..40);
+        assert!(s.pop_min().is_none());
+    }
+
+    // min/max tests
+
+    #[test]
+    fn min_max_empty() {
+        let s = empty();
+        assert!(s.min().is_none());
+        assert!(s.max().is_none());
+    }
+
+    #[test]
+    fn min_max_single_range() {
+        let s = single(10, 20);
+        assert_eq!(s.min(), Some(10));
+        assert_eq!(s.max(), Some(19));
+    }
+
+    #[test]
+    fn min_max_multiple_ranges() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        assert_eq!(s.min(), Some(10));
+        assert_eq!(s.max(), Some(39));
+    }
+
+    // Subtract tests
+
+    #[test]
+    fn subtract_non_overlapping_no_change() {
+        let mut s = single(10, 20);
+        let other = single(30, 40);
+        s.subtract(&other);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn subtract_overlapping_removes() {
+        let mut s = single(10, 30);
+        let other = single(15, 25);
+        s.subtract(&other);
+        assert_eq!(s.len(), 2);
+        assert!(s.contains(14));
+        assert!(!s.contains(15));
+        assert!(!s.contains(24));
+        assert!(s.contains(25));
+    }
+
+    #[test]
+    fn subtract_identical_empties() {
+        let mut s = single(10, 20);
+        let other = single(10, 20);
+        s.subtract(&other);
+        assert!(s.is_empty());
+    }
+
+    // Iteration tests
+
+    #[test]
+    fn iter_over_multiple_ranges() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        let ranges: Vec<_> = s.iter().collect();
+        assert_eq!(ranges, vec![10..20, 30..40]);
+    }
+
+    #[test]
+    fn elts_over_multiple_ranges() {
+        let mut s = empty();
+        s.insert(10..12);
+        s.insert(20..22);
+        let values: Vec<_> = s.elts().collect();
+        assert_eq!(values, vec![10, 11, 20, 21]);
+    }
+
+    #[test]
+    fn elts_empty() {
+        let s = empty();
+        let values: Vec<_> = s.elts().collect();
+        assert!(values.is_empty());
+    }
+
+    // Clone with inline representation
+
+    #[test]
+    fn clone_preserves_content() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(30..40);
+        let c = s.clone();
+        assert_eq!(c.len(), 2);
+        assert!(c.contains(15));
+        assert!(c.contains(35));
+    }
+
+    // Edge cases
+
+    #[test]
+    fn contains_at_boundaries() {
+        let s = single(0, 100);
+        assert!(s.contains(0));
+        assert!(s.contains(99));
+        assert!(!s.contains(100));
+    }
+
+    #[test]
+    fn insert_at_zero() {
+        let mut s = empty();
+        s.insert(0..1);
+        assert!(s.contains(0));
+    }
+
+    #[test]
+    fn insert_large_values() {
+        let mut s = empty();
+        let near_max = u64::MAX - 10;
+        s.insert(near_max..u64::MAX);
+        assert!(s.contains(near_max));
+        assert!(s.contains(u64::MAX - 1));
+        assert!(!s.contains(u64::MAX));
+    }
+
+    #[test]
+    fn remove_at_boundaries() {
+        let mut s = single(0, 10);
+        s.remove(0..1);
+        assert!(!s.contains(0));
+        assert!(s.contains(1));
+    }
+
+    #[test]
+    fn insert_many_tiny_ranges() {
+        let mut s = empty();
+        for i in 0..10 {
+            s.insert_one(i);
+        }
+        // Should merge into one range
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(0));
+        assert!(s.contains(9));
+    }
+
+    #[test]
+    fn insert_sparse_ranges() {
+        let mut s = empty();
+        s.insert(10..20);
+        s.insert(50..60);
+        s.insert(100..110);
+        assert_eq!(s.len(), 3);
+        assert!(!s.contains(30));
+        assert!(!s.contains(80));
+    }
+}

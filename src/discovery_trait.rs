@@ -337,37 +337,230 @@ mod tests {
         PeerId([0u8; 32])
     }
 
+    fn test_discovered_addr(port: u16, source: DiscoverySource, priority: u32) -> DiscoveredAddress {
+        DiscoveredAddress {
+            addr: test_addr(port),
+            source,
+            priority,
+            ttl: None,
+        }
+    }
+
+    // DiscoverySource tests
+
     #[test]
-    fn test_discovery_source_priority() {
-        assert!(
-            DiscoverySource::Observed.base_priority()
-                > DiscoverySource::LocalInterface.base_priority()
-        );
-        assert!(
-            DiscoverySource::LocalInterface.base_priority()
-                > DiscoverySource::PeerExchange.base_priority()
-        );
-        assert!(DiscoverySource::Config.base_priority() > DiscoverySource::Manual.base_priority());
+    fn test_discovery_source_priority_values() {
+        assert_eq!(DiscoverySource::Observed.base_priority(), 100);
+        assert_eq!(DiscoverySource::LocalInterface.base_priority(), 90);
+        assert_eq!(DiscoverySource::PeerExchange.base_priority(), 80);
+        assert_eq!(DiscoverySource::Config.base_priority(), 70);
+        assert_eq!(DiscoverySource::Dns.base_priority(), 60);
+        assert_eq!(DiscoverySource::Manual.base_priority(), 50);
+    }
+
+    #[test]
+    fn test_discovery_source_order() {
+        assert!(DiscoverySource::Observed.base_priority() > DiscoverySource::LocalInterface.base_priority());
+        assert!(DiscoverySource::LocalInterface.base_priority() > DiscoverySource::PeerExchange.base_priority());
+        assert!(DiscoverySource::PeerExchange.base_priority() > DiscoverySource::Config.base_priority());
+        assert!(DiscoverySource::Config.base_priority() > DiscoverySource::Dns.base_priority());
+        assert!(DiscoverySource::Dns.base_priority() > DiscoverySource::Manual.base_priority());
+    }
+
+    #[test]
+    fn test_discovery_source_equality() {
+        assert_eq!(DiscoverySource::Observed, DiscoverySource::Observed);
+        assert_ne!(DiscoverySource::Observed, DiscoverySource::Config);
+    }
+
+    #[test]
+    fn test_discovery_source_clone_copy() {
+        let a = DiscoverySource::Observed;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_discovery_source_debug() {
+        assert_eq!(format!("{:?}", DiscoverySource::Observed), "Observed");
+        assert_eq!(format!("{:?}", DiscoverySource::Dns), "Dns");
+    }
+
+    // DiscoveredAddress tests
+
+    #[test]
+    fn test_discovered_address_clone() {
+        let addr = test_discovered_addr(5000, DiscoverySource::Observed, 100);
+        let cloned = addr.clone();
+        assert_eq!(addr, cloned);
+    }
+
+    #[test]
+    fn test_discovered_address_debug() {
+        let addr = test_discovered_addr(8080, DiscoverySource::Config, 70);
+        let debug = format!("{addr:?}");
+        assert!(debug.contains("8080"));
+        assert!(debug.contains("Config"));
+    }
+
+    #[test]
+    fn test_discovered_address_equality() {
+        let a = test_discovered_addr(5000, DiscoverySource::Config, 70);
+        let b = test_discovered_addr(5000, DiscoverySource::Config, 70);
+        let c = test_discovered_addr(5001, DiscoverySource::Config, 70);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_discovered_address_different_sources_not_equal() {
+        let a = test_discovered_addr(5000, DiscoverySource::Config, 70);
+        let b = test_discovered_addr(5000, DiscoverySource::Observed, 100);
+        assert_ne!(a, b);
+    }
+
+    // DiscoveryError tests
+
+    #[test]
+    fn test_discovery_error_display() {
+        let err = DiscoveryError {
+            message: "test error".to_string(),
+            source: Some(DiscoverySource::Dns),
+            retryable: true,
+        };
+        let display = err.to_string();
+        assert!(display.contains("test error"));
+        assert!(display.contains("Discovery error"));
+    }
+
+    #[test]
+    fn test_discovery_error_clone() {
+        let err = DiscoveryError {
+            message: "err".to_string(),
+            source: None,
+            retryable: false,
+        };
+        let cloned = err.clone();
+        assert_eq!(err.message, cloned.message);
+        assert_eq!(err.source, cloned.source);
+        assert_eq!(err.retryable, cloned.retryable);
+    }
+
+    #[test]
+    fn test_discovery_error_debug() {
+        let err = DiscoveryError {
+            message: "debug me".to_string(),
+            source: Some(DiscoverySource::Config),
+            retryable: true,
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("debug me"));
+        assert!(debug.contains("Config"));
+    }
+
+    #[test]
+    fn test_discovery_error_retryable_flag() {
+        let err_retryable = DiscoveryError {
+            message: "retry".to_string(),
+            source: None,
+            retryable: true,
+        };
+        let err_not = DiscoveryError {
+            message: "fatal".to_string(),
+            source: None,
+            retryable: false,
+        };
+        assert!(err_retryable.retryable);
+        assert!(!err_not.retryable);
+    }
+
+    #[test]
+    fn test_discovery_error_with_source() {
+        let err = DiscoveryError {
+            message: "dns failed".to_string(),
+            source: Some(DiscoverySource::Dns),
+            retryable: true,
+        };
+        assert_eq!(err.source, Some(DiscoverySource::Dns));
+    }
+
+    // StaticDiscovery tests
+
+    #[test]
+    fn test_static_discovery_name() {
+        let discovery = StaticDiscovery::from_addrs(vec![]);
+        assert_eq!(discovery.name(), "static");
     }
 
     #[tokio::test]
     async fn test_static_discovery() {
         let addrs = vec![test_addr(5000), test_addr(5001)];
         let discovery = StaticDiscovery::from_addrs(addrs.clone());
-
         let mut stream = discovery.discover(&test_peer_id());
-
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.addr, addrs[0]);
-
         let second = stream.next().await.unwrap().unwrap();
         assert_eq!(second.addr, addrs[1]);
-
         assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn test_concurrent_discovery() {
+    async fn test_static_discovery_empty() {
+        let discovery = StaticDiscovery::from_addrs(vec![]);
+        let mut stream = discovery.discover(&test_peer_id());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_static_discovery_new() {
+        let addr = test_discovered_addr(9000, DiscoverySource::Config, 70);
+        let discovery = StaticDiscovery::new(vec![addr.clone()]);
+        assert_eq!(discovery.name(), "static");
+        let mut stream = discovery.discover(&test_peer_id());
+        let result = stream.next().await.unwrap().unwrap();
+        assert_eq!(result.addr, addr.addr);
+    }
+
+    // ConcurrentDiscovery tests
+
+    #[test]
+    fn test_concurrent_discovery_new_empty() {
+        let discovery = ConcurrentDiscovery::new();
+        assert_eq!(discovery.source_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_discovery_default() {
+        let discovery = ConcurrentDiscovery::default();
+        assert_eq!(discovery.source_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_discovery_add_source() {
+        let mut discovery = ConcurrentDiscovery::new();
+        assert_eq!(discovery.source_count(), 0);
+        discovery.add_source(StaticDiscovery::from_addrs(vec![test_addr(5000)]));
+        assert_eq!(discovery.source_count(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_discovery_multiple_sources() {
+        let mut discovery = ConcurrentDiscovery::new();
+        discovery.add_source(StaticDiscovery::from_addrs(vec![test_addr(5000)]));
+        discovery.add_source(StaticDiscovery::from_addrs(vec![test_addr(6000)]));
+        assert_eq!(discovery.source_count(), 2);
+    }
+
+    #[test]
+    fn test_concurrent_discovery_add_boxed_source() {
+        let mut discovery = ConcurrentDiscovery::new();
+        let source: Arc<dyn Discovery> = Arc::new(StaticDiscovery::from_addrs(vec![]));
+        discovery.add_boxed_source(source);
+        assert_eq!(discovery.source_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_discovery_with_two_sources() {
         let addrs1 = vec![test_addr(5000)];
         let addrs2 = vec![test_addr(6000)];
 
@@ -377,88 +570,28 @@ mod tests {
             .build();
 
         assert_eq!(discovery.source_count(), 2);
-
         let mut stream = discovery.discover(&test_peer_id());
         let mut found_ports = vec![];
-
         while let Some(result) = stream.next().await {
             found_ports.push(result.unwrap().addr.port());
         }
-
         assert!(found_ports.contains(&5000));
         assert!(found_ports.contains(&6000));
     }
 
     #[tokio::test]
-    async fn test_channel_discovery() {
-        let discovery = ChannelDiscovery::new("test", 10);
-        let sender = discovery.sender();
-
-        // Send addresses in background
-        tokio::spawn(async move {
-            sender
-                .send(DiscoveredAddress {
-                    addr: test_addr(7000),
-                    source: DiscoverySource::Observed,
-                    priority: 100,
-                    ttl: None,
-                })
-                .await
-                .unwrap();
-        });
-
-        let mut stream = discovery.discover(&test_peer_id());
-
-        // Wait for address
-        let result = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
-
-        assert!(result.is_ok());
-        let addr = result.unwrap().unwrap().unwrap();
-        assert_eq!(addr.addr.port(), 7000);
-    }
-
-    #[test]
-    fn test_discovery_error_display() {
-        let err = DiscoveryError {
-            message: "test error".to_string(),
-            source: Some(DiscoverySource::Dns),
-            retryable: true,
-        };
-        assert!(err.to_string().contains("test error"));
-    }
-
-    #[tokio::test]
     async fn test_empty_concurrent_discovery() {
         let discovery = ConcurrentDiscovery::new();
-        assert_eq!(discovery.source_count(), 0);
-
         let mut stream = discovery.discover(&test_peer_id());
         assert!(stream.next().await.is_none());
     }
 
-    #[test]
-    fn test_discovered_address_equality() {
-        let addr1 = DiscoveredAddress {
-            addr: test_addr(5000),
-            source: DiscoverySource::Config,
-            priority: 70,
-            ttl: None,
-        };
-        let addr2 = DiscoveredAddress {
-            addr: test_addr(5000),
-            source: DiscoverySource::Config,
-            priority: 70,
-            ttl: None,
-        };
-        let addr3 = DiscoveredAddress {
-            addr: test_addr(5001),
-            source: DiscoverySource::Config,
-            priority: 70,
-            ttl: None,
-        };
+    // ConcurrentDiscoveryBuilder tests
 
-        assert_eq!(addr1, addr2);
-        assert_ne!(addr1, addr3);
+    #[test]
+    fn test_builder_empty() {
+        let discovery = ConcurrentDiscoveryBuilder::new().build();
+        assert_eq!(discovery.source_count(), 0);
     }
 
     #[test]
@@ -467,7 +600,50 @@ mod tests {
             .with_source(StaticDiscovery::from_addrs(vec![test_addr(5000)]))
             .with_source(StaticDiscovery::from_addrs(vec![test_addr(6000)]))
             .build();
-
         assert_eq!(discovery.source_count(), 2);
     }
+
+    #[test]
+    fn test_builder_single_source() {
+        let discovery = ConcurrentDiscoveryBuilder::new()
+            .with_source(StaticDiscovery::from_addrs(vec![test_addr(5000)]))
+            .build();
+        assert_eq!(discovery.source_count(), 1);
+    }
+
+    // ChannelDiscovery tests
+
+    #[tokio::test]
+    async fn test_channel_discovery() {
+        let discovery = ChannelDiscovery::new("test", 10);
+        let sender = discovery.sender();
+        tokio::spawn(async move {
+            sender
+                .send(test_discovered_addr(7000, DiscoverySource::Observed, 100))
+                .await
+                .unwrap();
+        });
+        let mut stream = discovery.discover(&test_peer_id());
+        let result = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_ok());
+        let addr = result.unwrap().unwrap().unwrap();
+        assert_eq!(addr.addr.port(), 7000);
+    }
+
+    #[test]
+    fn test_channel_discovery_name() {
+        let discovery = ChannelDiscovery::new("custom-name", 5);
+        assert_eq!(discovery.name(), "custom-name");
+    }
+
+    #[test]
+    fn test_channel_discovery_sender_is_cloneable() {
+        let discovery = ChannelDiscovery::new("clone-test", 5);
+        let sender1 = discovery.sender();
+        let sender2 = discovery.sender();
+        // Both senders should be usable
+        drop(sender1);
+        drop(sender2);
+    }
 }
+
