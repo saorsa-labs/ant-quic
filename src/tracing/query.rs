@@ -204,7 +204,7 @@ mod tests {
     #[cfg(feature = "trace")]
     use super::*;
     #[cfg(feature = "trace")]
-    use crate::tracing::{Event, EventLog, TraceId};
+    use crate::tracing::{Event, EventData, EventLog, TraceId};
     #[cfg(feature = "trace")]
     use std::sync::Arc;
 
@@ -231,6 +231,158 @@ mod tests {
         assert_eq!(analysis.packets_received, 1);
         assert_eq!(analysis.bytes_sent, 2400);
         assert_eq!(analysis.bytes_received, 1200);
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn query_recent_time_range_and_count_reflect_logged_events() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        log.log(Event::packet_sent(100, 1, trace_id));
+        log.log(Event::packet_received(200, 2, trace_id));
+
+        assert_eq!(query.event_count(), 2);
+        assert_eq!(query.recent(10).len(), 2);
+        assert_eq!(query.get_trace(trace_id).len(), 2);
+        assert!(!query.time_range(0, u64::MAX).is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn analyze_connection_counts_loss_and_initial_rtt() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        log.log(Event::packet_sent(100, 1, trace_id));
+        log.log(Event::packet_sent(150, 2, trace_id));
+        log.log(Event::packet_received(75, 1, trace_id));
+        log.log(Event {
+            timestamp: crate::tracing::timestamp_now(),
+            trace_id,
+            event_data: EventData::PacketLost {
+                packet_num: 2,
+                _padding: [0u8; 56],
+            },
+            ..Default::default()
+        });
+        log.log(Event {
+            timestamp: crate::tracing::timestamp_now(),
+            trace_id,
+            event_data: EventData::ConnEstablished {
+                rtt: 1234,
+                _padding: [0u8; 60],
+            },
+            ..Default::default()
+        });
+
+        let analysis = query.analyze_connection(trace_id);
+        assert_eq!(analysis.packets_sent, 2);
+        assert_eq!(analysis.bytes_sent, 250);
+        assert_eq!(analysis.packets_received, 1);
+        assert_eq!(analysis.bytes_received, 75);
+        assert_eq!(analysis.packets_lost, 1);
+        assert!((analysis.loss_rate - 0.5).abs() < f32::EPSILON);
+        assert_eq!(analysis.initial_rtt, Some(1234));
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn analyze_connection_without_sent_packets_has_zero_loss_rate() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        log.log(Event::packet_received(88, 1, trace_id));
+        log.log(Event {
+            timestamp: crate::tracing::timestamp_now(),
+            trace_id,
+            event_data: EventData::PacketLost {
+                packet_num: 1,
+                _padding: [0u8; 56],
+            },
+            ..Default::default()
+        });
+
+        let analysis = query.analyze_connection(trace_id);
+        assert_eq!(analysis.packets_sent, 0);
+        assert_eq!(analysis.packets_lost, 1);
+        assert_eq!(analysis.loss_rate, 0.0);
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn find_problematic_traces_flags_loss_threshold() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        for packet_num in 0..6 {
+            log.log(Event {
+                timestamp: crate::tracing::timestamp_now(),
+                trace_id,
+                event_data: EventData::PacketLost {
+                    packet_num,
+                    _padding: [0u8; 56],
+                },
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(query.find_problematic_traces(10), vec![trace_id]);
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn find_problematic_traces_flags_nonzero_stream_close_error() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        log.log(Event {
+            timestamp: crate::tracing::timestamp_now(),
+            trace_id,
+            event_data: EventData::StreamClosed {
+                stream_id: 9,
+                error_code: 1,
+                _padding: [0u8; 56],
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(query.find_problematic_traces(10), vec![trace_id]);
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn find_problematic_traces_ignores_clean_stream_close() {
+        let log = Arc::new(EventLog::new());
+        let query = TraceQuery::new(log.clone());
+        let trace_id = TraceId::new();
+
+        log.log(Event {
+            timestamp: crate::tracing::timestamp_now(),
+            trace_id,
+            event_data: EventData::StreamClosed {
+                stream_id: 9,
+                error_code: 0,
+                _padding: [0u8; 56],
+            },
+            ..Default::default()
+        });
+
+        assert!(query.find_problematic_traces(10).is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "trace")]
+    fn connection_analysis_default_and_debug_are_stable() {
+        let analysis = ConnectionAnalysis::default();
+        assert_eq!(analysis.packets_sent, 0);
+        assert_eq!(analysis.initial_rtt, None);
+        assert!(format!("{analysis:?}").contains("ConnectionAnalysis"));
     }
 
     #[test]
