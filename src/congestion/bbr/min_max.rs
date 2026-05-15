@@ -134,7 +134,102 @@ mod test {
     use super::*;
 
     #[test]
-    fn test() {
+    fn default_starts_uninitialized() {
+        let min_max = MinMax::default();
+        assert_eq!(min_max.window, 10);
+        assert_eq!(min_max.get(), 0);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 0));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 0));
+    }
+
+    #[test]
+    fn first_sample_initializes_all_slots() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(1, 100);
+
+        assert_eq!(min_max.get(), 100);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 1));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 100));
+    }
+
+    #[test]
+    fn higher_sample_replaces_all_slots() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(1, 100);
+        min_max.update_max(2, 120);
+
+        assert_eq!(min_max.get(), 120);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 2));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 120));
+    }
+
+    #[test]
+    fn lower_samples_do_not_replace_current_max_inside_window() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(1, 100);
+        min_max.update_max(2, 80);
+        min_max.update_max(3, 90);
+
+        assert_eq!(min_max.get(), 100);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 1));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 100));
+    }
+
+    #[test]
+    fn quarter_and_half_window_samples_seed_backups() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(0, 100);
+        min_max.update_max(3, 80);
+        min_max.update_max(6, 70);
+
+        assert_eq!(min_max.get(), 100);
+        assert_eq!(min_max.samples[1].value, 80);
+        assert_eq!(min_max.samples[1].time, 3);
+        assert_eq!(min_max.samples[2].value, 70);
+        assert_eq!(min_max.samples[2].time, 6);
+    }
+
+    #[test]
+    fn stale_best_promotes_backup_samples() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(0, 100);
+        min_max.update_max(3, 80);
+        min_max.update_max(6, 70);
+        min_max.update_max(11, 60);
+
+        assert_eq!(min_max.get(), 80);
+        assert_eq!(min_max.samples[0].time, 3);
+        assert_eq!(min_max.samples[1].time, 6);
+        assert_eq!(min_max.samples[2].time, 11);
+    }
+
+    #[test]
+    fn expired_third_slot_resets_window() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(1, 100);
+        min_max.update_max(4, 80);
+        min_max.update_max(7, 70);
+        min_max.update_max(18, 60);
+
+        assert_eq!(min_max.get(), 60);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 18));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 60));
+    }
+
+    #[test]
+    fn equal_sample_counts_as_new_max() {
+        let mut min_max = MinMax::default();
+        min_max.update_max(1, 100);
+        min_max.update_max(5, 80);
+        min_max.update_max(6, 100);
+
+        assert_eq!(min_max.get(), 100);
+        assert!(min_max.samples.iter().all(|sample| sample.time == 6));
+        assert!(min_max.samples.iter().all(|sample| sample.value == 100));
+    }
+
+    #[test]
+    fn original_bbr_sequence_tracks_expected_max() {
         let round = 25;
         let mut min_max = MinMax::default();
         min_max.update_max(round + 1, 100);
