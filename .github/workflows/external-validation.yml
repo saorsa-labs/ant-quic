@@ -70,9 +70,14 @@ jobs:
         id: validate
         env:
           RUST_LOG: ${{ inputs.verbose && 'debug' || 'info' }}
+          ENDPOINT_FILTER: ${{ inputs.endpoints || 'all' }}
         run: |
           mkdir -p validation-results
-          ./target/release/test-public-endpoints | tee validation-results/results.txt
+          VALIDATION_ARGS=(--output validation-results/results.json)
+          if [ -n "$ENDPOINT_FILTER" ] && [ "$ENDPOINT_FILTER" != "all" ]; then
+            VALIDATION_ARGS+=(--endpoints "$ENDPOINT_FILTER")
+          fi
+          ./target/release/test-public-endpoints "${VALIDATION_ARGS[@]}" | tee validation-results/results.txt
 
           # Parse success rate
           SUCCESS_RATE=$(awk -F'[()]' '/Successful connections:/ {gsub("%","", $2); print $2}' validation-results/results.txt | tail -n1)
@@ -92,6 +97,11 @@ jobs:
 
           TOTAL=${TOTAL:-0}
           PASSED=${PASSED:-0}
+
+          if [ "$TOTAL" = "0" ]; then
+            echo "::error::No public QUIC endpoints were tested. Check docs/public-quic-endpoints.yaml or the endpoint filter."
+            exit 1
+          fi
 
           echo "total_endpoints=$TOTAL" >> $GITHUB_OUTPUT
           echo "passed_endpoints=$PASSED" >> $GITHUB_OUTPUT

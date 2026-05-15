@@ -93,17 +93,24 @@ struct EndpointEntry {
 
 struct ValidationConfig {
     timeout_seconds: u64,
+    #[serde(rename = "retry_attempts")]
     _retry_attempts: u32,
+    #[serde(rename = "retry_delay_ms")]
     _retry_delay_ms: u64,
+    #[serde(rename = "parallel_connections")]
     _parallel_connections: usize,
+    #[serde(rename = "tests")]
     _tests: Vec<TestConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 
 struct TestConfig {
+    #[serde(rename = "name")]
     _name: String,
+    #[serde(rename = "description")]
     _description: String,
+    #[serde(rename = "required")]
     _required: bool,
 }
 
@@ -453,6 +460,15 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
         config.endpoints
     };
 
+    if endpoints_to_test.is_empty() {
+        let filter = args.endpoints.as_deref().unwrap_or("all");
+        return Err(format!(
+            "no public QUIC endpoints configured for filter '{filter}' in {}",
+            args.config.display()
+        )
+        .into());
+    }
+
     // Test endpoints
     let mut results = Vec::new();
     let test_start = Instant::now();
@@ -486,8 +502,22 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
     }
 
     let test_duration = test_start.elapsed();
+    let summary = summarize_results(&results);
 
-    // Calculate summary
+    let validation_results = ValidationResults {
+        endpoints: results,
+        summary,
+        metadata: ResultMetadata {
+            ant_quic_version: env!("CARGO_PKG_VERSION").to_string(),
+            test_date: chrono::Utc::now().to_rfc3339(),
+            test_duration_ms: test_duration.as_millis() as u64,
+        },
+    };
+
+    Ok(validation_results)
+}
+
+fn summarize_results(results: &[TestResult]) -> ValidationSummary {
     let successful = results.iter().filter(|r| r.success).count();
     let total = results.len();
     let success_rate = if total > 0 {
@@ -496,7 +526,7 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
         0.0
     };
 
-    let avg_handshake = if successful > 0 {
+    let average_handshake_time = if successful > 0 {
         let sum: u64 = results
             .iter()
             .filter(|r| r.success)
@@ -508,28 +538,20 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
     };
 
     let mut protocols_seen = std::collections::HashSet::new();
-    for result in &results {
+    for result in results {
         protocols_seen.extend(result.successful_protocols.iter().cloned());
     }
+    let mut protocols_seen: Vec<_> = protocols_seen.into_iter().collect();
+    protocols_seen.sort();
 
-    let validation_results = ValidationResults {
-        endpoints: results,
-        summary: ValidationSummary {
-            total_endpoints: total,
-            passed_endpoints: successful,
-            failed_endpoints: total - successful,
-            success_rate,
-            average_handshake_time: avg_handshake,
-            protocols_seen: protocols_seen.into_iter().collect(),
-        },
-        metadata: ResultMetadata {
-            ant_quic_version: env!("CARGO_PKG_VERSION").to_string(),
-            test_date: chrono::Utc::now().to_rfc3339(),
-            test_duration_ms: test_duration.as_millis() as u64,
-        },
-    };
-
-    Ok(validation_results)
+    ValidationSummary {
+        total_endpoints: total,
+        passed_endpoints: successful,
+        failed_endpoints: total - successful,
+        success_rate,
+        average_handshake_time,
+        protocols_seen,
+    }
 }
 
 fn generate_markdown_report(results: &ValidationResults) -> String {
@@ -602,8 +624,98 @@ fn generate_markdown_report(results: &ValidationResults) -> String {
     report
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(endpoint_name: &str, success: bool, handshake_time_ms: Option<u64>) -> TestResult {
+        TestResult {
+            endpoint: format!("{endpoint_name}:443"),
+            endpoint_name: endpoint_name.to_string(),
+            address: format!("{endpoint_name}:443"),
+            success,
+            handshake_time_ms,
+            rtt_ms: handshake_time_ms,
+            quic_version: success.then_some(0x00000001),
+            error: (!success).then(|| "scripted failure".to_string()),
+            protocols_tested: vec!["h3".to_string()],
+            successful_protocols: if success {
+                vec!["h3".to_string()]
+            } else {
+                Vec::new()
+            },
+            features_tested: if success {
+                vec!["quic-v1".to_string()]
+            } else {
+                Vec::new()
+            },
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn summarize_results_handles_zero_endpoints_explicitly() {
+        let summary = summarize_results(&[]);
+        assert_eq!(summary.total_endpoints, 0);
+        assert_eq!(summary.passed_endpoints, 0);
+        assert_eq!(summary.failed_endpoints, 0);
+        assert_eq!(summary.success_rate, 0.0);
+        assert_eq!(summary.average_handshake_time, 0.0);
+        assert!(summary.protocols_seen.is_empty());
+    }
+
+    #[test]
+    fn summarize_results_reports_all_success() {
+        let results = vec![
+            result("a.example", true, Some(20)),
+            result("b.example", true, Some(40)),
+        ];
+        let summary = summarize_results(&results);
+        assert_eq!(summary.total_endpoints, 2);
+        assert_eq!(summary.passed_endpoints, 2);
+        assert_eq!(summary.failed_endpoints, 0);
+        assert_eq!(summary.success_rate, 100.0);
+        assert_eq!(summary.average_handshake_time, 30.0);
+        assert_eq!(summary.protocols_seen, vec!["h3".to_string()]);
+    }
+
+    #[test]
+    fn summarize_results_reports_partial_failure_below_threshold() {
+        let results = vec![
+            result("a.example", true, Some(10)),
+            result("b.example", false, None),
+            result("c.example", false, None),
+        ];
+        let summary = summarize_results(&results);
+        assert_eq!(summary.total_endpoints, 3);
+        assert_eq!(summary.passed_endpoints, 1);
+        assert_eq!(summary.failed_endpoints, 2);
+        assert!((summary.success_rate - 33.333336).abs() < f32::EPSILON);
+        assert_eq!(summary.average_handshake_time, 10.0);
+    }
+
+    #[test]
+    fn markdown_report_includes_zero_endpoint_summary() {
+        let results = ValidationResults {
+            endpoints: Vec::new(),
+            summary: summarize_results(&[]),
+            metadata: ResultMetadata {
+                ant_quic_version: "test".to_string(),
+                test_date: "2026-01-01T00:00:00Z".to_string(),
+                test_duration_ms: 0,
+            },
+        };
+        let report = generate_markdown_report(&results);
+        assert!(report.contains("Total Endpoints"));
+        assert!(report.contains("Success Rate"));
+        assert!(report.contains("0.0%"));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
 
     // Initialize logging

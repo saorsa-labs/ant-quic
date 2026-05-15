@@ -1,0 +1,51 @@
+# Public QUIC endpoints used by the External Validation workflow.
+# Keep this list intentionally small and conservative: these are third-party
+# Internet endpoints, so validation should detect broad interoperability or
+# egress problems without becoming noisy due to a large dependency surface.
+
+endpoints:
+  - name: cloudflare-quic
+    host: cloudflare-quic.com
+    port: 443
+    protocols: [h3]
+    type: public
+    category: http3
+    reliability: high
+    features: [quic-v1, http3]
+    notes: Cloudflare public HTTP/3 interoperability endpoint.
+    region: global
+
+  - name: google
+    host: www.google.com
+    port: 443
+    protocols: [h3]
+    type: public
+    category: http3
+    reliability: high
+    features: [quic-v1, http3]
+    notes: Google public HTTP/3 endpoint.
+    region: global
+
+  - name: facebook
+    host: www.facebook.com
+    port: 443
+    protocols: [h3]
+    type: public
+    category: http3
+    reliability: medium
+    features: [quic-v1, http3]
+    notes: Meta public HTTP/3 endpoint; useful as a third-provider signal.
+    region: global
+
+validation:
+  timeout_seconds: 10
+  retry_attempts: 1
+  retry_delay_ms: 500
+  parallel_connections: 3
+  tests:
+    - name: handshake
+      description: Complete a QUIC handshake with HTTP/3 ALPN.
+      required: true
+    - name: open_uni_stream
+      description: Open a unidirectional stream after handshake.
+      required: false
