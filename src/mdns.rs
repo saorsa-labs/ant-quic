@@ -715,6 +715,101 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_peer_id_metadata_does_not_block_otherwise_eligible_record() {
+        let local_peer_id = PeerId([0xab; 32]);
+        let mut directory = base_directory(local_peer_id);
+
+        let events = directory.apply_resolved(resolved_service(
+            "peer-invalid-id._ant-quic._udp.local.",
+            9000,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 60))],
+            &[
+                ("peer_id", "not-a-valid-peer-id"),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                MdnsRuntimeEvent::PeerDiscovered(peer),
+                MdnsRuntimeEvent::PeerEligible(_)
+            ] if peer.claimed_peer_id.is_none()
+        ));
+        assert_eq!(directory.snapshot(true, false).discovered_peers.len(), 1);
+    }
+
+    #[test]
+    fn test_deduplicates_and_sorts_candidate_addresses() {
+        let local_peer_id = PeerId([0xac; 32]);
+        let mut directory = base_directory(local_peer_id);
+        let remote_peer_id = PeerId([0xad; 32]);
+        let low = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 61));
+        let high = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 62));
+
+        let events = directory.apply_resolved(resolved_service(
+            "peer-dedupe._ant-quic._udp.local.",
+            9000,
+            vec![high, low, high, low],
+            &[
+                ("peer_id", &hex::encode(remote_peer_id.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [MdnsRuntimeEvent::PeerDiscovered(peer), MdnsRuntimeEvent::PeerEligible(_)]
+                if peer.addresses == vec![SocketAddr::new(low, 9000), SocketAddr::new(high, 9000)]
+        ));
+    }
+
+    #[test]
+    fn test_accepts_eligible_ipv6_addresses() {
+        let local_peer_id = PeerId([0xae; 32]);
+        let mut directory = base_directory(local_peer_id);
+        let remote_peer_id = PeerId([0xaf; 32]);
+        let global_ipv6 = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6));
+
+        let events = directory.apply_resolved(resolved_service(
+            "peer-ipv6._ant-quic._udp.local.",
+            9000,
+            vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), global_ipv6],
+            &[
+                ("peer_id", &hex::encode(remote_peer_id.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [MdnsRuntimeEvent::PeerDiscovered(peer), MdnsRuntimeEvent::PeerEligible(_)]
+                if peer.addresses == vec![SocketAddr::new(global_ipv6, 9000)]
+        ));
+    }
+
+    #[test]
+    fn test_advertised_instance_fullname_filters_self_even_with_missing_peer_id() {
+        let local_peer_id = PeerId([0xb0; 32]);
+        let mut directory = base_directory(local_peer_id);
+        directory.set_advertised_instance_fullname(Some(
+            "self-instance._ant-quic._udp.local.".to_string(),
+        ));
+
+        let events = directory.apply_resolved(resolved_service(
+            "self-instance._ant-quic._udp.local.",
+            9000,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 63))],
+            &[("namespace", "workspace-a")],
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [MdnsRuntimeEvent::PeerIneligible { reason, .. }] if reason == "self registration"
+        ));
+    }
+
+    #[test]
     fn test_advertised_metadata_preserves_user_entries_and_overrides_reserved_keys() {
         let local_peer_id = PeerId([0xcc; 32]);
         let mut config = MdnsConfig {

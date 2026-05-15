@@ -994,6 +994,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_same_port_conflict_without_random_fallback_reports_failure() {
+        let gateway = Arc::new(TestGateway::new(
+            "127.0.0.1:1900".parse().expect("valid gateway"),
+            "203.0.113.21".parse().expect("valid external IP"),
+        ));
+        gateway
+            .add_port_results
+            .lock()
+            .expect("lock add_port_results")
+            .push_back(Err("conflict".to_string()));
+
+        let discoverer = TestDiscoverer {
+            gateway: Arc::clone(&gateway),
+            failures_before_success: AtomicUsize::new(0),
+        };
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig {
+                allow_random_external_port: false,
+                ..PortMappingConfig::default()
+            },
+            31011,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let events = wait_for_events(&events, 1).await;
+        assert!(
+            matches!(events.as_slice(), [PortMappingEvent::Failed { error }] if error.contains("conflict"))
+        );
+        assert_eq!(
+            *gateway
+                .add_any_port_calls
+                .lock()
+                .expect("lock add_any_port_calls"),
+            0,
+            "random external port fallback must not run when disabled"
+        );
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+    }
+
+    #[tokio::test]
     async fn test_renewal_reuses_existing_external_port() {
         let gateway = Arc::new(TestGateway::new(
             "127.0.0.1:1900".parse().expect("valid gateway"),
