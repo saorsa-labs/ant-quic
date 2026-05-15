@@ -64,6 +64,7 @@ jobs:
       - name: Build validation tool
         run: |
           cargo build --release --bin test-public-endpoints
+          cargo build --release --bin validate-bootstrap-nodes
           cargo build --release --bin ant-quic
 
       - name: Run endpoint validation
@@ -135,6 +136,35 @@ jobs:
           cat validation-results/results.txt >> validation-results/report.md
           echo '```' >> validation-results/report.md
 
+          cat validation-results/report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Run first-party bootstrap validation
+        id: bootstrap_validate
+        run: |
+          ./target/release/validate-bootstrap-nodes \
+            --output validation-results/bootstrap-results.json \
+            | tee validation-results/bootstrap-results.txt
+
+          BOOTSTRAP_SUCCESS_RATE=$(jq -r '.summary.success_rate' validation-results/bootstrap-results.json)
+          BOOTSTRAP_TOTAL=$(jq -r '.summary.total_nodes' validation-results/bootstrap-results.json)
+          BOOTSTRAP_PASSED=$(jq -r '.summary.passed_nodes' validation-results/bootstrap-results.json)
+          echo "success_rate=$BOOTSTRAP_SUCCESS_RATE" >> $GITHUB_OUTPUT
+          echo "total_nodes=$BOOTSTRAP_TOTAL" >> $GITHUB_OUTPUT
+          echo "passed_nodes=$BOOTSTRAP_PASSED" >> $GITHUB_OUTPUT
+
+      - name: Add bootstrap validation to report
+        run: |
+          cat >> validation-results/report.md << EOF
+
+          ## First-Party Saorsa Bootstrap Validation
+          - Total Bootstrap Nodes Tested: ${{ steps.bootstrap_validate.outputs.total_nodes }}
+          - Successful Bootstrap Connections: ${{ steps.bootstrap_validate.outputs.passed_nodes }}
+          - Bootstrap Success Rate: ${{ steps.bootstrap_validate.outputs.success_rate }}%
+
+          EOF
+          echo '```' >> validation-results/report.md
+          cat validation-results/bootstrap-results.txt >> validation-results/report.md
+          echo '```' >> validation-results/report.md
           cat validation-results/report.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload results

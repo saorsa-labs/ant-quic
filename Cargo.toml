@@ -236,6 +236,11 @@ path = "src/bin/test_public_endpoints.rs"
 name = "e2e-test-node"
 path = "src/bin/e2e-test-node.rs"
 
+# First-party Saorsa bootstrap node validator
+[[bin]]
+name = "validate-bootstrap-nodes"
+path = "src/bin/validate_bootstrap_nodes.rs"
+
 # Benchmarks
 [[bench]]
 name = "quic_benchmarks"

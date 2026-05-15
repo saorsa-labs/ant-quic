@@ -1,0 +1,26 @@
+# First-party Saorsa ant-quic bootstrap/known-peer validation targets.
+#
+# These are IP literals by design. Bootstrap and validation must not depend on
+# DNS resolution, because users need cold-start connectivity even when local DNS
+# is unavailable or unreliable.
+
+nodes:
+  - name: saorsa-2-nyc
+    address: 142.93.199.50:9000
+    provider: DigitalOcean
+    region: NYC
+    role: bootstrap
+    notes: Long-term Saorsa bootstrap/known-peer node.
+
+  - name: saorsa-3-sfo
+    address: 147.182.234.192:9000
+    provider: DigitalOcean
+    region: SFO
+    role: bootstrap
+    notes: Long-term Saorsa bootstrap/known-peer node.
+
+validation:
+  threshold_percent: 50
+  connect_timeout_seconds: 20
+  per_node_timeout_seconds: 20
+  require_external_address: false
