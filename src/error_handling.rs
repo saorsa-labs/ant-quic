@@ -5,7 +5,6 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
-
 //! Standardized Error Handling Patterns for ant-quic
 //!
 //! This module provides consistent error handling patterns and utilities
@@ -71,7 +70,7 @@ pub type Result<T> = std::result::Result<T, AntQuicError>;
 /// Error handling utilities
 pub mod utils {
     use super::*;
-    use tracing::{error, warn, info, debug};
+    use tracing::{debug, error, info, warn};
 
     /// Log an error with appropriate level based on severity
     pub fn log_error(error: &(dyn std::error::Error + 'static), context: &str) {
@@ -89,18 +88,42 @@ pub mod utils {
     /// Convert an error to a user-friendly message
     pub fn to_user_message(error: &(dyn std::error::Error + 'static)) -> String {
         match error.downcast_ref::<AntQuicError>() {
-            Some(AntQuicError::Transport(_)) => "Network connection error. Please check your internet connection.".to_string(),
-            Some(AntQuicError::Connection(_)) => "Failed to establish connection. The remote peer may be unreachable.".to_string(),
-            Some(AntQuicError::Discovery(_)) => "Failed to discover network configuration. Please check your network settings.".to_string(),
-            Some(AntQuicError::NatTraversal(_)) => "NAT traversal failed. This may be due to restrictive network policies.".to_string(),
+            Some(AntQuicError::Transport(_)) => {
+                "Network connection error. Please check your internet connection.".to_string()
+            }
+            Some(AntQuicError::Connection(_)) => {
+                "Failed to establish connection. The remote peer may be unreachable.".to_string()
+            }
+            Some(AntQuicError::Discovery(_)) => {
+                "Failed to discover network configuration. Please check your network settings."
+                    .to_string()
+            }
+            Some(AntQuicError::NatTraversal(_)) => {
+                "NAT traversal failed. This may be due to restrictive network policies.".to_string()
+            }
             Some(AntQuicError::Timeout(_)) => "Operation timed out. Please try again.".to_string(),
-            Some(AntQuicError::Config(_)) => "Configuration error. Please check your settings.".to_string(),
-            Some(AntQuicError::Io(_)) => "System I/O error. Please check file permissions and disk space.".to_string(),
-            Some(AntQuicError::Crypto(_)) => "Cryptographic operation failed. This may indicate a security issue.".to_string(),
-            Some(AntQuicError::Pqc(_)) => "Post-quantum cryptographic operation failed.".to_string(),
-            Some(AntQuicError::ResourceExhausted(_)) => "System resources exhausted. Please close some applications and try again.".to_string(),
-            Some(AntQuicError::InvalidParameter(_)) => "Invalid input parameters provided.".to_string(),
-            Some(AntQuicError::Internal(_)) => "An internal error occurred. Please report this issue.".to_string(),
+            Some(AntQuicError::Config(_)) => {
+                "Configuration error. Please check your settings.".to_string()
+            }
+            Some(AntQuicError::Io(_)) => {
+                "System I/O error. Please check file permissions and disk space.".to_string()
+            }
+            Some(AntQuicError::Crypto(_)) => {
+                "Cryptographic operation failed. This may indicate a security issue.".to_string()
+            }
+            Some(AntQuicError::Pqc(_)) => {
+                "Post-quantum cryptographic operation failed.".to_string()
+            }
+            Some(AntQuicError::ResourceExhausted(_)) => {
+                "System resources exhausted. Please close some applications and try again."
+                    .to_string()
+            }
+            Some(AntQuicError::InvalidParameter(_)) => {
+                "Invalid input parameters provided.".to_string()
+            }
+            Some(AntQuicError::Internal(_)) => {
+                "An internal error occurred. Please report this issue.".to_string()
+            }
             _ => format!("An unexpected error occurred: {}", error),
         }
     }
@@ -114,26 +137,29 @@ pub mod utils {
             Some(AntQuicError::NatTraversal(_)) => true,
             Some(AntQuicError::Io(io_err)) => {
                 // Some I/O errors are recoverable
-                matches!(io_err.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted)
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                )
             }
             _ => false,
         }
     }
 
     /// Get recommended retry delay for an error
-    pub fn get_retry_delay(error: &(dyn std::error::Error + 'static)) -> Option<std::time::Duration> {
+    pub fn get_retry_delay(
+        error: &(dyn std::error::Error + 'static),
+    ) -> Option<std::time::Duration> {
         match error.downcast_ref::<AntQuicError>() {
             Some(AntQuicError::Timeout(_)) => Some(std::time::Duration::from_millis(100)),
             Some(AntQuicError::Connection(_)) => Some(std::time::Duration::from_millis(500)),
             Some(AntQuicError::Discovery(_)) => Some(std::time::Duration::from_secs(1)),
             Some(AntQuicError::NatTraversal(_)) => Some(std::time::Duration::from_secs(2)),
-            Some(AntQuicError::Io(io_err)) => {
-                match io_err.kind() {
-                    std::io::ErrorKind::TimedOut => Some(std::time::Duration::from_millis(100)),
-                    std::io::ErrorKind::Interrupted => Some(std::time::Duration::from_millis(10)),
-                    _ => None,
-                }
-            }
+            Some(AntQuicError::Io(io_err)) => match io_err.kind() {
+                std::io::ErrorKind::TimedOut => Some(std::time::Duration::from_millis(100)),
+                std::io::ErrorKind::Interrupted => Some(std::time::Duration::from_millis(10)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -338,7 +364,10 @@ mod tests {
 
     #[test]
     fn user_message_io() {
-        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        let err = AntQuicError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
         let msg = utils::to_user_message(&err);
         assert!(msg.contains("I/O error"));
     }
@@ -407,13 +436,19 @@ mod tests {
 
     #[test]
     fn io_interrupted_is_recoverable() {
-        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"));
+        let err = AntQuicError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "interrupted",
+        ));
         assert!(utils::is_recoverable(&err));
     }
 
     #[test]
     fn io_permission_denied_is_not_recoverable() {
-        let err = AntQuicError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        let err = AntQuicError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
         assert!(!utils::is_recoverable(&err));
     }
 
@@ -488,7 +523,10 @@ mod tests {
     #[test]
     fn ensure_passes_when_true() {
         let result: Result<()> = (|| {
-            ensure!(true, AntQuicError::Internal("should not happen".to_string()));
+            ensure!(
+                true,
+                AntQuicError::Internal("should not happen".to_string())
+            );
             Ok(())
         })();
         assert!(result.is_ok());
@@ -501,7 +539,10 @@ mod tests {
             Ok(())
         })();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AntQuicError::InvalidParameter(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            AntQuicError::InvalidParameter(_)
+        ));
     }
 
     #[test]

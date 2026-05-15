@@ -257,7 +257,10 @@ mod tests {
     #[test]
     fn timeout_config_default() {
         let cfg = TimeoutConfig::default();
-        assert_eq!(cfg.nat_traversal.coordination_timeout, Duration::from_secs(10));
+        assert_eq!(
+            cfg.nat_traversal.coordination_timeout,
+            Duration::from_secs(10)
+        );
         assert_eq!(cfg.discovery.total_timeout, Duration::from_secs(30));
         assert_eq!(cfg.relay.request_timeout, Duration::from_secs(30));
     }
@@ -278,7 +281,10 @@ mod tests {
     fn timeout_config_clone() {
         let a = TimeoutConfig::default();
         let b = a.clone();
-        assert_eq!(a.nat_traversal.coordination_timeout, b.nat_traversal.coordination_timeout);
+        assert_eq!(
+            a.nat_traversal.coordination_timeout,
+            b.nat_traversal.coordination_timeout
+        );
     }
 
     #[test]
@@ -296,7 +302,10 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let decoded: NatTraversalTimeouts = serde_json::from_str(&json).unwrap();
         assert_eq!(orig.coordination_timeout, decoded.coordination_timeout);
-        assert_eq!(orig.connection_establishment_timeout, decoded.connection_establishment_timeout);
+        assert_eq!(
+            orig.connection_establishment_timeout,
+            decoded.connection_establishment_timeout
+        );
         assert_eq!(orig.probe_timeout, decoded.probe_timeout);
     }
 
@@ -305,8 +314,14 @@ mod tests {
         let orig = TimeoutConfig::fast();
         let json = serde_json::to_string(&orig).unwrap();
         let decoded: TimeoutConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(orig.nat_traversal.coordination_timeout, decoded.nat_traversal.coordination_timeout);
-        assert_eq!(orig.discovery.total_timeout, decoded.discovery.total_timeout);
+        assert_eq!(
+            orig.nat_traversal.coordination_timeout,
+            decoded.nat_traversal.coordination_timeout
+        );
+        assert_eq!(
+            orig.discovery.total_timeout,
+            decoded.discovery.total_timeout
+        );
         assert_eq!(orig.relay.request_timeout, decoded.relay.request_timeout);
     }
 
@@ -317,7 +332,10 @@ mod tests {
         let fast = NatTraversalTimeouts::fast();
         let cons = NatTraversalTimeouts::conservative();
         assert_ne!(fast.coordination_timeout, cons.coordination_timeout);
-        assert_ne!(fast.connection_establishment_timeout, cons.connection_establishment_timeout);
+        assert_ne!(
+            fast.connection_establishment_timeout,
+            cons.connection_establishment_timeout
+        );
         assert_ne!(fast.probe_timeout, cons.probe_timeout);
         assert_ne!(fast.retry_interval, cons.retry_interval);
         assert_ne!(fast.bootstrap_query_timeout, cons.bootstrap_query_timeout);

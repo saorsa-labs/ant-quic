@@ -933,7 +933,9 @@ mod tests {
 
     #[test]
     fn nonce_u128_from_bytes_properly_pads() {
-        let nonce12 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let nonce12 = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+        ];
         let val = nonce_u128_from_bytes(nonce12);
         // The top 32 bits should be zero (since we only copied 12 bytes into 16)
         let restored = val.to_le_bytes();

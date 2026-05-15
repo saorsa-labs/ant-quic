@@ -738,4 +738,3 @@ mod tests {
         assert_eq!(hasher1.finish(), hasher2.finish());
     }
 }
-

@@ -144,8 +144,8 @@ errors! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
     use crate::coding::Codec;
+    use bytes::BytesMut;
 
     #[test]
     fn transport_error_display() {
@@ -357,20 +357,53 @@ mod tests {
         // Every standard code should have a named Debug representation
         assert_eq!(format!("{:?}", Code::NO_ERROR), "NO_ERROR");
         assert_eq!(format!("{:?}", Code::INTERNAL_ERROR), "INTERNAL_ERROR");
-        assert_eq!(format!("{:?}", Code::CONNECTION_REFUSED), "CONNECTION_REFUSED");
-        assert_eq!(format!("{:?}", Code::FLOW_CONTROL_ERROR), "FLOW_CONTROL_ERROR");
-        assert_eq!(format!("{:?}", Code::STREAM_LIMIT_ERROR), "STREAM_LIMIT_ERROR");
-        assert_eq!(format!("{:?}", Code::STREAM_STATE_ERROR), "STREAM_STATE_ERROR");
+        assert_eq!(
+            format!("{:?}", Code::CONNECTION_REFUSED),
+            "CONNECTION_REFUSED"
+        );
+        assert_eq!(
+            format!("{:?}", Code::FLOW_CONTROL_ERROR),
+            "FLOW_CONTROL_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::STREAM_LIMIT_ERROR),
+            "STREAM_LIMIT_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::STREAM_STATE_ERROR),
+            "STREAM_STATE_ERROR"
+        );
         assert_eq!(format!("{:?}", Code::FINAL_SIZE_ERROR), "FINAL_SIZE_ERROR");
-        assert_eq!(format!("{:?}", Code::FRAME_ENCODING_ERROR), "FRAME_ENCODING_ERROR");
-        assert_eq!(format!("{:?}", Code::TRANSPORT_PARAMETER_ERROR), "TRANSPORT_PARAMETER_ERROR");
-        assert_eq!(format!("{:?}", Code::CONNECTION_ID_LIMIT_ERROR), "CONNECTION_ID_LIMIT_ERROR");
-        assert_eq!(format!("{:?}", Code::PROTOCOL_VIOLATION), "PROTOCOL_VIOLATION");
+        assert_eq!(
+            format!("{:?}", Code::FRAME_ENCODING_ERROR),
+            "FRAME_ENCODING_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::TRANSPORT_PARAMETER_ERROR),
+            "TRANSPORT_PARAMETER_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::CONNECTION_ID_LIMIT_ERROR),
+            "CONNECTION_ID_LIMIT_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::PROTOCOL_VIOLATION),
+            "PROTOCOL_VIOLATION"
+        );
         assert_eq!(format!("{:?}", Code::INVALID_TOKEN), "INVALID_TOKEN");
-        assert_eq!(format!("{:?}", Code::APPLICATION_ERROR), "APPLICATION_ERROR");
-        assert_eq!(format!("{:?}", Code::CRYPTO_BUFFER_EXCEEDED), "CRYPTO_BUFFER_EXCEEDED");
+        assert_eq!(
+            format!("{:?}", Code::APPLICATION_ERROR),
+            "APPLICATION_ERROR"
+        );
+        assert_eq!(
+            format!("{:?}", Code::CRYPTO_BUFFER_EXCEEDED),
+            "CRYPTO_BUFFER_EXCEEDED"
+        );
         assert_eq!(format!("{:?}", Code::KEY_UPDATE_ERROR), "KEY_UPDATE_ERROR");
-        assert_eq!(format!("{:?}", Code::AEAD_LIMIT_REACHED), "AEAD_LIMIT_REACHED");
+        assert_eq!(
+            format!("{:?}", Code::AEAD_LIMIT_REACHED),
+            "AEAD_LIMIT_REACHED"
+        );
         assert_eq!(format!("{:?}", Code::NO_VIABLE_PATH), "NO_VIABLE_PATH");
     }
 

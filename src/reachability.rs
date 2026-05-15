@@ -207,7 +207,10 @@ mod tests {
     #[test]
     fn scope_ipv4_private_rfc1918_10() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9000)),
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                9000
+            )),
             Some(ReachabilityScope::LocalNetwork)
         );
     }
@@ -215,7 +218,10 @@ mod tests {
     #[test]
     fn scope_ipv4_private_rfc1918_172() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 9000)),
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+                9000
+            )),
             Some(ReachabilityScope::LocalNetwork)
         );
     }
@@ -223,7 +229,10 @@ mod tests {
     #[test]
     fn scope_ipv4_private_rfc1918_192() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 9000)),
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                9000
+            )),
             Some(ReachabilityScope::LocalNetwork)
         );
     }
@@ -231,7 +240,10 @@ mod tests {
     #[test]
     fn scope_ipv4_link_local() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 9000)),
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+                9000
+            )),
             Some(ReachabilityScope::LocalNetwork)
         );
     }
@@ -247,7 +259,10 @@ mod tests {
     #[test]
     fn scope_ipv4_multicast() {
         assert_eq!(
-            socket_addr_scope(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 9000)),
+            socket_addr_scope(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+                9000
+            )),
             None
         );
     }
@@ -372,7 +387,10 @@ mod tests {
 
     #[test]
     fn traversal_display_port_prediction() {
-        assert_eq!(TraversalMethod::PortPrediction.to_string(), "port prediction");
+        assert_eq!(
+            TraversalMethod::PortPrediction.to_string(),
+            "port prediction"
+        );
     }
 
     #[test]

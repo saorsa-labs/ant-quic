@@ -229,7 +229,6 @@ pub trait ControllerFactory: Send + Sync {
     ) -> Box<dyn Controller + Send + Sync>;
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

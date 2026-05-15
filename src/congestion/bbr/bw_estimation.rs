@@ -213,14 +213,20 @@ mod tests {
         let start = now();
 
         // Send data in bursts to build up prev_sent_time and prev_total_sent
-        bw.on_sent(start, 1000);                       // first send
-        bw.on_sent(start + Duration::from_millis(10), 2000);   // second send (prev_sent_time set)
-        bw.on_sent(start + Duration::from_millis(20), 3000);   // third send (prev_sent_time from second)
+        bw.on_sent(start, 1000); // first send
+        bw.on_sent(start + Duration::from_millis(10), 2000); // second send (prev_sent_time set)
+        bw.on_sent(start + Duration::from_millis(20), 3000); // third send (prev_sent_time from second)
 
         // First ack establishes prev_acked_time
         bw.on_ack(start + Duration::from_millis(10), start, 1000, 1, false);
         // Second ack can compute ack_rate from prev_acked_time
-        bw.on_ack(start + Duration::from_millis(100), start + Duration::from_millis(10), 5000, 1, false);
+        bw.on_ack(
+            start + Duration::from_millis(100),
+            start + Duration::from_millis(10),
+            5000,
+            1,
+            false,
+        );
         assert!(
             bw.get_estimate() > 0,
             "bandwidth estimate should be positive after ack"
@@ -268,8 +274,17 @@ mod tests {
         // First ack to establish prev_acked_time
         bw.on_ack(start + Duration::from_millis(10), start, 1000, 1, false);
         // Second ack with enough data to compute meaningful bandwidth
-        bw.on_ack(start + Duration::from_millis(100), start + Duration::from_millis(10), 5000, 1, false);
-        assert!(bw.get_estimate() > 0, "bandwidth estimate should be positive");
+        bw.on_ack(
+            start + Duration::from_millis(100),
+            start + Duration::from_millis(10),
+            5000,
+            1,
+            false,
+        );
+        assert!(
+            bw.get_estimate() > 0,
+            "bandwidth estimate should be positive"
+        );
     }
 
     // Clone + Default consistency

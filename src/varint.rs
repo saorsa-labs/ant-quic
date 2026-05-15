@@ -381,7 +381,13 @@ mod tests {
     #[test]
     fn encode_checked_and_decode_roundtrip_each_size() {
         let values = [
-            0u64, 63, 64, 16383, 16384, 1_073_741_823, 1_073_741_824,
+            0u64,
+            63,
+            64,
+            16383,
+            16384,
+            1_073_741_823,
+            1_073_741_824,
             VarInt::MAX.into_inner(),
         ];
         for &v in &values {
@@ -573,8 +579,8 @@ mod tests {
 
     #[test]
     fn hash_consistent() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let a = VarInt::from_u32(42);
         let b = VarInt::from_u32(42);
@@ -587,8 +593,8 @@ mod tests {
 
     #[test]
     fn hash_different_values_different() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         // Note: different values CAN have the same hash, but for small values
         // this is extremely unlikely

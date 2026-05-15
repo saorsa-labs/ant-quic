@@ -337,7 +337,11 @@ mod tests {
         PeerId([0u8; 32])
     }
 
-    fn test_discovered_addr(port: u16, source: DiscoverySource, priority: u32) -> DiscoveredAddress {
+    fn test_discovered_addr(
+        port: u16,
+        source: DiscoverySource,
+        priority: u32,
+    ) -> DiscoveredAddress {
         DiscoveredAddress {
             addr: test_addr(port),
             source,
@@ -360,9 +364,17 @@ mod tests {
 
     #[test]
     fn test_discovery_source_order() {
-        assert!(DiscoverySource::Observed.base_priority() > DiscoverySource::LocalInterface.base_priority());
-        assert!(DiscoverySource::LocalInterface.base_priority() > DiscoverySource::PeerExchange.base_priority());
-        assert!(DiscoverySource::PeerExchange.base_priority() > DiscoverySource::Config.base_priority());
+        assert!(
+            DiscoverySource::Observed.base_priority()
+                > DiscoverySource::LocalInterface.base_priority()
+        );
+        assert!(
+            DiscoverySource::LocalInterface.base_priority()
+                > DiscoverySource::PeerExchange.base_priority()
+        );
+        assert!(
+            DiscoverySource::PeerExchange.base_priority() > DiscoverySource::Config.base_priority()
+        );
         assert!(DiscoverySource::Config.base_priority() > DiscoverySource::Dns.base_priority());
         assert!(DiscoverySource::Dns.base_priority() > DiscoverySource::Manual.base_priority());
     }
@@ -646,4 +658,3 @@ mod tests {
         drop(sender2);
     }
 }
-

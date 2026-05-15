@@ -355,12 +355,7 @@ mod tests {
     fn snapshot_add_locator_claim_new() {
         let pid = peer_id(4);
         let mut snapshot = PeerDirectorySnapshot::default();
-        snapshot.add_locator_claim(
-            Some(pid),
-            vec![addr(9002)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(Some(pid), vec![addr(9002)], PeerDiscoverySource::Mdns, None);
         assert_eq!(snapshot.locator_claims().count(), 1);
     }
 
@@ -368,12 +363,7 @@ mod tests {
     fn snapshot_add_locator_claim_merges_existing() {
         let pid = peer_id(5);
         let mut snapshot = PeerDirectorySnapshot::default();
-        snapshot.add_locator_claim(
-            Some(pid),
-            vec![addr(9000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(Some(pid), vec![addr(9000)], PeerDiscoverySource::Mdns, None);
         // Same peer with different address should merge into existing record
         snapshot.add_locator_claim(
             Some(pid),
@@ -392,12 +382,7 @@ mod tests {
     #[test]
     fn snapshot_locator_claim_anonymous_not_merged_with_named() {
         let mut snapshot = PeerDirectorySnapshot::default();
-        snapshot.add_locator_claim(
-            None,
-            vec![addr(9000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(None, vec![addr(9000)], PeerDiscoverySource::Mdns, None);
         // A named claim for a different peer should create separate record
         let pid = peer_id(7);
         snapshot.add_locator_claim(
@@ -421,12 +406,7 @@ mod tests {
         let pid = peer_id(6);
         let mut snapshot = PeerDirectorySnapshot::default();
         snapshot.add_authenticated_addr(pid, addr(1000), PeerDiscoverySource::PeerHints);
-        snapshot.add_locator_claim(
-            Some(pid),
-            vec![addr(2000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(Some(pid), vec![addr(2000)], PeerDiscoverySource::Mdns, None);
         let addrs = snapshot.candidate_addrs_for_peer(pid);
         assert_eq!(addrs.len(), 2);
         assert!(addrs.contains(&addr(1000)));
@@ -484,12 +464,7 @@ mod tests {
     fn snapshot_add_locator_claim_anonymous_same_addrs_merges() {
         let mut snapshot = PeerDirectorySnapshot::default();
         // Two anonymous claims with same addresses should merge
-        snapshot.add_locator_claim(
-            None,
-            vec![addr(6000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(None, vec![addr(6000)], PeerDiscoverySource::Mdns, None);
         snapshot.add_locator_claim(
             None,
             vec![addr(6000)],
@@ -500,18 +475,17 @@ mod tests {
         let claim = snapshot.locator_claims().next().unwrap();
         assert_eq!(claim.sources.len(), 2);
         assert!(claim.sources.contains(&PeerDiscoverySource::Mdns));
-        assert!(claim.sources.contains(&PeerDiscoverySource::StaticKnownPeer));
+        assert!(
+            claim
+                .sources
+                .contains(&PeerDiscoverySource::StaticKnownPeer)
+        );
     }
 
     #[test]
     fn snapshot_add_locator_claim_anonymous_different_addrs_no_merge() {
         let mut snapshot = PeerDirectorySnapshot::default();
-        snapshot.add_locator_claim(
-            None,
-            vec![addr(7000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(None, vec![addr(7000)], PeerDiscoverySource::Mdns, None);
         snapshot.add_locator_claim(
             None,
             vec![addr(7001)],
@@ -527,12 +501,7 @@ mod tests {
         let mut snapshot = PeerDirectorySnapshot::default();
         // Same address from both sources
         snapshot.add_authenticated_addr(pid, addr(8000), PeerDiscoverySource::PeerHints);
-        snapshot.add_locator_claim(
-            Some(pid),
-            vec![addr(8000)],
-            PeerDiscoverySource::Mdns,
-            None,
-        );
+        snapshot.add_locator_claim(Some(pid), vec![addr(8000)], PeerDiscoverySource::Mdns, None);
         let addrs = snapshot.candidate_addrs_for_peer(pid);
         assert_eq!(addrs.len(), 1);
     }
@@ -547,7 +516,11 @@ mod tests {
             sources: BTreeSet::new(),
         };
         record.merge_cached_peer(&cached, PeerDiscoverySource::BootstrapCache);
-        assert!(record.sources.contains(&PeerDiscoverySource::BootstrapCache));
+        assert!(
+            record
+                .sources
+                .contains(&PeerDiscoverySource::BootstrapCache)
+        );
     }
 
     #[test]
@@ -561,7 +534,10 @@ mod tests {
         caps.nat_type = Some(crate::CacheNatType::FullCone);
         caps.supports_coordination = true;
         record.merge_capabilities(&caps);
-        assert_eq!(record.capabilities.nat_type, Some(crate::CacheNatType::FullCone));
+        assert_eq!(
+            record.capabilities.nat_type,
+            Some(crate::CacheNatType::FullCone)
+        );
         assert!(record.capabilities.supports_coordination);
     }
 
@@ -572,6 +548,10 @@ mod tests {
         let mut snapshot = PeerDirectorySnapshot::default();
         snapshot.add_cached_peer(&cached);
         let record = snapshot.authenticated_record_mut(pid);
-        assert!(record.sources.contains(&PeerDiscoverySource::BootstrapCache));
+        assert!(
+            record
+                .sources
+                .contains(&PeerDiscoverySource::BootstrapCache)
+        );
     }
 }

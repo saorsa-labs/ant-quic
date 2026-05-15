@@ -288,7 +288,10 @@ mod tests {
     fn sent_tracks_pn_and_delay() {
         let mut state = ack_state();
         state.ack_frequency_sent(10, Duration::from_millis(50));
-        assert_eq!(state.in_flight_ack_frequency_frame, Some((10, Duration::from_millis(50))));
+        assert_eq!(
+            state.in_flight_ack_frequency_frame,
+            Some((10, Duration::from_millis(50)))
+        );
     }
 
     // Constants test

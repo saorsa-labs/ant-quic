@@ -178,7 +178,10 @@ mod tests {
             (ConnectionCloseReason::Banned, "Banned"),
             (ConnectionCloseReason::LifecycleCleanup, "LifecycleCleanup"),
             (ConnectionCloseReason::LivenessTimeout, "LivenessTimeout"),
-            (ConnectionCloseReason::ApplicationClosed, "ApplicationClosed"),
+            (
+                ConnectionCloseReason::ApplicationClosed,
+                "ApplicationClosed",
+            ),
             (ConnectionCloseReason::ConnectionClosed, "ConnectionClosed"),
             (ConnectionCloseReason::TimedOut, "TimedOut"),
             (ConnectionCloseReason::Reset, "Reset"),

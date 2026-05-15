@@ -325,7 +325,11 @@ mod tests {
     #[test]
     fn test_message_serialization() {
         let peer_id = pid(1);
-        let message = ChatMessage::text("test-user".to_string(), peer_id, "Hello, world!".to_string());
+        let message = ChatMessage::text(
+            "test-user".to_string(),
+            peer_id,
+            "Hello, world!".to_string(),
+        );
         let data = message.serialize().unwrap();
         assert!(data.len() < MAX_MESSAGE_SIZE);
         let deserialized = ChatMessage::deserialize(&data).unwrap();
@@ -340,7 +344,12 @@ mod tests {
             ChatMessage::leave("alice".to_string(), peer_id),
             ChatMessage::text("alice".to_string(), peer_id, "Hello".to_string()),
             ChatMessage::status("alice".to_string(), peer_id, "Away".to_string()),
-            ChatMessage::direct("alice".to_string(), peer_id, pid(3), "Private msg".to_string()),
+            ChatMessage::direct(
+                "alice".to_string(),
+                peer_id,
+                pid(3),
+                "Private msg".to_string(),
+            ),
             ChatMessage::typing("alice".to_string(), peer_id, true),
             ChatMessage::PeerListRequest { peer_id: peer_id.0 },
             ChatMessage::PeerListResponse {
@@ -357,9 +366,20 @@ mod tests {
             let deserialized = ChatMessage::deserialize(&data).unwrap();
             match (&msg, &deserialized) {
                 (
-                    ChatMessage::Join { nickname: n1, peer_id: p1, .. },
-                    ChatMessage::Join { nickname: n2, peer_id: p2, .. },
-                ) => { assert_eq!(n1, n2); assert_eq!(p1, p2); }
+                    ChatMessage::Join {
+                        nickname: n1,
+                        peer_id: p1,
+                        ..
+                    },
+                    ChatMessage::Join {
+                        nickname: n2,
+                        peer_id: p2,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(n1, n2);
+                    assert_eq!(p1, p2);
+                }
                 _ => assert_eq!(msg, deserialized),
             }
         }
@@ -393,7 +413,10 @@ mod tests {
     fn test_invalid_version() {
         let peer_id = pid(5);
         let message = ChatMessage::text("user".to_string(), peer_id, "test".to_string());
-        let wire_format = ChatWireFormat { version: 999, message };
+        let wire_format = ChatWireFormat {
+            version: 999,
+            message,
+        };
         let data = serde_json::to_vec(&wire_format).unwrap();
         match ChatMessage::deserialize(&data) {
             Err(ChatError::InvalidProtocolVersion(999)) => {}
@@ -543,7 +566,10 @@ mod tests {
     #[test]
     fn test_join_constructor() {
         let msg = ChatMessage::join("alice".to_string(), pid(1));
-        if let ChatMessage::Join { nickname, peer_id, .. } = &msg {
+        if let ChatMessage::Join {
+            nickname, peer_id, ..
+        } = &msg
+        {
             assert_eq!(nickname, "alice");
             assert_eq!(peer_id, &pid(1).0);
         } else {
@@ -554,7 +580,10 @@ mod tests {
     #[test]
     fn test_leave_constructor() {
         let msg = ChatMessage::leave("bob".to_string(), pid(2));
-        if let ChatMessage::Leave { nickname, peer_id, .. } = &msg {
+        if let ChatMessage::Leave {
+            nickname, peer_id, ..
+        } = &msg
+        {
             assert_eq!(nickname, "bob");
             assert_eq!(peer_id, &pid(2).0);
         } else {
@@ -565,7 +594,13 @@ mod tests {
     #[test]
     fn test_text_constructor() {
         let msg = ChatMessage::text("carol".to_string(), pid(3), "hello".to_string());
-        if let ChatMessage::Text { nickname, peer_id, text, .. } = &msg {
+        if let ChatMessage::Text {
+            nickname,
+            peer_id,
+            text,
+            ..
+        } = &msg
+        {
             assert_eq!(nickname, "carol");
             assert_eq!(peer_id, &pid(3).0);
             assert_eq!(text, "hello");
@@ -577,7 +612,13 @@ mod tests {
     #[test]
     fn test_status_constructor() {
         let msg = ChatMessage::status("dave".to_string(), pid(4), "online".to_string());
-        if let ChatMessage::Status { nickname, peer_id, status, .. } = &msg {
+        if let ChatMessage::Status {
+            nickname,
+            peer_id,
+            status,
+            ..
+        } = &msg
+        {
             assert_eq!(nickname, "dave");
             assert_eq!(peer_id, &pid(4).0);
             assert_eq!(status, "online");
@@ -589,7 +630,14 @@ mod tests {
     #[test]
     fn test_direct_constructor() {
         let msg = ChatMessage::direct("eve".to_string(), pid(5), pid(6), "secret".to_string());
-        if let ChatMessage::Direct { from_nickname, from_peer_id, to_peer_id, text, .. } = &msg {
+        if let ChatMessage::Direct {
+            from_nickname,
+            from_peer_id,
+            to_peer_id,
+            text,
+            ..
+        } = &msg
+        {
             assert_eq!(from_nickname, "eve");
             assert_eq!(from_peer_id, &pid(5).0);
             assert_eq!(to_peer_id, &pid(6).0);
@@ -602,7 +650,12 @@ mod tests {
     #[test]
     fn test_typing_constructor() {
         let msg = ChatMessage::typing("frank".to_string(), pid(7), true);
-        if let ChatMessage::Typing { nickname, peer_id, is_typing } = &msg {
+        if let ChatMessage::Typing {
+            nickname,
+            peer_id,
+            is_typing,
+        } = &msg
+        {
             assert_eq!(nickname, "frank");
             assert_eq!(peer_id, &pid(7).0);
             assert!(is_typing);
@@ -619,8 +672,18 @@ mod tests {
         let msg2 = ChatMessage::text("alice".to_string(), pid(1), "hello".to_string());
         // These won't be equal because timestamps differ. Check that variants and fields match.
         match (&msg1, &msg2) {
-            (ChatMessage::Text { nickname: n1, text: t1, .. },
-             ChatMessage::Text { nickname: n2, text: t2, .. }) => {
+            (
+                ChatMessage::Text {
+                    nickname: n1,
+                    text: t1,
+                    ..
+                },
+                ChatMessage::Text {
+                    nickname: n2,
+                    text: t2,
+                    ..
+                },
+            ) => {
                 assert_eq!(n1, n2);
                 assert_eq!(t1, t2);
             }
@@ -653,13 +716,28 @@ mod tests {
 
     #[test]
     fn test_chat_error_display() {
-        assert!(ChatError::Serialization("err".to_string()).to_string().contains("err"));
-        assert!(ChatError::Deserialization("bad".to_string()).to_string().contains("bad"));
+        assert!(
+            ChatError::Serialization("err".to_string())
+                .to_string()
+                .contains("err")
+        );
+        assert!(
+            ChatError::Deserialization("bad".to_string())
+                .to_string()
+                .contains("bad")
+        );
         let too_large = ChatError::MessageTooLarge(2000, 1000);
         assert!(too_large.to_string().contains("2000"));
         assert!(too_large.to_string().contains("1000"));
-        assert!(ChatError::InvalidProtocolVersion(99).to_string().contains("99"));
-        assert_eq!(ChatError::InvalidFormat.to_string(), "Invalid message format");
+        assert!(
+            ChatError::InvalidProtocolVersion(99)
+                .to_string()
+                .contains("99")
+        );
+        assert_eq!(
+            ChatError::InvalidFormat.to_string(),
+            "Invalid message format"
+        );
     }
 
     #[test]

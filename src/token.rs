@@ -340,8 +340,14 @@ mod tests {
     #[test]
     fn none_token_log_rejects_all_nonces() {
         let log = NoneTokenLog;
-        assert!(log.check_and_insert(0, std::time::UNIX_EPOCH, Duration::from_secs(1)).is_err());
-        assert!(log.check_and_insert(u128::MAX, std::time::UNIX_EPOCH, Duration::from_secs(300)).is_err());
+        assert!(
+            log.check_and_insert(0, std::time::UNIX_EPOCH, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            log.check_and_insert(u128::MAX, std::time::UNIX_EPOCH, Duration::from_secs(300))
+                .is_err()
+        );
     }
 
     // ── NoneTokenStore tests ──

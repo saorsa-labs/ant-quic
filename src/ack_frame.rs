@@ -358,7 +358,10 @@ mod tests {
         bytes.push(1);
         bytes.push(99);
         let (_, outcome) = decode_ack_control(&bytes).unwrap();
-        assert_eq!(outcome, AckControlOutcome::Rejected(ReceiveRejectReason::Unknown));
+        assert_eq!(
+            outcome,
+            AckControlOutcome::Rejected(ReceiveRejectReason::Unknown)
+        );
     }
 
     #[test]
@@ -368,7 +371,10 @@ mod tests {
         bytes.push(2);
         bytes.push(99);
         let (_, outcome) = decode_ack_control(&bytes).unwrap();
-        assert_eq!(outcome, AckControlOutcome::Closed(ConnectionCloseReason::Unknown));
+        assert_eq!(
+            outcome,
+            AckControlOutcome::Closed(ConnectionCloseReason::Unknown)
+        );
     }
 
     // AckBidiRequest tests
@@ -381,7 +387,10 @@ mod tests {
         let decoded = decode_ack_bidi_request(&encoded).unwrap();
         assert_eq!(decoded.request_id, request_id);
         assert_eq!(decoded.payload, payload);
-        assert_eq!(encoded.len(), ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN + payload.len());
+        assert_eq!(
+            encoded.len(),
+            ACK_BIDI_REQUEST_MAGIC.len() + ACK_REQUEST_ID_LEN + payload.len()
+        );
     }
 
     #[test]
@@ -490,7 +499,10 @@ mod tests {
         bytes.push(1);
         bytes.push(99);
         let outcome = decode_ack_bidi_response(&bytes).unwrap();
-        assert_eq!(outcome, AckControlOutcome::Rejected(ReceiveRejectReason::Unknown));
+        assert_eq!(
+            outcome,
+            AckControlOutcome::Rejected(ReceiveRejectReason::Unknown)
+        );
     }
 
     #[test]
@@ -499,7 +511,10 @@ mod tests {
         bytes.push(2);
         bytes.push(99);
         let outcome = decode_ack_bidi_response(&bytes).unwrap();
-        assert_eq!(outcome, AckControlOutcome::Closed(ConnectionCloseReason::Unknown));
+        assert_eq!(
+            outcome,
+            AckControlOutcome::Closed(ConnectionCloseReason::Unknown)
+        );
     }
 
     // Probe request tests
@@ -558,17 +573,35 @@ mod tests {
 
     #[test]
     fn receive_reject_reason_display_all_variants() {
-        assert_eq!(ReceiveRejectReason::ConsumerGone.to_string(), "ConsumerGone");
-        assert_eq!(ReceiveRejectReason::InvalidEnvelope.to_string(), "InvalidEnvelope");
-        assert_eq!(ReceiveRejectReason::NotSupported.to_string(), "NotSupported");
-        assert_eq!(ReceiveRejectReason::Backpressured.to_string(), "Backpressured");
+        assert_eq!(
+            ReceiveRejectReason::ConsumerGone.to_string(),
+            "ConsumerGone"
+        );
+        assert_eq!(
+            ReceiveRejectReason::InvalidEnvelope.to_string(),
+            "InvalidEnvelope"
+        );
+        assert_eq!(
+            ReceiveRejectReason::NotSupported.to_string(),
+            "NotSupported"
+        );
+        assert_eq!(
+            ReceiveRejectReason::Backpressured.to_string(),
+            "Backpressured"
+        );
         assert_eq!(ReceiveRejectReason::Unknown.to_string(), "Unknown");
     }
 
     #[test]
     fn receive_reject_reason_equality_and_copy() {
-        assert_eq!(ReceiveRejectReason::ConsumerGone, ReceiveRejectReason::ConsumerGone);
-        assert_ne!(ReceiveRejectReason::ConsumerGone, ReceiveRejectReason::Unknown);
+        assert_eq!(
+            ReceiveRejectReason::ConsumerGone,
+            ReceiveRejectReason::ConsumerGone
+        );
+        assert_ne!(
+            ReceiveRejectReason::ConsumerGone,
+            ReceiveRejectReason::Unknown
+        );
         let a = ReceiveRejectReason::ConsumerGone;
         let b = a;
         assert_eq!(a, b);
