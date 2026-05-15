@@ -277,11 +277,11 @@ ant-quic --listen 0.0.0.0:9000
 
 ### Default Known Peers
 
-If no `--known-peers` are specified, ant-quic automatically seeds connectivity from the default Saorsa Labs known peers:
-- `saorsa-1.saorsalabs.com:9000`
-- `saorsa-2.saorsalabs.com:9000`
+If no `--known-peers` are specified, ant-quic automatically seeds connectivity from the default Saorsa Labs known peers using hard-coded IP literals, not DNS names:
+- `142.93.199.50:9000` — saorsa-2, NYC
+- `147.182.234.192:9000` — saorsa-3, SFO
 
-These are ordinary symmetric peers running the same ant-quic software as everyone else. They are useful starting points for initial discovery, but they are not special protocol roles.
+These are ordinary symmetric peers running the same ant-quic software as everyone else. They are useful starting points for initial discovery, but they are not special protocol roles. IP literals are used deliberately so first-run connectivity is not blocked by DNS resolver failures.
 
 ### Peer Cache
 

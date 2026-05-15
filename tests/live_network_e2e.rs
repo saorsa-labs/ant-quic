@@ -15,26 +15,39 @@ use ant_quic::{P2pConfig, P2pEndpoint, P2pEvent};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-/// Known saorsa network nodes for testing
-const SAORSA_NODES: &[&str] = &[
-    "saorsa-2.saorsalabs.com:9000",
-    "saorsa-3.saorsalabs.com:9000",
+#[derive(Clone, Copy)]
+struct LiveSaorsaNode {
+    name: &'static str,
+    addr: SocketAddr,
+}
+
+/// Known saorsa network nodes for testing. Use hard-coded IP literals so live
+/// validation does not depend on DNS resolution.
+const SAORSA_NODES: &[LiveSaorsaNode] = &[
+    LiveSaorsaNode {
+        name: "saorsa-2-nyc",
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(142, 93, 199, 50)), 9000),
+    },
+    LiveSaorsaNode {
+        name: "saorsa-3-sfo",
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(147, 182, 234, 192)), 9000),
+    },
 ];
 
 /// Test connection to saorsa-2 node
 #[tokio::test]
-#[ignore = "requires network access to saorsa-2.saorsalabs.com"]
+#[ignore = "requires network access to saorsa-2 hard-coded VPS address"]
 async fn test_connect_saorsa_2() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    connect_to_node("saorsa-2.saorsalabs.com:9000").await
+    connect_to_node(SAORSA_NODES[0]).await
 }
 
 /// Test connection to saorsa-3 node
 #[tokio::test]
-#[ignore = "requires network access to saorsa-3.saorsalabs.com"]
+#[ignore = "requires network access to saorsa-3 hard-coded VPS address"]
 async fn test_connect_saorsa_3() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    connect_to_node("saorsa-3.saorsalabs.com:9000").await
+    connect_to_node(SAORSA_NODES[1]).await
 }
 
 /// Test external address discovery via real saorsa nodes
@@ -44,24 +57,7 @@ async fn test_external_address_discovery_live() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     println!("Testing external address discovery via live saorsa nodes...");
 
-    // Resolve known peer addresses via DNS
-    let mut known_peers = Vec::new();
-    for addr in SAORSA_NODES {
-        match tokio::net::lookup_host(*addr).await {
-            Ok(mut addrs) => {
-                if let Some(sock_addr) = addrs.next() {
-                    println!("Resolved {} -> {}", addr, sock_addr);
-                    known_peers.push(sock_addr);
-                }
-            }
-            Err(e) => println!("Failed to resolve {}: {}", addr, e),
-        }
-    }
-
-    if known_peers.is_empty() {
-        println!("No resolvable known peers - skipping test");
-        return Ok(());
-    }
+    let known_peers: Vec<_> = SAORSA_NODES.iter().map(|node| node.addr).collect();
 
     let config = P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
@@ -153,15 +149,9 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
             _ => unreachable!(),
         };
 
-        // Resolve the known peer address
-        let peer_addr = tokio::net::lookup_host("saorsa-2.saorsalabs.com:9000")
-            .await?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Failed to resolve saorsa-2"))?;
-
         let config = P2pConfig::builder()
             .bind_addr(bind_addr)
-            .known_peers(vec![peer_addr])
+            .known_peers(vec![SAORSA_NODES[0].addr])
             .pqc(ant_quic::PqcConfig::default())
             .build()?;
 
@@ -193,18 +183,12 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
 }
 
 /// Helper function to connect to a specific node
-async fn connect_to_node(addr: &str) -> anyhow::Result<()> {
-    println!("Connecting to {}...", addr);
-
-    // Resolve DNS hostname to socket address
-    let peer_addr: SocketAddr = tokio::net::lookup_host(addr)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Failed to resolve {}", addr))?;
+async fn connect_to_node(node_addr: LiveSaorsaNode) -> anyhow::Result<()> {
+    println!("Connecting to {} ({})...", node_addr.name, node_addr.addr);
 
     let config = P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .known_peers(vec![peer_addr])
+        .known_peers(vec![node_addr.addr])
         .pqc(ant_quic::PqcConfig::default())
         .build()?;
 
@@ -219,12 +203,15 @@ async fn connect_to_node(addr: &str) -> anyhow::Result<()> {
 
     match connect_result {
         Ok(Ok(n)) => {
-            println!("Successfully connected to {} ({} peers)", addr, n);
+            println!("Successfully connected to {} ({} peers)", node_addr.name, n);
 
             // Verify connection by checking for observed address
             tokio::time::sleep(Duration::from_secs(2)).await;
             if let Some(external) = node.external_addr() {
-                println!("Our external address as seen by {}: {}", addr, external);
+                println!(
+                    "Our external address as seen by {}: {}",
+                    node_addr.name, external
+                );
             }
         }
         Ok(Err(e)) => {
@@ -251,7 +238,7 @@ async fn test_multiple_connections() -> anyhow::Result<()> {
     for i in 0..3 {
         let handle = tokio::spawn(async move {
             let peer = SAORSA_NODES[i % SAORSA_NODES.len()];
-            println!("Connection {} to {}", i, peer);
+            println!("Connection {} to {} ({})", i, peer.name, peer.addr);
             connect_to_node(peer).await
         });
         handles.push(handle);

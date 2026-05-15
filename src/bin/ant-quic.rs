@@ -45,7 +45,7 @@ use ant_quic::{MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPha
 use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,17 +54,40 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Default bootstrap nodes operated by Saorsa Labs
+/// Default known peers operated by Saorsa Labs.
 ///
-/// These nodes are available for initial network discovery. They run the same
-/// ant-quic software as any other node and provide:
+/// These are long-term VPS endpoints for initial network discovery. Use IP
+/// literals rather than DNS names so cold-start connectivity does not depend on
+/// resolver availability. They run the same ant-quic software as any other node
+/// and provide:
 /// - Initial peer discovery
 /// - NAT traversal coordination
 /// - External address observation (OBSERVED_ADDRESS frames)
-const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
-    "saorsa-1.saorsalabs.com:9000",
-    "saorsa-2.saorsalabs.com:9000",
+#[derive(Debug, Clone, Copy)]
+struct DefaultBootstrapNode {
+    name: &'static str,
+    addr: SocketAddr,
+}
+
+const DEFAULT_BOOTSTRAP_NODES: &[DefaultBootstrapNode] = &[
+    DefaultBootstrapNode {
+        name: "saorsa-2-nyc",
+        addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(142, 93, 199, 50), 9000)),
+    },
+    DefaultBootstrapNode {
+        name: "saorsa-3-sfo",
+        addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(147, 182, 234, 192), 9000)),
+    },
 ];
+
+fn default_bootstrap_addrs() -> impl Iterator<Item = SocketAddr> + 'static {
+    DEFAULT_BOOTSTRAP_NODES.iter().map(|node| node.addr)
+}
+
+fn is_valid_default_bootstrap_addr(addr: SocketAddr) -> bool {
+    addr.port() == 9000
+        && matches!(addr.ip(), IpAddr::V4(ip) if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified())
+}
 
 /// ant-quic P2P node
 ///
@@ -479,21 +502,16 @@ async fn main() -> anyhow::Result<()> {
         .copied()
         .collect();
 
-    // Use default bootstrap nodes if no peers were specified
+    // Use default bootstrap nodes if no peers were specified. These are IP
+    // literals to avoid making cold-start connectivity depend on DNS.
     if all_peers.is_empty() && !args.no_default_bootstrap {
         info!("No peers specified, using default Saorsa Labs bootstrap nodes");
-        for addr_str in DEFAULT_BOOTSTRAP_NODES {
-            match tokio::net::lookup_host(addr_str).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        all_peers.push(addr);
-                        info!("  - {} -> {}", addr_str, addr);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to resolve {}: {}", addr_str, e);
-                }
-            }
+        for (node, addr) in DEFAULT_BOOTSTRAP_NODES
+            .iter()
+            .zip(default_bootstrap_addrs())
+        {
+            all_peers.push(addr);
+            info!("  - {} ({})", node.name, addr);
         }
     }
 
@@ -2161,27 +2179,26 @@ async fn handle_doctor_command() -> anyhow::Result<()> {
         }
     }
 
-    // Check 6: DNS resolution for bootstrap nodes
-    print!("Checking DNS resolution... ");
-    let mut dns_ok = 0;
-    for node in DEFAULT_BOOTSTRAP_NODES {
-        if tokio::net::lookup_host(node).await.is_ok() {
-            dns_ok += 1;
-        }
-    }
-    if dns_ok == DEFAULT_BOOTSTRAP_NODES.len() {
-        println!("OK ({} nodes resolved)", dns_ok);
-        passed += 1;
-    } else if dns_ok > 0 {
+    // Check 6: default bootstrap address configuration. These should be IP
+    // literals, not DNS names, so users can cold-start without resolver access.
+    print!("Checking default bootstrap addresses... ");
+    if DEFAULT_BOOTSTRAP_NODES.is_empty() {
+        println!("FAILED");
+        issues.push("No default bootstrap addresses are configured.".to_string());
+    } else if DEFAULT_BOOTSTRAP_NODES
+        .iter()
+        .all(|node| is_valid_default_bootstrap_addr(node.addr))
+    {
         println!(
-            "PARTIAL ({}/{} nodes resolved)",
-            dns_ok,
+            "OK ({} hard-coded IP endpoints)",
             DEFAULT_BOOTSTRAP_NODES.len()
         );
         passed += 1;
     } else {
         println!("FAILED");
-        issues.push("Cannot resolve any bootstrap nodes. Check your DNS settings.".to_string());
+        issues.push(
+            "Default bootstrap addresses must be global IP literals on port 9000.".to_string(),
+        );
     }
 
     println!();
@@ -2203,4 +2220,31 @@ async fn handle_doctor_command() -> anyhow::Result<()> {
     println!("═══════════════════════════════════════════════════════════════");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bootstrap_nodes_are_global_ip_literals_on_ant_quic_port() {
+        let addrs: Vec<_> = default_bootstrap_addrs().collect();
+        assert_eq!(addrs.len(), DEFAULT_BOOTSTRAP_NODES.len());
+        assert!(!addrs.is_empty());
+        for addr in addrs {
+            assert!(
+                is_valid_default_bootstrap_addr(addr),
+                "invalid default bootstrap addr: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bootstrap_nodes_have_stable_names() {
+        let names: Vec<_> = DEFAULT_BOOTSTRAP_NODES
+            .iter()
+            .map(|node| node.name)
+            .collect();
+        assert_eq!(names, vec!["saorsa-2-nyc", "saorsa-3-sfo"]);
+    }
 }

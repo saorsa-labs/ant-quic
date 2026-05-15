@@ -2,15 +2,15 @@
 
 # Testnet monitoring script for ant-quic
 NODES=(
-  "162.243.167.201"  # bootstrap
-  "159.65.221.230"
-  "67.205.158.158"
-  "161.35.231.80"
-  "178.62.192.11"
-  "159.65.90.128"
+  "142.93.199.50"    # saorsa-2 bootstrap (NYC)
+  "147.182.234.192"  # saorsa-3 bootstrap (SFO)
+  "206.189.7.117"    # saorsa-4 test node (AMS)
+  "144.126.230.161"  # saorsa-5 test node (LON)
+  "65.21.157.229"    # saorsa-6 test node (Helsinki)
+  "116.203.101.172"  # saorsa-7 test node (Nuremberg)
 )
 
-BOOTSTRAP="162.243.167.201"
+BOOTSTRAP="142.93.199.50"
 DURATION=600  # 10 minutes in seconds
 INTERVAL=60   # Check every 60 seconds
 ITERATIONS=$((DURATION / INTERVAL))
