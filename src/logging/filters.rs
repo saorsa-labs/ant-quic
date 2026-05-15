@@ -298,4 +298,116 @@ mod tests {
         assert!(filter.should_log("test", Level::INFO, "this is important but noisy"));
         assert!(filter.should_log("test", Level::INFO, "this is normal"));
     }
+
+    #[test]
+    fn default_filter_uses_info_level() {
+        let filter = LogFilter::default();
+
+        assert!(filter.should_log("ant_quic::unknown", Level::ERROR, "error"));
+        assert!(filter.should_log("ant_quic::unknown", Level::WARN, "warn"));
+        assert!(filter.should_log("ant_quic::unknown", Level::INFO, "info"));
+        assert!(!filter.should_log("ant_quic::unknown", Level::DEBUG, "debug"));
+        assert!(!filter.should_log("ant_quic::unknown", Level::TRACE, "trace"));
+        assert_eq!(filter.level_for("ant_quic::unknown"), None);
+    }
+
+    #[test]
+    fn exact_module_match_takes_configured_level() {
+        let filter = LogFilter::new().with_module("ant_quic::connection", Level::WARN);
+
+        assert_eq!(filter.level_for("ant_quic::connection"), Some(Level::WARN));
+        assert_eq!(
+            filter.level_for("ant_quic::connection::streams"),
+            Some(Level::WARN)
+        );
+        assert!(filter.should_log("ant_quic::connection", Level::WARN, "warn"));
+        assert!(!filter.should_log("ant_quic::connection::streams", Level::INFO, "info"));
+    }
+
+    #[test]
+    fn include_pattern_matches_target_and_overrides_exclude() {
+        let filter = LogFilter::new()
+            .exclude_pattern(r"ant_quic::packet")
+            .unwrap()
+            .include_pattern(r"ant_quic::packet::important")
+            .unwrap();
+
+        assert!(!filter.should_log("ant_quic::packet", Level::INFO, "normal packet"));
+        assert!(filter.should_log("ant_quic::packet::important", Level::TRACE, "trace packet"));
+    }
+
+    #[test]
+    fn invalid_regex_is_reported() {
+        assert!(LogFilter::new().exclude_pattern("[").is_err());
+        assert!(LogFilter::new().include_pattern("[").is_err());
+    }
+
+    #[test]
+    fn builder_presets_set_expected_levels() {
+        let nat = LogFilterBuilder::new().nat_traversal_debug().build();
+        assert_eq!(nat.level_for("ant_quic::nat_traversal"), Some(Level::TRACE));
+        assert_eq!(
+            nat.level_for("ant_quic::candidate_discovery"),
+            Some(Level::DEBUG)
+        );
+
+        let perf = LogFilterBuilder::new().performance_analysis().build();
+        assert_eq!(perf.level_for("ant_quic::metrics"), Some(Level::INFO));
+        assert_eq!(perf.level_for("ant_quic::congestion"), Some(Level::DEBUG));
+
+        let prod = LogFilterBuilder::new().production().build();
+        assert_eq!(
+            prod.level_for("ant_quic::connection::lifecycle"),
+            Some(Level::INFO)
+        );
+        assert!(!prod.should_log("ant_quic::misc", Level::INFO, "info"));
+        assert!(prod.should_log("ant_quic::misc", Level::WARN, "warn"));
+    }
+
+    #[test]
+    fn quiet_excludes_noisy_packet_and_frame_messages() {
+        let filter = LogFilterBuilder::new().quiet().build();
+
+        for message in [
+            "packet.sent",
+            "packet.received",
+            "frame.sent",
+            "frame.received",
+        ] {
+            assert!(!filter.should_log("ant_quic::test", Level::INFO, message));
+        }
+        assert!(filter.should_log("ant_quic::test", Level::INFO, "connection.established"));
+    }
+
+    #[test]
+    fn dynamic_filter_update_changes_decision() {
+        let dynamic = DynamicLogFilter::new(LogFilter::new());
+        assert!(!dynamic.should_log("ant_quic::connection", Level::DEBUG, "before"));
+
+        dynamic
+            .update(|filter| {
+                *filter = filter
+                    .clone()
+                    .with_module("ant_quic::connection", Level::DEBUG);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(dynamic.should_log("ant_quic::connection", Level::DEBUG, "after"));
+        assert_eq!(
+            dynamic.level_for("ant_quic::connection"),
+            Some(Level::DEBUG)
+        );
+    }
+
+    #[test]
+    fn dynamic_filter_update_propagates_errors_without_mutation() {
+        let dynamic = DynamicLogFilter::new(LogFilter::new().with_default_level(Level::WARN));
+
+        let result = dynamic.update(|_| Err("scripted update failure".into()));
+
+        assert!(result.is_err());
+        assert!(!dynamic.should_log("ant_quic::misc", Level::INFO, "still warn"));
+        assert!(dynamic.should_log("ant_quic::misc", Level::WARN, "still warn"));
+    }
 }
