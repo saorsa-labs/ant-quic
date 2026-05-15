@@ -307,6 +307,15 @@ mod tests {
     }
 
     #[test]
+    fn filter_nodes_without_filter_returns_all_nodes() {
+        let nodes = vec![node("a"), node("b")];
+        let filtered = filter_nodes(nodes, None);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].name, "a");
+        assert_eq!(filtered[1].name, "b");
+    }
+
+    #[test]
     fn filter_nodes_selects_requested_names() {
         let nodes = vec![node("a"), node("b")];
         let filtered = filter_nodes(nodes, Some("b"));
@@ -315,16 +324,68 @@ mod tests {
     }
 
     #[test]
+    fn filter_nodes_trims_empty_filter_entries() {
+        let nodes = vec![node("a"), node("b"), node("c")];
+        let filtered = filter_nodes(nodes, Some(" b, ,c "));
+        let names: Vec<_> = filtered.into_iter().map(|node| node.name).collect();
+        assert_eq!(names, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn filter_nodes_unknown_filter_returns_empty() {
+        let nodes = vec![node("a"), node("b")];
+        let filtered = filter_nodes(nodes, Some("missing"));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
     fn summarize_requires_non_empty_results_for_threshold() {
         let report = summarize(Vec::new(), 50.0);
         assert_eq!(report.summary.total_nodes, 0);
+        assert_eq!(report.summary.passed_nodes, 0);
+        assert_eq!(report.summary.failed_nodes, 0);
+        assert_eq!(report.summary.success_rate, 0.0);
         assert!(!report.summary.threshold_met);
+    }
+
+    #[test]
+    fn summarize_marks_all_success_above_threshold() {
+        let report = summarize(vec![result("a", true), result("b", true)], 80.0);
+        assert_eq!(report.summary.total_nodes, 2);
+        assert_eq!(report.summary.passed_nodes, 2);
+        assert_eq!(report.summary.failed_nodes, 0);
+        assert_eq!(report.summary.success_rate, 100.0);
+        assert!(report.summary.threshold_met);
     }
 
     #[test]
     fn summarize_marks_threshold_edge_as_met() {
         let report = summarize(vec![result("a", true), result("b", false)], 50.0);
+        assert_eq!(report.summary.total_nodes, 2);
+        assert_eq!(report.summary.passed_nodes, 1);
+        assert_eq!(report.summary.failed_nodes, 1);
         assert_eq!(report.summary.success_rate, 50.0);
         assert!(report.summary.threshold_met);
+    }
+
+    #[test]
+    fn summarize_marks_below_threshold_as_not_met() {
+        let report = summarize(
+            vec![result("a", true), result("b", false), result("c", false)],
+            50.0,
+        );
+        assert_eq!(report.summary.total_nodes, 3);
+        assert_eq!(report.summary.passed_nodes, 1);
+        assert_eq!(report.summary.failed_nodes, 2);
+        assert!((report.summary.success_rate - 33.333336).abs() < f32::EPSILON);
+        assert!(!report.summary.threshold_met);
+    }
+
+    #[test]
+    fn summarize_preserves_results_for_json_report() {
+        let report = summarize(vec![result("a", true), result("b", false)], 50.0);
+        assert_eq!(report.results.len(), 2);
+        assert_eq!(report.results[0].node.name, "a");
+        assert_eq!(report.results[1].error.as_deref(), Some("failed"));
     }
 }
