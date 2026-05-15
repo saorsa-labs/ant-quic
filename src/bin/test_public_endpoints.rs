@@ -629,6 +629,15 @@ mod tests {
     use super::*;
 
     fn result(endpoint_name: &str, success: bool, handshake_time_ms: Option<u64>) -> TestResult {
+        result_with_protocols(endpoint_name, success, handshake_time_ms, &["h3"])
+    }
+
+    fn result_with_protocols(
+        endpoint_name: &str,
+        success: bool,
+        handshake_time_ms: Option<u64>,
+        protocols: &[&str],
+    ) -> TestResult {
         TestResult {
             endpoint: format!("{endpoint_name}:443"),
             endpoint_name: endpoint_name.to_string(),
@@ -638,9 +647,15 @@ mod tests {
             rtt_ms: handshake_time_ms,
             quic_version: success.then_some(0x00000001),
             error: (!success).then(|| "scripted failure".to_string()),
-            protocols_tested: vec!["h3".to_string()],
+            protocols_tested: protocols
+                .iter()
+                .map(|protocol| (*protocol).to_string())
+                .collect(),
             successful_protocols: if success {
-                vec!["h3".to_string()]
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol).to_string())
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -651,6 +666,18 @@ mod tests {
             },
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             metrics: None,
+        }
+    }
+
+    fn report_for(results: Vec<TestResult>) -> ValidationResults {
+        ValidationResults {
+            summary: summarize_results(&results),
+            endpoints: results,
+            metadata: ResultMetadata {
+                ant_quic_version: "test".to_string(),
+                test_date: "2026-01-01T00:00:00Z".to_string(),
+                test_duration_ms: 0,
+            },
         }
     }
 
@@ -696,20 +723,68 @@ mod tests {
     }
 
     #[test]
+    fn summarize_results_deduplicates_and_sorts_successful_protocols() {
+        let results = vec![
+            result_with_protocols("a.example", true, Some(20), &["h3-29", "h3"]),
+            result_with_protocols("b.example", true, Some(40), &["h3"]),
+            result_with_protocols("c.example", false, None, &["failed-proto"]),
+        ];
+        let summary = summarize_results(&results);
+        assert_eq!(
+            summary.protocols_seen,
+            vec!["h3".to_string(), "h3-29".to_string()]
+        );
+    }
+
+    #[test]
+    fn summarize_results_counts_success_without_handshake_time() {
+        let results = vec![
+            result("a.example", true, None),
+            result("b.example", true, Some(40)),
+        ];
+        let summary = summarize_results(&results);
+        assert_eq!(summary.total_endpoints, 2);
+        assert_eq!(summary.passed_endpoints, 2);
+        assert_eq!(summary.success_rate, 100.0);
+        assert_eq!(summary.average_handshake_time, 20.0);
+    }
+
+    #[test]
     fn markdown_report_includes_zero_endpoint_summary() {
-        let results = ValidationResults {
-            endpoints: Vec::new(),
-            summary: summarize_results(&[]),
-            metadata: ResultMetadata {
-                ant_quic_version: "test".to_string(),
-                test_date: "2026-01-01T00:00:00Z".to_string(),
-                test_duration_ms: 0,
-            },
-        };
+        let results = report_for(Vec::new());
         let report = generate_markdown_report(&results);
         assert!(report.contains("Total Endpoints"));
         assert!(report.contains("Success Rate"));
         assert!(report.contains("0.0%"));
+    }
+
+    #[test]
+    fn markdown_report_includes_success_and_failure_rows() {
+        let results = report_for(vec![
+            result("ok.example", true, Some(25)),
+            result("bad.example", false, None),
+        ]);
+        let report = generate_markdown_report(&results);
+        assert!(
+            report.contains("| ok.example | ok.example:443 | ✅ Success | 25ms | 25ms | h3 |  |")
+        );
+        assert!(report.contains(
+            "| bad.example | bad.example:443 | ❌ Failed | N/A | N/A |  | scripted failure |"
+        ));
+    }
+
+    #[test]
+    fn markdown_report_includes_metadata_and_protocol_summary() {
+        let results = report_for(vec![result_with_protocols(
+            "proto.example",
+            true,
+            Some(5),
+            &["h3-29", "h3"],
+        )]);
+        let report = generate_markdown_report(&results);
+        assert!(report.contains("**ant-quic Version**: test"));
+        assert!(report.contains("**Test Duration**: 0ms"));
+        assert!(report.contains("**Protocols Seen**: h3, h3-29"));
     }
 }
 
