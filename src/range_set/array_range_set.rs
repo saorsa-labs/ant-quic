@@ -272,6 +272,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn insert_reverse_range_is_noop() {
         let mut s = empty();
         assert!(!s.insert(20..10));

@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn log_error_generic() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "generic");
+        let err = std::io::Error::other("generic");
         utils::log_error(&err, "generic context");
     }
 
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn user_message_discovery() {
         // DiscoveryError is in candidate_discovery module — use a generic fallback
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "weird");
+        let err = std::io::Error::other("weird");
         let msg = utils::to_user_message(&err);
         assert!(msg.contains("unexpected error"));
     }
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn generic_error_is_not_recoverable() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        let err = std::io::Error::other("other");
         assert!(!utils::is_recoverable(&err));
     }
 
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn generic_error_has_no_retry_delay() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        let err = std::io::Error::other("other");
         assert!(utils::get_retry_delay(&err).is_none());
     }
 

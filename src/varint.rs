@@ -176,6 +176,7 @@ impl<'arbitrary> Arbitrary<'arbitrary> for VarInt {
 pub struct VarIntBoundsExceeded;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
@@ -567,7 +568,7 @@ mod tests {
         let a = VarInt::from_u32(10);
         let b = VarInt::from_u32(10);
         assert_eq!(a, b);
-        assert!(!(a < b));
+        assert!(a >= b);
     }
 
     #[test]
@@ -649,7 +650,7 @@ mod tests {
     #[test]
     fn varint_clone_is_copy() {
         let a = VarInt::from_u32(42);
-        let b = a.clone();
+        let b = a;
         assert_eq!(a, b);
     }
 
