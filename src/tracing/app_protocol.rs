@@ -197,4 +197,109 @@ mod tests {
         let desc = registry.describe_command(&app_id, 0x01);
         assert_eq!(desc, "STORE_CHUNK");
     }
+
+    #[test]
+    fn datamap_app_id_is_stable() {
+        assert_eq!(DataMapProtocol.app_id(), *b"DMAP");
+    }
+
+    #[test]
+    fn datamap_describes_all_known_commands() {
+        let protocol = DataMapProtocol;
+        assert_eq!(protocol.describe_command(0x01), "STORE_CHUNK");
+        assert_eq!(protocol.describe_command(0x02), "GET_CHUNK");
+        assert_eq!(protocol.describe_command(0x03), "DELETE_CHUNK");
+        assert_eq!(protocol.describe_command(0x04), "CHUNK_EXISTS");
+        assert_eq!(protocol.describe_command(0x05), "UNKNOWN");
+    }
+
+    #[test]
+    fn datamap_trace_data_store_copies_hash_and_size() {
+        let mut payload = vec![0u8; 36];
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte = idx as u8;
+        }
+
+        let data = DataMapProtocol.to_trace_data(0x01, &payload);
+
+        assert_eq!(&data[..36], &payload[..36]);
+        assert!(data[36..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn datamap_trace_data_get_and_delete_copy_hash_only() {
+        let payload: Vec<u8> = (0..40).collect();
+
+        let get = DataMapProtocol.to_trace_data(0x02, &payload);
+        let delete = DataMapProtocol.to_trace_data(0x03, &payload);
+
+        assert_eq!(&get[..32], &payload[..32]);
+        assert_eq!(&delete[..32], &payload[..32]);
+        assert!(get[32..].iter().all(|byte| *byte == 0));
+        assert!(delete[32..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn datamap_trace_data_short_known_payloads_remain_zeroed() {
+        let payload = [7u8; 31];
+        assert_eq!(DataMapProtocol.to_trace_data(0x01, &payload), [0u8; 42]);
+        assert_eq!(DataMapProtocol.to_trace_data(0x02, &payload), [0u8; 42]);
+        assert_eq!(DataMapProtocol.to_trace_data(0x03, &payload), [0u8; 42]);
+    }
+
+    #[test]
+    fn datamap_trace_data_unknown_command_copies_up_to_limit() {
+        let payload: Vec<u8> = (0..64).collect();
+        let data = DataMapProtocol.to_trace_data(0xff, &payload);
+
+        assert_eq!(&data[..], &payload[..42]);
+    }
+
+    #[test]
+    fn registry_defaults_for_unknown_app() {
+        let registry = AppRegistry::default();
+        let app_id = *b"NONE";
+
+        assert!(registry.get(&app_id).is_none());
+        assert!(registry.should_trace(&app_id, 0x04));
+        assert_eq!(
+            registry.describe_command(&app_id, 7),
+            "Unknown app [78, 79, 78, 69] cmd 7"
+        );
+    }
+
+    struct ReplacementProtocol;
+
+    impl AppProtocol for ReplacementProtocol {
+        fn app_id(&self) -> [u8; 4] {
+            *b"DMAP"
+        }
+
+        fn to_trace_data(&self, _cmd: u16, _payload: &[u8]) -> [u8; 42] {
+            [9u8; 42]
+        }
+
+        fn describe_command(&self, _cmd: u16) -> &'static str {
+            "REPLACED"
+        }
+
+        fn should_trace(&self, _cmd: u16) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn registry_replaces_existing_app_id() {
+        let registry = AppRegistry::new();
+        let app_id = DataMapProtocol.app_id();
+        registry.register(DataMapProtocol);
+        registry.register(ReplacementProtocol);
+
+        assert!(!registry.should_trace(&app_id, 0x01));
+        assert_eq!(registry.describe_command(&app_id, 0x01), "REPLACED");
+        assert_eq!(
+            registry.get(&app_id).expect("app").to_trace_data(0, &[]),
+            [9u8; 42]
+        );
+    }
 }
