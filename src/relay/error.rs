@@ -221,4 +221,134 @@ mod tests {
             _ => panic!("Expected NetworkError"),
         }
     }
+
+    #[test]
+    fn relay_error_display_covers_all_variants() {
+        let cases = [
+            (
+                RelayError::AuthenticationFailed {
+                    reason: "bad token".to_string(),
+                },
+                "Authentication failed: bad token",
+            ),
+            (
+                RelayError::RateLimitExceeded {
+                    retry_after_ms: 250,
+                },
+                "Rate limit exceeded, retry after 250 ms",
+            ),
+            (
+                RelayError::SessionError {
+                    session_id: None,
+                    kind: SessionErrorKind::Expired,
+                },
+                "Session error: session expired",
+            ),
+            (
+                RelayError::NetworkError {
+                    operation: "dial".to_string(),
+                    source: "timeout".to_string(),
+                },
+                "Network error during dial: timeout",
+            ),
+            (
+                RelayError::ProtocolError {
+                    frame_type: 0xab,
+                    reason: "reserved".to_string(),
+                },
+                "Protocol error in frame 0xab: reserved",
+            ),
+            (
+                RelayError::ResourceExhausted {
+                    resource_type: "sessions".to_string(),
+                    current_usage: 11,
+                    limit: 10,
+                },
+                "Resource exhausted: sessions usage (11) exceeds limit (10)",
+            ),
+            (
+                RelayError::ConfigurationError {
+                    parameter: "port".to_string(),
+                    reason: "out of range".to_string(),
+                },
+                "Configuration error for port: out of range",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn session_error_kind_display_covers_all_variants() {
+        let cases = [
+            (SessionErrorKind::NotFound, "session not found"),
+            (SessionErrorKind::AlreadyExists, "session already exists"),
+            (SessionErrorKind::Expired, "session expired"),
+            (SessionErrorKind::Terminated, "session terminated"),
+            (
+                SessionErrorKind::InvalidState {
+                    current_state: "open".to_string(),
+                    expected_state: "closed".to_string(),
+                },
+                "invalid state 'open', expected 'closed'",
+            ),
+            (
+                SessionErrorKind::BandwidthExceeded {
+                    used: 1025,
+                    limit: 1024,
+                },
+                "bandwidth exceeded: 1025 > 1024",
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn relay_error_clone_and_equality_preserve_payloads() {
+        let error = RelayError::SessionError {
+            session_id: Some(7),
+            kind: SessionErrorKind::BandwidthExceeded {
+                used: 2048,
+                limit: 1024,
+            },
+        };
+
+        let cloned = error.clone();
+        assert_eq!(cloned, error);
+        assert!(format!("{cloned:?}").contains("BandwidthExceeded"));
+    }
+
+    #[test]
+    fn relay_result_alias_accepts_relay_error() {
+        fn failing() -> RelayResult<()> {
+            Err(RelayError::ConfigurationError {
+                parameter: "relay.enabled".to_string(),
+                reason: "disabled".to_string(),
+            })
+        }
+
+        let error = failing().expect_err("expected relay error");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error for relay.enabled: disabled"
+        );
+    }
+
+    #[test]
+    fn relay_error_implements_std_error() {
+        fn as_error(error: &dyn std::error::Error) -> String {
+            error.to_string()
+        }
+
+        let error = RelayError::ProtocolError {
+            frame_type: 0x01,
+            reason: "too short".to_string(),
+        };
+        assert_eq!(as_error(&error), "Protocol error in frame 0x01: too short");
+    }
 }
