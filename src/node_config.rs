@@ -97,6 +97,10 @@ pub struct NodeConfig {
     /// Default: 100.
     pub max_concurrent_uni_streams: Option<u32>,
 
+    /// Maximum bytes accepted for a single message read from a stream.
+    /// Default: [`crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`].
+    pub max_message_size: Option<usize>,
+
     /// Reviewer P2 #2: surface ant-quic's best-effort UPnP IGD port-mapping
     /// toggle at the simpler `NodeConfig` builder layer (the existing knob
     /// is only on `P2pConfigBuilder`). When `Some(false)`, the UPnP
@@ -161,6 +165,7 @@ pub struct NodeConfigBuilder {
     transport_providers: Vec<Arc<dyn TransportProvider>>,
     data_channel_capacity: Option<usize>,
     max_concurrent_uni_streams: Option<u32>,
+    max_message_size: Option<usize>,
     port_mapping_enabled: Option<bool>,
 }
 
@@ -345,6 +350,17 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the maximum bytes accepted for a single message read from a stream.
+    ///
+    /// This mirrors [`crate::unified_config::P2pConfigBuilder::max_message_size`]
+    /// for applications using the simpler [`NodeConfig`] builder. Values must be
+    /// at least 1; [`crate::Node::with_config`] rejects zero with a configuration
+    /// error before constructing the endpoint.
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
+        self
+    }
+
     /// Reviewer P2 #2: enable or disable the best-effort UPnP IGD
     /// port-mapping task. Default (when not called) follows the global
     /// ant-quic default — currently enabled. Use `false` on networks
@@ -364,6 +380,7 @@ impl NodeConfigBuilder {
             transport_providers: self.transport_providers,
             data_channel_capacity: self.data_channel_capacity,
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
+            max_message_size: self.max_message_size,
             port_mapping_enabled: self.port_mapping_enabled,
         }
     }
@@ -404,6 +421,21 @@ mod tests {
         assert!(config.known_peers.is_empty());
         assert!(config.keypair.is_none());
         assert!(config.transport_providers.is_empty());
+        assert!(config.max_message_size.is_none());
+    }
+
+    #[test]
+    fn test_builder_with_max_message_size() {
+        let config = NodeConfig::builder()
+            .max_message_size(10 * 1024 * 1024)
+            .build();
+        assert_eq!(config.max_message_size, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_builder_records_zero_max_message_size_for_node_validation() {
+        let config = NodeConfig::builder().max_message_size(0).build();
+        assert_eq!(config.max_message_size, Some(0));
     }
 
     #[test]

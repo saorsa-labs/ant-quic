@@ -136,6 +136,44 @@ pub struct Node {
     event_tx: broadcast::Sender<NodeEvent>,
 }
 
+fn node_config_to_p2p_config(config: NodeConfig) -> Result<P2pConfig, NodeError> {
+    let mut p2p_config = P2pConfig::default();
+
+    // Build transport registry first (before any partial moves)
+    p2p_config.transport_registry = config.build_transport_registry();
+
+    if let Some(bind_addr) = config.bind_addr {
+        p2p_config.bind_addr = Some(bind_addr.into());
+    }
+
+    p2p_config.known_peers = config.known_peers.into_iter().map(Into::into).collect();
+    p2p_config.keypair = config.keypair;
+
+    if let Some(capacity) = config.data_channel_capacity {
+        p2p_config.data_channel_capacity = capacity;
+    }
+    if let Some(streams) = config.max_concurrent_uni_streams {
+        p2p_config.max_concurrent_uni_streams = streams;
+    }
+    if let Some(max_message_size) = config.max_message_size {
+        if max_message_size == 0 {
+            return Err(NodeError::Creation(
+                "max_message_size must be at least 1".to_string(),
+            ));
+        }
+        p2p_config.max_message_size = max_message_size;
+    }
+    // Reviewer P2 #2: pipe NodeConfig::port_mapping_enabled into the
+    // underlying P2pConfig's NAT port-mapping toggle so app-level
+    // opt-out (e.g. x0x daemon config / CLI flag) actually disables
+    // the UPnP discovery task.
+    if let Some(enabled) = config.port_mapping_enabled {
+        p2p_config.nat.port_mapping.enabled = enabled;
+    }
+
+    Ok(p2p_config)
+}
+
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
@@ -267,32 +305,7 @@ impl Node {
     /// let node = Node::with_config(config).await?;
     /// ```
     pub async fn with_config(config: NodeConfig) -> Result<Self, NodeError> {
-        // Convert NodeConfig to P2pConfig
-        let mut p2p_config = P2pConfig::default();
-
-        // Build transport registry first (before any partial moves)
-        p2p_config.transport_registry = config.build_transport_registry();
-
-        if let Some(bind_addr) = config.bind_addr {
-            p2p_config.bind_addr = Some(bind_addr.into());
-        }
-
-        p2p_config.known_peers = config.known_peers.into_iter().map(Into::into).collect();
-        p2p_config.keypair = config.keypair;
-
-        if let Some(capacity) = config.data_channel_capacity {
-            p2p_config.data_channel_capacity = capacity;
-        }
-        if let Some(streams) = config.max_concurrent_uni_streams {
-            p2p_config.max_concurrent_uni_streams = streams;
-        }
-        // Reviewer P2 #2: pipe NodeConfig::port_mapping_enabled into the
-        // underlying P2pConfig's NAT port-mapping toggle so app-level
-        // opt-out (e.g. x0x daemon config / CLI flag) actually disables
-        // the UPnP discovery task.
-        if let Some(enabled) = config.port_mapping_enabled {
-            p2p_config.nat.port_mapping.enabled = enabled;
-        }
+        let p2p_config = node_config_to_p2p_config(config)?;
 
         // Create event channel
         let (event_tx, _) = broadcast::channel(256);
@@ -1028,6 +1041,22 @@ mod tests {
         assert!(node.is_ok(), "Node::with_config() should succeed");
 
         node.unwrap().shutdown().await;
+    }
+
+    #[test]
+    fn test_node_config_max_message_size_propagates_to_p2p_config() {
+        let config = NodeConfig::builder()
+            .max_message_size(10 * 1024 * 1024)
+            .build();
+        let p2p_config = node_config_to_p2p_config(config).unwrap();
+        assert_eq!(p2p_config.max_message_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_node_config_rejects_zero_max_message_size() {
+        let config = NodeConfig::builder().max_message_size(0).build();
+        let err = node_config_to_p2p_config(config).unwrap_err();
+        assert!(err.to_string().contains("max_message_size"));
     }
 
     #[tokio::test]
