@@ -81,3 +81,78 @@ impl NetworkDiscovery for MockDiscovery {
         Ok(self.default_route)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface(name: &str, address: &str, is_up: bool) -> NetworkInterface {
+        NetworkInterface {
+            name: name.to_string(),
+            addresses: vec![address.parse().expect("valid socket address")],
+            is_up,
+            is_wireless: false,
+            mtu: Some(1500),
+        }
+    }
+
+    #[test]
+    fn new_returns_configured_interfaces_and_route() {
+        let route = "10.0.0.1:0".parse().expect("valid route");
+        let discovery =
+            MockDiscovery::new(vec![interface("test0", "10.0.0.2:0", true)], Some(route));
+
+        let interfaces = discovery.discover_interfaces().expect("interfaces");
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name, "test0");
+        assert_eq!(interfaces[0].addresses[0], "10.0.0.2:0".parse().unwrap());
+        assert_eq!(discovery.get_default_route().expect("route"), Some(route));
+    }
+
+    #[test]
+    fn new_supports_empty_configuration() {
+        let discovery = MockDiscovery::new(Vec::new(), None);
+        assert!(
+            discovery
+                .discover_interfaces()
+                .expect("interfaces")
+                .is_empty()
+        );
+        assert_eq!(discovery.get_default_route().expect("route"), None);
+    }
+
+    #[test]
+    fn discover_interfaces_returns_clone_not_internal_storage() {
+        let discovery = MockDiscovery::new(vec![interface("test0", "10.0.0.2:0", true)], None);
+
+        let mut interfaces = discovery.discover_interfaces().expect("first clone");
+        interfaces[0].name = "mutated".to_string();
+
+        let interfaces = discovery.discover_interfaces().expect("second clone");
+        assert_eq!(interfaces[0].name, "test0");
+    }
+
+    #[test]
+    fn simple_config_contains_loopback_and_external_interfaces() {
+        let discovery = MockDiscovery::with_simple_config();
+        let interfaces = discovery.discover_interfaces().expect("interfaces");
+
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0].name, "lo");
+        assert_eq!(interfaces[0].addresses.len(), 2);
+        assert!(interfaces[0].is_up);
+        assert_eq!(interfaces[0].mtu, Some(65535));
+        assert_eq!(interfaces[1].name, "eth0");
+        assert_eq!(interfaces[1].addresses.len(), 2);
+        assert_eq!(interfaces[1].mtu, Some(1500));
+    }
+
+    #[test]
+    fn simple_config_default_route_matches_gateway() {
+        let discovery = MockDiscovery::with_simple_config();
+        assert_eq!(
+            discovery.get_default_route().expect("route"),
+            Some("192.168.1.1:0".parse().unwrap())
+        );
+    }
+}
