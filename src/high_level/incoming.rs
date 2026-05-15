@@ -208,6 +208,8 @@ impl IntoFuture for Incoming {
 #[cfg(test)]
 mod tests {
     use super::{Incoming, RetryError};
+    use crate::{ConnectionError, ConnectionId};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn retry_on_consumed_incoming_returns_error() {
@@ -218,5 +220,42 @@ mod tests {
                 assert!(inner.0.is_none());
             }
         }
+    }
+
+    #[test]
+    fn consumed_incoming_accessors_return_safe_defaults() {
+        let incoming = Incoming(None);
+
+        assert_eq!(incoming.local_ip(), None);
+        assert_eq!(
+            incoming.remote_address(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        );
+        assert!(!incoming.remote_address_validated());
+        assert!(!incoming.may_retry());
+        assert_eq!(incoming.orig_dst_cid(), ConnectionId::new(&[]));
+    }
+
+    #[test]
+    fn accept_on_consumed_incoming_returns_locally_closed() {
+        let incoming = Incoming(None);
+        let error = incoming
+            .accept()
+            .expect_err("consumed incoming cannot accept");
+        assert_eq!(error, ConnectionError::LocallyClosed);
+    }
+
+    #[test]
+    fn refuse_and_ignore_on_consumed_incoming_are_noops() {
+        Incoming(None).refuse();
+        Incoming(None).ignore();
+    }
+
+    #[test]
+    fn retry_error_roundtrips_original_incoming() {
+        let err = RetryError::incoming(Incoming(None));
+        assert_eq!(err.to_string(), "retry() with invalid Incoming");
+        let incoming = err.into_incoming();
+        assert!(incoming.0.is_none());
     }
 }
