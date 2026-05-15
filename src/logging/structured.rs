@@ -291,4 +291,107 @@ mod tests {
         assert!(json.contains(r#""message":"Error occurred""#));
         assert!(json.contains(r#""error_code","E001""#));
     }
+
+    #[test]
+    fn log_level_converts_all_tracing_levels() {
+        assert_eq!(LogLevel::from(Level::ERROR), LogLevel::ERROR);
+        assert_eq!(LogLevel::from(Level::WARN), LogLevel::WARN);
+        assert_eq!(LogLevel::from(Level::INFO), LogLevel::INFO);
+        assert_eq!(LogLevel::from(Level::DEBUG), LogLevel::DEBUG);
+        assert_eq!(LogLevel::from(Level::TRACE), LogLevel::TRACE);
+    }
+
+    #[test]
+    fn structured_event_chain_sets_optional_identifiers() {
+        let conn_id = ConnectionId::new(&[1, 2, 3, 4]);
+        let event = StructuredLogEvent::new(Level::DEBUG, "target", "message")
+            .with_fields(vec![
+                ("alpha".to_string(), "one".to_string()),
+                ("beta".to_string(), "two".to_string()),
+            ])
+            .with_span_id("span-1")
+            .with_trace_id("trace-1")
+            .with_connection_id(&conn_id);
+
+        assert_eq!(event.fields.len(), 2);
+        assert_eq!(event.span_id.as_deref(), Some("span-1"));
+        assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
+        assert!(event.connection_id.is_some());
+    }
+
+    #[test]
+    fn pretty_json_includes_optional_fields_when_present() {
+        let event = StructuredLogEvent::new(Level::INFO, "pretty", "message")
+            .with_trace_id("trace-2")
+            .with_span_id("span-2");
+
+        let json = event.to_json_pretty().unwrap();
+        assert!(json.contains("\n"));
+        assert!(json.contains(r#""trace_id": "trace-2""#));
+        assert!(json.contains(r#""span_id": "span-2""#));
+    }
+
+    #[test]
+    fn json_omits_trace_and_connection_when_absent() {
+        let event = StructuredLogEvent::new(Level::INFO, "target", "message");
+        let value: serde_json::Value = serde_json::from_str(&event.to_json().unwrap()).unwrap();
+
+        assert!(value.get("trace_id").is_none());
+        assert!(value.get("connection_id").is_none());
+        assert!(value.get("span_id").is_some());
+    }
+
+    #[test]
+    fn builder_sets_connection_and_span_ids() {
+        let conn_id = ConnectionId::new(&[9, 8, 7, 6]);
+        let event = StructuredEventBuilder::new(Level::WARN, "builder", "built")
+            .connection_id(&conn_id)
+            .span_id("span-builder")
+            .build();
+
+        assert_eq!(event.level, LogLevel::WARN);
+        assert_eq!(event.span_id.as_deref(), Some("span-builder"));
+        assert!(event.connection_id.is_some());
+    }
+
+    #[test]
+    fn extract_field_name_accepts_equals_and_colon_forms() {
+        assert_eq!(extract_field_name(" peer_id="), Some("peer_id".to_string()));
+        assert_eq!(extract_field_name("rtt_ms:"), Some("rtt_ms".to_string()));
+        assert_eq!(extract_field_name("not valid="), None);
+        assert_eq!(extract_field_name("="), None);
+    }
+
+    #[test]
+    fn parse_structured_fields_uses_following_literal_names() {
+        let first = 7;
+        let second = "ok";
+        let fields = parse_structured_fields("ignored={} rtt_ms={} status", &[&first, &second]);
+
+        assert_eq!(fields, vec![("rtt_ms".to_string(), "7".to_string())]);
+    }
+
+    #[test]
+    fn format_as_json_converts_plain_log_event() {
+        use std::collections::HashMap;
+
+        let mut fields = HashMap::new();
+        fields.insert("key".to_string(), "value".to_string());
+        let event = super::super::LogEvent {
+            timestamp: crate::Instant::now(),
+            level: Level::TRACE,
+            target: "plain".to_string(),
+            message: "converted".to_string(),
+            fields,
+            span_id: Some("span-plain".to_string()),
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&format_as_json(&event)).unwrap();
+        assert_eq!(value["level"], "TRACE");
+        assert_eq!(value["target"], "plain");
+        assert_eq!(value["message"], "converted");
+        assert_eq!(value["fields"][0][0], "key");
+        assert_eq!(value["fields"][0][1], "value");
+        assert_eq!(value["span_id"], "span-plain");
+    }
 }
