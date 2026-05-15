@@ -205,4 +205,60 @@ mod tests {
         let b = gso_diagnostics() as *const _;
         assert_eq!(a, b, "OnceLock must yield the same address on every call");
     }
+
+    #[test]
+    fn submitted_counter_counts_bundles_not_segments() {
+        let diags = GsoDiagnostics::default();
+        diags.record_bundle_submitted(2);
+        diags.record_bundle_submitted(64);
+
+        assert_eq!(diags.bundle_send_total(), 2);
+        assert_eq!(diags.bundle_partial_send(), 0);
+    }
+
+    #[test]
+    fn partial_send_can_be_recorded_without_submission() {
+        let diags = GsoDiagnostics::default();
+        diags.record_bundle_partial_send();
+        diags.record_bundle_partial_send();
+
+        assert_eq!(diags.bundle_send_total(), 0);
+        assert_eq!(diags.bundle_partial_send(), 2);
+    }
+
+    #[test]
+    fn snapshot_is_copy_clone_and_debuggable() {
+        let snapshot = GsoDiagnosticsSnapshot {
+            bundle_send_total: 3,
+            bundle_partial_send: 1,
+        };
+        let copied = snapshot;
+        let cloned = snapshot;
+
+        assert_eq!(copied.bundle_send_total, 3);
+        assert_eq!(cloned.bundle_partial_send, 1);
+        assert!(format!("{snapshot:?}").contains("GsoDiagnosticsSnapshot"));
+    }
+
+    #[test]
+    fn snapshot_serializes_with_stable_field_names() {
+        let snapshot = GsoDiagnosticsSnapshot {
+            bundle_send_total: 7,
+            bundle_partial_send: 2,
+        };
+        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
+
+        assert_eq!(json["bundle_send_total"], 7);
+        assert_eq!(json["bundle_partial_send"], 2);
+    }
+
+    #[test]
+    fn diagnostics_debug_includes_counter_names() {
+        let diags = GsoDiagnostics::default();
+        let debug = format!("{diags:?}");
+
+        assert!(debug.contains("GsoDiagnostics"));
+        assert!(debug.contains("bundle_send_total"));
+        assert!(debug.contains("bundle_partial_send"));
+    }
 }
