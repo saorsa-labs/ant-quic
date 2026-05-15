@@ -245,4 +245,106 @@ mod tests {
         ];
         assert!(validate_bootstrap_nodes(&duplicate_nodes).is_err());
     }
+
+    #[test]
+    fn validation_error_display_covers_all_variants() {
+        let cases = [
+            (
+                ConfigValidationError::InvalidBootstrapNode("bad node".to_string()),
+                "Invalid bootstrap node configuration: bad node",
+            ),
+            (
+                ConfigValidationError::IncompatibleConfiguration("mixed modes".to_string()),
+                "Incompatible configuration combination: mixed modes",
+            ),
+            (
+                ConfigValidationError::MissingRequiredConfig("listen_addr".to_string()),
+                "Missing required configuration: listen_addr",
+            ),
+            (
+                ConfigValidationError::ValueOutOfRange("mtu".to_string()),
+                "Configuration value out of range: mtu",
+            ),
+            (
+                ConfigValidationError::InvalidAddress("0.0.0.0".to_string()),
+                "Invalid address format: 0.0.0.0",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn validate_socket_addr_rejects_reserved_ipv4_and_ipv6() {
+        let invalid = [
+            "255.255.255.255:9000",
+            "224.0.0.1:9000",
+            "[::]:9000",
+            "[ff02::1]:9000",
+        ];
+
+        for addr in invalid {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert!(validate_socket_addr(&addr, "reserved").is_err());
+        }
+    }
+
+    #[test]
+    fn validate_socket_addr_allows_known_quic_privileged_ports() {
+        for port in [80, 443, 853] {
+            let addr = SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), port);
+            assert!(validate_socket_addr(&addr, "privileged").is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_socket_addr_rejects_unlisted_privileged_port() {
+        let addr = SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), 22);
+        let error = validate_socket_addr(&addr, "ssh").expect_err("port 22 rejected");
+        assert!(error.to_string().contains("privileged port"));
+    }
+
+    #[test]
+    fn validate_duration_accepts_exact_boundaries() {
+        let min = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+
+        assert!(validate_duration(min, min, max, "min").is_ok());
+        assert!(validate_duration(max, min, max, "max").is_ok());
+    }
+
+    #[test]
+    fn validate_range_accepts_exact_boundaries() {
+        assert!(validate_range(1, 1, 100, "min").is_ok());
+        assert!(validate_range(100, 1, 100, "max").is_ok());
+    }
+
+    #[test]
+    fn validate_bootstrap_nodes_rejects_too_many_nodes() {
+        let nodes: Vec<_> = (0..101)
+            .map(|idx| SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), 10_000 + idx))
+            .collect();
+
+        let error = validate_bootstrap_nodes(&nodes).expect_err("too many nodes rejected");
+        assert!(error.to_string().contains("maximum 100"));
+    }
+
+    struct AlwaysValid;
+
+    impl ConfigValidator for AlwaysValid {
+        fn validate(&self) -> ValidationResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn config_validator_trait_can_be_used_as_bound() {
+        fn validate_with_trait<T: ConfigValidator>(value: &T) -> ValidationResult<()> {
+            value.validate()
+        }
+
+        assert!(validate_with_trait(&AlwaysValid).is_ok());
+    }
 }
