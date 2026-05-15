@@ -243,4 +243,89 @@ mod tests {
             "Should not predict with only 1 valid sample"
         );
     }
+
+    #[test]
+    fn default_config_values_are_conservative() {
+        let config = PortPredictorConfig::default();
+        assert_eq!(config.max_samples, 10);
+        assert_eq!(config.sample_ttl, Duration::from_secs(60));
+        assert_eq!(config.min_samples_for_prediction, 2);
+        assert_eq!(config.max_prediction_attempts, 3);
+    }
+
+    #[test]
+    fn duplicate_ports_are_ignored() {
+        let mut predictor = PortPredictor::new(PortPredictorConfig::default());
+        let ip = test_ip();
+        let now = Instant::now();
+
+        predictor.record_observation(SocketAddr::new(ip, 1000), now);
+        predictor.record_observation(SocketAddr::new(ip, 1000), now + Duration::from_secs(1));
+        predictor.record_observation(SocketAddr::new(ip, 1002), now + Duration::from_secs(2));
+
+        assert_eq!(predictor.predict_ports(ip), vec![1004, 1006]);
+    }
+
+    #[test]
+    fn max_samples_evicts_oldest_observations() {
+        let config = PortPredictorConfig {
+            max_samples: 2,
+            ..PortPredictorConfig::default()
+        };
+        let mut predictor = PortPredictor::new(config);
+        let ip = test_ip();
+        let now = Instant::now();
+
+        predictor.record_observation(SocketAddr::new(ip, 1000), now);
+        predictor.record_observation(SocketAddr::new(ip, 1001), now + Duration::from_secs(1));
+        predictor.record_observation(SocketAddr::new(ip, 1010), now + Duration::from_secs(2));
+
+        assert_eq!(predictor.predict_ports(ip), vec![1019, 1028]);
+    }
+
+    #[test]
+    fn prediction_uses_observation_time_not_insertion_order() {
+        let mut predictor = PortPredictor::new(PortPredictorConfig::default());
+        let ip = test_ip();
+        let now = Instant::now();
+
+        predictor.record_observation(SocketAddr::new(ip, 1004), now + Duration::from_secs(2));
+        predictor.record_observation(SocketAddr::new(ip, 1000), now);
+        predictor.record_observation(SocketAddr::new(ip, 1002), now + Duration::from_secs(1));
+
+        assert_eq!(predictor.predict_ports(ip), vec![1006, 1008]);
+    }
+
+    #[test]
+    fn clear_removes_history_for_only_requested_ip() {
+        let mut predictor = PortPredictor::new(PortPredictorConfig::default());
+        let ip = test_ip();
+        let other_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let now = Instant::now();
+
+        predictor.record_observation(SocketAddr::new(ip, 1000), now);
+        predictor.record_observation(SocketAddr::new(ip, 1001), now + Duration::from_secs(1));
+        predictor.record_observation(SocketAddr::new(other_ip, 2000), now);
+        predictor.record_observation(
+            SocketAddr::new(other_ip, 2001),
+            now + Duration::from_secs(1),
+        );
+
+        predictor.clear(ip);
+
+        assert!(predictor.predict_ports(ip).is_empty());
+        assert_eq!(predictor.predict_ports(other_ip), vec![2002, 2003]);
+    }
+
+    #[test]
+    fn wrapping_delta_predictions_are_supported() {
+        let mut predictor = PortPredictor::new(PortPredictorConfig::default());
+        let ip = test_ip();
+        let now = Instant::now();
+
+        predictor.record_observation(SocketAddr::new(ip, 65_534), now);
+        predictor.record_observation(SocketAddr::new(ip, 1), now + Duration::from_secs(1));
+
+        assert_eq!(predictor.predict_ports(ip), vec![4, 7]);
+    }
 }
