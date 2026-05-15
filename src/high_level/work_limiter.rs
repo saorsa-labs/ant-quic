@@ -148,6 +148,88 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn new_starts_in_measure_mode_with_no_limit() {
+        let limiter = WorkLimiter::new(Duration::from_millis(10));
+
+        assert_eq!(limiter.mode, Mode::Measure);
+        assert_eq!(limiter.cycle, 0);
+        assert_eq!(limiter.start_time, None);
+        assert_eq!(limiter.completed, 0);
+        assert_eq!(limiter.allowed, 0);
+        assert_eq!(limiter.smoothed_time_per_work_item_nanos, 0.0);
+    }
+
+    #[test]
+    fn start_cycle_resets_completed_and_sets_start_in_measure_mode() {
+        let mut limiter = WorkLimiter::new(Duration::from_millis(10));
+        reset_time();
+        limiter.completed = 7;
+
+        limiter.start_cycle(get_time);
+
+        assert_eq!(limiter.completed, 0);
+        assert_eq!(limiter.start_time, Some(get_time()));
+    }
+
+    #[test]
+    fn finish_cycle_without_work_keeps_measurement_open_and_cycle_unchanged() {
+        let mut limiter = WorkLimiter::new(Duration::from_millis(10));
+        reset_time();
+        limiter.start_cycle(get_time);
+
+        limiter.finish_cycle(get_time);
+
+        assert_eq!(limiter.mode, Mode::Measure);
+        assert_eq!(limiter.cycle, 0);
+        assert_eq!(limiter.allowed, 0);
+        assert!(limiter.start_time.is_some());
+    }
+
+    #[test]
+    fn first_measurement_allows_at_least_one_work_item() {
+        let mut limiter = WorkLimiter::new(Duration::from_nanos(1));
+        reset_time();
+        limiter.start_cycle(get_time);
+        limiter.record_work(10);
+        advance_time(Duration::from_millis(1));
+
+        limiter.finish_cycle(get_time);
+
+        assert_eq!(limiter.allowed, 1);
+        assert!(limiter.smoothed_time_per_work_item_nanos >= 1.0);
+        assert_eq!(limiter.mode, Mode::HistoricData);
+    }
+
+    #[test]
+    fn historic_mode_uses_completed_less_than_allowed() {
+        let mut limiter = WorkLimiter::new(Duration::from_millis(10));
+        limiter.mode = Mode::HistoricData;
+        limiter.allowed = 3;
+
+        assert!(limiter.allow_work(get_time));
+        limiter.record_work(2);
+        assert!(limiter.allow_work(get_time));
+        limiter.record_work(1);
+        assert!(!limiter.allow_work(get_time));
+    }
+
+    #[test]
+    fn sampling_interval_wraps_back_to_measure_mode() {
+        let mut limiter = WorkLimiter::new(Duration::from_millis(10));
+        reset_time();
+        limiter.mode = Mode::HistoricData;
+        limiter.allowed = 1;
+        limiter.cycle = SAMPLING_INTERVAL - 1;
+
+        limiter.start_cycle(get_time);
+        limiter.record_work(1);
+        limiter.finish_cycle(get_time);
+
+        assert_eq!(limiter.cycle, SAMPLING_INTERVAL);
+        assert_eq!(limiter.mode, Mode::Measure);
+    }
+
+    #[test]
     fn limit_work() {
         const CYCLE_TIME: Duration = Duration::from_millis(500);
         const BATCH_WORK_ITEMS: usize = 12;
