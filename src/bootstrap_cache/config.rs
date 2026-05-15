@@ -225,4 +225,96 @@ mod tests {
         let config = BootstrapCacheConfig::builder().epsilon(-0.5).build();
         assert!(config.epsilon.abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn default_config_sets_all_intervals_and_flags() {
+        let config = BootstrapCacheConfig::default();
+        assert_eq!(
+            config.reachability_ttl,
+            crate::reachability::DIRECT_REACHABILITY_TTL
+        );
+        assert_eq!(config.save_interval, Duration::from_secs(5 * 60));
+        assert_eq!(config.quality_update_interval, Duration::from_secs(3600));
+        assert_eq!(config.cleanup_interval, Duration::from_secs(6 * 3600));
+        assert_eq!(config.min_peers_to_save, 10);
+        assert!(config.enable_file_locking);
+        assert!(
+            config.cache_dir.ends_with("ant-quic-cache") || config.cache_dir.ends_with("ant-quic")
+        );
+    }
+
+    #[test]
+    fn quality_weights_default_sum_to_one() {
+        let weights = QualityWeights::default();
+        assert!((weights.success_rate - 0.4).abs() < f64::EPSILON);
+        assert!((weights.rtt - 0.25).abs() < f64::EPSILON);
+        assert!((weights.freshness - 0.15).abs() < f64::EPSILON);
+        assert!((weights.capabilities - 0.2).abs() < f64::EPSILON);
+        let total = weights.success_rate + weights.rtt + weights.freshness + weights.capabilities;
+        assert!((total - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn builder_sets_all_duration_fields() {
+        let config = BootstrapCacheConfig::builder()
+            .stale_threshold(Duration::from_secs(1))
+            .reachability_ttl(Duration::from_secs(2))
+            .save_interval(Duration::from_secs(3))
+            .quality_update_interval(Duration::from_secs(4))
+            .cleanup_interval(Duration::from_secs(5))
+            .build();
+
+        assert_eq!(config.stale_threshold, Duration::from_secs(1));
+        assert_eq!(config.reachability_ttl, Duration::from_secs(2));
+        assert_eq!(config.save_interval, Duration::from_secs(3));
+        assert_eq!(config.quality_update_interval, Duration::from_secs(4));
+        assert_eq!(config.cleanup_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn builder_sets_save_threshold_and_locking() {
+        let config = BootstrapCacheConfig::builder()
+            .min_peers_to_save(0)
+            .enable_file_locking(false)
+            .build();
+
+        assert_eq!(config.min_peers_to_save, 0);
+        assert!(!config.enable_file_locking);
+    }
+
+    #[test]
+    fn builder_replaces_quality_weights() {
+        let weights = QualityWeights {
+            success_rate: 1.0,
+            rtt: 2.0,
+            freshness: 3.0,
+            capabilities: 4.0,
+        };
+        let config = BootstrapCacheConfig::builder()
+            .weights(weights.clone())
+            .build();
+
+        assert!((config.weights.success_rate - weights.success_rate).abs() < f64::EPSILON);
+        assert!((config.weights.rtt - weights.rtt).abs() < f64::EPSILON);
+        assert!((config.weights.freshness - weights.freshness).abs() < f64::EPSILON);
+        assert!((config.weights.capabilities - weights.capabilities).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_clone_preserves_custom_values() {
+        let config = BootstrapCacheConfig::builder()
+            .cache_dir("relative/cache")
+            .max_peers(42)
+            .epsilon(0.75)
+            .min_peers_to_save(3)
+            .enable_file_locking(false)
+            .build();
+        let cloned = config.clone();
+
+        assert_eq!(cloned.cache_dir, PathBuf::from("relative/cache"));
+        assert_eq!(cloned.max_peers, 42);
+        assert!((cloned.epsilon - 0.75).abs() < f64::EPSILON);
+        assert_eq!(cloned.min_peers_to_save, 3);
+        assert!(!cloned.enable_file_locking);
+    }
 }
