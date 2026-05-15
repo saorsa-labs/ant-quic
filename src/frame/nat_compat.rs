@@ -213,4 +213,95 @@ mod tests {
         assert!(pub_priority.into_inner() > priv_priority.into_inner());
         assert!(priv_priority.into_inner() > loop_priority.into_inner());
     }
+
+    #[test]
+    fn default_compat_mode_is_mixed() {
+        assert_eq!(NatCompatMode::default(), NatCompatMode::Mixed);
+        assert_ne!(NatCompatMode::Legacy, NatCompatMode::RfcCompliant);
+    }
+
+    #[test]
+    fn punch_me_now_conversion_roundtrips_rfc_fields_and_drops_target_peer() {
+        let old = PunchMeNow {
+            round: VarInt::from_u32(7),
+            paired_with_sequence_number: VarInt::from_u32(42),
+            address: "203.0.113.1:9000".parse().unwrap(),
+            target_peer_id: Some([9u8; 32]),
+        };
+
+        let rfc = punch_me_now_to_rfc(&old);
+        assert_eq!(rfc.round, old.round);
+        assert_eq!(
+            rfc.paired_with_sequence_number,
+            old.paired_with_sequence_number
+        );
+        assert_eq!(rfc.address, old.address);
+
+        let converted = rfc_to_punch_me_now(&rfc);
+        assert_eq!(converted.round, old.round);
+        assert_eq!(
+            converted.paired_with_sequence_number,
+            old.paired_with_sequence_number
+        );
+        assert_eq!(converted.address, old.address);
+        assert_eq!(converted.target_peer_id, None);
+    }
+
+    #[test]
+    fn remove_address_conversion_roundtrips_sequence() {
+        let old = RemoveAddress {
+            sequence: VarInt::from_u32(123),
+        };
+
+        let rfc = remove_address_to_rfc(&old);
+        assert_eq!(rfc.sequence_number, old.sequence);
+        assert_eq!(rfc_to_remove_address(&rfc).sequence, old.sequence);
+    }
+
+    #[test]
+    fn detect_frame_format_classifies_rfc_range_inclusively() {
+        assert_eq!(detect_frame_format(0x3d7e90), FrameFormat::Rfc);
+        assert_eq!(detect_frame_format(0x3d7e94), FrameFormat::Rfc);
+        assert_eq!(detect_frame_format(0x3d7e8f), FrameFormat::Legacy);
+        assert_eq!(detect_frame_format(0x3d7e95), FrameFormat::Legacy);
+    }
+
+    #[test]
+    fn priority_strategy_default_uses_configured_priority_for_all_addresses() {
+        let strategy = PriorityStrategy::default();
+        let addresses = ["8.8.8.8:53", "192.168.1.1:80", "[::1]:443"];
+
+        for address in addresses {
+            let address = address.parse().unwrap();
+            assert_eq!(
+                strategy.calculate_priority(&address),
+                strategy.default_priority
+            );
+        }
+    }
+
+    #[test]
+    fn ice_priority_covers_ipv6_address_classes() {
+        let strategy = PriorityStrategy {
+            use_ice_priority: true,
+            ..Default::default()
+        };
+
+        let loopback: SocketAddr = "[::1]:9000".parse().unwrap();
+        let link_local: SocketAddr = "[fe80::1]:9000".parse().unwrap();
+        let global: SocketAddr = "[2001:4860:4860::8888]:9000".parse().unwrap();
+
+        assert_eq!(
+            strategy.calculate_priority(&loopback),
+            VarInt::from_u32(32768)
+        );
+        assert_eq!(
+            strategy.calculate_priority(&link_local),
+            VarInt::from_u32(49152)
+        );
+        assert_eq!(
+            strategy.calculate_priority(&global),
+            VarInt::from_u32(114688)
+        );
+    }
 }
