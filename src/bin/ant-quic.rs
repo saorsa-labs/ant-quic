@@ -131,7 +131,7 @@ struct Args {
     counter_test: bool,
 
     /// Counter interval in milliseconds
-    #[arg(long, default_value = "1000")]
+    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
     counter_interval: u64,
 
     /// Enable echo mode - echo received data back to sender
@@ -151,7 +151,7 @@ struct Args {
     stats: bool,
 
     /// Stats update interval in seconds
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(1..))]
     stats_interval: u64,
 
     /// Run duration in seconds (0 = indefinite)
@@ -208,7 +208,7 @@ struct Args {
     metrics_server: Option<String>,
 
     /// Metrics reporting interval in seconds
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(1..))]
     metrics_interval: u64,
 
     /// Node location identifier (e.g., "hetzner-eu", "do-nyc")
@@ -2246,5 +2246,16 @@ mod tests {
             .map(|node| node.name)
             .collect();
         assert_eq!(names, vec!["saorsa-2-nyc", "saorsa-3-sfo"]);
+    }
+
+    #[test]
+    fn zero_interval_arguments_are_rejected() {
+        for args in [
+            ["ant-quic", "--stats-interval", "0"],
+            ["ant-quic", "--metrics-interval", "0"],
+            ["ant-quic", "--counter-interval", "0"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err(), "{args:?}");
+        }
     }
 }
