@@ -542,11 +542,10 @@ impl fmt::Display for StreamId {
 impl StreamId {
     /// Create a new StreamId if it fits in QUIC's variable-length integer range.
     pub fn try_new(initiator: Side, dir: Dir, index: u64) -> Result<Self, VarIntBoundsExceeded> {
-        let type_bits = ((dir as u64) << 1) | initiator as u64;
-        let raw = index
-            .checked_shl(2)
-            .and_then(|value| value.checked_add(type_bits))
-            .ok_or(VarIntBoundsExceeded)?;
+        if index > (VarInt::MAX.into_inner() >> 2) {
+            return Err(VarIntBoundsExceeded);
+        }
+        let raw = (index << 2) | ((dir as u64) << 1) | initiator as u64;
         VarInt::from_u64(raw).map(|_| Self(raw))
     }
 
@@ -574,7 +573,9 @@ impl StreamId {
 
 impl From<StreamId> for VarInt {
     fn from(x: StreamId) -> Self {
-        VarInt::from_u64(x.0).unwrap_or(VarInt::MAX)
+        // StreamId values enter through VarInt decoding, checked public construction,
+        // or trusted internal stream accounting bounded by MAX_STREAM_COUNT.
+        unsafe { Self::from_u64_unchecked(x.0) }
     }
 }
 
@@ -614,6 +615,12 @@ mod stream_id_tests {
     fn try_new_rejects_stream_index_outside_varint_range() {
         let invalid_index = (VarInt::MAX.into_inner() >> 2) + 1;
         let stream_id = StreamId::try_new(Side::Client, Dir::Bi, invalid_index);
+        assert!(stream_id.is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_indexes_that_would_lose_bits_when_shifted() {
+        let stream_id = StreamId::try_new(Side::Client, Dir::Bi, u64::MAX);
         assert!(stream_id.is_err());
     }
 
