@@ -46,6 +46,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,7 +231,7 @@ struct Args {
 
     /// Chunk size for data generation/verification (bytes)
     #[arg(long, default_value = "65536")]
-    chunk_size: usize,
+    chunk_size: NonZeroUsize,
 
     /// Targeted send: 64-char hex peer ID. Sends `--generate-data` bytes (or
     /// 64 MiB by default) to ONLY this peer as a stream of SHA-256-verified
@@ -391,7 +392,8 @@ fn compute_sha256(data: &[u8]) -> String {
 }
 
 /// Generate `total_size` bytes of random-ish data split into `chunk_size` pieces.
-fn generate_verified_chunks(total_size: u64, chunk_size: usize) -> Vec<VerifiedDataChunk> {
+fn generate_verified_chunks(total_size: u64, chunk_size: NonZeroUsize) -> Vec<VerifiedDataChunk> {
+    let chunk_size = chunk_size.get();
     let mut chunks = Vec::new();
     let mut remaining = total_size;
     let mut sequence = 0u64;
@@ -2249,11 +2251,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_interval_arguments_are_rejected() {
+    fn zero_value_arguments_are_rejected() {
         for args in [
             ["ant-quic", "--stats-interval", "0"],
             ["ant-quic", "--metrics-interval", "0"],
             ["ant-quic", "--counter-interval", "0"],
+            ["ant-quic", "--chunk-size", "0"],
         ] {
             assert!(Args::try_parse_from(args).is_err(), "{args:?}");
         }
