@@ -788,8 +788,9 @@ mod tests {
 
     #[test]
     fn cli_rejects_zero_parallelism() {
-        let result = Args::try_parse_from(["test_public_endpoints", "--parallel", "0"]);
-        assert!(result.is_err());
+        let error = Args::try_parse_from(["test_public_endpoints", "--parallel", "0"])
+            .expect_err("zero parallelism should be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
