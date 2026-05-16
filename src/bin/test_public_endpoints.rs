@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ struct Args {
 
     /// Number of parallel connections
     #[arg(short, long, default_value = "5")]
-    parallel: usize,
+    parallel: NonZeroUsize,
 
     /// Specific endpoints to test (comma-separated)
     #[arg(short, long)]
@@ -420,10 +421,23 @@ async fn test_endpoint(
     }
 }
 
+fn validation_config_with_cli_overrides(
+    mut validation: ValidationConfig,
+    args: &Args,
+) -> ValidationConfig {
+    validation.timeout_seconds = args.timeout;
+    validation
+}
+
 async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>> {
     // Load configuration
     let config_content = fs::read_to_string(&args.config)?;
     let config: EndpointDatabase = serde_yaml::from_str(&config_content)?;
+    let EndpointDatabase {
+        endpoints,
+        validation,
+    } = config;
+    let validation = validation_config_with_cli_overrides(validation, &args);
 
     // Create client configuration
     let mut roots = rustls::RootCertStore::empty();
@@ -451,13 +465,12 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
     // Filter endpoints if specified
     let endpoints_to_test = if let Some(filter) = &args.endpoints {
         let filter_list: Vec<&str> = filter.split(',').collect();
-        config
-            .endpoints
+        endpoints
             .into_iter()
             .filter(|e| filter_list.contains(&e.name.as_str()))
             .collect()
     } else {
-        config.endpoints
+        endpoints
     };
 
     if endpoints_to_test.is_empty() {
@@ -474,13 +487,13 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
     let test_start = Instant::now();
 
     // Run tests in batches
-    for chunk in endpoints_to_test.chunks(args.parallel) {
+    for chunk in endpoints_to_test.chunks(args.parallel.get()) {
         let mut handles = vec![];
 
         for endpoint in chunk {
             let client_config = client_config.clone();
             let endpoint = endpoint.clone();
-            let test_config = config.validation.clone();
+            let test_config = validation.clone();
 
             let handle =
                 tokio::spawn(
@@ -670,6 +683,29 @@ mod tests {
         }
     }
 
+    fn args_with_timeout(timeout: u64) -> Args {
+        Args {
+            config: PathBuf::from("docs/public-quic-endpoints.yaml"),
+            output: None,
+            timeout,
+            parallel: NonZeroUsize::new(5).unwrap(),
+            endpoints: None,
+            analyze: None,
+            format: "markdown".to_string(),
+            verbose: false,
+        }
+    }
+
+    fn validation_config(timeout_seconds: u64) -> ValidationConfig {
+        ValidationConfig {
+            timeout_seconds,
+            _retry_attempts: 1,
+            _retry_delay_ms: 100,
+            _parallel_connections: 5,
+            _tests: Vec::new(),
+        }
+    }
+
     fn report_for(results: Vec<TestResult>) -> ValidationResults {
         ValidationResults {
             summary: summarize_results(&results),
@@ -748,6 +784,19 @@ mod tests {
         assert_eq!(summary.passed_endpoints, 2);
         assert_eq!(summary.success_rate, 100.0);
         assert_eq!(summary.average_handshake_time, 20.0);
+    }
+
+    #[test]
+    fn cli_rejects_zero_parallelism() {
+        let result = Args::try_parse_from(["test_public_endpoints", "--parallel", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_timeout_overrides_validation_config_timeout() {
+        let args = args_with_timeout(42);
+        let validation = validation_config_with_cli_overrides(validation_config(10), &args);
+        assert_eq!(validation.timeout_seconds, 42);
     }
 
     #[test]
