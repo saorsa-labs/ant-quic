@@ -59,6 +59,24 @@ struct BootstrapValidationConfig {
     require_external_address: bool,
 }
 
+impl BootstrapValidationConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !self.threshold_percent.is_finite() {
+            anyhow::bail!("validation threshold_percent must be finite");
+        }
+        if !(0.0..=100.0).contains(&self.threshold_percent) {
+            anyhow::bail!("validation threshold_percent must be between 0 and 100 inclusive");
+        }
+        if self.connect_timeout_seconds == 0 {
+            anyhow::bail!("validation connect_timeout_seconds must be greater than zero");
+        }
+        if self.per_node_timeout_seconds == 0 {
+            anyhow::bail!("validation per_node_timeout_seconds must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct BootstrapValidationResult {
     node: BootstrapNode,
@@ -222,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = std::fs::read_to_string(&args.config)?;
     let database: BootstrapDatabase = serde_yaml::from_str(&config)?;
+    database.validation.validate()?;
     let nodes = filter_nodes(database.nodes, args.nodes.as_deref());
 
     if nodes.is_empty() {
@@ -304,6 +323,40 @@ mod tests {
             elapsed_ms: 1,
             error: (!success).then(|| "failed".to_string()),
         }
+    }
+
+    fn validation_config(threshold_percent: f32) -> BootstrapValidationConfig {
+        BootstrapValidationConfig {
+            threshold_percent,
+            connect_timeout_seconds: 10,
+            per_node_timeout_seconds: 20,
+            require_external_address: true,
+        }
+    }
+
+    #[test]
+    fn validation_config_rejects_invalid_thresholds() {
+        for threshold_percent in [-1.0, 100.1, f32::INFINITY, f32::NAN] {
+            let config = validation_config(threshold_percent);
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn validation_config_rejects_zero_timeouts() {
+        let mut config = validation_config(80.0);
+        config.connect_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = validation_config(80.0);
+        config.per_node_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_config_accepts_boundary_thresholds() {
+        assert!(validation_config(0.0).validate().is_ok());
+        assert!(validation_config(100.0).validate().is_ok());
     }
 
     #[test]
