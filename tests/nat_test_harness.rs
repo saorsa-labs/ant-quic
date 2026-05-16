@@ -2,13 +2,14 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
 /// NAT Test Harness
 ///
 /// Comprehensive test harness for NAT traversal scenarios
 /// Integrates with Docker environment and real ant-quic binaries
-use std::process::{Command, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -77,15 +78,22 @@ impl NatTestHarness {
         let start_time = Instant::now();
 
         // Start listener on client2
-        let listener_handle = self.start_listener(client2_container).await?;
+        let mut listener_handle = self.start_listener(client2_container).await?;
 
         // Get peer ID from listener
-        let peer_id = self.get_peer_id_from_logs(&listener_handle).await?;
-
-        // Connect from client1
-        let connection_result = self.connect_to_peer(client1_container, &peer_id).await;
+        let connection_result = match self.get_peer_id_from_logs(&listener_handle).await {
+            Ok(peer_id) => {
+                // Connect from client1
+                self.connect_to_peer(client1_container, &peer_id).await
+            }
+            Err(error) => Err(error),
+        };
 
         let elapsed = start_time.elapsed();
+
+        if let Err(error) = listener_handle.stop().await {
+            eprintln!("Failed to stop NAT test listener: {error:#}");
+        }
 
         // Analyze results
         let result = match connection_result {
@@ -119,35 +127,33 @@ impl NatTestHarness {
 
     /// Start ant-quic listener in a container
     async fn start_listener(&self, container: &str) -> Result<ListenerHandle> {
-        let cmd = format!(
-            "docker exec -e RUST_LOG={} {} ant-quic --listen 0.0.0.0:9000 --dashboard",
-            self.config.log_level, container
-        );
-
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+        let mut child = Command::new("docker")
+            .arg("exec")
+            .arg("-e")
+            .arg(format!("RUST_LOG={}", self.config.log_level))
+            .arg(container)
+            .arg("ant-quic")
+            .arg("--listen")
+            .arg("0.0.0.0:9000")
+            .arg("--dashboard")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("Failed to start listener")?;
 
-        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
         let (tx, rx) = mpsc::channel(100);
 
-        // Spawn log reader
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(line).await;
-            }
-        });
+        Self::spawn_log_reader(stdout, tx.clone());
+        Self::spawn_log_reader(stderr, tx);
 
         // Wait for listener to be ready
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         Ok(ListenerHandle {
-            _process: child,
+            process: Some(child),
             _log_rx: rx,
         })
     }
@@ -161,16 +167,24 @@ impl NatTestHarness {
 
     /// Connect to a peer from a container
     async fn connect_to_peer(&self, container: &str, peer_id: &str) -> Result<ConnectionMetrics> {
-        let cmd = format!(
-            "docker exec -e RUST_LOG={} {} ant-quic --connect {} --bootstrap {}",
-            self.config.log_level, container, peer_id, self.config.bootstrap_addr
-        );
+        let mut command = Command::new("docker");
+        command
+            .arg("exec")
+            .arg("-e")
+            .arg(format!("RUST_LOG={}", self.config.log_level))
+            .arg(container)
+            .arg("ant-quic")
+            .arg("--connect")
+            .arg(peer_id)
+            .arg("--bootstrap")
+            .arg(&self.config.bootstrap_addr);
 
-        let output = timeout(
+        let output = Self::run_command_with_timeout(
+            command,
             self.config.connection_timeout,
-            tokio::task::spawn_blocking(move || Command::new("sh").arg("-c").arg(&cmd).output()),
+            "Connection command",
         )
-        .await??
+        .await
         .context("Failed to execute connection command")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -194,6 +208,90 @@ impl NatTestHarness {
             packets_sent: 100,
             packets_received: 95,
         }
+    }
+
+    fn spawn_log_reader<R>(stream: R, tx: mpsc::Sender<String>)
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stream);
+            let mut lines = reader.lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn run_command_with_timeout(
+        mut command: Command,
+        command_timeout: Duration,
+        timeout_context: &str,
+    ) -> Result<Output> {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().context("Failed to start command")?;
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
+
+        let stdout_task = tokio::spawn(Self::read_to_end(stdout));
+        let stderr_task = tokio::spawn(Self::read_to_end(stderr));
+
+        let status = match timeout(command_timeout, child.wait()).await {
+            Ok(status) => status.context("Failed to wait for command")?,
+            Err(_) => {
+                Self::terminate_child(&mut child)
+                    .await
+                    .with_context(|| format!("Failed to terminate timed-out {timeout_context}"))?;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(anyhow::anyhow!(
+                    "{timeout_context} timed out after {command_timeout:?}"
+                ));
+            }
+        };
+
+        let stdout = stdout_task
+            .await
+            .context("Failed to join stdout reader")?
+            .context("Failed to read stdout")?;
+        let stderr = stderr_task
+            .await
+            .context("Failed to join stderr reader")?
+            .context("Failed to read stderr")?;
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    async fn read_to_end<R>(mut stream: R) -> std::io::Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).await?;
+        Ok(buffer)
+    }
+
+    async fn terminate_child(child: &mut Child) -> Result<()> {
+        if child
+            .try_wait()
+            .context("Failed to inspect child process")?
+            .is_none()
+        {
+            child.kill().await.context("Failed to kill child process")?;
+        }
+
+        Ok(())
     }
 
     /// Generate comprehensive test report
@@ -240,8 +338,26 @@ impl NatTestHarness {
 
 /// Handle for a running listener process
 struct ListenerHandle {
-    _process: std::process::Child,
+    process: Option<Child>,
     _log_rx: mpsc::Receiver<String>,
+}
+
+impl ListenerHandle {
+    async fn stop(&mut self) -> Result<()> {
+        if let Some(mut child) = self.process.take() {
+            NatTestHarness::terminate_child(&mut child).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ListenerHandle {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.process.take() {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 /// Connection metrics
@@ -325,6 +441,55 @@ mod tests {
         let harness = NatTestHarness::new(config);
 
         assert!(harness.results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_stop_terminates_running_child() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to spawn test child");
+        assert!(child.try_wait().expect("Failed to poll child").is_none());
+
+        let (_tx, rx) = mpsc::channel(1);
+        let mut handle = ListenerHandle {
+            process: Some(child),
+            _log_rx: rx,
+        };
+
+        timeout(Duration::from_secs(1), handle.stop())
+            .await
+            .expect("Timed out stopping listener")
+            .expect("Failed to stop listener");
+        assert!(handle.process.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_command_is_terminated() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let marker_path = temp_dir.path().join("command-finished");
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 0.5; touch \"$1\"")
+            .arg("sh")
+            .arg(&marker_path);
+
+        let result =
+            NatTestHarness::run_command_with_timeout(command, Duration::from_millis(50), "test")
+                .await;
+
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !marker_path.exists(),
+            "timed-out command continued running after timeout"
+        );
     }
 
     #[test]
