@@ -103,19 +103,33 @@ struct BootstrapValidationReport {
     results: Vec<BootstrapValidationResult>,
 }
 
-fn filter_nodes(nodes: Vec<BootstrapNode>, filter: Option<&str>) -> Vec<BootstrapNode> {
+fn filter_nodes(
+    nodes: Vec<BootstrapNode>,
+    filter: Option<&str>,
+) -> anyhow::Result<Vec<BootstrapNode>> {
     let Some(filter) = filter else {
-        return nodes;
+        return Ok(nodes);
     };
     let wanted: std::collections::BTreeSet<_> = filter
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .collect();
-    nodes
+    let available: std::collections::BTreeSet<_> =
+        nodes.iter().map(|node| node.name.as_str()).collect();
+    let missing: Vec<_> = wanted.difference(&available).copied().collect();
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "unknown Saorsa bootstrap node(s) requested by --nodes: {}",
+            missing.join(", ")
+        );
+    }
+
+    Ok(nodes
         .into_iter()
         .filter(|node| wanted.contains(node.name.as_str()))
-        .collect()
+        .collect())
 }
 
 fn summarize(
@@ -241,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
     let config = std::fs::read_to_string(&args.config)?;
     let database: BootstrapDatabase = serde_yaml::from_str(&config)?;
     database.validation.validate()?;
-    let nodes = filter_nodes(database.nodes, args.nodes.as_deref());
+    let nodes = filter_nodes(database.nodes, args.nodes.as_deref())?;
 
     if nodes.is_empty() {
         anyhow::bail!(
@@ -360,35 +374,51 @@ mod tests {
     }
 
     #[test]
-    fn filter_nodes_without_filter_returns_all_nodes() {
+    fn filter_nodes_without_filter_returns_all_nodes() -> anyhow::Result<()> {
         let nodes = vec![node("a"), node("b")];
-        let filtered = filter_nodes(nodes, None);
+        let filtered = filter_nodes(nodes, None)?;
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].name, "a");
         assert_eq!(filtered[1].name, "b");
+        Ok(())
     }
 
     #[test]
-    fn filter_nodes_selects_requested_names() {
+    fn filter_nodes_selects_requested_names() -> anyhow::Result<()> {
         let nodes = vec![node("a"), node("b")];
-        let filtered = filter_nodes(nodes, Some("b"));
+        let filtered = filter_nodes(nodes, Some("b"))?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "b");
+        Ok(())
     }
 
     #[test]
-    fn filter_nodes_trims_empty_filter_entries() {
+    fn filter_nodes_trims_empty_filter_entries() -> anyhow::Result<()> {
         let nodes = vec![node("a"), node("b"), node("c")];
-        let filtered = filter_nodes(nodes, Some(" b, ,c "));
+        let filtered = filter_nodes(nodes, Some(" b, ,c "))?;
         let names: Vec<_> = filtered.into_iter().map(|node| node.name).collect();
         assert_eq!(names, vec!["b", "c"]);
+        Ok(())
     }
 
     #[test]
-    fn filter_nodes_unknown_filter_returns_empty() {
+    fn filter_nodes_unknown_filter_reports_missing_name() -> anyhow::Result<()> {
         let nodes = vec![node("a"), node("b")];
-        let filtered = filter_nodes(nodes, Some("missing"));
-        assert!(filtered.is_empty());
+        let Err(error) = filter_nodes(nodes, Some("missing")) else {
+            anyhow::bail!("unknown filter should fail");
+        };
+        assert!(error.to_string().contains("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn filter_nodes_mixed_unknown_filter_reports_missing_name() -> anyhow::Result<()> {
+        let nodes = vec![node("a"), node("b")];
+        let Err(error) = filter_nodes(nodes, Some("a,missing")) else {
+            anyhow::bail!("mixed unknown filter should fail");
+        };
+        assert!(error.to_string().contains("missing"));
+        Ok(())
     }
 
     #[test]
