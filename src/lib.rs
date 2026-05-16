@@ -540,8 +540,18 @@ impl fmt::Display for StreamId {
 }
 
 impl StreamId {
-    /// Create a new StreamId
-    pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
+    /// Create a new StreamId if it fits in QUIC's variable-length integer range.
+    pub fn try_new(initiator: Side, dir: Dir, index: u64) -> Result<Self, VarIntBoundsExceeded> {
+        let type_bits = ((dir as u64) << 1) | initiator as u64;
+        let raw = index
+            .checked_shl(2)
+            .and_then(|value| value.checked_add(type_bits))
+            .ok_or(VarIntBoundsExceeded)?;
+        VarInt::from_u64(raw).map(|_| Self(raw))
+    }
+
+    /// Create a new StreamId from trusted internal stream accounting.
+    pub(crate) fn new(initiator: Side, dir: Dir, index: u64) -> Self {
         Self((index << 2) | ((dir as u64) << 1) | initiator as u64)
     }
     /// Which side of a connection initiated the stream
@@ -564,7 +574,7 @@ impl StreamId {
 
 impl From<StreamId> for VarInt {
     fn from(x: StreamId) -> Self {
-        unsafe { Self::from_u64_unchecked(x.0) }
+        VarInt::from_u64(x.0).unwrap_or(VarInt::MAX)
     }
 }
 
@@ -585,14 +595,34 @@ impl coding::Codec for StreamId {
         VarInt::decode(buf).map(|x| Self(x.into_inner()))
     }
     fn encode<B: bytes::BufMut>(&self, buf: &mut B) {
-        // StreamId values should always be valid VarInt values, but handle the error case
-        match VarInt::from_u64(self.0) {
-            Ok(varint) => varint.encode(buf),
-            Err(_) => {
-                // This should never happen for valid StreamIds, but use a safe fallback
-                VarInt::MAX.encode(buf);
-            }
-        }
+        VarInt::from(*self).encode(buf);
+    }
+}
+
+#[cfg(test)]
+mod stream_id_tests {
+    use super::{Dir, Side, StreamId, VarInt};
+
+    #[test]
+    fn try_new_accepts_largest_valid_stream_index() {
+        let max_index = VarInt::MAX.into_inner() >> 2;
+        let stream_id = StreamId::try_new(Side::Server, Dir::Uni, max_index);
+        assert!(stream_id.is_ok());
+    }
+
+    #[test]
+    fn try_new_rejects_stream_index_outside_varint_range() {
+        let invalid_index = (VarInt::MAX.into_inner() >> 2) + 1;
+        let stream_id = StreamId::try_new(Side::Client, Dir::Bi, invalid_index);
+        assert!(stream_id.is_err());
+    }
+
+    #[test]
+    fn valid_stream_id_converts_to_varint() {
+        let stream_id =
+            StreamId::try_new(Side::Client, Dir::Uni, 7).expect("test stream id should be valid");
+        let varint = VarInt::from(stream_id);
+        assert_eq!(varint.into_inner(), u64::from(stream_id));
     }
 }
 

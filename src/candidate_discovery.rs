@@ -1339,6 +1339,17 @@ impl CandidateDiscoveryManager {
     /// OBSERVED_ADDRESS frame (draft-ietf-quic-address-discovery). These addresses
     /// are server-reflexive and represent how we appear to external peers.
     pub fn add_external_address(&mut self, peer_id: PeerId, external_addr: SocketAddr) {
+        if let Err(error) = CandidateAddress::validate_address(&external_addr) {
+            if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                session.statistics.invalid_addresses_rejected += 1;
+            }
+            warn!(
+                "Rejecting invalid external address {} for peer {:?}: {}",
+                external_addr, peer_id, error
+            );
+            return;
+        }
+
         if let Some(session) = self.active_sessions.get_mut(&peer_id) {
             // Check if we already have this address
             if session
@@ -1393,6 +1404,17 @@ impl CandidateDiscoveryManager {
     /// This is useful when we discover our external address from any connected peer -
     /// it can be used for NAT traversal to other peers as well.
     pub fn add_external_address_to_all(&mut self, external_addr: SocketAddr) {
+        if let Err(error) = CandidateAddress::validate_address(&external_addr) {
+            for session in self.active_sessions.values_mut() {
+                session.statistics.invalid_addresses_rejected += 1;
+            }
+            warn!(
+                "Rejecting invalid external address {} for all peers: {}",
+                external_addr, error
+            );
+            return;
+        }
+
         let peer_ids: Vec<PeerId> = self.active_sessions.keys().copied().collect();
         let mut added_count = 0;
 
@@ -1523,6 +1545,15 @@ impl CandidateDiscoveryManager {
         peer_id: PeerId,
         discovered_address: SocketAddr,
     ) -> Result<bool, DiscoveryError> {
+        if let Err(error) = CandidateAddress::validate_address(&discovered_address) {
+            if let Some(session) = self.active_sessions.get_mut(&peer_id) {
+                session.statistics.invalid_addresses_rejected += 1;
+            }
+            return Err(DiscoveryError::ConfigurationError(format!(
+                "invalid QUIC-discovered address {discovered_address}: {error}"
+            )));
+        }
+
         // Calculate priority for the discovered address first to avoid borrow issues
         let priority = self.calculate_quic_discovered_priority(&discovered_address);
 
@@ -1905,7 +1936,7 @@ mod tests {
         let private_addr = "192.168.1.100:5000"
             .parse()
             .expect("Failed to parse test address");
-        let ipv6_addr = "[2001:db8::1]:5000"
+        let ipv6_addr = "[2606:2800:220:1:248:1893:25c8:1946]:5000"
             .parse()
             .expect("Failed to parse test address");
 
@@ -2109,7 +2140,11 @@ mod tests {
             // (address, expected_priority_range, description)
             ("1.2.3.4:5678", (250, 260), "Public IPv4"),
             ("192.168.1.100:9000", (240, 250), "Private IPv4"),
-            ("[2001:db8::1]:5678", (260, 280), "Global IPv6"),
+            (
+                "[2606:2800:220:1:248:1893:25c8:1946]:5678",
+                (260, 280),
+                "Global IPv6",
+            ),
             ("[fe80::1]:5678", (220, 240), "Link-local IPv6"),
             ("[fc00::1]:5678", (240, 260), "Unique local IPv6"),
             ("10.0.0.1:9000", (240, 250), "Private IPv4 (10.x)"),
@@ -2321,7 +2356,7 @@ mod tests {
             "1.1.1.1:6000"
                 .parse()
                 .expect("Failed to parse test address"),
-            "[2001:db8::1]:7000"
+            "[2606:2800:220:1:248:1893:25c8:1946]:7000"
                 .parse()
                 .expect("Failed to parse test address"),
         ];
@@ -2579,7 +2614,47 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_rejects_invalid_addresses() {}
+    fn quic_discovered_address_rejects_invalid_observed_address() {
+        let mut manager = create_test_manager();
+        let peer_id = PeerId([42; 32]);
+        manager
+            .start_discovery(peer_id, Vec::new())
+            .expect("discovery should start");
+
+        let invalid_address = "0.0.0.0:9000".parse().expect("parse invalid address");
+        let result = manager.accept_quic_discovered_address(peer_id, invalid_address);
+
+        assert!(matches!(
+            result,
+            Err(DiscoveryError::ConfigurationError(message)) if message.contains("invalid QUIC-discovered address")
+        ));
+        let status = manager
+            .get_discovery_status(peer_id)
+            .expect("active discovery status");
+        assert_eq!(status.discovered_candidates.len(), 0);
+        assert_eq!(status.statistics.invalid_addresses_rejected, 1);
+    }
+
+    #[test]
+    fn quic_discovered_address_adds_real_observed_candidate() {
+        let mut manager = create_test_manager();
+        let peer_id = PeerId([43; 32]);
+        manager
+            .start_discovery(peer_id, Vec::new())
+            .expect("discovery should start");
+
+        let observed_address = "93.184.216.34:4433"
+            .parse()
+            .expect("parse observed address");
+        let accepted = manager
+            .accept_quic_discovered_address(peer_id, observed_address)
+            .expect("observed address should be valid");
+
+        assert!(accepted);
+        let candidates = manager.get_candidates_for_peer(peer_id);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].address, observed_address);
+    }
 
     #[test]
     fn test_candidate_validation_error_types() {
