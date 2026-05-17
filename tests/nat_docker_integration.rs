@@ -13,6 +13,25 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const ANT_QUIC_LISTEN_ADDR: &str = "0.0.0.0:9000";
+const LISTENER_PID_FILE: &str = "/tmp/ant-quic-listener.pid";
+const LISTENER_LOG_FILE: &str = "/tmp/ant-quic-listener.log";
+const STOP_LISTENER_SCRIPT: &str = r#"if [ -f /tmp/ant-quic-listener.pid ]; then
+    pid=$(cat /tmp/ant-quic-listener.pid)
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || {
+            rm -f /tmp/ant-quic-listener.pid
+            exit 0
+        }
+        sleep 1
+    done
+    kill -s KILL "$pid" 2>/dev/null || true
+    kill -0 "$pid" 2>/dev/null && exit 1
+fi
+rm -f /tmp/ant-quic-listener.pid
+exit 0"#;
+const VERIFY_LISTENER_SCRIPT: &str = r#"test -f /tmp/ant-quic-listener.pid && pid=$(cat /tmp/ant-quic-listener.pid) && kill -0 "$pid" 2>/dev/null"#;
 
 async fn command_output_with_timeout(
     mut command: Command,
@@ -25,6 +44,19 @@ async fn command_output_with_timeout(
         Ok(output) => output.with_context(|| format!("Failed to execute {description}")),
         Err(_) => anyhow::bail!("{description} timed out after {duration:?}"),
     }
+}
+
+fn ensure_command_success(output: &Output, description: &str) -> Result<()> {
+    if !output.status.success() {
+        anyhow::bail!(
+            "{description} failed with status {}. stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
 }
 
 /// Docker-based NAT test configuration
@@ -226,8 +258,7 @@ impl DockerNatTestRunner {
             scenario.client2_nat.chars().last().unwrap_or('2')
         );
 
-        // Execute test in containers
-        match timeout(
+        let test_outcome = timeout(
             Duration::from_secs(scenario.timeout_seconds),
             self.execute_nat_test(
                 &client1_container,
@@ -235,48 +266,59 @@ impl DockerNatTestRunner {
                 Duration::from_secs(scenario.timeout_seconds),
             ),
         )
-        .await
-        {
+        .await;
+
+        let cleanup_error = self
+            .stop_listener(&client2_container, DOCKER_COMMAND_TIMEOUT)
+            .await
+            .err()
+            .map(|e| e.to_string());
+
+        let logs = self
+            .collect_container_logs(&[&client1_container, &client2_container])
+            .await;
+
+        match test_outcome {
             Ok(Ok((success, relay_used))) => {
                 let elapsed = start_time.elapsed();
-                let logs = self
-                    .collect_container_logs(&[&client1_container, &client2_container])
-                    .await;
 
                 TestExecutionResult {
                     test_name: scenario.name.clone(),
-                    success,
+                    success: success && cleanup_error.is_none(),
                     connection_time_ms: Some(elapsed.as_millis() as u64),
                     relay_used,
-                    error_message: None,
+                    error_message: cleanup_error
+                        .map(|error| format!("Listener cleanup failed: {error}")),
                     logs,
                 }
             }
             Ok(Err(e)) => {
-                let logs = self
-                    .collect_container_logs(&[&client1_container, &client2_container])
-                    .await;
+                let mut error_message = e.to_string();
+                if let Some(error) = cleanup_error {
+                    error_message.push_str(&format!("; listener cleanup failed: {error}"));
+                }
 
                 TestExecutionResult {
                     test_name: scenario.name.clone(),
                     success: false,
                     connection_time_ms: None,
                     relay_used: false,
-                    error_message: Some(e.to_string()),
+                    error_message: Some(error_message),
                     logs,
                 }
             }
             Err(_) => {
-                let logs = self
-                    .collect_container_logs(&[&client1_container, &client2_container])
-                    .await;
+                let mut error_message = "Test timeout".to_string();
+                if let Some(error) = cleanup_error {
+                    error_message.push_str(&format!("; listener cleanup failed: {error}"));
+                }
 
                 TestExecutionResult {
                     test_name: scenario.name.clone(),
                     success: false,
                     connection_time_ms: None,
                     relay_used: false,
-                    error_message: Some("Test timeout".to_string()),
+                    error_message: Some(error_message),
                     logs,
                 }
             }
@@ -290,21 +332,23 @@ impl DockerNatTestRunner {
         client2: &str,
         command_timeout: Duration,
     ) -> Result<(bool, bool)> {
-        // Start ant-quic in listening mode on client2
-        let mut listen_cmd = Command::new("docker");
-        listen_cmd.args([
-            "exec",
-            "-d",
-            client2,
-            "ant-quic",
-            "--listen",
-            "0.0.0.0:9000",
-        ]);
+        self.stop_listener(client2, command_timeout).await?;
 
-        command_output_with_timeout(listen_cmd, "start listener", command_timeout).await?;
+        // Start ant-quic in listening mode on client2
+        let start_listener_script = format!(
+            "echo $$ >{LISTENER_PID_FILE}; exec ant-quic --listen {ANT_QUIC_LISTEN_ADDR} >{LISTENER_LOG_FILE} 2>&1"
+        );
+        let mut listen_cmd = Command::new("docker");
+        listen_cmd.args(["exec", "-d", client2, "sh", "-c", &start_listener_script]);
+
+        let output =
+            command_output_with_timeout(listen_cmd, "start listener", command_timeout).await?;
+        ensure_command_success(&output, "start listener")?;
 
         // Give listener time to start
         sleep(Duration::from_secs(2)).await;
+        self.verify_listener_running(client2, command_timeout)
+            .await?;
 
         // Get client2's peer ID (would be from actual implementation)
         let peer_id = "test_peer_id"; // Placeholder
@@ -342,6 +386,28 @@ impl DockerNatTestRunner {
         }
 
         Ok((success, relay_used))
+    }
+
+    async fn stop_listener(&self, container: &str, command_timeout: Duration) -> Result<()> {
+        let mut command = Command::new("docker");
+        command.args(["exec", container, "sh", "-c", STOP_LISTENER_SCRIPT]);
+
+        let output = command_output_with_timeout(command, "stop listener", command_timeout).await?;
+        ensure_command_success(&output, "stop listener")
+    }
+
+    async fn verify_listener_running(
+        &self,
+        container: &str,
+        command_timeout: Duration,
+    ) -> Result<()> {
+        let mut command = Command::new("docker");
+        command.args(["exec", container, "sh", "-c", VERIFY_LISTENER_SCRIPT]);
+
+        let output =
+            command_output_with_timeout(command, "verify listener startup", command_timeout)
+                .await?;
+        ensure_command_success(&output, "verify listener startup")
     }
 
     /// Apply network profile to containers
@@ -526,6 +592,26 @@ mod tests {
         assert!(scenarios.iter().any(|s| s.name.contains("symmetric")));
         assert!(scenarios.iter().any(|s| s.name.contains("cgnat")));
         assert!(scenarios.iter().any(|s| s.network_profile != "normal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_status_failure_is_reported() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"listener stdout".to_vec(),
+            stderr: b"listener stderr".to_vec(),
+        };
+
+        let error = ensure_command_success(&output, "start listener")
+            .expect_err("failed status should be rejected")
+            .to_string();
+
+        assert!(error.contains("start listener failed"));
+        assert!(error.contains("listener stdout"));
+        assert!(error.contains("listener stderr"));
     }
 
     #[tokio::test]
