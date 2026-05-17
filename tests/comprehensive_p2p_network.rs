@@ -151,28 +151,33 @@ mod first_node_tests {
         let connector = create_test_node(vec![listener_addr]).await;
         println!("Connector created, attempting connection...");
 
-        // Connect to listener
-        let connect_result = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr)).await;
+        // Verify outbound and inbound connection paths both succeed.
+        let peer_conn = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr))
+            .await
+            .expect("connect_addr should not time out")
+            .expect("connect_addr should succeed");
+        assert_eq!(
+            peer_conn.peer_id,
+            listener.peer_id(),
+            "connector should connect to listener peer ID"
+        );
+        println!(
+            "Connected to peer {:?} at {}",
+            peer_conn.peer_id, peer_conn.remote_addr
+        );
 
-        // Verify connection succeeded
-        match connect_result {
-            Ok(Ok(peer_conn)) => {
-                println!(
-                    "Connected to peer {:?} at {}",
-                    peer_conn.peer_id, peer_conn.remote_addr
-                );
-            }
-            Ok(Err(e)) => {
-                // Connection errors may happen in test environment
-                println!("Connection error (expected in some environments): {}", e);
-            }
-            Err(_) => {
-                println!("Connection timed out (expected in some environments)");
-            }
-        }
+        let accepted = accept_handle
+            .await
+            .expect("accept task should not panic")
+            .expect("listener accept should not time out")
+            .expect("listener should accept connector");
+        assert_eq!(
+            accepted.peer_id,
+            connector.peer_id(),
+            "listener should accept connector peer ID"
+        );
 
         // Cleanup
-        accept_handle.abort();
         shutdown_with_timeout(connector).await;
         shutdown_with_timeout(listener).await;
     }
@@ -233,21 +238,27 @@ mod bootstrap_tests {
 
         // Node2 connects to known peers
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let connect_result = timeout(SHORT_TIMEOUT, node2.connect_known_peers()).await;
+        let count = timeout(SHORT_TIMEOUT, node2.connect_known_peers())
+            .await
+            .expect("connect_known_peers should not time out")
+            .expect("connect_known_peers should succeed");
+        assert!(
+            count > 0,
+            "connect_known_peers should connect to at least one localhost known peer"
+        );
+        println!("Node 2 connected to {} known peers", count);
 
-        match connect_result {
-            Ok(Ok(count)) => {
-                println!("Node 2 connected to {} known peers", count);
-            }
-            Ok(Err(e)) => {
-                println!("Connect error (may be expected): {}", e);
-            }
-            Err(_) => {
-                println!("Connect timed out");
-            }
-        }
+        let accepted = accept_task
+            .await
+            .expect("accept task should not panic")
+            .expect("node1 accept should not time out")
+            .expect("node1 should accept node2");
+        assert_eq!(
+            accepted.peer_id,
+            node2.peer_id(),
+            "node1 should accept node2 peer ID"
+        );
 
-        accept_task.abort();
         shutdown_with_timeout(node1).await;
         shutdown_with_timeout(node2).await;
     }
@@ -387,39 +398,47 @@ mod data_transfer_tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Client connects
-        let connect_result = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr)).await;
+        // Client connects and the server must accept the connection.
+        let peer_conn = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr))
+            .await
+            .expect("connect_addr should not time out")
+            .expect("connect_addr should succeed");
+        assert_eq!(
+            peer_conn.peer_id,
+            server.peer_id(),
+            "client should connect to server peer ID"
+        );
+        println!("Connected to server, peer_id: {:?}", peer_conn.peer_id);
 
-        match connect_result {
-            Ok(Ok(peer_conn)) => {
-                println!("Connected to server, peer_id: {:?}", peer_conn.peer_id);
+        let accepted = accept_task
+            .await
+            .expect("accept task should not panic")
+            .expect("server accept should not time out")
+            .expect("server should accept client");
+        assert_eq!(
+            accepted.peer_id,
+            client.peer_id(),
+            "server should accept client peer ID"
+        );
 
-                // Try to send data
-                let test_data = b"Hello from client!";
-                let send_result =
-                    timeout(SHORT_TIMEOUT, client.send(&peer_conn.peer_id, test_data)).await;
+        let test_data = b"Hello from client!";
+        timeout(SHORT_TIMEOUT, client.send(&peer_conn.peer_id, test_data))
+            .await
+            .expect("send should not time out")
+            .expect("send should succeed");
+        println!("Data sent successfully");
 
-                match send_result {
-                    Ok(Ok(())) => {
-                        println!("Data sent successfully");
-                    }
-                    Ok(Err(e)) => {
-                        println!("Send error (may be expected): {}", e);
-                    }
-                    Err(_) => {
-                        println!("Send timed out");
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                println!("Connection error: {}", e);
-            }
-            Err(_) => {
-                println!("Connection timed out");
-            }
-        }
+        let (peer_id, data) = timeout(SHORT_TIMEOUT, server.recv())
+            .await
+            .expect("server recv should not time out")
+            .expect("server recv should succeed");
+        assert_eq!(
+            peer_id,
+            client.peer_id(),
+            "server should receive from client peer ID"
+        );
+        assert_eq!(data, test_data, "Received data should match sent data");
 
-        accept_task.abort();
         shutdown_with_timeout(client).await;
         shutdown_with_timeout(server).await;
     }
@@ -1027,60 +1046,48 @@ mod channel_recv_and_shutdown_tests {
 
         // Client connects
         let client = create_test_node(vec![server_addr]).await;
-        let connect_result = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr)).await;
-
-        let peer_conn = match connect_result {
-            Ok(Ok(pc)) => pc,
-            other => {
-                println!(
-                    "Connection not established ({:?}), skipping recv test",
-                    other.err()
-                );
-                accept_handle.abort();
-                shutdown_with_timeout(client).await;
-                shutdown_with_timeout(server).await;
-                return;
-            }
-        };
+        let peer_conn = timeout(SHORT_TIMEOUT, client.connect_addr(server_addr))
+            .await
+            .expect("connect_addr should not time out")
+            .expect("connect_addr should succeed");
 
         // Wait for accept to complete so the server-side reader task is running
-        let _ = accept_handle.await;
+        let accepted = accept_handle
+            .await
+            .expect("accept task should not panic")
+            .expect("server accept should not time out")
+            .expect("server should accept client");
+        assert_eq!(
+            accepted.peer_id,
+            client.peer_id(),
+            "server should accept client peer ID"
+        );
 
         // Client sends data
         let test_data = b"channel-recv proof";
-        let send_result = timeout(SHORT_TIMEOUT, client.send(&peer_conn.peer_id, test_data)).await;
-        match send_result {
-            Ok(Ok(())) => println!("Data sent successfully"),
-            other => {
-                println!(
-                    "Send did not succeed ({:?}), skipping recv assertion",
-                    other.err()
-                );
-                shutdown_with_timeout(client).await;
-                shutdown_with_timeout(server).await;
-                return;
-            }
-        }
+        timeout(SHORT_TIMEOUT, client.send(&peer_conn.peer_id, test_data))
+            .await
+            .expect("send should not time out")
+            .expect("send should succeed");
+        println!("Data sent successfully");
 
         // Server calls recv() — this blocks on the mpsc channel.
         // If the background reader task isn't running, this will time out.
-        let recv_result = timeout(SHORT_TIMEOUT, server.recv()).await;
-        match recv_result {
-            Ok(Ok((peer_id, data))) => {
-                println!(
-                    "Received {} bytes from {:?} via channel",
-                    data.len(),
-                    peer_id
-                );
-                assert_eq!(data, test_data, "Received data should match sent data");
-            }
-            Ok(Err(e)) => {
-                println!("recv() returned error (may be expected in CI): {}", e);
-            }
-            Err(_) => {
-                panic!("recv() timed out — channel-based delivery is not working");
-            }
-        }
+        let (peer_id, data) = timeout(SHORT_TIMEOUT, server.recv())
+            .await
+            .expect("recv should not time out")
+            .expect("recv should succeed");
+        println!(
+            "Received {} bytes from {:?} via channel",
+            data.len(),
+            peer_id
+        );
+        assert_eq!(
+            peer_id,
+            client.peer_id(),
+            "recv should report client peer ID"
+        );
+        assert_eq!(data, test_data, "Received data should match sent data");
 
         shutdown_with_timeout(client).await;
         shutdown_with_timeout(server).await;
