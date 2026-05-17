@@ -7,10 +7,10 @@
 
 use ant_quic::{
     VarInt,
-    coding::{BufExt, BufMutExt, UnexpectedEnd},
+    coding::{BufExt, BufMutExt},
+    frame::nat_traversal_unified::{AddAddress, PunchMeNow, RemoveAddress},
 };
 use bytes::{Buf, BufMut, BytesMut};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 // Frame type constants from the RFC
 const FRAME_TYPE_ADD_ADDRESS_IPV4: u64 = 0x3d7e90;
@@ -19,224 +19,16 @@ const FRAME_TYPE_PUNCH_ME_NOW_IPV4: u64 = 0x3d7e92;
 const FRAME_TYPE_PUNCH_ME_NOW_IPV6: u64 = 0x3d7e93;
 const FRAME_TYPE_REMOVE_ADDRESS: u64 = 0x3d7e94;
 
-// Simple test frame structures
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestAddAddress {
-    sequence_number: VarInt,
-    address: SocketAddr,
-}
-
-impl TestAddAddress {
-    fn encode(&self, buf: &mut BytesMut) {
-        match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV4),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV6),
-        }
-        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
-        match self.address {
-            SocketAddr::V4(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-            SocketAddr::V6(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestPunchMeNow {
-    round: VarInt,
-    paired_with_sequence_number: VarInt,
-    address: SocketAddr,
-}
-
-impl TestPunchMeNow {
-    fn encode(&self, buf: &mut BytesMut) {
-        match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
-        }
-        buf.write_var_or_debug_assert(u64::from(self.round));
-        buf.write_var_or_debug_assert(u64::from(self.paired_with_sequence_number));
-        match self.address {
-            SocketAddr::V4(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-            SocketAddr::V6(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestRemoveAddress {
-    sequence_number: VarInt,
-}
-
-impl TestRemoveAddress {
-    fn encode(&self, buf: &mut BytesMut) {
-        buf.write_var_or_debug_assert(FRAME_TYPE_REMOVE_ADDRESS);
-        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
-    }
-}
-
-// Simple frame structures for testing
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RfcAddAddress {
-    sequence_number: VarInt,
-    address: SocketAddr,
-}
-
-impl RfcAddAddress {
-    fn encode(&self, buf: &mut BytesMut) {
-        // Frame type determines IPv4 vs IPv6
-        match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV4),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV6),
-        }
-
-        // Sequence number
-        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
-
-        // Address (no IP version byte!)
-        match self.address {
-            SocketAddr::V4(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-            SocketAddr::V6(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-                // No flowinfo or scope_id in RFC!
-            }
-        }
+fn decode_add_address_rfc_exact(
+    buf: &mut BytesMut,
+    is_ipv6: bool,
+) -> Result<AddAddress, &'static str> {
+    let frame = AddAddress::decode_rfc(buf, is_ipv6).map_err(|_| "invalid ADD_ADDRESS payload")?;
+    if buf.has_remaining() {
+        return Err("trailing bytes after ADD_ADDRESS payload");
     }
 
-    #[allow(dead_code)]
-    fn decode(buf: &mut BytesMut, is_ipv6: bool) -> Result<Self, UnexpectedEnd> {
-        let sequence_number: VarInt = buf.get()?;
-
-        let address = if is_ipv6 {
-            if buf.remaining() < 16 + 2 {
-                return Err(UnexpectedEnd);
-            }
-            let mut octets = [0u8; 16];
-            buf.copy_to_slice(&mut octets);
-            let port = buf.get_u16();
-            SocketAddr::V6(std::net::SocketAddrV6::new(
-                Ipv6Addr::from(octets),
-                port,
-                0, // flowinfo always 0
-                0, // scope_id always 0
-            ))
-        } else {
-            if buf.remaining() < 4 + 2 {
-                return Err(UnexpectedEnd);
-            }
-            let mut octets = [0u8; 4];
-            buf.copy_to_slice(&mut octets);
-            let port = buf.get_u16();
-            SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::from(octets), port))
-        };
-
-        Ok(Self {
-            sequence_number,
-            address,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-struct RfcPunchMeNow {
-    round: VarInt,
-    paired_with_sequence_number: VarInt,
-    address: SocketAddr,
-}
-
-impl RfcPunchMeNow {
-    #[allow(dead_code)]
-    fn encode(&self, buf: &mut BytesMut) {
-        match self.address {
-            SocketAddr::V4(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV4),
-            SocketAddr::V6(_) => buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV6),
-        }
-
-        buf.write_var_or_debug_assert(u64::from(self.round));
-        buf.write_var_or_debug_assert(u64::from(self.paired_with_sequence_number));
-
-        match self.address {
-            SocketAddr::V4(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-            SocketAddr::V6(addr) => {
-                buf.put_slice(&addr.ip().octets());
-                buf.put_u16(addr.port());
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn decode(buf: &mut BytesMut, is_ipv6: bool) -> Result<Self, UnexpectedEnd> {
-        let round: VarInt = buf.get()?;
-        let paired_with_sequence_number: VarInt = buf.get()?;
-
-        let address = if is_ipv6 {
-            if buf.remaining() < 16 + 2 {
-                return Err(UnexpectedEnd);
-            }
-            let mut octets = [0u8; 16];
-            buf.copy_to_slice(&mut octets);
-            let port = buf.get_u16();
-            SocketAddr::V6(std::net::SocketAddrV6::new(
-                Ipv6Addr::from(octets),
-                port,
-                0,
-                0,
-            ))
-        } else {
-            if buf.remaining() < 4 + 2 {
-                return Err(UnexpectedEnd);
-            }
-            let mut octets = [0u8; 4];
-            buf.copy_to_slice(&mut octets);
-            let port = buf.get_u16();
-            SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::from(octets), port))
-        };
-
-        Ok(Self {
-            round,
-            paired_with_sequence_number,
-            address,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-struct RfcRemoveAddress {
-    sequence_number: VarInt,
-}
-
-impl RfcRemoveAddress {
-    #[allow(dead_code)]
-    fn encode(&self, buf: &mut BytesMut) {
-        buf.write_var_or_debug_assert(FRAME_TYPE_REMOVE_ADDRESS);
-        buf.write_var_or_debug_assert(u64::from(self.sequence_number));
-    }
-
-    #[allow(dead_code)]
-    fn decode(buf: &mut BytesMut) -> Result<Self, UnexpectedEnd> {
-        let sequence_number: VarInt = buf.get()?;
-        Ok(Self { sequence_number })
-    }
+    Ok(frame)
 }
 
 /// Test round cancellation logic according to RFC Section 4.4
@@ -503,20 +295,21 @@ fn test_add_address_ipv4_rfc_encoding() {
     // Write port
     expected.put_u16(8080);
 
-    // Test our implementation
-    let frame = TestAddAddress {
-        sequence_number: VarInt::from_u32(42),
-        address: "192.168.1.100:8080".parse().unwrap(),
-    };
+    let frame = AddAddress::new(VarInt::from_u32(42), "192.168.1.100:8080".parse().unwrap());
 
     let mut output = BytesMut::new();
-    frame.encode(&mut output);
+    frame.encode_rfc(&mut output);
 
     assert_eq!(
-        output.freeze(),
-        expected.freeze(),
+        output.as_ref(),
+        expected.as_ref(),
         "ADD_ADDRESS IPv4 encoding mismatch"
     );
+
+    output.advance(4);
+    let decoded = decode_add_address_rfc_exact(&mut output, false).unwrap();
+    assert_eq!(decoded.sequence, frame.sequence);
+    assert_eq!(decoded.address, frame.address);
 }
 
 /// Test ADD_ADDRESS frame encoding for IPv6 according to RFC
@@ -535,7 +328,7 @@ fn test_add_address_ipv6_rfc_encoding() {
     // - Address: [2001:db8::1]:9000
 
     // Write frame type (VarInt encoding of 0x3d7e91)
-    buf.put_slice(&[0x80, 0x3d, 0x7e, 0x91]); // 4-byte VarInt
+    buf.write_var_or_debug_assert(FRAME_TYPE_ADD_ADDRESS_IPV6);
 
     // Write sequence number (VarInt encoding of 999)
     buf.put_slice(&[0x43, 0xe7]); // 999 as 2-byte VarInt
@@ -551,20 +344,21 @@ fn test_add_address_ipv6_rfc_encoding() {
 
     let expected = buf.freeze();
 
-    // Test our implementation (match expected)
-    let frame = TestAddAddress {
-        sequence_number: VarInt::from_u32(999),
-        address: "[2001:db8::1]:9000".parse().unwrap(),
-    };
+    let frame = AddAddress::new(VarInt::from_u32(999), "[2001:db8::1]:9000".parse().unwrap());
 
     let mut output = BytesMut::new();
-    frame.encode(&mut output);
+    frame.encode_rfc(&mut output);
 
     assert_eq!(
-        output.freeze(),
-        expected,
+        output.as_ref(),
+        expected.as_ref(),
         "ADD_ADDRESS IPv6 encoding mismatch"
     );
+
+    output.advance(4);
+    let decoded = decode_add_address_rfc_exact(&mut output, true).unwrap();
+    assert_eq!(decoded.sequence, frame.sequence);
+    assert_eq!(decoded.address, frame.address);
 }
 
 /// Test PUNCH_ME_NOW frame encoding for IPv4 according to RFC
@@ -585,7 +379,7 @@ fn test_punch_me_now_ipv4_rfc_encoding() {
     // - Address: 10.0.0.1:1234
 
     // Write frame type (VarInt encoding of 0x3d7e92)
-    buf.put_slice(&[0x80, 0x3d, 0x7e, 0x92]); // 4-byte VarInt
+    buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV4);
 
     // Write round number
     buf.put_u8(0x05); // 5 as 1-byte VarInt
@@ -601,21 +395,71 @@ fn test_punch_me_now_ipv4_rfc_encoding() {
 
     let expected = buf.freeze();
 
-    // Test our implementation
-    let frame = TestPunchMeNow {
-        round: VarInt::from_u32(5),
-        paired_with_sequence_number: VarInt::from_u32(42),
-        address: "10.0.0.1:1234".parse().unwrap(),
-    };
+    let frame = PunchMeNow::new(
+        VarInt::from_u32(5),
+        VarInt::from_u32(42),
+        "10.0.0.1:1234".parse().unwrap(),
+    );
 
     let mut output = BytesMut::new();
-    frame.encode(&mut output);
+    frame.encode_rfc(&mut output);
 
     assert_eq!(
-        output.freeze(),
-        expected,
+        output.as_ref(),
+        expected.as_ref(),
         "PUNCH_ME_NOW IPv4 encoding mismatch"
     );
+
+    output.advance(4);
+    let decoded = PunchMeNow::decode_rfc(&mut output, false).unwrap();
+    assert_eq!(decoded.round, frame.round);
+    assert_eq!(
+        decoded.paired_with_sequence_number,
+        frame.paired_with_sequence_number
+    );
+    assert_eq!(decoded.address, frame.address);
+    assert_eq!(output.remaining(), 0, "decoder left trailing bytes");
+}
+
+/// Test PUNCH_ME_NOW frame encoding for IPv6 according to RFC
+#[test]
+fn test_punch_me_now_ipv6_rfc_encoding() {
+    let mut buf = BytesMut::new();
+
+    buf.write_var_or_debug_assert(FRAME_TYPE_PUNCH_ME_NOW_IPV6);
+    buf.put_u8(0x07);
+    buf.put_slice(&[0x43, 0xe7]);
+    buf.put_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05,
+    ]);
+    buf.put_u16(9001);
+    let expected = buf.freeze();
+
+    let frame = PunchMeNow::new(
+        VarInt::from_u32(7),
+        VarInt::from_u32(999),
+        "[2001:db8::5]:9001".parse().unwrap(),
+    );
+
+    let mut output = BytesMut::new();
+    frame.encode_rfc(&mut output);
+
+    assert_eq!(
+        output.as_ref(),
+        expected.as_ref(),
+        "PUNCH_ME_NOW IPv6 encoding mismatch"
+    );
+
+    output.advance(4);
+    let decoded = PunchMeNow::decode_rfc(&mut output, true).unwrap();
+    assert_eq!(decoded.round, frame.round);
+    assert_eq!(
+        decoded.paired_with_sequence_number,
+        frame.paired_with_sequence_number
+    );
+    assert_eq!(decoded.address, frame.address);
+    assert_eq!(output.remaining(), 0, "decoder left trailing bytes");
 }
 
 /// Test REMOVE_ADDRESS frame encoding according to RFC
@@ -631,26 +475,28 @@ fn test_remove_address_rfc_encoding() {
     // - Sequence Number: 12345
 
     // Write frame type (VarInt encoding of 0x3d7e94)
-    buf.put_slice(&[0x80, 0x3d, 0x7e, 0x94]); // 4-byte VarInt
+    buf.write_var_or_debug_assert(FRAME_TYPE_REMOVE_ADDRESS);
 
     // Write sequence number (VarInt encoding of 12345)
     buf.put_slice(&[0x70, 0x39]); // 12345 as 2-byte VarInt
 
     let expected = buf.freeze();
 
-    // Test our implementation
-    let frame = TestRemoveAddress {
-        sequence_number: VarInt::from_u32(12345),
-    };
+    let frame = RemoveAddress::new(VarInt::from_u32(12345));
 
     let mut output = BytesMut::new();
     frame.encode(&mut output);
 
     assert_eq!(
-        output.freeze(),
-        expected,
+        output.as_ref(),
+        expected.as_ref(),
         "REMOVE_ADDRESS encoding mismatch"
     );
+
+    output.advance(4);
+    let decoded = RemoveAddress::decode(&mut output).unwrap();
+    assert_eq!(decoded.sequence, frame.sequence);
+    assert_eq!(output.remaining(), 0, "decoder left trailing bytes");
 }
 
 /// Test decoding of ADD_ADDRESS IPv4 frame
@@ -665,10 +511,9 @@ fn test_add_address_ipv4_rfc_decoding() {
     // Port
     buf.put_u16(8080);
 
-    // Test basic frame structure
-    assert_eq!(FRAME_TYPE_ADD_ADDRESS_IPV4, 0x3d7e90);
-    assert_eq!(FRAME_TYPE_PUNCH_ME_NOW_IPV4, 0x3d7e92);
-    assert_eq!(FRAME_TYPE_REMOVE_ADDRESS, 0x3d7e94);
+    let decoded = decode_add_address_rfc_exact(&mut buf, false).unwrap();
+    assert_eq!(decoded.sequence, VarInt::from_u32(42));
+    assert_eq!(decoded.address, "192.168.1.100:8080".parse().unwrap());
 }
 
 /// Test decoding of ADD_ADDRESS IPv6 frame
@@ -686,15 +531,9 @@ fn test_add_address_ipv6_rfc_decoding() {
     // Port
     buf.put_u16(9000);
 
-    // Test basic frame structure
-    assert_eq!(FRAME_TYPE_ADD_ADDRESS_IPV4, 0x3d7e90);
-    assert_eq!(FRAME_TYPE_PUNCH_ME_NOW_IPV4, 0x3d7e92);
-    assert_eq!(FRAME_TYPE_REMOVE_ADDRESS, 0x3d7e94);
-}
-
-// Helper function to encode ADD_ADDRESS frame according to RFC
-fn encode_add_address_rfc(frame: &RfcAddAddress, buf: &mut BytesMut) {
-    frame.encode(buf);
+    let decoded = decode_add_address_rfc_exact(&mut buf, true).unwrap();
+    assert_eq!(decoded.sequence, VarInt::from_u32(999));
+    assert_eq!(decoded.address, "[2001:db8::1]:9000".parse().unwrap());
 }
 
 /// Test edge cases for sequence numbers
@@ -713,12 +552,12 @@ fn test_varint_edge_cases() {
 
     for value in test_cases {
         let mut buf = BytesMut::new();
-        let frame = RfcAddAddress {
-            sequence_number: VarInt::from_u64(value).unwrap(),
-            address: "127.0.0.1:80".parse().unwrap(),
-        };
+        let frame = AddAddress::new(
+            VarInt::from_u64(value).unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        );
 
-        encode_add_address_rfc(&frame, &mut buf);
+        frame.encode_rfc(&mut buf);
 
         // Skip frame type
         buf.advance(4);
@@ -742,10 +581,8 @@ fn test_reject_extra_data() {
     // Extra data that shouldn't be there
     buf.put_slice(b"extra");
 
-    // Test basic frame structure
-    assert_eq!(FRAME_TYPE_ADD_ADDRESS_IPV4, 0x3d7e90);
-    assert_eq!(FRAME_TYPE_PUNCH_ME_NOW_IPV4, 0x3d7e92);
-    assert_eq!(FRAME_TYPE_REMOVE_ADDRESS, 0x3d7e94);
+    let err = decode_add_address_rfc_exact(&mut buf, false).unwrap_err();
+    assert_eq!(err, "trailing bytes after ADD_ADDRESS payload");
 }
 
 /// Test maximum size boundaries
@@ -756,23 +593,20 @@ fn test_frame_size_boundaries() {
     // Maximum: 4 + 8 + 4 + 2 = 18 bytes
 
     // Test minimum size
-    let frame = RfcAddAddress {
-        sequence_number: VarInt::from_u32(0), // 1 byte
-        address: "0.0.0.0:0".parse().unwrap(),
-    };
+    let frame = AddAddress::new(VarInt::from_u32(0), "0.0.0.0:0".parse().unwrap());
 
     let mut buf = BytesMut::new();
-    encode_add_address_rfc(&frame, &mut buf);
+    frame.encode_rfc(&mut buf);
     assert_eq!(buf.len(), 11, "Minimum ADD_ADDRESS IPv4 size incorrect");
 
     // Test with large sequence number
-    let frame = RfcAddAddress {
-        sequence_number: VarInt::from_u64(1073741824).unwrap(), // 8 bytes
-        address: "255.255.255.255:65535".parse().unwrap(),
-    };
+    let frame = AddAddress::new(
+        VarInt::from_u64(1073741824).unwrap(),
+        "255.255.255.255:65535".parse().unwrap(),
+    );
 
     let mut buf = BytesMut::new();
-    encode_add_address_rfc(&frame, &mut buf);
+    frame.encode_rfc(&mut buf);
     assert_eq!(buf.len(), 18, "Maximum ADD_ADDRESS IPv4 size incorrect");
 }
 
@@ -782,21 +616,15 @@ fn test_frame_type_determines_ip_version() {
     // We should NOT have a separate IP version byte
     // The frame type itself determines IPv4 vs IPv6
 
-    let frame_ipv4 = RfcAddAddress {
-        sequence_number: VarInt::from_u32(1),
-        address: "1.2.3.4:5678".parse().unwrap(),
-    };
+    let frame_ipv4 = AddAddress::new(VarInt::from_u32(1), "1.2.3.4:5678".parse().unwrap());
 
-    let frame_ipv6 = RfcAddAddress {
-        sequence_number: VarInt::from_u32(1),
-        address: "[::1]:5678".parse().unwrap(),
-    };
+    let frame_ipv6 = AddAddress::new(VarInt::from_u32(1), "[::1]:5678".parse().unwrap());
 
     let mut buf_ipv4 = BytesMut::new();
     let mut buf_ipv6 = BytesMut::new();
 
-    encode_add_address_rfc(&frame_ipv4, &mut buf_ipv4);
-    encode_add_address_rfc(&frame_ipv6, &mut buf_ipv6);
+    frame_ipv4.encode_rfc(&mut buf_ipv4);
+    frame_ipv6.encode_rfc(&mut buf_ipv6);
 
     // Check frame types
     assert_eq!(&buf_ipv4[0..4], &[0x80, 0x3d, 0x7e, 0x90]);
