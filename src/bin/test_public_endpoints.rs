@@ -425,6 +425,51 @@ fn validation_config_with_cli_overrides(
     validation
 }
 
+fn root_cert_store_from_native_certs(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    load_errors: &[rustls_native_certs::Error],
+) -> Result<rustls::RootCertStore, Box<dyn Error>> {
+    let mut roots = rustls::RootCertStore::empty();
+    let (usable_roots, ignored_roots) = roots.add_parsable_certificates(certs);
+
+    if usable_roots == 0 {
+        let reason = if load_errors.is_empty() {
+            "no native certificates could be loaded".to_string()
+        } else {
+            load_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+
+        return Err(format!("no usable platform certificate roots found: {reason}").into());
+    }
+
+    if !load_errors.is_empty() {
+        tracing::warn!(
+            ?load_errors,
+            usable_roots,
+            "failed to load some native certificate roots"
+        );
+    }
+
+    if ignored_roots > 0 {
+        tracing::warn!(
+            usable_roots,
+            ignored_roots,
+            "ignored unparsable native certificate roots"
+        );
+    }
+
+    Ok(roots)
+}
+
+fn load_native_root_cert_store() -> Result<rustls::RootCertStore, Box<dyn Error>> {
+    let cert_result = rustls_native_certs::load_native_certs();
+    root_cert_store_from_native_certs(cert_result.certs, &cert_result.errors)
+}
+
 async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>> {
     // Load configuration
     let config_content = fs::read_to_string(&args.config)?;
@@ -436,11 +481,7 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
     let validation = validation_config_with_cli_overrides(validation, &args);
 
     // Create client configuration
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs") {
-        #[allow(clippy::unwrap_used)]
-        roots.add(cert).unwrap();
-    }
+    let roots = load_native_root_cert_store()?;
 
     let mut crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
@@ -829,6 +870,19 @@ mod tests {
         let args = args_with_timeout(42);
         let validation = validation_config_with_cli_overrides(validation_config(10), &args);
         assert_eq!(validation.timeout_seconds, 42);
+    }
+
+    #[test]
+    fn invalid_native_root_returns_error_instead_of_panicking() {
+        let certs = vec![rustls::pki_types::CertificateDer::from(vec![0_u8])];
+        let error = root_cert_store_from_native_certs(certs, &[])
+            .err()
+            .map(|error| error.to_string());
+
+        assert!(matches!(
+            error.as_deref(),
+            Some(message) if message.contains("no usable platform certificate roots found")
+        ));
     }
 
     #[test]
