@@ -88,7 +88,15 @@ async fn p2p_endpoint_send_surfaces_all_short_streams_under_concurrent_large_sen
         }
     });
 
-    // Server recv loop — runs until idle grace expires.
+    // Client — connect.
+    let _peer_conn = timeout(CONNECT_TIMEOUT, client.connect_addr(server_addr))
+        .await
+        .expect("client connect timeout")
+        .expect("client connect failed");
+    let server_peer_id = server.peer_id();
+
+    // Server recv loop starts after connect so the idle grace cannot
+    // expire during connection setup on slow CI hosts.
     let received = Arc::new(Mutex::new(Vec::<(usize, u32)>::new()));
     let recv_received = Arc::clone(&received);
     let recv_server = Arc::clone(&server);
@@ -114,13 +122,6 @@ async fn p2p_endpoint_send_surfaces_all_short_streams_under_concurrent_large_sen
             }
         }
     });
-
-    // Client — connect.
-    let _peer_conn = timeout(CONNECT_TIMEOUT, client.connect_addr(server_addr))
-        .await
-        .expect("client connect timeout")
-        .expect("client connect failed");
-    let server_peer_id = server.peer_id();
 
     // Let authentication + reader task spin up.
     tokio::time::sleep(Duration::from_millis(500)).await;
