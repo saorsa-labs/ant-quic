@@ -79,7 +79,7 @@ ble = ["dep:btleplug"]
 [dependencies]
 # Core dependencies
 async-trait = "0.1"
-bytes = ">=1.11.1"
+bytes = "1.11.1"
 blake3 = "1"
 rustc-hash = "2"
 rand = "0.8"
