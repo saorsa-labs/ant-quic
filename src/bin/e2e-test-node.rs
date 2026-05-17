@@ -41,6 +41,7 @@ use ant_quic::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -336,6 +337,27 @@ fn format_peer_id(peer_id: &PeerId) -> String {
     hex::encode(&peer_id.0[..8])
 }
 
+fn print_json(value: serde_json::Value) {
+    println!("{value}");
+}
+
+fn final_stats_json(node_id: &str, stats: &RuntimeStats, duration: Duration) -> serde_json::Value {
+    json!({
+        "type": "final_stats",
+        "node_id": node_id,
+        "duration_secs": duration.as_secs_f64(),
+        "bytes_sent": stats.bytes_sent.load(Ordering::SeqCst),
+        "bytes_received": stats.bytes_received.load(Ordering::SeqCst),
+        "connections_accepted": stats.connections_accepted.load(Ordering::SeqCst),
+        "connections_initiated": stats.connections_initiated.load(Ordering::SeqCst),
+        "nat_traversals_completed": stats.nat_traversals_completed.load(Ordering::SeqCst),
+        "nat_traversals_failed": stats.nat_traversals_failed.load(Ordering::SeqCst),
+        "chunks_sent": stats.data_chunks_sent.load(Ordering::SeqCst),
+        "chunks_verified": stats.data_chunks_verified.load(Ordering::SeqCst),
+        "verification_failures": stats.data_verification_failures.load(Ordering::SeqCst),
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -441,16 +463,16 @@ async fn main() -> anyhow::Result<()> {
 
     if args.json {
         if let Some(addr) = endpoint.local_addr() {
-            println!(
-                r#"{{"event":"local_identity","peer_id":"{}","addr":"{}"}}"#,
-                hex::encode(peer_id.0),
-                addr
-            );
+            print_json(json!({
+                "event": "local_identity",
+                "peer_id": hex::encode(peer_id.0),
+                "addr": addr.to_string(),
+            }));
         } else {
-            println!(
-                r#"{{"event":"local_identity","peer_id":"{}"}}"#,
-                hex::encode(peer_id.0)
-            );
+            print_json(json!({
+                "event": "local_identity",
+                "peer_id": hex::encode(peer_id.0),
+            }));
         }
     }
 
@@ -577,11 +599,11 @@ async fn main() -> anyhow::Result<()> {
                             let counter = u64::from_be_bytes(bytes);
                             stats_recv.counters_received.fetch_add(1, Ordering::SeqCst);
                             if json {
-                                println!(
-                                    r#"{{"event":"counter_received","counter":{},"peer":"{}"}}"#,
-                                    counter,
-                                    format_peer_id(&peer_id)
-                                );
+                                print_json(json!({
+                                    "event": "counter_received",
+                                    "counter": counter,
+                                    "peer": format_peer_id(&peer_id),
+                                }));
                             } else {
                                 debug!(
                                     "Received counter {} from {}",
@@ -597,12 +619,12 @@ async fn main() -> anyhow::Result<()> {
                                     .data_chunks_verified
                                     .fetch_add(1, Ordering::SeqCst);
                                 if json {
-                                    println!(
-                                        r#"{{"event":"chunk_verified","sequence":{},"peer":"{}","size":{}}}"#,
-                                        chunk.sequence,
-                                        format_peer_id(&peer_id),
-                                        chunk.data.len()
-                                    );
+                                    print_json(json!({
+                                        "event": "chunk_verified",
+                                        "sequence": chunk.sequence,
+                                        "peer": format_peer_id(&peer_id),
+                                        "size": chunk.data.len(),
+                                    }));
                                 } else {
                                     debug!(
                                         "Verified chunk {} from {} ({} bytes)",
@@ -623,11 +645,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     } else if json {
-                        println!(
-                            r#"{{"event":"data_received","bytes":{},"peer":"{}"}}"#,
-                            data.len(),
-                            format_peer_id(&peer_id)
-                        );
+                        print_json(json!({
+                            "event": "data_received",
+                            "bytes": data.len(),
+                            "peer": format_peer_id(&peer_id),
+                        }));
                     } else {
                         debug!(
                             "Received {} bytes from {}",
@@ -689,11 +711,11 @@ async fn main() -> anyhow::Result<()> {
                                     .bytes_sent
                                     .fetch_add(data.len() as u64, Ordering::SeqCst);
                                 if json {
-                                    println!(
-                                        r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
-                                        counter,
-                                        format_peer_id(&peer_id)
-                                    );
+                                    print_json(json!({
+                                        "event": "counter_sent",
+                                        "counter": counter,
+                                        "peer": format_peer_id(&peer_id),
+                                    }));
                                 }
                             }
                             Err(e) => debug!(
@@ -804,10 +826,12 @@ async fn main() -> anyhow::Result<()> {
                     let throughput_mbps = (bytes_sent as f64 * 8.0) / (elapsed * 1_000_000.0);
 
                     if json {
-                        println!(
-                            r#"{{"event":"progress","percent":{:.1},"chunks_sent":{},"throughput_mbps":{:.2}}}"#,
-                            progress, chunks_sent, throughput_mbps
-                        );
+                        print_json(json!({
+                            "event": "progress",
+                            "percent": progress,
+                            "chunks_sent": chunks_sent,
+                            "throughput_mbps": throughput_mbps,
+                        }));
                     } else {
                         info!(
                             "Progress: {:.1}% ({}/{} chunks, {:.2} Mbps)",
@@ -825,13 +849,13 @@ async fn main() -> anyhow::Result<()> {
             let throughput_mbps = (data_size as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
 
             if json {
-                println!(
-                    r#"{{"event":"data_transfer_complete","chunks_sent":{},"bytes":{},"duration_secs":{:.2},"throughput_mbps":{:.2}}}"#,
-                    chunks_sent,
-                    data_size,
-                    elapsed.as_secs_f64(),
-                    throughput_mbps
-                );
+                print_json(json!({
+                    "event": "data_transfer_complete",
+                    "chunks_sent": chunks_sent,
+                    "bytes": data_size,
+                    "duration_secs": elapsed.as_secs_f64(),
+                    "throughput_mbps": throughput_mbps,
+                }));
             } else {
                 info!("═══════════════════════════════════════════════════════════════");
                 info!("                DATA TRANSFER COMPLETE");
@@ -953,13 +977,13 @@ async fn handle_event(
                 },
             );
             if json {
-                println!(
-                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}","connection_type":"{}"}}"#,
-                    format_peer_id(peer_id),
-                    addr,
-                    direction,
-                    connection_type
-                );
+                print_json(json!({
+                    "event": "peer_connected",
+                    "peer_id": format_peer_id(peer_id),
+                    "addr": addr.to_string(),
+                    "direction": direction,
+                    "connection_type": connection_type,
+                }));
             } else {
                 info!(
                     "Peer connected: {} at {} ({} / {})",
@@ -973,11 +997,11 @@ async fn handle_event(
         P2pEvent::PeerDisconnected { peer_id, reason } => {
             peers.write().await.remove(peer_id);
             if json {
-                println!(
-                    r#"{{"event":"peer_disconnected","peer_id":"{}","reason":"{:?}"}}"#,
-                    format_peer_id(peer_id),
-                    reason
-                );
+                print_json(json!({
+                    "event": "peer_disconnected",
+                    "peer_id": format_peer_id(peer_id),
+                    "reason": format!("{reason:?}"),
+                }));
             } else {
                 info!(
                     "Peer disconnected: {} ({:?})",
@@ -989,10 +1013,10 @@ async fn handle_event(
         P2pEvent::PortMappingEstablished { external_addr }
         | P2pEvent::PortMappingRenewed { external_addr } => {
             if json {
-                println!(
-                    r#"{{"event":"port_mapping_established","addr":"{}"}}"#,
-                    external_addr
-                );
+                print_json(json!({
+                    "event": "port_mapping_established",
+                    "addr": external_addr.to_string(),
+                }));
             } else {
                 info!("Port mapping active at {}", external_addr);
             }
@@ -1002,10 +1026,11 @@ async fn handle_event(
             external_addr,
         } => {
             if json {
-                println!(
-                    r#"{{"event":"port_mapping_address_changed","previous_addr":"{}","external_addr":"{}"}}"#,
-                    previous_addr, external_addr
-                );
+                print_json(json!({
+                    "event": "port_mapping_address_changed",
+                    "previous_addr": previous_addr.to_string(),
+                    "external_addr": external_addr.to_string(),
+                }));
             } else {
                 info!(
                     "Port mapping address changed from {} to {}",
@@ -1015,7 +1040,10 @@ async fn handle_event(
         }
         P2pEvent::PortMappingFailed { error } => {
             if json {
-                println!(r#"{{"event":"port_mapping_failed","error":"{}"}}"#, error);
+                print_json(json!({
+                    "event": "port_mapping_failed",
+                    "error": error,
+                }));
             } else {
                 warn!("Port mapping failed: {}", error);
             }
@@ -1026,10 +1054,10 @@ async fn handle_event(
                 .fetch_add(1, Ordering::SeqCst);
             external_addrs.write().await.push(addr.clone());
             if json {
-                println!(
-                    r#"{{"event":"external_address_discovered","addr":"{}"}}"#,
-                    addr
-                );
+                print_json(json!({
+                    "event": "external_address_discovered",
+                    "addr": addr.to_string(),
+                }));
             } else {
                 info!("External address discovered: {}", addr);
             }
@@ -1047,11 +1075,11 @@ async fn handle_event(
                 _ => {}
             }
             if json {
-                println!(
-                    r#"{{"event":"nat_traversal_progress","peer_id":"{}","phase":"{:?}"}}"#,
-                    format_peer_id(peer_id),
-                    phase
-                );
+                print_json(json!({
+                    "event": "nat_traversal_progress",
+                    "peer_id": format_peer_id(peer_id),
+                    "phase": format!("{phase:?}"),
+                }));
             } else {
                 debug!(
                     "NAT traversal progress: {} - {:?}",
@@ -1066,15 +1094,12 @@ async fn handle_event(
             instance_fullname,
         } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_service_advertised","service":"{}","namespace":{},"instance_fullname":"{}"}}"#,
-                    service,
-                    namespace
-                        .as_ref()
-                        .map(|value| format!("\"{}\"", value))
-                        .unwrap_or_else(|| "null".to_string()),
-                    instance_fullname
-                );
+                print_json(json!({
+                    "event": "mdns_service_advertised",
+                    "service": service,
+                    "namespace": namespace.as_deref(),
+                    "instance_fullname": instance_fullname,
+                }));
             } else {
                 info!(
                     "mDNS service advertised: {} ({})",
@@ -1087,54 +1112,57 @@ async fn handle_event(
         }
         P2pEvent::MdnsPeerDiscovered { peer } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_peer_discovered","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    peer.addresses
+                print_json(json!({
+                    "event": "mdns_peer_discovered",
+                    "fullname": peer.fullname,
+                    "addresses": peer
+                        .addresses
                         .iter()
                         .map(SocketAddr::to_string)
                         .collect::<Vec<_>>()
-                        .join(",")
-                );
+                        .join(","),
+                }));
             } else {
                 info!("mDNS peer discovered: {}", peer.fullname);
             }
         }
         P2pEvent::MdnsPeerUpdated { peer } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_peer_updated","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    peer.addresses
+                print_json(json!({
+                    "event": "mdns_peer_updated",
+                    "fullname": peer.fullname,
+                    "addresses": peer
+                        .addresses
                         .iter()
                         .map(SocketAddr::to_string)
                         .collect::<Vec<_>>()
-                        .join(",")
-                );
+                        .join(","),
+                }));
             }
         }
         P2pEvent::MdnsPeerRemoved { peer } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_peer_removed","fullname":"{}"}}"#,
-                    peer.fullname
-                );
+                print_json(json!({
+                    "event": "mdns_peer_removed",
+                    "fullname": peer.fullname,
+                }));
             }
         }
         P2pEvent::MdnsAutoConnectSucceeded { peer, .. } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_auto_connect_succeeded","fullname":"{}"}}"#,
-                    peer.fullname
-                );
+                print_json(json!({
+                    "event": "mdns_auto_connect_succeeded",
+                    "fullname": peer.fullname,
+                }));
             }
         }
         P2pEvent::MdnsAutoConnectFailed { peer, error, .. } => {
             if json {
-                println!(
-                    r#"{{"event":"mdns_auto_connect_failed","fullname":"{}","error":"{}"}}"#,
-                    peer.fullname, error
-                );
+                print_json(json!({
+                    "event": "mdns_auto_connect_failed",
+                    "fullname": peer.fullname,
+                    "error": error,
+                }));
             }
         }
         P2pEvent::DataReceived { peer_id, bytes } => {
@@ -1230,20 +1258,7 @@ fn print_final_stats(node_id: &str, stats: &RuntimeStats, duration: Duration, js
     let secs = duration.as_secs_f64();
 
     if json {
-        println!(
-            r#"{{"type":"final_stats","node_id":"{}","duration_secs":{:.2},"bytes_sent":{},"bytes_received":{},"connections_accepted":{},"connections_initiated":{},"nat_traversals_completed":{},"nat_traversals_failed":{},"chunks_sent":{},"chunks_verified":{},"verification_failures":{}}}"#,
-            node_id,
-            secs,
-            bytes_sent,
-            bytes_received,
-            stats.connections_accepted.load(Ordering::SeqCst),
-            stats.connections_initiated.load(Ordering::SeqCst),
-            stats.nat_traversals_completed.load(Ordering::SeqCst),
-            stats.nat_traversals_failed.load(Ordering::SeqCst),
-            stats.data_chunks_sent.load(Ordering::SeqCst),
-            stats.data_chunks_verified.load(Ordering::SeqCst),
-            stats.data_verification_failures.load(Ordering::SeqCst),
-        );
+        print_json(final_stats_json(node_id, stats, duration));
     } else {
         info!("═══════════════════════════════════════════════════════════════");
         info!("                    FINAL STATISTICS");
@@ -1287,5 +1302,24 @@ fn print_final_stats(node_id: &str, stats: &RuntimeStats, duration: Duration, js
             info!("  Throughput: {:.2} Mbps", throughput_mbps);
         }
         info!("═══════════════════════════════════════════════════════════════");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_stats_json_escapes_node_id() {
+        let stats = RuntimeStats::default();
+        stats.bytes_sent.store(42, Ordering::SeqCst);
+        let node_id = "bad\"id\nnext";
+
+        let line = final_stats_json(node_id, &stats, Duration::from_millis(1250)).to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("final stats must be valid JSON");
+
+        assert_eq!(parsed["node_id"].as_str(), Some(node_id));
+        assert_eq!(parsed["bytes_sent"].as_u64(), Some(42));
     }
 }
