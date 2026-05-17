@@ -105,7 +105,7 @@ impl SimulatedNat {
             }
             NatType::PortRestrictedCone => {
                 // Allow if prior outbound to exact source
-                mappings.contains_key(&(internal, source))
+                mappings.get(&(internal, source)) == Some(&external)
             }
             NatType::Symmetric => {
                 // Allow if exact mapping exists
@@ -113,6 +113,24 @@ impl SimulatedNat {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn test_port_restricted_cone_rejects_wrong_external_port() {
+    let nat = SimulatedNat::new(
+        NatType::PortRestrictedCone,
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        40000,
+    );
+
+    let internal = SocketAddr::from(([192, 168, 1, 100], 50000));
+    let source = SocketAddr::from(([198, 51, 100, 25], 443));
+
+    let external = nat.translate_outbound(internal, source).await;
+    assert!(nat.allows_inbound(external, internal, source).await);
+
+    let wrong_external = SocketAddr::new(external.ip(), external.port() + 1);
+    assert!(!nat.allows_inbound(wrong_external, internal, source).await);
 }
 
 /// Test address discovery improves connectivity through NATs
