@@ -3,13 +3,29 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::process::Output;
 /// NAT Docker Integration Tests
 ///
 /// Integration tests that use the Docker NAT testing environment
 /// to validate NAT traversal under realistic network conditions
-use std::process::Command;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::time::{sleep, timeout};
+
+const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn command_output_with_timeout(
+    mut command: Command,
+    description: &str,
+    duration: Duration,
+) -> Result<Output> {
+    command.kill_on_drop(true);
+
+    match timeout(duration, command.output()).await {
+        Ok(output) => output.with_context(|| format!("Failed to execute {description}")),
+        Err(_) => anyhow::bail!("{description} timed out after {duration:?}"),
+    }
+}
 
 /// Docker-based NAT test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +229,11 @@ impl DockerNatTestRunner {
         // Execute test in containers
         match timeout(
             Duration::from_secs(scenario.timeout_seconds),
-            self.execute_nat_test(&client1_container, &client2_container),
+            self.execute_nat_test(
+                &client1_container,
+                &client2_container,
+                Duration::from_secs(scenario.timeout_seconds),
+            ),
         )
         .await
         {
@@ -264,15 +284,24 @@ impl DockerNatTestRunner {
     }
 
     /// Execute NAT traversal test between two containers
-    async fn execute_nat_test(&self, client1: &str, client2: &str) -> Result<(bool, bool)> {
+    async fn execute_nat_test(
+        &self,
+        client1: &str,
+        client2: &str,
+        command_timeout: Duration,
+    ) -> Result<(bool, bool)> {
         // Start ant-quic in listening mode on client2
-        let listen_cmd = format!("docker exec -d {client2} ant-quic --listen 0.0.0.0:9000");
+        let mut listen_cmd = Command::new("docker");
+        listen_cmd.args([
+            "exec",
+            "-d",
+            client2,
+            "ant-quic",
+            "--listen",
+            "0.0.0.0:9000",
+        ]);
 
-        Command::new("sh")
-            .arg("-c")
-            .arg(&listen_cmd)
-            .output()
-            .context("Failed to start listener")?;
+        command_output_with_timeout(listen_cmd, "start listener", command_timeout).await?;
 
         // Give listener time to start
         sleep(Duration::from_secs(2)).await;
@@ -281,15 +310,19 @@ impl DockerNatTestRunner {
         let peer_id = "test_peer_id"; // Placeholder
 
         // Connect from client1 to client2
-        let connect_cmd = format!(
-            "docker exec {client1} ant-quic --connect {peer_id} --bootstrap bootstrap:9000"
-        );
+        let connect_cmd = format!("ant-quic --connect {peer_id} --bootstrap bootstrap:9000");
+        let mut command = Command::new("docker");
+        command.args([
+            "exec",
+            client1,
+            "ant-quic",
+            "--connect",
+            peer_id,
+            "--bootstrap",
+            "bootstrap:9000",
+        ]);
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&connect_cmd)
-            .output()
-            .context("Failed to execute connection test")?;
+        let output = command_output_with_timeout(command, &connect_cmd, command_timeout).await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -315,12 +348,12 @@ impl DockerNatTestRunner {
     async fn apply_network_profile(&self, profile: &str) -> Result<()> {
         let script_path = "docker/scripts/network-conditions.sh";
 
-        let cmd = format!("bash {script_path} apply {profile}");
+        let cmd = format!("{script_path} apply {profile}");
+        let mut command = Command::new("bash");
+        command.args([script_path, "apply", profile]);
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
+        let output = command_output_with_timeout(command, &cmd, DOCKER_COMMAND_TIMEOUT)
+            .await
             .context("Failed to apply network profile")?;
 
         if !output.status.success() {
@@ -339,8 +372,12 @@ impl DockerNatTestRunner {
 
         for container in containers {
             let cmd = format!("docker logs {container} --tail 100");
+            let mut command = Command::new("docker");
+            command.args(["logs", container, "--tail", "100"]);
 
-            if let Ok(output) = Command::new("sh").arg("-c").arg(&cmd).output() {
+            if let Ok(output) =
+                command_output_with_timeout(command, &cmd, DOCKER_COMMAND_TIMEOUT).await
+            {
                 let container_logs = String::from_utf8_lossy(&output.stdout);
                 logs.push(format!("=== {container} logs ===\n{container_logs}"));
             }
@@ -353,13 +390,16 @@ impl DockerNatTestRunner {
     async fn start_docker_environment(&self) -> Result<()> {
         println!("Starting Docker NAT test environment...");
 
-        let output = Command::new("docker-compose")
+        let mut command = Command::new("docker-compose");
+        command
             .arg("-f")
             .arg(&self.docker_compose_path)
             .arg("up")
-            .arg("-d")
-            .output()
-            .context("Failed to start Docker environment")?;
+            .arg("-d");
+        let output =
+            command_output_with_timeout(command, "docker-compose up", DOCKER_COMMAND_TIMEOUT)
+                .await
+                .context("Failed to start Docker environment")?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -375,12 +415,12 @@ impl DockerNatTestRunner {
     async fn cleanup_docker_environment(&self) -> Result<()> {
         println!("Cleaning up Docker environment...");
 
-        let output = Command::new("docker-compose")
-            .arg("-f")
-            .arg(&self.docker_compose_path)
-            .arg("down")
-            .output()
-            .context("Failed to stop Docker environment")?;
+        let mut command = Command::new("docker-compose");
+        command.arg("-f").arg(&self.docker_compose_path).arg("down");
+        let output =
+            command_output_with_timeout(command, "docker-compose down", DOCKER_COMMAND_TIMEOUT)
+                .await
+                .context("Failed to stop Docker environment")?;
 
         if !output.status.success() {
             eprintln!(
@@ -486,5 +526,33 @@ mod tests {
         assert!(scenarios.iter().any(|s| s.name.contains("symmetric")));
         assert!(scenarios.iter().any(|s| s.name.contains("cgnat")));
         assert!(scenarios.iter().any(|s| s.network_profile != "normal"));
+    }
+
+    #[tokio::test]
+    async fn command_output_timeout_returns_without_blocking_runtime() {
+        if std::env::var_os("ANT_QUIC_NAT_DOCKER_SLEEP_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(5));
+            return;
+        }
+
+        let mut command = Command::new(std::env::current_exe().expect("test binary path"));
+        command
+            .arg("tests::command_output_timeout_returns_without_blocking_runtime")
+            .arg("--exact")
+            .env("ANT_QUIC_NAT_DOCKER_SLEEP_CHILD", "1");
+
+        let started = std::time::Instant::now();
+        let result =
+            command_output_with_timeout(command, "test sleep child", Duration::from_millis(50))
+                .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            result
+                .expect_err("sleep child should time out")
+                .to_string()
+                .contains("timed out")
+        );
     }
 }
