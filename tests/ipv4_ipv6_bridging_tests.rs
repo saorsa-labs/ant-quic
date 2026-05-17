@@ -18,6 +18,8 @@
 //!
 //! Test approach: Use loopback binding (127.0.0.1 for IPv4, ::1 for IPv6)
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
