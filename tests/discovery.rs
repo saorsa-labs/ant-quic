@@ -257,19 +257,13 @@ fn discovery_child_config(mode: DiscoveryChildMode) -> DiscoveryConfig {
 
 #[tokio::test]
 async fn test_discovery_basic_functionality() {
-    let candidates = match run_discovery_with_timeout(
+    let candidates = run_discovery_with_timeout(
         Duration::from_secs(30),
         "Basic discovery",
         DiscoveryChildMode::Basic,
     )
     .await
-    {
-        Ok(candidates) => candidates,
-        Err(e) => {
-            println!("Discovery failed: {} — skipping assertions", e);
-            return;
-        }
-    };
+    .expect("Basic discovery should succeed");
 
     assert!(
         !candidates.is_empty(),
@@ -350,19 +344,13 @@ mod mock_tests {
     #[tokio::test]
     async fn test_mock_discovery() {
         // Mock test that should work on all platforms
-        let candidates = match run_discovery_with_timeout(
+        let candidates = run_discovery_with_timeout(
             Duration::from_secs(30),
             "Mock discovery",
             DiscoveryChildMode::Mock,
         )
         .await
-        {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                println!("Mock discovery failed: {} — skipping assertions", e);
-                return;
-            }
-        };
+        .expect("Mock discovery should succeed");
 
         // Should at least have localhost
         assert!(!candidates.is_empty());
@@ -429,19 +417,13 @@ mod macos_tests {
 
     #[tokio::test]
     async fn test_macos_interface_discovery() {
-        let candidates = match run_discovery_with_timeout(
+        let candidates = run_discovery_with_timeout(
             Duration::from_secs(30),
             "macOS discovery",
             DiscoveryChildMode::Macos,
         )
         .await
-        {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                println!("macOS discovery failed: {} — skipping assertions", e);
-                return;
-            }
-        };
+        .expect("macOS discovery should succeed");
 
         assert!(
             !candidates.is_empty(),
