@@ -11,7 +11,7 @@
 //! to verify protocol compliance and interoperability.
 
 use ant_quic::{
-    ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt,
+    ClientConfig, ConnectionStats, Endpoint, EndpointConfig, TransportConfig, VarInt,
     crypto::rustls::QuicClientConfig, high_level,
 };
 use clap::Parser;
@@ -26,7 +26,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use tracing::{info, warn};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -122,6 +121,7 @@ struct TestResult {
     address: String,
     success: bool,
     handshake_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     rtt_ms: Option<u64>,
     quic_version: Option<u32>,
     error: Option<String>,
@@ -136,7 +136,8 @@ struct TestResult {
 #[derive(Debug, Serialize, Deserialize)]
 struct EndpointMetrics {
     handshake_time_ms: u64,
-    rtt_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtt_ms: Option<u64>,
     success_rate: f32,
 }
 
@@ -162,6 +163,11 @@ struct ResultMetadata {
     ant_quic_version: String,
     test_date: String,
     test_duration_ms: u64,
+}
+
+fn rtt_ms_from_connection_stats(stats: &ConnectionStats) -> Option<u64> {
+    let rtt = stats.path.rtt;
+    (stats.frame_rx.acks > 0 && !rtt.is_zero()).then_some(rtt.as_millis() as u64)
 }
 
 async fn test_endpoint(
@@ -354,17 +360,7 @@ async fn test_endpoint(
             // Mark successful protocols
             successful_protocols = endpoint.protocols.clone();
 
-            // Test opening a stream
-            let rtt_start = Instant::now();
-            match connection.open_uni().await {
-                Ok(_stream) => {
-                    info!("Successfully opened stream to {}", endpoint.name);
-                }
-                Err(e) => {
-                    warn!("Failed to open stream to {}: {}", endpoint.name, e);
-                }
-            }
-            let rtt_ms = rtt_start.elapsed().as_millis() as u64;
+            let rtt_ms = rtt_ms_from_connection_stats(&connection.stats());
 
             connection.close(0u32.into(), b"test complete");
 
@@ -374,7 +370,7 @@ async fn test_endpoint(
                 address: address.clone(),
                 success: true,
                 handshake_time_ms: Some(handshake_ms),
-                rtt_ms: Some(rtt_ms),
+                rtt_ms,
                 quic_version: Some(0x00000001), // QUIC v1
                 error: None,
                 protocols_tested,
@@ -716,6 +712,41 @@ mod tests {
                 test_duration_ms: 0,
             },
         }
+    }
+
+    #[test]
+    fn rtt_ms_from_connection_stats_requires_ack_sample() {
+        let mut stats = ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(25);
+        assert_eq!(rtt_ms_from_connection_stats(&stats), None);
+
+        stats.frame_rx.acks = 1;
+        assert_eq!(rtt_ms_from_connection_stats(&stats), Some(25));
+    }
+
+    #[test]
+    fn rtt_ms_from_connection_stats_ignores_zero_rtt() {
+        let mut stats = ConnectionStats::default();
+        stats.frame_rx.acks = 1;
+
+        assert_eq!(rtt_ms_from_connection_stats(&stats), None);
+    }
+
+    #[test]
+    fn json_result_omits_unmeasured_rtt() -> Result<(), serde_json::Error> {
+        let mut result = result("ok.example", true, Some(25));
+        result.rtt_ms = None;
+        result.metrics = Some(EndpointMetrics {
+            handshake_time_ms: 25,
+            rtt_ms: None,
+            success_rate: 100.0,
+        });
+
+        let value = serde_json::to_value(result)?;
+        assert!(value.get("rtt_ms").is_none());
+        assert!(value["metrics"].get("rtt_ms").is_none());
+
+        Ok(())
     }
 
     #[test]
