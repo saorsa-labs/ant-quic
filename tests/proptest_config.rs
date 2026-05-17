@@ -76,12 +76,12 @@ pub fn arb_priority() -> impl Strategy<Value = u32> {
 
 /// Strategy for generating candidate addresses with various characteristics
 pub fn arb_candidate_address() -> impl Strategy<Value = ant_quic::CandidateAddress> {
-    (arb_socket_addr(), arb_priority()).prop_map(|(addr, priority)| ant_quic::CandidateAddress {
-        address: addr,
-        priority,
-        source: ant_quic::CandidateSource::Local,
-        state: ant_quic::CandidateState::New,
-    })
+    (arb_socket_addr(), arb_priority()).prop_filter_map(
+        "candidate address must pass validation",
+        |(addr, priority)| {
+            ant_quic::CandidateAddress::new(addr, priority, ant_quic::CandidateSource::Local).ok()
+        },
+    )
 }
 
 /// Strategy for generating realistic network delays
@@ -236,6 +236,13 @@ pub fn arb_transport_params() -> impl Strategy<Value = TransportParameters> {
                     .expect("Failed to decode synthesized transport parameters")
             },
         )
+}
+
+proptest! {
+    #[test]
+    fn candidate_address_strategy_emits_valid_candidates(candidate in arb_candidate_address()) {
+        prop_assert!(ant_quic::CandidateAddress::validate_address(&candidate.address).is_ok());
+    }
 }
 
 // Note: Frame and Packet types are internal to ant_quic and not exposed in the public API.
