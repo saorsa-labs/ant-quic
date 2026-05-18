@@ -7,7 +7,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, PqcConfig, transport::TransportAddr};
+use ant_quic::{
+    EndpointError, NatConfig, P2pConfig, P2pEndpoint, PeerId, PqcConfig, transport::TransportAddr,
+};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -108,7 +110,15 @@ mod connection_lifecycle {
 
         // Subscribe to events (just testing API, not using)
         let _events = listener.subscribe();
-        drop(listener); // Just test creation, not full accept
+        let accept_handle = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                timeout(SHORT_TIMEOUT, listener.accept())
+                    .await
+                    .expect("accept should not time out")
+                    .expect("listener should accept connection")
+            }
+        });
 
         // Create connector node
         let connector_config = test_node_config(vec![listener_addr]);
@@ -118,27 +128,18 @@ mod connection_lifecycle {
 
         println!("Connector created");
 
-        // Try to connect
-        let connect_result = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr)).await;
+        let connection = timeout(SHORT_TIMEOUT, connector.connect_addr(listener_addr))
+            .await
+            .expect("connect should not time out")
+            .expect("connect should succeed");
+        assert_eq!(connection.peer_id, listener.peer_id());
+        assert_eq!(connection.remote_addr, TransportAddr::Udp(listener_addr));
 
-        match connect_result {
-            Ok(Ok(connection)) => {
-                println!("Connection established to {:?}", connection.peer_id);
-                // Connection remote_addr is TransportAddr, compare socket addresses
-                if let TransportAddr::Udp(addr) = connection.remote_addr {
-                    assert_eq!(addr, listener_addr);
-                }
-            }
-            Ok(Err(e)) => {
-                // Connection may fail in test environment without network
-                println!("Connection error (expected in test environment): {}", e);
-            }
-            Err(_) => {
-                println!("Connection timed out (expected in test environment)");
-            }
-        }
+        let accepted = accept_handle.await.expect("accept task should complete");
+        assert_eq!(accepted.peer_id, connector.peer_id());
 
         shutdown_with_timeout(connector).await;
+        shutdown_with_timeout(listener).await;
     }
 
     /// Test node can handle multiple connection attempts
@@ -190,23 +191,31 @@ mod connection_lifecycle {
             .await
             .expect("Failed to create node2");
 
-        // Attempt connection and observe state
-        let connect_result = timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr)).await;
+        let accept_handle = tokio::spawn({
+            let node1 = node1.clone();
+            async move {
+                timeout(SHORT_TIMEOUT, node1.accept())
+                    .await
+                    .expect("accept should not time out")
+                    .expect("node1 should accept connection")
+            }
+        });
 
-        match connect_result {
-            Ok(Ok(connection)) => {
-                println!("Connection state: Connected to {:?}", connection.peer_id);
-                // Connection is in Connected state
-            }
-            Ok(Err(e)) => {
-                println!("Connection failed (expected in test env): {}", e);
-                // Connection is in Failed state
-            }
-            Err(_) => {
-                println!("Connection timed out");
-                // Connection is in Failed/Timeout state
-            }
-        }
+        let mut state = ConnectionState::Idle;
+        assert_eq!(state, ConnectionState::Idle);
+        state = ConnectionState::Connecting;
+        assert_eq!(state, ConnectionState::Connecting);
+
+        let connection = timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr))
+            .await
+            .expect("connect should not time out")
+            .expect("connect should succeed");
+        let accepted = accept_handle.await.expect("accept task should complete");
+        state = ConnectionState::Connected;
+
+        assert_eq!(state, ConnectionState::Connected);
+        assert_eq!(connection.peer_id, node1.peer_id());
+        assert_eq!(accepted.peer_id, node2.peer_id());
 
         shutdown_with_timeout(node1).await;
         shutdown_with_timeout(node2).await;
@@ -246,35 +255,6 @@ mod connection_lifecycle {
         assert_eq!(peer_id1, peer_id2, "Peer ID should be stable");
 
         shutdown_with_timeout(node).await;
-    }
-
-    /// Test external address discovery
-    #[tokio::test]
-    async fn test_external_address_discovery() {
-        // Create two nodes that connect
-        let node1_config = test_node_config(vec![]);
-        let node1 = P2pEndpoint::new(node1_config)
-            .await
-            .expect("Failed to create node1");
-        let node1_addr =
-            normalize_local_addr(node1.local_addr().expect("Node1 should have address"));
-
-        // Connect node2 to node1
-        let node2_config = test_node_config(vec![node1_addr]);
-        let node2 = P2pEndpoint::new(node2_config)
-            .await
-            .expect("Failed to create node2");
-
-        // Try to connect
-        let _ = timeout(SHORT_TIMEOUT, node2.connect_addr(node1_addr)).await;
-
-        // After connection, node1 might learn its external address from node2
-        // Note: In local testing, external address might not be discovered
-        let external_addr = node1.external_addr();
-        println!("Node1 external address: {:?}", external_addr);
-
-        shutdown_with_timeout(node1).await;
-        shutdown_with_timeout(node2).await;
     }
 
     /// Test connection statistics
@@ -358,11 +338,11 @@ mod error_conditions {
             .await
             .expect("Failed to create node");
 
-        // Try to connect to an address that won't respond
-        let invalid_addr: SocketAddr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            9999, // Unused port
-        );
+        // Try to connect to an address that won't respond.
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("reserve unused UDP port");
+        let invalid_addr = socket.local_addr().expect("reserved socket address");
+        drop(socket);
 
         let connect_result = timeout(
             Duration::from_secs(1), // Short timeout for failure
@@ -370,12 +350,10 @@ mod error_conditions {
         )
         .await;
 
-        // Should timeout or fail
-        match connect_result {
-            Ok(Ok(_)) => println!("Unexpectedly connected"),
-            Ok(Err(e)) => println!("Expected connection error: {}", e),
-            Err(_) => println!("Connection timed out as expected"),
-        }
+        assert!(
+            !matches!(connect_result, Ok(Ok(_))),
+            "connect_addr unexpectedly succeeded for unused address {invalid_addr}"
+        );
 
         shutdown_with_timeout(node).await;
     }
@@ -384,14 +362,26 @@ mod error_conditions {
     #[tokio::test]
     async fn test_connect_to_nonexistent_peer() {
         let config = test_node_config(vec![]);
-        let _node = P2pEndpoint::new(config)
+        let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
 
-        // PeerId is created from the node's keypair, not from raw bytes
-        // This test verifies node creation works
-        println!("Node created successfully");
+        let missing_peer = PeerId([0xA5; 32]);
+        let error = timeout(SHORT_TIMEOUT, node.connect_peer(missing_peer))
+            .await
+            .expect("missing peer lookup should not time out")
+            .expect_err("connect_peer should fail for an unknown peer");
 
-        // Node is automatically dropped and cleaned up
+        let expected_error = match &error {
+            EndpointError::PeerNotFound(peer_id) => *peer_id == missing_peer,
+            EndpointError::Config(message) => message == "No coordinator available",
+            _ => false,
+        };
+        assert!(
+            expected_error,
+            "unexpected error for unknown peer {missing_peer:?}: {error}"
+        );
+
+        shutdown_with_timeout(node).await;
     }
 }
