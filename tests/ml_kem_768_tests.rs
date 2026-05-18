@@ -76,12 +76,18 @@ mod ml_kem_768_tests {
             .decapsulate(&secret_key, &ciphertext)
             .expect("Failed to decapsulate");
 
-        // Note: With our test implementation, these may not match exactly
-        // but both should be valid 32-byte values
         assert_eq!(
             shared_secret1.as_bytes().len(),
+            ML_KEM_768_SHARED_SECRET_SIZE
+        );
+        assert_eq!(
             shared_secret2.as_bytes().len(),
-            "Shared secret sizes should match"
+            ML_KEM_768_SHARED_SECRET_SIZE
+        );
+        assert_eq!(
+            shared_secret1.as_bytes(),
+            shared_secret2.as_bytes(),
+            "Decapsulation with the matching secret key must reproduce the encapsulated shared secret"
         );
     }
 
@@ -105,8 +111,6 @@ mod ml_kem_768_tests {
             .decapsulate(&secret_key2, &ciphertext)
             .expect("Decapsulation should succeed even with wrong key");
 
-        // With a proper implementation, these should not match
-        // For our test implementation, we can at least verify both are valid
         assert_eq!(
             shared_secret1.as_bytes().len(),
             ML_KEM_768_SHARED_SECRET_SIZE
@@ -114,6 +118,11 @@ mod ml_kem_768_tests {
         assert_eq!(
             shared_secret2.as_bytes().len(),
             ML_KEM_768_SHARED_SECRET_SIZE
+        );
+        assert_ne!(
+            shared_secret1.as_bytes(),
+            shared_secret2.as_bytes(),
+            "Decapsulation with the wrong secret key must not reproduce the encapsulated shared secret"
         );
     }
 
@@ -234,7 +243,6 @@ mod ml_kem_768_tests {
             .decapsulate(&secret_key, &corrupted_ciphertext)
             .expect("Decapsulation should succeed with corrupted ciphertext");
 
-        // Both should be valid shared secrets
         assert_eq!(
             shared_secret1.as_bytes().len(),
             ML_KEM_768_SHARED_SECRET_SIZE
@@ -242,6 +250,11 @@ mod ml_kem_768_tests {
         assert_eq!(
             shared_secret2.as_bytes().len(),
             ML_KEM_768_SHARED_SECRET_SIZE
+        );
+        assert_ne!(
+            shared_secret1.as_bytes(),
+            shared_secret2.as_bytes(),
+            "Decapsulation of a corrupted ciphertext must not reproduce the encapsulated shared secret"
         );
     }
 
@@ -264,7 +277,13 @@ mod ml_kem_768_tests {
                     .decapsulate(&secret_key, &ciphertext)
                     .unwrap_or_else(|_| panic!("Failed decapsulation {j} for keypair {i}"));
 
-                assert_eq!(ss1.as_bytes().len(), ss2.as_bytes().len());
+                assert_eq!(ss1.as_bytes().len(), ML_KEM_768_SHARED_SECRET_SIZE);
+                assert_eq!(ss2.as_bytes().len(), ML_KEM_768_SHARED_SECRET_SIZE);
+                assert_eq!(
+                    ss1.as_bytes(),
+                    ss2.as_bytes(),
+                    "Decapsulation {j} for keypair {i} must reproduce the encapsulated shared secret"
+                );
             }
         }
     }
