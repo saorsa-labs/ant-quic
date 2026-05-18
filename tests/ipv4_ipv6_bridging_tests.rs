@@ -13,7 +13,7 @@
 //! 1. Same-version relay (IPv4→IPv4, IPv6→IPv6)
 //! 2. Cross-version bridging (IPv4→IPv6, IPv6→IPv4)
 //! 3. Failure scenarios (no relay, auth failure, timeout)
-//! 4. Relay chaining when no direct dual-stack relay available
+//! 4. No cross-version relay path when no compatible relay is available
 //! 5. Best-path selection when multiple paths exist
 //!
 //! Test approach: Use loopback binding (127.0.0.1 for IPv4, ::1 for IPv6)
@@ -23,7 +23,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use ant_quic::bootstrap_cache::{CachedPeer, PeerCapabilities};
+use ant_quic::bootstrap_cache::{
+    BootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
+};
 use ant_quic::masque::{
     ConnectUdpRequest, MasqueRelayConfig, MasqueRelayServer, RelayManager, RelayManagerConfig,
 };
@@ -280,30 +282,41 @@ async fn test_relay_session_timeout() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // TODO: Implement add_relay_info_dual_stack and select_relay_for_target
 async fn test_relay_manager_selects_dual_stack_for_bridging() {
     let config = RelayManagerConfig::default();
-    let _manager = RelayManager::new(config);
+    let manager = RelayManager::new(config);
 
-    // TODO: Implement when RelayManager has dual-stack relay selection
-    // manager.add_relay_info(ipv4_addr(9400), false).await;
-    // manager.add_relay_info_dual_stack(ipv4_addr(9401), ipv6_addr(9401)).await;
-    // let selected = manager.select_relay_for_target(ipv6_addr(20000)).await;
-    // assert!(selected.is_some(), "Should find a relay");
-    // assert!(selected.unwrap().supports_dual_stack(), "Should select dual-stack relay for bridging");
+    manager.add_relay_node(ipv4_addr(9400)).await;
+    manager
+        .add_dual_stack_relay(ipv4_addr(9401), ipv6_addr(9401))
+        .await;
+
+    let selected = manager.relays_for_target(ipv6_addr(20000)).await;
+
+    assert_eq!(
+        selected,
+        vec![ipv4_addr(9401)],
+        "IPv4-only relay must not be selected for IPv6 bridging"
+    );
+    assert!(
+        manager.is_dual_stack(selected[0]).await,
+        "Selected relay should support dual-stack bridging"
+    );
 }
 
 #[tokio::test]
-#[ignore] // TODO: Implement relay chaining support
-async fn test_relay_manager_fallback_to_chaining() {
+async fn test_relay_manager_no_dual_stack_relay_cannot_bridge_cross_version() {
     let config = RelayManagerConfig::default();
-    let _manager = RelayManager::new(config);
+    let manager = RelayManager::new(config);
 
-    // TODO: Implement when RelayManager has relay chaining
-    // manager.add_relay_info(ipv4_addr(9500), false).await;
-    // manager.add_relay_info(ipv4_addr(9501), false).await;
-    // let chain_result = manager.plan_relay_chain(ipv4_addr(11000), ipv6_addr(12000)).await;
-    // assert!(chain_result.is_ok() || chain_result.is_chain_unavailable());
+    manager.add_relay_node(ipv4_addr(9500)).await;
+    manager.add_relay_node(ipv4_addr(9501)).await;
+
+    let selected = manager.relays_for_target(ipv6_addr(12000)).await;
+    assert!(
+        selected.is_empty(),
+        "IPv4-only relays should not be selected for IPv6 targets without dual-stack bridging"
+    );
 }
 
 // ============================================================================
@@ -311,25 +324,33 @@ async fn test_relay_manager_fallback_to_chaining() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // TODO: Implement BootstrapCache relay selection
 async fn test_bootstrap_cache_prefers_dual_stack_relay() {
-    // TODO: Implement when BootstrapCache has add_peer and select_relay_for_cross_version
-    // use ant_quic::bootstrap_cache::{BootstrapCache, BootstrapCacheConfig};
-    // use tempfile::tempdir;
-    //
-    // let dir = tempdir().unwrap();
-    // let config = BootstrapCacheConfig::builder().cache_dir(dir.path()).build();
-    // let cache = BootstrapCache::open(config).await.unwrap();
-    //
-    // let ipv4_peer = create_test_peer(ipv4_addr(9600), false);
-    // cache.add_peer(ipv4_peer).await;
-    //
-    // let dual_stack_peer = create_test_peer_dual_stack(ipv4_addr(9601), ipv6_addr(9601));
-    // cache.add_peer(dual_stack_peer).await;
-    //
-    // let selected = cache.select_relay_for_cross_version(ipv6_addr(20000)).await;
-    // assert!(selected.is_some());
-    // assert!(selected.unwrap().capabilities.supports_dual_stack());
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let config = BootstrapCacheConfig::builder()
+        .cache_dir(dir.path())
+        .build();
+    let cache = BootstrapCache::open(config)
+        .await
+        .expect("bootstrap cache should open");
+
+    cache.upsert(create_test_peer(ipv4_addr(9600), false)).await;
+    let dual_stack_peer = create_test_peer_dual_stack(ipv4_addr(9601), ipv6_addr(9601));
+    let dual_stack_peer_id = dual_stack_peer.peer_id;
+    cache.upsert(dual_stack_peer).await;
+
+    let selected = cache
+        .select_relays_for_target(1, &ipv6_addr(20000), true)
+        .await;
+
+    assert_eq!(selected.len(), 1, "Should find one compatible relay");
+    assert_eq!(
+        selected[0].peer_id, dual_stack_peer_id,
+        "Should select the dual-stack relay for cross-version bridging"
+    );
+    assert!(
+        selected[0].capabilities.supports_dual_stack(),
+        "Selected relay should advertise IPv4 and IPv6 addresses"
+    );
 }
 
 // ============================================================================
@@ -408,12 +429,11 @@ fn create_test_peer(addr: SocketAddr, dual_stack: bool) -> CachedPeer {
         vec![addr]
     };
 
-    let caps = PeerCapabilities {
-        supports_relay: true,
-        supports_coordination: true,
+    let mut caps = PeerCapabilities {
         external_addresses,
         ..PeerCapabilities::default()
     };
+    caps.record_assist_hints(true, true);
 
     // Generate a simple test peer ID
     let mut peer_id_bytes = [0u8; 32];
@@ -440,12 +460,11 @@ fn create_test_peer_dual_stack(v4: SocketAddr, v6: SocketAddr) -> CachedPeer {
     use ant_quic::nat_traversal_api::PeerId;
     use std::time::SystemTime;
 
-    let caps = PeerCapabilities {
-        supports_relay: true,
-        supports_coordination: true,
+    let mut caps = PeerCapabilities {
         external_addresses: vec![v4, v6],
         ..PeerCapabilities::default()
     };
+    caps.record_assist_hints(true, true);
 
     // Generate a simple test peer ID
     let mut peer_id_bytes = [0u8; 32];
