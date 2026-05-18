@@ -78,11 +78,9 @@ async fn sanity_single_send_surfaces_at_recv() {
     // Use the peer_id from the PeerConnection (what the client observed)
     // rather than server.peer_id(), to catch any id divergence.
     let target = conn.peer_id;
+    let payload = b"0000sanity-payload-40-bytes-pad123456789";
     eprintln!("sending 40 bytes to {target:?}");
-    client
-        .send(&target, b"0000sanity-payload-40-bytes-pad123456789")
-        .await
-        .expect("client send");
+    client.send(&target, payload).await.expect("client send");
     eprintln!("send returned Ok");
 
     // Server recv.
@@ -90,7 +88,7 @@ async fn sanity_single_send_surfaces_at_recv() {
     match got {
         Ok(Ok((peer, bytes))) => {
             eprintln!("server recv: peer={peer:?} bytes.len()={}", bytes.len());
-            assert_eq!(bytes.len(), 40, "payload length mismatch");
+            assert_eq!(bytes.as_slice(), payload, "payload mismatch");
             assert_eq!(peer, client.peer_id(), "peer id mismatch");
         }
         Ok(Err(e)) => panic!("server recv error: {e}"),
