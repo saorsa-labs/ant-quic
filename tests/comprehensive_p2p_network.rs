@@ -609,12 +609,17 @@ mod nat_traversal_tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static NEXT_NAT_HOST: AtomicU8 = AtomicU8::new(1);
 
     /// Simulated NAT environment for testing
     #[derive(Clone)]
     struct MockNatEnvironment {
-        /// Maps internal addresses to external addresses
-        mappings: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+        /// Maps NAT-specific flows to external addresses
+        mappings: Arc<Mutex<HashMap<(SocketAddr, Option<SocketAddr>), SocketAddr>>>,
+        /// External address assigned to this NAT instance
+        external_ip: Ipv4Addr,
         /// NAT type simulation
         nat_type: NatType,
     }
@@ -633,26 +638,30 @@ mod nat_traversal_tests {
 
     impl MockNatEnvironment {
         fn new(nat_type: NatType) -> Self {
+            let host_octet = (NEXT_NAT_HOST.fetch_add(1, Ordering::Relaxed) % 254) + 1;
             Self {
                 mappings: Arc::new(Mutex::new(HashMap::new())),
+                external_ip: Ipv4Addr::new(203, 0, 113, host_octet),
                 nat_type,
             }
         }
 
-        fn map_address(&self, internal: SocketAddr) -> SocketAddr {
+        fn map_address(&self, internal: SocketAddr, destination: SocketAddr) -> SocketAddr {
             let mut mappings = self.mappings.lock().unwrap();
+            let key = match self.nat_type {
+                NatType::Symmetric => (internal, Some(destination)),
+                _ => (internal, None),
+            };
 
-            if let Some(&external) = mappings.get(&internal) {
+            if let Some(&external) = mappings.get(&key) {
                 return external;
             }
 
             // Create new mapping
-            let external = SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(203, 0, 113, rand::random::<u8>())),
-                40000 + (rand::random::<u16>() % 20000),
-            );
+            let mapping_index = mappings.len() as u16;
+            let external = SocketAddr::new(IpAddr::V4(self.external_ip), 40000 + mapping_index);
 
-            mappings.insert(internal, external);
+            mappings.insert(key, external);
             external
         }
 
@@ -672,14 +681,50 @@ mod nat_traversal_tests {
         ] {
             let nat = MockNatEnvironment::new(nat_type);
             let internal = "192.168.1.100:12345".parse().unwrap();
-            let external = nat.map_address(internal);
+            let destination1 = "198.51.100.10:9000".parse().unwrap();
+            let destination2 = "198.51.100.20:9000".parse().unwrap();
+            let external = nat.map_address(internal, destination1);
 
             println!("{:?} NAT: {} -> {}", nat.get_nat_type(), internal, external);
 
-            // Same internal address should get same external mapping
-            let external2 = nat.map_address(internal);
-            assert_eq!(external, external2, "NAT mapping should be consistent");
+            // Repeating the same destination keeps the same external mapping.
+            let repeated = nat.map_address(internal, destination1);
+            assert_eq!(external, repeated, "NAT mapping should be consistent");
+
+            let external2 = nat.map_address(internal, destination2);
+            if matches!(nat_type, NatType::Symmetric) {
+                assert_ne!(
+                    external, external2,
+                    "symmetric NAT should use a distinct mapping per destination"
+                );
+            } else {
+                assert_eq!(
+                    external, external2,
+                    "non-symmetric NAT should reuse mapping across destinations"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn test_symmetric_nat_mapping_is_destination_specific() {
+        let nat = MockNatEnvironment::new(NatType::Symmetric);
+        let internal = "192.168.1.100:12345".parse().unwrap();
+        let bootstrap1 = "198.51.100.10:9000".parse().unwrap();
+        let bootstrap2 = "198.51.100.20:9000".parse().unwrap();
+
+        let first_destination = nat.map_address(internal, bootstrap1);
+        let repeated_first_destination = nat.map_address(internal, bootstrap1);
+        let second_destination = nat.map_address(internal, bootstrap2);
+
+        assert_eq!(
+            first_destination, repeated_first_destination,
+            "mapping to the same destination should remain stable"
+        );
+        assert_ne!(
+            first_destination, second_destination,
+            "mapping to a different destination should use a different external address"
+        );
     }
 
     #[tokio::test]
@@ -693,8 +738,8 @@ mod nat_traversal_tests {
         let node2_internal: SocketAddr = "10.0.0.50:5000".parse().unwrap();
 
         // Get external mappings
-        let node1_external = nat1.map_address(node1_internal);
-        let node2_external = nat2.map_address(node2_internal);
+        let node1_external = nat1.map_address(node1_internal, node2_internal);
+        let node2_external = nat2.map_address(node2_internal, node1_internal);
 
         println!("Node 1: {} -> {}", node1_internal, node1_external);
         println!("Node 2: {} -> {}", node2_internal, node2_external);
@@ -723,9 +768,9 @@ mod nat_traversal_tests {
 
         // Simulate NAT mappings
         let nat = MockNatEnvironment::new(NatType::FullCone);
-        let ext1 = nat.map_address(addr1);
-        let ext2 = nat.map_address(addr2);
-        let ext3 = nat.map_address(addr3);
+        let ext1 = nat.map_address(addr1, addr2);
+        let ext2 = nat.map_address(addr2, addr1);
+        let ext3 = nat.map_address(addr3, addr1);
 
         println!("Three-node NAT simulation:");
         println!("  Node 1: {} -> {}", addr1, ext1);
