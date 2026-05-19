@@ -29,7 +29,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Barrier, mpsc};
 use tracing::info;
 
 /// Helper to create a NAT traversal endpoint with event tracking and counting
@@ -358,7 +358,7 @@ async fn test_coordinator_connection_must_check_existing() {
 
 /// Test that concurrent calls to initiate_nat_traversal() for the same peer
 /// are properly handled without duplicate sessions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_initiate_nat_traversal_same_peer() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -369,11 +369,17 @@ async fn test_concurrent_initiate_nat_traversal_same_peer() {
     let peer_id = generate_random_peer_id();
     let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
 
-    // Spawn multiple concurrent calls
-    let handles: Vec<_> = (0..5)
+    const CONCURRENT_CALLS: usize = 5;
+    let start_barrier = Arc::new(Barrier::new(CONCURRENT_CALLS));
+
+    // Spawn multiple calls and release them together so the synchronous
+    // initiation path runs on multiple runtime workers.
+    let handles: Vec<_> = (0..CONCURRENT_CALLS)
         .map(|i| {
             let ep = endpoint.clone();
+            let barrier = start_barrier.clone();
             tokio::spawn(async move {
+                barrier.wait().await;
                 let result = ep.initiate_nat_traversal(peer_id, coordinator);
                 info!("Concurrent call {} result: {:?}", i, result);
                 result
@@ -396,7 +402,10 @@ async fn test_concurrent_initiate_nat_traversal_same_peer() {
     // The existing session check should limit this to 1 coordination event
     // (first call creates session, subsequent calls return early)
     let count = coord_count.load(Ordering::SeqCst);
-    info!("Coordination events from {} concurrent calls: {}", 5, count);
+    info!(
+        "Coordination events from {} concurrent calls: {}",
+        CONCURRENT_CALLS, count
+    );
 
     // The existing code has session deduplication, so this should be 1
     // This test verifies the session check works
