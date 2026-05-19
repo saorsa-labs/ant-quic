@@ -25,9 +25,31 @@ async fn lifecycle_keeps_one_live_connection_and_monotonic_generations() {
         clients.push(make_node(vec![hub_addr]).await);
     }
 
+    let mut seen_reconnects = vec![false; clients.len()];
+    let mut expected_live_transitions = vec![0usize; clients.len()];
+
     for cycle in 0..100usize {
-        let client = &clients[cycle % clients.len()];
+        let client_index = cycle % clients.len();
+        let client = &clients[client_index];
         let client_id = client.peer_id();
+
+        if seen_reconnects[client_index] {
+            assert!(
+                client
+                    .get_quic_connection(&hub_id)
+                    .expect("client connection lookup before disconnect")
+                    .is_some(),
+                "client {:?} dropped its hub connection before cycle {cycle}",
+                client.peer_id()
+            );
+            assert!(
+                hub.get_quic_connection(&client_id)
+                    .expect("hub connection lookup before disconnect")
+                    .is_some(),
+                "hub dropped its connection for {:?} before cycle {cycle}",
+                client.peer_id()
+            );
+        }
 
         let _ = client.disconnect(&hub_id).await;
         let _ = hub.disconnect(&client_id).await;
@@ -39,12 +61,22 @@ async fn lifecycle_keeps_one_live_connection_and_monotonic_generations() {
                 && hub.get_quic_connection(&client_id).ok().flatten().is_some()
         })
         .await;
+        seen_reconnects[client_index] = true;
+        expected_live_transitions[client_index] += 1;
     }
 
     let mut total_live_transitions = 0usize;
-    for client in &clients {
+    for (client_index, client) in clients.iter().enumerate() {
         let generations = lifecycle_generations_for_peer(client.peer_id());
         total_live_transitions += generations.len();
+        assert!(
+            generations.len() >= expected_live_transitions[client_index],
+            "client {:?} expected at least {} live transitions, got {}: {:?}",
+            client.peer_id(),
+            expected_live_transitions[client_index],
+            generations.len(),
+            generations
+        );
         assert!(
             generations.windows(2).all(|window| window[0] < window[1]),
             "generations must increase monotonically: {:?}",
@@ -66,9 +98,11 @@ async fn lifecycle_keeps_one_live_connection_and_monotonic_generations() {
             client.peer_id()
         );
     }
+    let expected_total_live_transitions = expected_live_transitions.iter().sum::<usize>();
     assert!(
-        total_live_transitions >= clients.len() + 16,
-        "expected many lifecycle live transitions, got {}",
+        total_live_transitions >= expected_total_live_transitions,
+        "expected at least {} lifecycle live transitions, got {}",
+        expected_total_live_transitions,
         total_live_transitions
     );
 
