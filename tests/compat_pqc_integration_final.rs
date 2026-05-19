@@ -259,10 +259,10 @@ async fn test_pqc_performance_overhead() {
 
 #[tokio::test]
 async fn test_backward_compatibility() {
-    // v0.13.0+: Test that endpoints can still be created
+    // v0.13.0+: Test that endpoints can still connect
     // (backward compatibility with non-PQC is no longer a goal)
     let (cert_chain, private_key) = generate_test_cert();
-    let server_config = ServerConfig::with_single_cert(cert_chain, private_key)
+    let server_config = ServerConfig::with_single_cert(cert_chain.clone(), private_key)
         .expect("Failed to create server config");
 
     let server_endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
@@ -270,9 +270,20 @@ async fn test_backward_compatibility() {
 
     let server_addr = server_endpoint.local_addr().unwrap();
 
-    // Create a client
+    let server_task = tokio::spawn(async move {
+        let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
+            .await
+            .expect("Server accept timed out")
+            .expect("Server did not receive connection");
+
+        timeout(Duration::from_secs(5), incoming)
+            .await
+            .expect("Server handshake timed out")
+            .expect("Server handshake failed")
+    });
+
+    // Create a client that trusts the server certificate
     let mut roots = rustls::RootCertStore::empty();
-    let (cert_chain, _) = generate_test_cert();
     for cert in cert_chain {
         roots
             .add(cert)
@@ -291,10 +302,14 @@ async fn test_backward_compatibility() {
         .connect(server_addr, "localhost")
         .expect("Failed to start connection");
 
-    let _connect_result = timeout(Duration::from_secs(5), connecting).await;
+    let client_conn = timeout(Duration::from_secs(5), connecting)
+        .await
+        .expect("Client connect timed out")
+        .expect("Client connect failed");
+    let server_conn = server_task.await.expect("Server task panicked");
 
-    // Verify the endpoint was created successfully
-    assert!(client_endpoint.local_addr().is_ok());
+    assert!(client_conn.is_pqc(), "client should report PQC in use");
+    assert!(server_conn.is_pqc(), "server should report PQC in use");
 }
 
 #[tokio::test]
