@@ -12,13 +12,20 @@
 
 use ant_quic::transport::TransportAddr;
 use ant_quic::{P2pConfig, P2pEndpoint, P2pEvent};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
 struct LiveSaorsaNode {
     name: &'static str,
     addr: SocketAddr,
+}
+
+#[derive(Clone, Copy)]
+struct LiveDualStackCase {
+    mode: &'static str,
+    bind_addr: SocketAddr,
+    peer: LiveSaorsaNode,
 }
 
 /// Known saorsa network nodes for testing. Use hard-coded IP literals so live
@@ -32,7 +39,51 @@ const SAORSA_NODES: &[LiveSaorsaNode] = &[
         name: "saorsa-3-sfo",
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(147, 182, 234, 192)), 9000),
     },
+    LiveSaorsaNode {
+        name: "saorsa-2-nyc-ipv6",
+        addr: SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                0x2604, 0xa880, 0x0400, 0x00d1, 0x0000, 0x0003, 0x7db3, 0xf001,
+            )),
+            9000,
+        ),
+    },
 ];
+
+fn live_node_for_family(ipv6: bool) -> LiveSaorsaNode {
+    SAORSA_NODES
+        .iter()
+        .copied()
+        .find(|node| node.addr.is_ipv6() == ipv6)
+        .expect("SAORSA_NODES must include live nodes for both IP families")
+}
+
+fn dual_stack_live_cases() -> [LiveDualStackCase; 2] {
+    [
+        LiveDualStackCase {
+            mode: "IPv4",
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            peer: live_node_for_family(false),
+        },
+        LiveDualStackCase {
+            mode: "IPv6",
+            bind_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            peer: live_node_for_family(true),
+        },
+    ]
+}
+
+#[test]
+fn dual_stack_live_cases_use_matching_peer_families() {
+    for case in dual_stack_live_cases() {
+        assert_eq!(
+            case.peer.addr.is_ipv6(),
+            case.bind_addr.is_ipv6(),
+            "{} live test must dial a peer with the selected IP family",
+            case.mode
+        );
+    }
+}
 
 /// Test connection to saorsa-2 node
 #[tokio::test]
@@ -139,42 +190,59 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     println!("Testing dual-stack connectivity...");
 
-    // Try to connect using different IP modes
-    for mode in ["IPv4", "IPv6"] {
-        println!("Testing {} connectivity...", mode);
-
-        let bind_addr = match mode {
-            "IPv4" => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            "IPv6" => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
-            _ => unreachable!(),
-        };
+    for case in dual_stack_live_cases() {
+        println!("Testing {} connectivity...", case.mode);
+        assert_eq!(
+            case.peer.addr.is_ipv6(),
+            case.bind_addr.is_ipv6(),
+            "{} live test must dial a peer with the selected IP family",
+            case.mode
+        );
 
         let config = P2pConfig::builder()
-            .bind_addr(bind_addr)
-            .known_peers(vec![SAORSA_NODES[0].addr])
+            .bind_addr(case.bind_addr)
+            .known_peers(vec![case.peer.addr])
             .pqc(ant_quic::PqcConfig::default())
             .build()?;
 
         match P2pEndpoint::new(config).await {
             Ok(node) => {
-                println!("{} node started at {:?}", mode, node.local_addr());
+                println!("{} node started at {:?}", case.mode, node.local_addr());
 
                 // Try to connect
-                let result = tokio::time::timeout(Duration::from_secs(10), async {
-                    node.connect_known_peers().await
-                })
-                .await;
+                let result =
+                    tokio::time::timeout(Duration::from_secs(10), node.connect_known_peers()).await;
 
-                match result {
-                    Ok(Ok(n)) => println!("{} connection successful! {} peers connected", mode, n),
-                    Ok(Err(e)) => println!("{} connection failed: {:?}", mode, e),
-                    Err(_) => println!("{} connection timed out", mode),
-                }
+                let outcome = match result {
+                    Ok(Ok(n)) if n > 0 => Ok(n),
+                    Ok(Ok(_)) => Err(anyhow::anyhow!(
+                        "{} connection to {} connected zero peers",
+                        case.mode,
+                        case.peer.addr
+                    )),
+                    Ok(Err(e)) => Err(anyhow::anyhow!(
+                        "{} connection to {} failed: {:?}",
+                        case.mode,
+                        case.peer.addr,
+                        e
+                    )),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "{} connection to {} timed out",
+                        case.mode,
+                        case.peer.addr
+                    )),
+                };
 
                 node.shutdown().await;
+
+                let connected = outcome?;
+                println!(
+                    "{} connection successful! {} peers connected",
+                    case.mode, connected
+                );
             }
             Err(e) => {
-                println!("{} mode not available: {:?}", mode, e);
+                println!("{} mode not available: {:?}", case.mode, e);
             }
         }
     }
@@ -186,8 +254,13 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
 async fn connect_to_node(node_addr: LiveSaorsaNode) -> anyhow::Result<()> {
     println!("Connecting to {} ({})...", node_addr.name, node_addr.addr);
 
+    let bind_addr = match node_addr.addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+
     let config = P2pConfig::builder()
-        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .bind_addr(bind_addr)
         .known_peers(vec![node_addr.addr])
         .pqc(ant_quic::PqcConfig::default())
         .build()?;
