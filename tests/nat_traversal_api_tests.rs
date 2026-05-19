@@ -13,17 +13,10 @@ use ant_quic::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
-use tokio::{
-    sync::mpsc,
-    time::{sleep, timeout},
-};
-use tracing::debug;
+use tokio::{sync::mpsc, time::timeout};
 
 /// Test helper to create a NAT traversal endpoint
 /// v0.13.0+: No role parameter - all nodes are symmetric P2P nodes
@@ -50,6 +43,26 @@ async fn create_endpoint(
     Ok((endpoint, rx))
 }
 
+fn is_udp_bind_blocked(error: &str) -> bool {
+    error.contains("Failed to bind UDP socket") && error.contains("Operation not permitted")
+}
+
+fn assert_endpoint_created_or_udp_bind_blocked(
+    result: Result<NatTraversalEndpoint, NatTraversalError>,
+    context: &str,
+) -> Option<NatTraversalEndpoint> {
+    match result {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            assert!(
+                matches!(&error, NatTraversalError::NetworkError(message) if is_udp_bind_blocked(message)),
+                "{context}: {error}"
+            );
+            None
+        }
+    }
+}
+
 // ===== Basic Endpoint Creation Tests =====
 
 #[tokio::test]
@@ -64,8 +77,12 @@ async fn test_create_endpoint_without_known_peers() {
     };
 
     let result = NatTraversalEndpoint::new(config, None, None).await;
-    // May succeed or fail based on implementation - just ensure no panic
-    let _ = result;
+    let Some(_endpoint) = assert_endpoint_created_or_udp_bind_blocked(
+        result,
+        "Endpoint should succeed without known peers",
+    ) else {
+        return;
+    };
 }
 
 #[tokio::test]
@@ -94,8 +111,12 @@ async fn test_create_endpoint_with_bind_addr() {
     };
 
     let result = NatTraversalEndpoint::new(config, None, None).await;
-    // Just ensure it doesn't panic
-    let _ = result;
+    let Some(_endpoint) = assert_endpoint_created_or_udp_bind_blocked(
+        result,
+        "Endpoint should succeed with bind address",
+    ) else {
+        return;
+    };
 }
 
 // ===== Listening and Connection Tests =====
@@ -181,33 +202,42 @@ async fn test_list_connections() {
 async fn test_event_callback() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let event_count = Arc::new(AtomicU32::new(0));
-    let event_count_clone = event_count.clone();
+    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 
     let config = NatTraversalConfig {
-        known_peers: vec![],
+        known_peers: vec![coordinator],
         ..NatTraversalConfig::default()
     };
 
-    let event_callback = Box::new(move |_event: NatTraversalEvent| {
-        event_count_clone.fetch_add(1, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let event_callback = Box::new(move |event: NatTraversalEvent| {
+        let _ = tx.send(event);
     });
 
-    let endpoint = NatTraversalEndpoint::new(config, Some(event_callback), None)
-        .await
-        .expect("Failed to create endpoint");
+    let Some(endpoint) = assert_endpoint_created_or_udp_bind_blocked(
+        NatTraversalEndpoint::new(config, Some(event_callback), None).await,
+        "Endpoint should be created for event callback",
+    ) else {
+        return;
+    };
 
-    // Start listening should generate events
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let _ = endpoint.start_listening(bind_addr).await;
+    let (public_key, _secret_key) = generate_ml_dsa_keypair().unwrap();
+    let peer_id = derive_peer_id_from_public_key(&public_key);
+    endpoint
+        .initiate_nat_traversal(peer_id, coordinator)
+        .expect("NAT traversal initiation should succeed");
 
-    // Give some time for events to be processed
-    sleep(Duration::from_millis(100)).await;
-
-    // We should have received at least one event
-    // Note: The actual event count depends on implementation details
-    let count = event_count.load(Ordering::SeqCst);
-    debug!("Received {} events", count);
+    let event = rx.try_recv().expect("callback should receive an event");
+    assert!(
+        matches!(
+            event,
+            NatTraversalEvent::CoordinationRequested {
+                peer_id: event_peer_id,
+                coordinator: event_coordinator,
+            } if event_peer_id == peer_id && event_coordinator == coordinator
+        ),
+        "callback should receive the CoordinationRequested event"
+    );
 }
 
 // ===== Error Handling Tests =====
