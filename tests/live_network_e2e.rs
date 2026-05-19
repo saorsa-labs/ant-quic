@@ -73,6 +73,24 @@ fn dual_stack_live_cases() -> [LiveDualStackCase; 2] {
     ]
 }
 
+fn require_connected_peer_count(target: &str, connected: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(connected > 0, "connection to {target} connected zero peers");
+    Ok(connected)
+}
+
+async fn connect_known_peers_or_fail(
+    node: &P2pEndpoint,
+    target: &str,
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    let connected = tokio::time::timeout(timeout, node.connect_known_peers())
+        .await
+        .map_err(|_| anyhow::anyhow!("connection to {target} timed out after {timeout:?}"))?
+        .map_err(|e| anyhow::anyhow!("connection to {target} failed: {e:?}"))?;
+
+    require_connected_peer_count(target, connected)
+}
+
 #[test]
 fn dual_stack_live_cases_use_matching_peer_families() {
     for case in dual_stack_live_cases() {
@@ -83,6 +101,15 @@ fn dual_stack_live_cases_use_matching_peer_families() {
             case.mode
         );
     }
+}
+
+#[test]
+fn connected_peer_count_requires_at_least_one_peer() {
+    assert!(require_connected_peer_count("test peer", 0).is_err());
+    assert_eq!(
+        require_connected_peer_count("test peer", 1).expect("one peer should pass"),
+        1
+    );
 }
 
 /// Test connection to saorsa-2 node
@@ -119,34 +146,41 @@ async fn test_external_address_discovery_live() -> anyhow::Result<()> {
     let node = P2pEndpoint::new(config).await?;
     println!("Local node started at {:?}", node.local_addr());
 
-    // Connect to known peers
     println!("Connecting to {} known peers...", known_peers.len());
-    let connect_task = {
-        let node = node.clone();
-        tokio::spawn(async move { node.connect_known_peers().await })
+    let connected_peers = match connect_known_peers_or_fail(
+        &node,
+        "live saorsa nodes",
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(connected_peers) => connected_peers,
+        Err(e) => {
+            node.shutdown().await;
+            return Err(e);
+        }
     };
+    println!(
+        "Successfully connected to saorsa network! {} peers connected",
+        connected_peers
+    );
 
-    // Wait for connection and external address discovery
     let mut events = node.subscribe();
-    let timeout = Duration::from_secs(30);
+    let discovery_timeout = Duration::from_secs(30);
     let start = std::time::Instant::now();
 
-    let mut connected = false;
     let mut external_addr: Option<TransportAddr> = None;
 
-    while start.elapsed() < timeout {
-        // Check for external address
+    while start.elapsed() < discovery_timeout {
         if let Some(addr) = node.external_addr() {
             println!("Discovered external address: {}", addr);
             external_addr = Some(TransportAddr::Udp(addr));
             break;
         }
 
-        // Check for events
         match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
             Ok(Ok(P2pEvent::PeerConnected { peer_id, addr, .. })) => {
                 println!("Connected to peer {} at {}", peer_id, addr);
-                connected = true;
             }
             Ok(Ok(P2pEvent::ExternalAddressDiscovered { addr })) => {
                 println!("Event: External address discovered: {}", addr);
@@ -160,26 +194,25 @@ async fn test_external_address_discovery_live() -> anyhow::Result<()> {
         }
     }
 
-    // Cleanup
+    let Some(addr) = external_addr else {
+        node.shutdown().await;
+        anyhow::bail!("external address was not discovered within {discovery_timeout:?}");
+    };
+
+    println!("External address verified: {}", addr);
+    let verification = || -> anyhow::Result<()> {
+        let socket_addr = addr
+            .as_socket_addr()
+            .ok_or_else(|| anyhow::anyhow!("external address was not a socket address: {addr}"))?;
+        anyhow::ensure!(
+            !socket_addr.ip().is_loopback(),
+            "external address should not be loopback: {socket_addr}"
+        );
+        Ok(())
+    };
+
     node.shutdown().await;
-    connect_task.abort();
-    let _ = connect_task.await;
-
-    // Verify results
-    if connected {
-        println!("Successfully connected to saorsa network!");
-    }
-    if let Some(addr) = external_addr {
-        println!("External address verified: {}", addr);
-        // On a real network, we should get our public IP
-        if let Some(socket_addr) = addr.as_socket_addr() {
-            assert!(
-                !socket_addr.ip().is_loopback(),
-                "Should not be loopback address"
-            );
-        }
-    }
-
+    verification()?;
     Ok(())
 }
 
@@ -205,46 +238,19 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
             .pqc(ant_quic::PqcConfig::default())
             .build()?;
 
-        match P2pEndpoint::new(config).await {
-            Ok(node) => {
-                println!("{} node started at {:?}", case.mode, node.local_addr());
+        let node = P2pEndpoint::new(config).await?;
+        println!("{} node started at {:?}", case.mode, node.local_addr());
 
-                // Try to connect
-                let result =
-                    tokio::time::timeout(Duration::from_secs(10), node.connect_known_peers()).await;
+        let target = format!("{} peer {}", case.mode, case.peer.addr);
+        let outcome = connect_known_peers_or_fail(&node, &target, Duration::from_secs(10)).await;
 
-                let outcome = match result {
-                    Ok(Ok(n)) if n > 0 => Ok(n),
-                    Ok(Ok(_)) => Err(anyhow::anyhow!(
-                        "{} connection to {} connected zero peers",
-                        case.mode,
-                        case.peer.addr
-                    )),
-                    Ok(Err(e)) => Err(anyhow::anyhow!(
-                        "{} connection to {} failed: {:?}",
-                        case.mode,
-                        case.peer.addr,
-                        e
-                    )),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "{} connection to {} timed out",
-                        case.mode,
-                        case.peer.addr
-                    )),
-                };
+        node.shutdown().await;
 
-                node.shutdown().await;
-
-                let connected = outcome?;
-                println!(
-                    "{} connection successful! {} peers connected",
-                    case.mode, connected
-                );
-            }
-            Err(e) => {
-                println!("{} mode not available: {:?}", case.mode, e);
-            }
-        }
+        let connected = outcome?;
+        println!(
+            "{} connection successful! {} peers connected",
+            case.mode, connected
+        );
     }
 
     Ok(())
@@ -268,34 +274,26 @@ async fn connect_to_node(node_addr: LiveSaorsaNode) -> anyhow::Result<()> {
     let node = P2pEndpoint::new(config).await?;
     println!("Local node started at {:?}", node.local_addr());
 
-    // Connect with timeout
-    let connect_result = tokio::time::timeout(Duration::from_secs(15), async {
-        node.connect_known_peers().await
-    })
-    .await;
+    let target = format!("{} ({})", node_addr.name, node_addr.addr);
+    let outcome = connect_known_peers_or_fail(&node, &target, Duration::from_secs(15)).await;
 
-    match connect_result {
-        Ok(Ok(n)) => {
-            println!("Successfully connected to {} ({} peers)", node_addr.name, n);
+    if let Ok(connected) = outcome.as_ref() {
+        println!(
+            "Successfully connected to {} ({} peers)",
+            node_addr.name, connected
+        );
 
-            // Verify connection by checking for observed address
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Some(external) = node.external_addr() {
-                println!(
-                    "Our external address as seen by {}: {}",
-                    node_addr.name, external
-                );
-            }
-        }
-        Ok(Err(e)) => {
-            println!("Connection failed: {:?}", e);
-        }
-        Err(_) => {
-            println!("Connection timed out after 15 seconds");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(external) = node.external_addr() {
+            println!(
+                "Our external address as seen by {}: {}",
+                node_addr.name, external
+            );
         }
     }
 
     node.shutdown().await;
+    outcome?;
     Ok(())
 }
 
@@ -308,7 +306,8 @@ async fn test_multiple_connections() -> anyhow::Result<()> {
 
     let mut handles = Vec::new();
 
-    for i in 0..3 {
+    let total_connections = 3;
+    for i in 0..total_connections {
         let handle = tokio::spawn(async move {
             let peer = SAORSA_NODES[i % SAORSA_NODES.len()];
             println!("Connection {} to {} ({})", i, peer.name, peer.addr);
@@ -324,15 +323,14 @@ async fn test_multiple_connections() -> anyhow::Result<()> {
                 successes += 1;
                 println!("Connection {} succeeded", i);
             }
-            Ok(Err(e)) => println!("Connection {} failed: {:?}", i, e),
-            Err(e) => println!("Connection {} panicked: {:?}", i, e),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("connection {i} failed: {e:?}")),
+            Err(e) => return Err(anyhow::anyhow!("connection {i} join failed: {e:?}")),
         }
     }
 
     println!(
         "Multiple connections test: {}/{} succeeded",
-        successes,
-        SAORSA_NODES.len()
+        successes, total_connections
     );
     Ok(())
 }
