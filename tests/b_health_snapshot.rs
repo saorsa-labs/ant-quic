@@ -5,7 +5,7 @@ mod support;
 use ant_quic::{ConnectionCloseReason, PeerId};
 use std::time::{Duration, Instant};
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connection_health_tracks_lifecycle_and_directional_activity() {
@@ -59,7 +59,10 @@ async fn connection_health_tracks_lifecycle_and_directional_activity() {
         .send(&receiver_id, b"health-check")
         .await
         .expect("send");
-    let (peer_id, payload) = receiver.recv().await.expect("recv");
+    let (peer_id, payload) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv");
     assert_eq!(peer_id, sender_id);
     assert_eq!(payload, b"health-check");
 
