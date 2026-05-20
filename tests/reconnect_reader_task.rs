@@ -9,16 +9,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, PqcConfig};
+use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, PeerLifecycleEvent, PqcConfig};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
-use tokio::time::timeout;
+use tokio::{sync::broadcast, time::timeout};
 use tracing_subscriber::EnvFilter;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+const REPLACEMENT_ATTEMPTS: usize = 10;
 
 fn normalize(addr: SocketAddr) -> SocketAddr {
     if addr.ip().is_unspecified() {
@@ -45,13 +46,40 @@ async fn make_node(known: Vec<SocketAddr>) -> P2pEndpoint {
     .expect("node creation")
 }
 
-/// Verify recv() works after disconnect + reconnect to the same peer.
-///
-/// Both sides must disconnect to ensure clean QUIC state before reconnection.
-/// Without the reader-task abort fix, the second recv() would hang because the
-/// old zombie reader task (bound to the dead connection) would be the one
-/// registered in `reader_handles`, shadowing the new reader task.
-#[tokio::test]
+fn spawn_accept_loop(node: Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while node.accept().await.is_some() {} })
+}
+
+async fn try_wait_for_peer_event(
+    rx: &mut broadcast::Receiver<PeerLifecycleEvent>,
+    wait: Duration,
+    expected: impl Fn(&PeerLifecycleEvent) -> bool,
+) -> Option<PeerLifecycleEvent> {
+    timeout(wait, async {
+        loop {
+            match rx.recv().await {
+                Ok(event) if expected(&event) => break Some(event),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn wait_for_peer_event(
+    rx: &mut broadcast::Receiver<PeerLifecycleEvent>,
+    expected: impl Fn(&PeerLifecycleEvent) -> bool,
+) -> PeerLifecycleEvent {
+    try_wait_for_peer_event(rx, TIMEOUT, expected)
+        .await
+        .expect("timed out waiting for peer lifecycle event")
+}
+
+/// Verify recv() works after replacing a live reader task for the same peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recv_after_reconnect() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -63,21 +91,28 @@ async fn recv_after_reconnect() {
     let b_id = b.peer_id();
 
     let a = Arc::new(make_node(vec![b_addr]).await);
+    let a_addr = normalize(a.local_addr().expect("bound addr"));
     let a_id = a.peer_id();
+    let mut b_peer_events = b.subscribe_peer_events(&a_id);
+
+    let accept_a = spawn_accept_loop(Arc::clone(&a));
+    let accept_b = spawn_accept_loop(Arc::clone(&b));
 
     // --- First session ---
-    let b2 = Arc::clone(&b);
-    let accept1 = tokio::spawn(async move { timeout(TIMEOUT, b2.accept()).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let conn = a.connect_addr(b_addr).await.expect("connect");
     assert_eq!(conn.peer_id, b_id);
-    let accepted1 = accept1
-        .await
-        .expect("accept1 join")
-        .expect("accept1 timeout")
-        .expect("accept1 none");
-    assert_eq!(accepted1.peer_id, a_id);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let established = wait_for_peer_event(&mut b_peer_events, |event| {
+        matches!(event, PeerLifecycleEvent::Established { .. })
+    })
+    .await;
+    assert!(matches!(
+        established,
+        PeerLifecycleEvent::Established { .. }
+    ));
+    let initial_generation = match established {
+        PeerLifecycleEvent::Established { generation } => generation,
+        _ => 0,
+    };
 
     // Verify first session works
     a.send(&b_id, b"msg1").await.expect("send1");
@@ -88,30 +123,62 @@ async fn recv_after_reconnect() {
     assert_eq!(from, a_id);
     assert_eq!(&data, b"msg1");
 
-    // --- Disconnect BOTH sides for clean QUIC state ---
-    a.disconnect(&b_id).await.expect("disconnect a→b");
-    // B must also disconnect so its QUIC endpoint fully releases
-    // the old connection, allowing a fresh accept on reconnection.
-    let _ = b.disconnect(&a_id).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // --- Replace the live reader without disconnecting first ---
+    let mut replacement_generation = None;
+    for _ in 0..REPLACEMENT_ATTEMPTS {
+        let a2 = Arc::clone(&a);
+        let a_connect = tokio::spawn(async move { a2.connect_addr(b_addr).await });
+        let b2 = Arc::clone(&b);
+        let b_connect = tokio::spawn(async move { b2.connect_addr(a_addr).await });
+        let _ = a_connect
+            .await
+            .expect("a replacement task")
+            .expect("a replacement connect");
+        let _ = b_connect
+            .await
+            .expect("b replacement task")
+            .expect("b replacement connect");
 
-    // --- Second session (reconnection) ---
-    let b3 = Arc::clone(&b);
-    let accept2 = tokio::spawn(async move { timeout(TIMEOUT, b3.accept()).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let reconnect = a.connect_addr(b_addr).await.expect("reconnect");
-    assert_eq!(reconnect.peer_id, b_id);
-    let accepted2 = accept2
-        .await
-        .expect("accept2 join")
-        .expect("accept2 timeout")
-        .expect("accept2 none");
-    assert_eq!(accepted2.peer_id, a_id);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(PeerLifecycleEvent::Replaced { new_generation, .. }) =
+            try_wait_for_peer_event(&mut b_peer_events, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    PeerLifecycleEvent::Replaced {
+                        old_generation,
+                        new_generation,
+                    } if *old_generation == initial_generation
+                        && *new_generation > initial_generation
+                )
+            })
+            .await
+        {
+            replacement_generation = Some(new_generation);
+            break;
+        }
+    }
+
+    assert!(
+        replacement_generation.is_some(),
+        "timed out waiting for live reader replacement"
+    );
+
+    let reader_exited = wait_for_peer_event(&mut b_peer_events, |event| {
+        matches!(
+            event,
+            PeerLifecycleEvent::ReaderExited { generation } if *generation == initial_generation
+        )
+    })
+    .await;
+    assert_eq!(
+        reader_exited,
+        PeerLifecycleEvent::ReaderExited {
+            generation: initial_generation,
+        }
+    );
 
     // Regression check: recv() must work on the new connection.
-    // Before the fix, the zombie reader task from session 1 would shadow
-    // the new reader task, causing this recv() to hang.
+    // Before the fix, the old reader task could stay registered for the peer
+    // and shadow the replacement reader, causing this recv() to hang.
     a.send(&b_id, b"msg2").await.expect("send2");
     let (from2, data2) = timeout(TIMEOUT, b.recv())
         .await
@@ -122,4 +189,6 @@ async fn recv_after_reconnect() {
 
     let _ = timeout(Duration::from_secs(2), a.shutdown()).await;
     let _ = timeout(Duration::from_secs(2), b.shutdown()).await;
+    accept_a.abort();
+    accept_b.abort();
 }
