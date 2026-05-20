@@ -123,33 +123,10 @@ fn create_pqc_provider(config: &PqcConfig) -> Result<Arc<CryptoProvider>, PqcErr
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
 
     if config.ml_kem_enabled {
-        // v0.2: Use only pure ML-KEM groups from available providers.
-        let mlkem_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = provider
-            .kx_groups
-            .iter()
-            .filter(|g| is_pure_pqc_kx_group(g.name()))
-            .copied()
-            .collect();
-
-        if mlkem_groups.is_empty() {
-            // Try rustls_post_quantum provider
-            let pq_provider = rustls_post_quantum::provider();
-            let pq_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = pq_provider
-                .kx_groups
-                .iter()
-                .filter(|g| is_pure_pqc_kx_group(g.name()))
-                .copied()
-                .collect();
-
-            if pq_groups.is_empty() {
-                return Err(PqcError::CryptoError(
-                    "No ML-KEM key exchange groups available".to_string(),
-                ));
-            }
-            provider.kx_groups = pq_groups;
-        } else {
-            provider.kx_groups = mlkem_groups;
-        }
+        provider.kx_groups = vec![
+            rustls::crypto::aws_lc_rs::kx_group::MLKEM768,
+            rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
+        ];
     }
 
     // Add ML-DSA-65 to signature verification algorithms

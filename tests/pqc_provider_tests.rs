@@ -15,6 +15,22 @@ use ant_quic::crypto::pqc::{
     PqcConfig, create_crypto_provider, is_pqc_group, validate_negotiated_group,
 };
 
+fn assert_provider_only_has_pure_ml_kem_groups(provider: &rustls::crypto::CryptoProvider) {
+    assert!(
+        !provider.kx_groups.is_empty(),
+        "Provider should advertise PQC key exchange groups"
+    );
+
+    for group in provider.kx_groups.iter() {
+        let group_code = u16::from(group.name());
+        assert!(
+            matches!(group_code, 0x0200..=0x0202),
+            "Provider should only have pure ML-KEM groups, found {:?}",
+            group.name()
+        );
+    }
+}
+
 /// Test that PQC provider can be created successfully
 #[test]
 fn test_pqc_provider_creation() {
@@ -24,19 +40,8 @@ fn test_pqc_provider_creation() {
         .build()
         .expect("Failed to build PqcConfig");
 
-    let result = create_crypto_provider(&config);
-
-    // The provider creation might fail if no PQC groups are available
-    // from rustls-post-quantum, but if it succeeds, all groups should be PQC
-    if let Ok(provider) = result {
-        for group in provider.kx_groups.iter() {
-            assert!(
-                is_pqc_group(group.name()),
-                "Provider should only have PQC groups, found {:?}",
-                group.name()
-            );
-        }
-    }
+    let provider = create_crypto_provider(&config).expect("PQC provider creation should succeed");
+    assert_provider_only_has_pure_ml_kem_groups(&provider);
 }
 
 /// Test that PQC algorithms cannot be disabled (v0.13.0+: PQC is mandatory)
@@ -128,16 +133,8 @@ fn test_provider_only_has_pqc_groups() {
         .build()
         .expect("Failed to build config");
 
-    let result = create_crypto_provider(&config);
-    if let Ok(provider) = result {
-        let has_classical = provider.kx_groups.iter().any(|g| !is_pqc_group(g.name()));
-
-        // v0.13.0+: No classical groups should be present
-        assert!(
-            !has_classical,
-            "Provider should not have any classical key exchange groups"
-        );
-    }
+    let provider = create_crypto_provider(&config).expect("PQC provider creation should succeed");
+    assert_provider_only_has_pure_ml_kem_groups(&provider);
 }
 
 /// Test configured_provider_with_pqc function
@@ -147,10 +144,7 @@ fn test_configured_provider_with_pqc() {
 
     // Without config, should return default provider with PQC support
     let provider = configured_provider_with_pqc(None);
-    assert!(
-        !provider.kx_groups.is_empty(),
-        "Default provider should have groups"
-    );
+    assert_provider_only_has_pure_ml_kem_groups(&provider);
 
     // With PQC config
     let config = PqcConfig::builder()
@@ -160,10 +154,7 @@ fn test_configured_provider_with_pqc() {
         .expect("Failed to build PqcConfig");
 
     let provider = configured_provider_with_pqc(Some(&config));
-    assert!(
-        !provider.kx_groups.is_empty(),
-        "PQC provider should have groups"
-    );
+    assert_provider_only_has_pure_ml_kem_groups(&provider);
 }
 
 /// Test validate_pqc_connection function (v0.2: ML-KEM required)
