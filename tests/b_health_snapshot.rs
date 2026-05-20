@@ -70,12 +70,14 @@ async fn connection_health_tracks_lifecycle_and_directional_activity() {
     assert!(sender_health.connected);
     assert_eq!(sender_health.generation, Some(first_generation));
     assert!(sender_health.last_sent_at.is_some());
+    assert_eq!(sender_health.last_received_at, None);
     assert!(sender_health.idle_for.is_some());
 
     let receiver_health = receiver.connection_health(&sender_id).await;
     assert!(receiver_health.connected);
     assert!(receiver_health.generation.is_some());
     assert!(receiver_health.last_received_at.is_some());
+    assert_eq!(receiver_health.last_sent_at, None);
     assert!(receiver_health.idle_for.is_some());
 
     sender
