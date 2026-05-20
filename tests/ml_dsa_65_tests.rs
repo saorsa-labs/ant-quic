@@ -287,11 +287,11 @@ mod ml_dsa_65_tests {
             let message = format!("Test message number {}", i);
             let signature = ml_dsa
                 .sign(&secret_key, message.as_bytes())
-                .unwrap_or_else(|_| panic!("Failed to sign message {}", i));
+                .expect("Failed to sign message");
 
             let is_valid = ml_dsa
                 .verify(&public_key, message.as_bytes(), &signature)
-                .unwrap_or_else(|_| panic!("Failed to verify message {}", i));
+                .expect("Failed to verify message");
 
             assert!(is_valid, "Signature {} should be valid", i);
         }
