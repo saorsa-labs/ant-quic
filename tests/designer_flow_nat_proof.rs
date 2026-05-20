@@ -196,6 +196,15 @@ mod nat_matrix {
 mod vps_integration {
     use std::process::Command;
 
+    const NAT_MATRIX_SUCCESS_MARKER: &str = "Connectivity matrix completed successfully";
+
+    fn vps_nat_matrix_succeeded(status_success: bool, stdout: &str) -> bool {
+        status_success
+            && stdout
+                .lines()
+                .any(|line| line.trim() == NAT_MATRIX_SUCCESS_MARKER)
+    }
+
     /// Run the NAT matrix scenario on VPS fleet
     #[test]
     #[ignore = "Requires VPS fleet access"]
@@ -206,11 +215,21 @@ mod vps_integration {
             .expect("Failed to run VPS test");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.contains("PASS") || output.status.success(),
-            "VPS NAT matrix test failed: {}",
-            stdout
+            vps_nat_matrix_succeeded(output.status.success(), &stdout),
+            "VPS NAT matrix test failed (status: {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            stderr
         );
+    }
+
+    #[test]
+    fn vps_nat_matrix_rejects_failed_status_with_pass_stdout() {
+        let stdout = "PASS\nConnectivity matrix completed successfully\n";
+
+        assert!(!vps_nat_matrix_succeeded(false, stdout));
     }
 
     /// Run chaos test on VPS fleet
