@@ -717,6 +717,8 @@ pub struct BleConnection {
     shutdown_tx: mpsc::Sender<()>,
     /// Whether this connection used session resumption
     session_resumed: bool,
+    /// Whether this connection is backed by the simulated non-hardware path
+    simulated: bool,
 }
 
 impl BleConnection {
@@ -746,6 +748,7 @@ impl BleConnection {
             last_activity: Arc::new(RwLock::new(Instant::now())),
             shutdown_tx,
             session_resumed,
+            simulated: false,
         }
     }
 
@@ -861,6 +864,16 @@ impl BleConnection {
     /// Check if this connection used session resumption
     pub fn was_session_resumed(&self) -> bool {
         self.session_resumed
+    }
+
+    /// Mark this connection as simulated.
+    fn set_simulated(&mut self, simulated: bool) {
+        self.simulated = simulated;
+    }
+
+    /// Check whether this connection is simulated.
+    fn is_simulated(&self) -> bool {
+        self.simulated
     }
 
     /// Begin graceful disconnection
@@ -1333,7 +1346,7 @@ pub struct BleTransport {
     active_connections: Arc<RwLock<HashMap<[u8; 6], Arc<RwLock<BleConnection>>>>>,
     /// Btleplug adapter for Central mode operations (scanning, connecting)
     #[cfg(feature = "ble")]
-    adapter: Arc<Adapter>,
+    adapter: Option<Arc<Adapter>>,
     /// Fragmenter for splitting large messages
     fragmenter: BlePacketFragmenter,
     /// Reassembly buffer for combining fragments
@@ -1388,6 +1401,20 @@ impl BleTransport {
         // Get adapter and local device ID
         let (adapter, local_device_id) = Self::get_adapter_and_device_id().await?;
 
+        let transport = Self::from_parts(config, local_device_id, Some(adapter));
+
+        // Load persisted sessions from disk if configured
+        if transport.config.session_persist_path.is_some() {
+            if let Err(e) = transport.load_sessions_from_disk().await {
+                tracing::warn!(error = %e, "Failed to load session cache from disk");
+            }
+        }
+
+        Ok(transport)
+    }
+
+    #[cfg(feature = "ble")]
+    fn from_parts(config: BleConfig, local_device_id: [u8; 6], adapter: Option<Adapter>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
         let (scan_event_tx, scan_event_rx) = mpsc::channel(64);
@@ -1395,7 +1422,7 @@ impl BleTransport {
         // Create fragmenter with BLE MTU from capabilities
         let fragmenter = BlePacketFragmenter::new(TransportCapabilities::ble().mtu);
 
-        let transport = Self {
+        Self {
             config,
             capabilities: TransportCapabilities::ble(),
             local_device_id,
@@ -1410,20 +1437,18 @@ impl BleTransport {
             scan_event_tx,
             scan_event_rx: Arc::new(RwLock::new(Some(scan_event_rx))),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
-            adapter: Arc::new(adapter),
+            adapter: adapter.map(Arc::new),
             fragmenter,
             reassembly: Arc::new(RwLock::new(BleReassemblyBuffer::default())),
             next_msg_id: AtomicU8::new(0),
-        };
-
-        // Load persisted sessions from disk if configured
-        if transport.config.session_persist_path.is_some() {
-            if let Err(e) = transport.load_sessions_from_disk().await {
-                tracing::warn!(error = %e, "Failed to load session cache from disk");
-            }
         }
+    }
 
-        Ok(transport)
+    /// Create a simulated BLE transport for deterministic non-hardware tests.
+    #[cfg(feature = "ble")]
+    #[doc(hidden)]
+    pub fn new_simulated(config: BleConfig, local_device_id: [u8; 6]) -> Self {
+        Self::from_parts(config, local_device_id, None)
     }
 
     /// Create a new BLE transport with custom configuration (non-BLE platforms)
@@ -1882,8 +1907,8 @@ impl BleTransport {
 
     /// Get reference to the btleplug adapter
     #[cfg(feature = "ble")]
-    pub fn adapter(&self) -> &Arc<Adapter> {
-        &self.adapter
+    pub fn adapter(&self) -> Option<&Arc<Adapter>> {
+        self.adapter.as_ref()
     }
 
     /// Estimate handshake time for BLE
@@ -1949,6 +1974,10 @@ impl BleTransport {
             return Err(TransportError::Offline);
         }
 
+        let adapter = self.adapter.clone().ok_or_else(|| TransportError::Other {
+            message: "BLE scanning is unavailable on simulated transport".to_string(),
+        })?;
+
         let mut state = self.scan_state.write().await;
         if *state == ScanState::Scanning {
             return Err(TransportError::Other {
@@ -1970,7 +1999,7 @@ impl BleTransport {
         };
 
         // Start the btleplug scan with our service filter
-        self.adapter
+        adapter
             .start_scan(service_filter)
             .await
             .map_err(|e| TransportError::Other {
@@ -1978,7 +2007,6 @@ impl BleTransport {
             })?;
 
         // Spawn background task to process scan events
-        let adapter = self.adapter.clone();
         let discovered_devices = self.discovered_devices.clone();
         let scan_event_tx = self.scan_event_tx.clone();
         let scan_state = self.scan_state.clone();
@@ -2133,12 +2161,14 @@ impl BleTransport {
         );
 
         // Stop the btleplug scan
-        self.adapter
-            .stop_scan()
-            .await
-            .map_err(|e| TransportError::Other {
-                message: format!("Failed to stop BLE scan: {e}"),
-            })?;
+        if let Some(adapter) = &self.adapter {
+            adapter
+                .stop_scan()
+                .await
+                .map_err(|e| TransportError::Other {
+                    message: format!("Failed to stop BLE scan: {e}"),
+                })?;
+        }
 
         // Transition to Idle (the background task will stop on its own)
         *state = ScanState::Idle;
@@ -2493,7 +2523,7 @@ impl BleTransport {
         use btleplug::api::Peripheral as _;
 
         // Get all peripherals from the adapter
-        let peripherals = self.adapter.peripherals().await.ok()?;
+        let peripherals = self.adapter.as_ref()?.peripherals().await.ok()?;
 
         for peripheral in peripherals {
             if peripheral.id().to_string() == id_str {
@@ -2513,11 +2543,9 @@ impl BleTransport {
         })
     }
 
-    /// Connect to a device in simulated mode (for testing)
+    /// Connect to a device in simulated mode.
     ///
     /// Creates a connection without requiring real btleplug hardware.
-    /// Only available in test builds.
-    #[cfg(test)]
     pub async fn connect_to_device_simulated(
         &self,
         device_id: [u8; 6],
@@ -2558,6 +2586,7 @@ impl BleTransport {
 
         // Create simulated connection
         let mut connection = BleConnection::new(device_id);
+        connection.set_simulated(true);
         connection.start_connecting().await?;
         connection
             .mark_connected(CharacteristicHandle::tx(), CharacteristicHandle::rx())
@@ -3288,18 +3317,15 @@ impl TransportProvider for BleTransport {
 
             // Check if this is a simulated connection (no peripheral - test mode)
             if conn_guard.peripheral().is_none() {
-                // Simulated connection - skip actual btleplug write
-                #[cfg(test)]
-                {
+                if conn_guard.is_simulated() {
+                    // Simulated connection - skip actual btleplug write
                     tracing::debug!(
                         device_id = ?device_id,
                         data_len = data.len(),
                         fragments = fragment_count,
                         "BLE fragmented write (simulated connection)"
                     );
-                }
-                #[cfg(not(test))]
-                {
+                } else {
                     self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(TransportError::Other {
                         message: "Peripheral not available".to_string(),

@@ -551,24 +551,80 @@ async fn test_ble_transport_connection() {
 /// Test send/receive data over BLE
 #[cfg(feature = "ble")]
 #[tokio::test]
-#[ignore = "requires BLE hardware and nearby ant-quic peer"]
 async fn test_ble_transport_data_transfer() {
-    let _transport = match BleTransport::new().await {
-        Ok(t) => t,
-        Err(e) => {
-            println!("Skipping test (no BLE hardware): {e}");
-            return;
-        }
-    };
+    const BLE_FRAGMENT_START: u8 = 0x01;
+    const BLE_FRAGMENT_END: u8 = 0x02;
 
-    // This test requires a connected peer
-    // Implementation would:
-    // 1. Connect to a peer
-    // 2. Send test data via TX characteristic
-    // 3. Receive response via RX notifications
-    // 4. Verify data integrity
+    fn ble_fragment(seq_num: u8, flags: u8, total: u8, msg_id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut fragment = vec![seq_num, flags, total, msg_id];
+        fragment.extend_from_slice(payload);
+        fragment
+    }
 
-    println!("BLE data transfer test placeholder - requires real peer");
+    let local_device_id = [0xA0, 0x3D, 0x7E, 0x9F, 0x00, 0x01];
+    let peer_device_id = [0x10, 0x22, 0x34, 0x46, 0x58, 0x6A];
+    let transport = BleTransport::new_simulated(BleConfig::default(), local_device_id);
+
+    let mut device = DiscoveredDevice::new(peer_device_id);
+    device.has_service = true;
+    transport.add_discovered_device(device).await;
+    transport
+        .connect_to_device_simulated(peer_device_id)
+        .await
+        .expect("simulated BLE connection should succeed");
+
+    let mut inbound = transport
+        .take_inbound_receiver()
+        .await
+        .expect("inbound receiver should be available");
+
+    let payload: Vec<u8> = (0..320).map(|i| (i % 251) as u8).collect();
+    let dest = TransportAddr::ble(peer_device_id, None);
+    transport
+        .send(&payload, &dest)
+        .await
+        .expect("simulated BLE send should succeed");
+
+    let split_at = 180;
+    let first_fragment = ble_fragment(0, BLE_FRAGMENT_START, 2, 7, &payload[..split_at]);
+    let second_fragment = ble_fragment(1, BLE_FRAGMENT_END, 2, 7, &payload[split_at..]);
+    let received_bytes = (first_fragment.len() + second_fragment.len()) as u64;
+
+    transport
+        .process_notification(peer_device_id, first_fragment)
+        .await
+        .expect("first BLE notification fragment should be accepted");
+    assert!(
+        inbound.try_recv().is_err(),
+        "incomplete fragmented BLE message should not be delivered"
+    );
+
+    transport
+        .process_notification(peer_device_id, second_fragment)
+        .await
+        .expect("second BLE notification fragment should be accepted");
+
+    let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv())
+        .await
+        .expect("inbound BLE datagram should arrive")
+        .expect("inbound BLE channel should remain open");
+
+    assert_eq!(received.data, payload);
+    assert!(matches!(
+        received.source,
+        TransportAddr::Ble {
+            device_id,
+            service_uuid: Some(ANT_QUIC_SERVICE_UUID),
+        } if device_id == peer_device_id
+    ));
+
+    let stats = transport.stats();
+    assert_eq!(stats.datagrams_sent, 1);
+    assert_eq!(stats.bytes_sent, payload.len() as u64);
+    assert_eq!(stats.datagrams_received, 1);
+    assert_eq!(stats.bytes_received, received_bytes);
+    assert_eq!(stats.send_errors, 0);
+    assert_eq!(stats.receive_errors, 0);
 }
 
 // ============================================================================
