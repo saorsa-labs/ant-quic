@@ -15,11 +15,15 @@
 
 use ant_quic::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair;
 use ant_quic::transport::TransportAddr;
-use ant_quic::{NatType, Node, NodeConfig, NodeStatus};
+use ant_quic::{NatType, Node, NodeConfig, NodeEvent, NodeStatus, PeerId};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::timeout;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
 fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
@@ -28,6 +32,30 @@ fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
     } else {
         addr
     }
+}
+
+fn spawn_accept_loop(node: Node) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while node.accept().await.is_some() {} })
+}
+
+async fn wait_for_peer_connected_event(
+    events: &mut broadcast::Receiver<NodeEvent>,
+    expected_peer_id: PeerId,
+) {
+    timeout(EVENT_TIMEOUT, async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("event channel should stay open while nodes are running");
+            if matches!(event, NodeEvent::PeerConnected { peer_id, .. } if peer_id == expected_peer_id)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for PeerConnected event");
 }
 
 // ============================================================================
@@ -315,21 +343,31 @@ mod event_tests {
 
     #[tokio::test]
     async fn test_node_subscribe() {
-        let node = Node::new().await.expect("Node should create");
+        let receiver = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("receiver node should create");
+        let receiver_addr =
+            normalize_local_addr(receiver.local_addr().expect("receiver should have address"));
+        let receiver_id = receiver.peer_id();
+        let accept_receiver = spawn_accept_loop(receiver.clone());
 
         // Subscribe to events
-        let mut events = node.subscribe();
+        let sender = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("sender node should create");
+        let mut events = sender.subscribe();
         println!("Subscribed to events");
 
-        // Events channel should be valid
-        // (In real usage, events would arrive from connections)
+        timeout(CONNECT_TIMEOUT, sender.connect_addr(receiver_addr))
+            .await
+            .expect("connect_addr should not time out")
+            .expect("connect_addr should succeed");
+        wait_for_peer_connected_event(&mut events, receiver_id).await;
 
         // Clean shutdown
-        node.shutdown().await;
-
-        // Channel should close after shutdown
-        let recv_result = events.try_recv();
-        println!("After shutdown, recv result: {:?}", recv_result);
+        sender.shutdown().await;
+        receiver.shutdown().await;
+        accept_receiver.abort();
     }
 
     #[tokio::test]
@@ -355,27 +393,46 @@ mod connection_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_connect_addr_method_exists() {
-        // This test validates the connect_addr API exists and can be called
-        // Actual connectivity is tested in E2E tests with proper network setup
-        let node = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+    async fn test_connect_addr_establishes_connection_and_payload() {
+        let receiver = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
-            .expect("Node should create");
+            .expect("receiver node should create");
+        let receiver_addr =
+            normalize_local_addr(receiver.local_addr().expect("receiver should have address"));
+        let receiver_id = receiver.peer_id();
+        let accept_receiver = spawn_accept_loop(receiver.clone());
 
-        let target_addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let sender = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("sender node should create");
+        let sender_id = sender.peer_id();
 
-        // Try to connect with a very short timeout - will fail since no one is listening
-        // but this validates the API works
-        let result = timeout(Duration::from_millis(100), node.connect_addr(target_addr)).await;
+        let conn = timeout(CONNECT_TIMEOUT, sender.connect_addr(receiver_addr))
+            .await
+            .expect("connect_addr should not time out")
+            .expect("connect_addr should succeed");
+        assert_eq!(conn.peer_id, receiver_id);
 
-        // Either timeout or connection error is expected (no listener at that address)
-        match result {
-            Ok(Ok(_)) => println!("Unexpectedly connected"),
-            Ok(Err(e)) => println!("Connection error (expected): {}", e),
-            Err(_) => println!("Timeout (expected)"),
-        }
+        sender
+            .send(&receiver_id, b"simple node api payload")
+            .await
+            .expect("send should succeed");
+        let (peer_id, payload) = timeout(CONNECT_TIMEOUT, receiver.recv())
+            .await
+            .expect("recv should not time out")
+            .expect("recv should succeed");
+        assert_eq!(peer_id, sender_id);
+        assert_eq!(payload, b"simple node api payload");
 
-        node.shutdown().await;
+        let peers = sender.connected_peers().await;
+        assert!(
+            peers.iter().any(|peer| peer.peer_id == receiver_id),
+            "sender should report receiver as connected"
+        );
+
+        sender.shutdown().await;
+        receiver.shutdown().await;
+        accept_receiver.abort();
     }
 
     #[tokio::test]
@@ -404,20 +461,33 @@ mod connection_tests {
         let node1 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .expect("Node 1 should create");
-        let node2 = Node::new().await.expect("Node 2 should create");
+        let node2 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("Node 2 should create");
+        let accept_node1 = spawn_accept_loop(node1.clone());
 
-        let node1_addr = node1.local_addr().expect("Should have address");
+        let node1_addr = normalize_local_addr(node1.local_addr().expect("Should have address"));
+        let node1_id = node1.peer_id();
 
         // Dynamically add node1 as peer of node2
-        let _ = node2.add_peer(node1_addr).await;
+        node2.add_peer(node1_addr).await;
         println!("Added {} as known peer", node1_addr);
 
-        // Get connected peers (should be empty until actual connection)
+        let connected = timeout(CONNECT_TIMEOUT, node2.connect_known_peers())
+            .await
+            .expect("connect_known_peers should not time out")
+            .expect("connect_known_peers should succeed");
+        assert_eq!(connected, 1, "node2 should connect to its added peer");
+
         let peers = node2.connected_peers().await;
-        println!("Connected peers: {:?}", peers);
+        assert!(
+            peers.iter().any(|peer| peer.peer_id == node1_id),
+            "node2 should report dynamically added peer as connected"
+        );
 
         node1.shutdown().await;
         node2.shutdown().await;
+        accept_node1.abort();
     }
 }
 
