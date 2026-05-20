@@ -1174,6 +1174,40 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn socket_addrs_csv(addresses: &[SocketAddr]) -> String {
+    addresses
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn mdns_service_advertised_json(
+    service: &str,
+    namespace: Option<&str>,
+    instance_fullname: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "mdns_service_advertised",
+        "service": service,
+        "namespace": namespace,
+        "instance_fullname": instance_fullname,
+    })
+}
+
+fn mdns_auto_connect_failed_json(
+    fullname: &str,
+    addresses: &[SocketAddr],
+    error: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "mdns_auto_connect_failed",
+        "fullname": fullname,
+        "addresses": socket_addrs_csv(addresses),
+        "error": error,
+    })
+}
+
 async fn handle_event_with_state(
     event: &P2pEvent,
     stats: &RuntimeStats,
@@ -1364,13 +1398,8 @@ async fn handle_event_with_state(
         } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_service_advertised","service":"{}","namespace":{},"instance_fullname":"{}"}}"#,
-                    service,
-                    namespace
-                        .as_ref()
-                        .map(|value| format!("\"{}\"", value))
-                        .unwrap_or_else(|| "null".to_string()),
-                    instance_fullname
+                    "{}",
+                    mdns_service_advertised_json(service, namespace.as_deref(), instance_fullname,)
                 );
             } else {
                 info!(
@@ -1385,13 +1414,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerDiscovered { peer } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_discovered","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    peer.addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_discovered",
+                        "fullname": peer.fullname,
+                        "addresses": socket_addrs_csv(&peer.addresses),
+                    })
                 );
             } else {
                 info!(
@@ -1403,13 +1431,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerUpdated { peer } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_updated","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    peer.addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_updated",
+                        "fullname": peer.fullname,
+                        "addresses": socket_addrs_csv(&peer.addresses),
+                    })
                 );
             } else {
                 info!(
@@ -1421,8 +1448,11 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerRemoved { peer } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_removed","fullname":"{}"}}"#,
-                    peer.fullname
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_removed",
+                        "fullname": peer.fullname,
+                    })
                 );
             } else {
                 info!("mDNS peer removed: {}", peer.fullname);
@@ -1431,13 +1461,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerEligible { peer } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_eligible","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    peer.addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_eligible",
+                        "fullname": peer.fullname,
+                        "addresses": socket_addrs_csv(&peer.addresses),
+                    })
                 );
             } else {
                 info!(
@@ -1449,8 +1478,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerIneligible { peer, reason } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_ineligible","fullname":"{}","reason":"{}"}}"#,
-                    peer.fullname, reason
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_ineligible",
+                        "fullname": peer.fullname,
+                        "reason": reason,
+                    })
                 );
             } else {
                 info!("mDNS peer ineligible: {} ({})", peer.fullname, reason);
@@ -1459,8 +1492,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsPeerApprovalRequired { peer, reason } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_peer_approval_required","fullname":"{}","reason":"{}"}}"#,
-                    peer.fullname, reason
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_peer_approval_required",
+                        "fullname": peer.fullname,
+                        "reason": reason,
+                    })
                 );
             } else {
                 info!(
@@ -1472,13 +1509,12 @@ async fn handle_event_with_state(
         P2pEvent::MdnsAutoConnectAttempted { peer, addresses } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_auto_connect_attempted","fullname":"{}","addresses":"{}"}}"#,
-                    peer.fullname,
-                    addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_auto_connect_attempted",
+                        "fullname": peer.fullname,
+                        "addresses": socket_addrs_csv(addresses),
+                    })
                 );
             } else {
                 info!(
@@ -1494,10 +1530,13 @@ async fn handle_event_with_state(
         } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_auto_connect_succeeded","fullname":"{}","peer_id":"{}","remote_addr":"{}"}}"#,
-                    peer.fullname,
-                    hex::encode(authenticated_peer_id.0),
-                    remote_addr
+                    "{}",
+                    serde_json::json!({
+                        "event": "mdns_auto_connect_succeeded",
+                        "fullname": peer.fullname,
+                        "peer_id": hex::encode(authenticated_peer_id.0),
+                        "remote_addr": remote_addr.to_string(),
+                    })
                 );
             } else {
                 info!(
@@ -1515,14 +1554,8 @@ async fn handle_event_with_state(
         } => {
             if json {
                 println!(
-                    r#"{{"event":"mdns_auto_connect_failed","fullname":"{}","addresses":"{}","error":"{}"}}"#,
-                    peer.fullname,
-                    addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    error
+                    "{}",
+                    mdns_auto_connect_failed_json(&peer.fullname, addresses, error)
                 );
             } else {
                 warn!(
@@ -2260,5 +2293,51 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn mdns_service_advertised_json_escapes_user_strings() -> Result<(), serde_json::Error> {
+        let service = "ant\"quic\\svc";
+        let namespace = "work\"space\\line\nnext";
+        let instance_fullname = "node\"one\\._ant-quic._udp.local.";
+        let line =
+            mdns_service_advertised_json(service, Some(namespace), instance_fullname).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&line)?;
+
+        let expected_event = serde_json::json!("mdns_service_advertised");
+        let expected_service = serde_json::json!(service);
+        let expected_namespace = serde_json::json!(namespace);
+        let expected_instance_fullname = serde_json::json!(instance_fullname);
+
+        assert_eq!(parsed.get("event"), Some(&expected_event));
+        assert_eq!(parsed.get("service"), Some(&expected_service));
+        assert_eq!(parsed.get("namespace"), Some(&expected_namespace));
+        assert_eq!(
+            parsed.get("instance_fullname"),
+            Some(&expected_instance_fullname)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn mdns_auto_connect_failed_json_escapes_network_strings() -> Result<(), serde_json::Error> {
+        let fullname = "peer\"name\\._ant-quic._udp.local.";
+        let error = "route failed: \"no path\"\\retry\nlater";
+        let addresses = [SocketAddr::from(([127, 0, 0, 1], 9000))];
+        let line = mdns_auto_connect_failed_json(fullname, &addresses, error).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&line)?;
+
+        let expected_event = serde_json::json!("mdns_auto_connect_failed");
+        let expected_fullname = serde_json::json!(fullname);
+        let expected_addresses = serde_json::json!("127.0.0.1:9000");
+        let expected_error = serde_json::json!(error);
+
+        assert_eq!(parsed.get("event"), Some(&expected_event));
+        assert_eq!(parsed.get("fullname"), Some(&expected_fullname));
+        assert_eq!(parsed.get("addresses"), Some(&expected_addresses));
+        assert_eq!(parsed.get("error"), Some(&expected_error));
+
+        Ok(())
     }
 }
