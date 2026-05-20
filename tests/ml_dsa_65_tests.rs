@@ -126,7 +126,7 @@ mod ml_dsa_65_tests {
     fn test_ml_dsa_65_deterministic_signing() {
         // Test that signing is deterministic (same message + key = same signature)
         let ml_dsa = MlDsa65::new();
-        let (_, secret_key) = ml_dsa
+        let (public_key, secret_key) = ml_dsa
             .generate_keypair()
             .expect("Failed to generate keypair");
 
@@ -141,12 +141,16 @@ mod ml_dsa_65_tests {
         // Note: ML-DSA can be either deterministic or randomized
         // This test documents the behavior - adjust based on implementation
         // For now, we'll test that both signatures are valid
-        let ml_dsa2 = MlDsa65::new();
-        let (_public_key, _) = ml_dsa2
-            .generate_keypair()
-            .expect("Failed to generate verification keypair");
+        let is_valid1 = ml_dsa
+            .verify(&public_key, message, &signature1)
+            .expect("Failed to verify signature 1");
+        let is_valid2 = ml_dsa
+            .verify(&public_key, message, &signature2)
+            .expect("Failed to verify signature 2");
 
         // Both signatures should be valid regardless of determinism
+        assert!(is_valid1, "First signature should be valid");
+        assert!(is_valid2, "Second signature should be valid");
         assert_eq!(signature1.as_bytes().len(), ML_DSA_65_SIGNATURE_SIZE);
         assert_eq!(signature2.as_bytes().len(), ML_DSA_65_SIGNATURE_SIZE);
     }
