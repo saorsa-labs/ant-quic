@@ -22,6 +22,7 @@ use tracing::info;
 
 const OBSERVED_ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
 const NO_OBSERVED_ADDRESS_GRACE: Duration = Duration::from_millis(300);
+const CONCURRENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Ensure crypto provider is installed for tests
 fn ensure_crypto_provider() {
@@ -322,27 +323,28 @@ async fn test_concurrent_connections() {
     let server_addr = server.local_addr().unwrap();
 
     // Server accepts multiple connections
-    tokio::spawn(async move {
-        let mut count = 0;
-        while let Some(incoming) = server.accept().await {
-            count += 1;
-            let id = count;
-            tokio::spawn(async move {
-                let connection = incoming.await.unwrap();
-                info!(
-                    "Server accepted connection {} from {}",
-                    id,
-                    connection.remote_address()
-                );
-
-                // Keep connections alive
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            });
-
-            if count >= 3 {
-                break;
-            }
+    let server_handle = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        for id in 1..=3 {
+            let incoming = tokio::time::timeout(CONCURRENT_ACCEPT_TIMEOUT, server.accept())
+                .await
+                .expect("server timed out waiting for incoming connection")
+                .expect("server endpoint closed before accepting all connections");
+            let connection = tokio::time::timeout(CONCURRENT_ACCEPT_TIMEOUT, incoming)
+                .await
+                .expect("server timed out establishing incoming connection")
+                .unwrap();
+            info!(
+                "Server accepted connection {} from {}",
+                id,
+                connection.remote_address()
+            );
+            connections.push(connection);
         }
+
+        let accepted = connections.len();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        accepted
     });
 
     // Multiple clients connect
@@ -361,11 +363,13 @@ async fn test_concurrent_connections() {
         client_config.transport_config(address_discovery_transport_config());
         client.set_default_client_config(client_config);
 
-        let connection = client
-            .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
+        let connection = tokio::time::timeout(
+            CONCURRENT_ACCEPT_TIMEOUT,
+            client.connect(server_addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("client timed out connecting to server")
+        .unwrap();
 
         info!("Client {} connected", i);
         clients.push(connection);
@@ -373,6 +377,11 @@ async fn test_concurrent_connections() {
 
     // Verify all connections established
     assert_eq!(clients.len(), 3);
+    let accepted = tokio::time::timeout(CONCURRENT_ACCEPT_TIMEOUT, server_handle)
+        .await
+        .expect("server accept task timed out")
+        .unwrap();
+    assert_eq!(accepted, 3);
 
     info!("✓ Concurrent connections test completed");
 }
