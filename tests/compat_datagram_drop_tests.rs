@@ -216,9 +216,11 @@ async fn test_datagram_no_drop_when_reading() {
 
     let server_conn = accept_handle.await.expect("accept task failed");
 
-    // Send and immediately read datagrams - should not cause drops
-    let num_datagrams = 20;
+    // Send and immediately read datagrams - should not cause drops.
+    // Total traffic exceeds the 1024-byte receive buffer, so success depends on draining.
+    let num_datagrams = 40;
     let datagram_size = 50;
+    assert!(num_datagrams * datagram_size > 1024);
     let mut received_count = 0;
 
     for i in 0..num_datagrams {
