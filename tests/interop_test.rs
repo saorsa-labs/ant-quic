@@ -86,34 +86,88 @@ async fn test_endpoint_creation() {
 }
 
 #[test]
-#[ignore = "Requires Docker infrastructure setup"]
 fn test_docker_config_exists() {
     // Verify Docker configuration files exist
-    let docker_compose = Path::new("docker/docker-compose.yml");
-    let nat_script = Path::new("docker/scripts/nat-gateway-entrypoint.sh");
-    let network_config = Path::new("docker/configs/network-conditions.yaml");
+    let docker_root = Path::new("docker/nat-emulation");
+    let docker_compose = docker_root.join("docker-compose.yml");
 
-    assert!(docker_compose.exists(), "docker-compose.yml not found");
-    assert!(nat_script.exists(), "NAT gateway script not found");
     assert!(
-        network_config.exists(),
-        "Network conditions config not found"
+        docker_compose.exists(),
+        "{} not found",
+        docker_compose.display()
     );
+
+    for nat_type in [
+        "nat-cgnat",
+        "nat-fullcone",
+        "nat-hairpin",
+        "nat-portrestricted",
+        "nat-restricted",
+        "nat-symmetric",
+    ] {
+        let nat_dir = docker_root.join(nat_type);
+        let dockerfile = nat_dir.join("Dockerfile");
+        let entrypoint = nat_dir.join("entrypoint.sh");
+
+        assert!(dockerfile.exists(), "{} not found", dockerfile.display());
+        assert!(entrypoint.exists(), "{} not found", entrypoint.display());
+    }
 }
 
 #[test]
-#[ignore = "Requires public endpoints documentation"]
-fn test_public_endpoints_doc() {
-    // Verify public endpoints documentation exists
-    let endpoints_doc = Path::new("docs/public-quic-endpoints.md");
+fn test_public_endpoints_config() -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(serde::Deserialize)]
+    struct PublicEndpoints {
+        endpoints: Vec<PublicEndpoint>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PublicEndpoint {
+        name: String,
+        host: String,
+        port: u16,
+        protocols: Vec<String>,
+    }
+
+    // Verify public endpoints configuration exists and matches the current schema.
+    let endpoints_doc = Path::new("docs/public-quic-endpoints.yaml");
     assert!(
         endpoints_doc.exists(),
-        "Public endpoints documentation not found"
+        "{} not found",
+        endpoints_doc.display()
     );
 
-    // Verify it contains expected content
-    let content = std::fs::read_to_string(endpoints_doc).unwrap();
-    assert!(content.contains("Google"));
-    assert!(content.contains("Cloudflare"));
-    assert!(content.contains("Picoquic"));
+    let content = std::fs::read_to_string(endpoints_doc)?;
+    let endpoints: PublicEndpoints = serde_yaml::from_str(&content)?;
+
+    assert!(
+        !endpoints.endpoints.is_empty(),
+        "public endpoints must not be empty"
+    );
+
+    for endpoint in &endpoints.endpoints {
+        assert!(
+            !endpoint.name.trim().is_empty(),
+            "endpoint names must be non-empty strings"
+        );
+        assert!(
+            !endpoint.host.trim().is_empty(),
+            "endpoint hosts must be non-empty strings"
+        );
+        assert_ne!(endpoint.port, 0, "endpoint ports must be non-zero");
+        assert!(
+            !endpoint.protocols.is_empty(),
+            "endpoint protocols must not be empty"
+        );
+    }
+
+    let endpoint_names: std::collections::BTreeSet<_> = endpoints
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.name.as_str())
+        .collect();
+    assert!(endpoint_names.contains("cloudflare-quic"));
+    assert!(endpoint_names.contains("google"));
+
+    Ok(())
 }
