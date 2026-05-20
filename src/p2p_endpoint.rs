@@ -88,8 +88,8 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
-    IncomingAckBidiStream, NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
-    TraversalFailureReason,
+    ConstrainedEventWithAddr, IncomingAckBidiStream, NatTraversalEndpoint, NatTraversalError,
+    NatTraversalEvent, PeerId, TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{
@@ -3180,6 +3180,12 @@ impl P2pEndpoint {
     #[doc(hidden)]
     pub fn nat_traversal_transport_registry(&self) -> Option<&Arc<TransportRegistry>> {
         self.inner.transport_registry()
+    }
+
+    /// Inject a constrained transport event into the endpoint's production event path.
+    #[doc(hidden)]
+    pub fn inject_constrained_event_for_testing(&self, event: ConstrainedEventWithAddr) -> bool {
+        self.inner.constrained_event_tx().send(event).is_ok()
     }
 
     /// Get the ML-DSA-65 public key bytes (1952 bytes)

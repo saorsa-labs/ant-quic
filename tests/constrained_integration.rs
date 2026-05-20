@@ -412,24 +412,44 @@ fn test_udp_synthetic_addr_passthrough() {
 async fn test_constrained_connection_registration() {
     use ant_quic::constrained::ConnectionId;
 
-    // Create a mock PeerId
-    let peer_id = ant_quic::PeerId([0x42; 32]);
     let conn_id = ConnectionId::new(123);
+    let remote_addr = constrained_test_ble_addr(0x42);
+    let endpoint = constrained_test_endpoint().await;
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    let mut events = endpoint.subscribe();
 
-    // Since we can't easily create a full P2pEndpoint in tests,
-    // verify the ConnectionId type works as expected
-    assert_eq!(conn_id.value(), 123);
+    assert!(
+        endpoint.inject_constrained_event_for_testing(ConstrainedEventWithAddr {
+            event: EngineEvent::ConnectionEstablished {
+                connection_id: conn_id,
+            },
+            remote_addr: remote_addr.clone(),
+        })
+    );
 
-    // Verify ConnectionId can be copied (needed for HashMap storage)
-    let conn_id_copy = conn_id;
-    assert_eq!(conn_id.value(), conn_id_copy.value());
+    let connected = wait_for_peer_connected(&mut events, &remote_addr).await;
+    assert!(
+        connected.is_some(),
+        "constrained PeerConnected event should arrive"
+    );
+    let Some((peer_id, side)) = connected else {
+        endpoint.shutdown().await;
+        return;
+    };
+    assert_eq!(side, ant_quic::Side::Client);
+    assert!(endpoint.has_constrained_connection(&peer_id).await);
+    assert_eq!(
+        endpoint.get_constrained_connection_id(&peer_id).await,
+        Some(conn_id)
+    );
+    assert_eq!(
+        endpoint.peer_id_from_constrained_conn(conn_id).await,
+        Some(peer_id)
+    );
 
-    // Verify PeerId can be used as HashMap key
-    use std::collections::HashMap;
-    let mut map: HashMap<ant_quic::PeerId, ConnectionId> = HashMap::new();
-    map.insert(peer_id, conn_id);
-    assert!(map.contains_key(&peer_id));
-    assert_eq!(map.get(&peer_id), Some(&conn_id));
+    endpoint.shutdown().await;
 }
 
 // ============================================================================
@@ -439,6 +459,99 @@ async fn test_constrained_connection_registration() {
 
 use ant_quic::constrained::EngineEvent;
 use ant_quic::nat_traversal_api::ConstrainedEventWithAddr;
+
+fn constrained_test_ble_addr(seed: u8) -> TransportAddr {
+    TransportAddr::Ble {
+        device_id: [seed, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        service_uuid: None,
+    }
+}
+
+async fn constrained_test_endpoint() -> Option<ant_quic::P2pEndpoint> {
+    let bind_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+    let config = ant_quic::P2pConfig::builder()
+        .bind_addr(bind_addr)
+        .port_mapping_enabled(false)
+        .mdns_enabled(false)
+        .build();
+    let Ok(config) = config else {
+        return None;
+    };
+
+    ant_quic::P2pEndpoint::new(config).await.ok()
+}
+
+fn constrained_test_socket_addr(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+}
+
+async fn wait_for_peer_connected(
+    events: &mut tokio::sync::broadcast::Receiver<ant_quic::p2p_endpoint::P2pEvent>,
+    remote_addr: &TransportAddr,
+) -> Option<(ant_quic::PeerId, ant_quic::Side)> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(ant_quic::p2p_endpoint::P2pEvent::PeerConnected {
+                    peer_id,
+                    addr,
+                    side,
+                    ..
+                }) if &addr == remote_addr => break Some((peer_id, side)),
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn wait_for_peer_disconnected(
+    events: &mut tokio::sync::broadcast::Receiver<ant_quic::p2p_endpoint::P2pEvent>,
+    peer_id: ant_quic::PeerId,
+) -> bool {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(ant_quic::p2p_endpoint::P2pEvent::PeerDisconnected {
+                    peer_id: observed_peer_id,
+                    ..
+                }) if observed_peer_id == peer_id => break true,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(found) => found,
+        Err(_) => false,
+    }
+}
+
+async fn wait_for_data_received(
+    events: &mut tokio::sync::broadcast::Receiver<ant_quic::p2p_endpoint::P2pEvent>,
+    peer_id: ant_quic::PeerId,
+) -> Option<usize> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(ant_quic::p2p_endpoint::P2pEvent::DataReceived {
+                    peer_id: observed_peer_id,
+                    bytes,
+                }) if observed_peer_id == peer_id => break Some(bytes),
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 /// Test that ConstrainedEventWithAddr can be created and contains correct data
 #[test]
@@ -641,78 +754,132 @@ fn test_registry_provider_management() {
 }
 
 /// Test peer registration lookup methods
-#[test]
-fn test_constrained_connection_bidirectional_lookup() {
+#[tokio::test]
+async fn test_constrained_connection_bidirectional_lookup() {
     use ant_quic::constrained::ConnectionId;
-    use std::collections::HashMap;
 
-    // Simulate the bidirectional maps used in P2pEndpoint
-    let peer_id = ant_quic::PeerId([0x42; 32]);
     let conn_id = ConnectionId::new(100);
-    let addr = TransportAddr::Ble {
-        device_id: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
-        service_uuid: None,
+    let remote_addr = constrained_test_ble_addr(0xAA);
+    let endpoint = constrained_test_endpoint().await;
+    let Some(endpoint) = endpoint else {
+        return;
     };
+    let mut events = endpoint.subscribe();
 
-    // Forward map: PeerId → ConnectionId
-    let mut constrained_connections: HashMap<ant_quic::PeerId, ConnectionId> = HashMap::new();
-    constrained_connections.insert(peer_id, conn_id);
+    assert!(
+        endpoint.inject_constrained_event_for_testing(ConstrainedEventWithAddr {
+            event: EngineEvent::ConnectionAccepted {
+                connection_id: conn_id,
+                remote_addr: constrained_test_socket_addr(9100),
+            },
+            remote_addr: remote_addr.clone(),
+        })
+    );
 
-    // Reverse map: ConnectionId → (PeerId, TransportAddr)
-    let mut constrained_peer_addrs: HashMap<ConnectionId, (ant_quic::PeerId, TransportAddr)> =
-        HashMap::new();
-    constrained_peer_addrs.insert(conn_id, (peer_id, addr.clone()));
+    let connected = wait_for_peer_connected(&mut events, &remote_addr).await;
+    assert!(
+        connected.is_some(),
+        "constrained PeerConnected event should arrive"
+    );
+    let Some((peer_id, side)) = connected else {
+        endpoint.shutdown().await;
+        return;
+    };
+    assert_eq!(side, ant_quic::Side::Server);
+    assert_eq!(
+        endpoint.get_constrained_connection_id(&peer_id).await,
+        Some(conn_id)
+    );
+    assert_eq!(
+        endpoint.peer_id_from_constrained_conn(conn_id).await,
+        Some(peer_id)
+    );
 
-    // Test forward lookup: PeerId → ConnectionId
-    assert_eq!(constrained_connections.get(&peer_id), Some(&conn_id));
+    assert!(
+        endpoint.inject_constrained_event_for_testing(ConstrainedEventWithAddr {
+            event: EngineEvent::ConnectionClosed {
+                connection_id: conn_id,
+            },
+            remote_addr,
+        })
+    );
 
-    // Test reverse lookup: ConnectionId → PeerId
-    let (found_peer_id, found_addr) = constrained_peer_addrs.get(&conn_id).unwrap();
-    assert_eq!(*found_peer_id, peer_id);
-    assert_eq!(*found_addr, addr);
+    assert!(
+        wait_for_peer_disconnected(&mut events, peer_id).await,
+        "constrained PeerDisconnected event should arrive"
+    );
+    assert_eq!(endpoint.constrained_connection_count().await, 0);
+    assert_eq!(endpoint.peer_id_from_constrained_conn(conn_id).await, None);
+
+    endpoint.shutdown().await;
 }
 
 /// Test that unified DataReceived event structure works for both QUIC and constrained
-#[test]
-fn test_unified_data_received_event() {
-    use ant_quic::p2p_endpoint::P2pEvent;
+#[tokio::test]
+async fn test_unified_data_received_event() {
+    use ant_quic::constrained::ConnectionId;
 
-    let peer_id = ant_quic::PeerId([0x55; 32]);
+    let conn_id = ConnectionId::new(512);
+    let remote_addr = constrained_test_ble_addr(0x55);
+    let endpoint = constrained_test_endpoint().await;
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    let mut events = endpoint.subscribe();
 
-    // QUIC-style DataReceived
-    let quic_event = P2pEvent::DataReceived {
-        peer_id,
-        bytes: 1024,
+    assert!(
+        endpoint.inject_constrained_event_for_testing(ConstrainedEventWithAddr {
+            event: EngineEvent::ConnectionEstablished {
+                connection_id: conn_id,
+            },
+            remote_addr: remote_addr.clone(),
+        })
+    );
+    let connected = wait_for_peer_connected(&mut events, &remote_addr).await;
+    assert!(
+        connected.is_some(),
+        "constrained PeerConnected event should arrive"
+    );
+    let Some((peer_id, _)) = connected else {
+        endpoint.shutdown().await;
+        return;
     };
 
-    match quic_event {
-        P2pEvent::DataReceived {
-            peer_id: p,
-            bytes: b,
-        } => {
-            assert_eq!(p, peer_id);
-            assert_eq!(b, 1024);
-        }
-        _ => panic!("Expected DataReceived"),
-    }
+    let test_data = b"endpoint-level constrained receive".to_vec();
+    assert!(
+        endpoint.inject_constrained_event_for_testing(ConstrainedEventWithAddr {
+            event: EngineEvent::DataReceived {
+                connection_id: conn_id,
+                data: test_data.clone(),
+            },
+            remote_addr,
+        })
+    );
 
-    // Same event structure can be used for constrained data
-    // (after peer registration, we emit DataReceived instead of ConstrainedDataReceived)
-    let constrained_event = P2pEvent::DataReceived {
-        peer_id, // Derived from registered constrained connection
-        bytes: 512,
+    let received = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.recv()).await;
+    assert!(
+        received.is_ok(),
+        "constrained data should reach endpoint recv"
+    );
+    let Ok(received) = received else {
+        endpoint.shutdown().await;
+        return;
     };
+    assert!(received.is_ok(), "endpoint recv should succeed");
+    let Ok((received_peer_id, received_data)) = received else {
+        endpoint.shutdown().await;
+        return;
+    };
+    assert_eq!(received_peer_id, peer_id);
+    assert_eq!(received_data, test_data);
+    let received_bytes = wait_for_data_received(&mut events, peer_id).await;
+    assert!(
+        received_bytes.is_some(),
+        "constrained DataReceived event should arrive"
+    );
+    assert_eq!(received_bytes, Some(test_data.len()));
 
-    match constrained_event {
-        P2pEvent::DataReceived {
-            peer_id: p,
-            bytes: b,
-        } => {
-            assert_eq!(p, peer_id);
-            assert_eq!(b, 512);
-        }
-        _ => panic!("Expected DataReceived"),
-    }
+    endpoint.shutdown().await;
 }
 
 /// Test that UdpTransport::bind_for_quinn creates shared socket
