@@ -24,7 +24,9 @@ async fn peer_shutdown_cleans_up_remote_view_without_waiting_for_reaper() {
     b.shutdown().await;
 
     wait_until(Duration::from_secs(2), || {
-        a.get_quic_connection(&b_id).ok().flatten().is_none()
+        a.get_quic_connection(&b_id)
+            .expect("connection lookup during cleanup wait")
+            .is_none()
     })
     .await;
 
