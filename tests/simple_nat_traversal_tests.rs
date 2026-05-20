@@ -1,144 +1,162 @@
-//! Simple RFC Compliance Tests for NAT Traversal
+//! Simple RFC compliance tests for NAT traversal.
 //!
-//! These tests verify basic compliance with draft-seemann-quic-nat-traversal-02.
+//! These tests verify draft-seemann-quic-nat-traversal-02 wire compatibility
+//! through the crate's production NAT traversal frame codecs.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::{
+    error::Error,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+};
 
-use ant_quic::VarInt;
+use ant_quic::{
+    VarInt,
+    coding::BufExt,
+    frame::nat_traversal_unified::{AddAddress, PunchMeNow, RemoveAddress},
+};
+use bytes::{Buf, Bytes, BytesMut};
 
-// Frame type constants from the RFC
-const FRAME_TYPE_ADD_ADDRESS_IPV4: u64 = 0x3d7e90;
-const FRAME_TYPE_ADD_ADDRESS_IPV6: u64 = 0x3d7e91;
-const FRAME_TYPE_PUNCH_ME_NOW_IPV4: u64 = 0x3d7e92;
-const FRAME_TYPE_PUNCH_ME_NOW_IPV6: u64 = 0x3d7e93;
-const FRAME_TYPE_REMOVE_ADDRESS: u64 = 0x3d7e94;
+fn payload_after_frame_type(
+    encoded: BytesMut,
+    expected_frame_type: u64,
+) -> Result<Bytes, Box<dyn Error>> {
+    let mut payload = encoded.freeze();
+    let actual_frame_type = payload.get_var()?;
 
-/// Test round cancellation logic according to RFC Section 4.4
-#[test]
-fn test_round_cancellation_logic() {
-    let round1 = VarInt::from_u32(5);
-    let round2 = VarInt::from_u32(10);
-    let round3 = VarInt::from_u32(5);
+    assert_eq!(actual_frame_type, expected_frame_type);
 
-    // Test that higher round is detected correctly
-    assert!(
-        round2 > round1,
-        "Higher round should be greater than lower round"
-    );
-    assert!(
-        round2 > round3,
-        "Higher round should be greater than equal round"
-    );
-
-    // Test that cancellation should happen for higher rounds
-    assert!(
-        round2 > round1,
-        "Round cancellation should trigger for higher rounds"
-    );
-
-    // Test that cancellation should NOT happen for lower or equal rounds
-    assert!(
-        round1 <= round2,
-        "Round cancellation should NOT trigger for lower rounds"
-    );
-    assert!(
-        round1 <= round2,
-        "Lower round should not trigger cancellation"
-    );
-    assert!(
-        round1 <= round3,
-        "Equal round should not trigger cancellation"
-    );
+    Ok(payload)
 }
 
-/// Test sequence number validation
 #[test]
-fn test_sequence_number_validation() {
-    let valid_sequences = vec![
-        VarInt::from_u32(0),        // Zero is valid
-        VarInt::from_u32(1),        // Small positive
-        VarInt::from_u32(1000),     // Medium positive
-        VarInt::from_u32(u32::MAX), // Max u32
-        VarInt::from_u64(4611686018427387903u64).expect("Large u64 should be valid"), // Large u64
-    ];
+fn add_address_ipv4_uses_production_rfc_codec() -> Result<(), Box<dyn Error>> {
+    let sequence = VarInt::from_u32(42);
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 10), 4433));
+    let frame = AddAddress::new(sequence, address);
 
-    for seq in valid_sequences {
-        let _ = seq.into_inner();
-    }
+    let mut encoded = BytesMut::new();
+    frame.try_encode_rfc(&mut encoded)?;
 
-    // Test sequence number ordering
-    let seq1 = VarInt::from_u32(1);
-    let seq2 = VarInt::from_u32(2);
-    let seq100 = VarInt::from_u32(100);
+    let mut payload = payload_after_frame_type(encoded, 0x3d7e90)?;
+    let decoded = AddAddress::decode_rfc(&mut payload, false)?;
 
-    assert!(seq2 > seq1, "Higher sequence should be greater");
-    assert!(seq100 > seq2, "Much higher sequence should be greater");
-    assert!(seq1 <= seq2, "Lower sequence should not be greater");
+    assert_eq!(decoded.sequence, sequence);
+    assert_eq!(decoded.address, address);
+    assert!(!payload.has_remaining());
+
+    Ok(())
 }
 
-/// Test frame type constants are exactly as specified in RFC
 #[test]
-fn test_frame_type_constants() {
-    assert_eq!(FRAME_TYPE_ADD_ADDRESS_IPV4, 0x3d7e90);
-    assert_eq!(FRAME_TYPE_ADD_ADDRESS_IPV6, 0x3d7e91);
-    assert_eq!(FRAME_TYPE_PUNCH_ME_NOW_IPV4, 0x3d7e92);
-    assert_eq!(FRAME_TYPE_PUNCH_ME_NOW_IPV6, 0x3d7e93);
-    assert_eq!(FRAME_TYPE_REMOVE_ADDRESS, 0x3d7e94);
+fn add_address_ipv6_uses_production_rfc_codec() -> Result<(), Box<dyn Error>> {
+    let sequence = VarInt::from_u32(43);
+    let address = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::new(0x2001, 0x0db8, 0, 1, 0, 0, 0, 10),
+        4434,
+        0,
+        0,
+    ));
+    let frame = AddAddress::new(sequence, address);
 
-    // Verify IPv4/IPv6 LSB pattern
-    assert_eq!(
-        FRAME_TYPE_ADD_ADDRESS_IPV4 & 1,
-        0,
-        "IPv4 frame type should have LSB = 0"
-    );
-    assert_eq!(
-        FRAME_TYPE_ADD_ADDRESS_IPV6 & 1,
-        1,
-        "IPv6 frame type should have LSB = 1"
-    );
-    assert_eq!(
-        FRAME_TYPE_PUNCH_ME_NOW_IPV4 & 1,
-        0,
-        "IPv4 frame type should have LSB = 0"
-    );
-    assert_eq!(
-        FRAME_TYPE_PUNCH_ME_NOW_IPV6 & 1,
-        1,
-        "IPv6 frame type should have LSB = 1"
-    );
-    assert_eq!(
-        FRAME_TYPE_REMOVE_ADDRESS & 1,
-        0,
-        "REMOVE_ADDRESS frame type should have LSB = 0"
-    );
+    let mut encoded = BytesMut::new();
+    frame.try_encode_rfc(&mut encoded)?;
+
+    let mut payload = payload_after_frame_type(encoded, 0x3d7e91)?;
+    let decoded = AddAddress::decode_rfc(&mut payload, true)?;
+
+    assert_eq!(decoded.sequence, sequence);
+    assert_eq!(decoded.address, address);
+    assert!(!payload.has_remaining());
+
+    Ok(())
 }
 
-/// Test VarInt edge cases for RFC compliance
 #[test]
-fn test_varint_edge_cases() {
-    let test_values = vec![
-        0u64,
-        1u64,
-        63u64,
-        64u64,
-        16383u64,
-        16384u64,
-        1073741823u64,
-        1073741824u64,
-        4611686018427387903u64,
-    ];
+fn punch_me_now_ipv4_uses_production_rfc_codec() -> Result<(), Box<dyn Error>> {
+    let round = VarInt::from_u32(7);
+    let paired_with_sequence_number = VarInt::from_u32(42);
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 20), 9000));
+    let frame = PunchMeNow::new(round, paired_with_sequence_number, address);
 
-    for &value in &test_values {
-        let varint = VarInt::from_u64(value).expect("VarInt creation should succeed");
-        assert_eq!(
-            varint.into_inner(),
-            value,
-            "VarInt roundtrip failed for {}",
-            value
-        );
-    }
+    let mut encoded = BytesMut::new();
+    frame.try_encode_rfc(&mut encoded)?;
 
-    // Test VarInt bounds
-    assert!(VarInt::from_u64(0).is_ok());
-    assert!(VarInt::from_u64(4611686018427387903u64).is_ok()); // Max valid VarInt value
+    let mut payload = payload_after_frame_type(encoded, 0x3d7e92)?;
+    let decoded = PunchMeNow::decode_rfc(&mut payload, false)?;
+
+    assert_eq!(decoded.round, round);
+    assert_eq!(
+        decoded.paired_with_sequence_number,
+        paired_with_sequence_number
+    );
+    assert_eq!(decoded.address, address);
+    assert!(!payload.has_remaining());
+
+    Ok(())
+}
+
+#[test]
+fn punch_me_now_ipv6_uses_production_rfc_codec() -> Result<(), Box<dyn Error>> {
+    let round = VarInt::from_u32(8);
+    let paired_with_sequence_number = VarInt::from_u32(43);
+    let address = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::new(0x2001, 0x0db8, 0, 2, 0, 0, 0, 20),
+        9001,
+        0,
+        0,
+    ));
+    let frame = PunchMeNow::new(round, paired_with_sequence_number, address);
+
+    let mut encoded = BytesMut::new();
+    frame.try_encode_rfc(&mut encoded)?;
+
+    let mut payload = payload_after_frame_type(encoded, 0x3d7e93)?;
+    let decoded = PunchMeNow::decode_rfc(&mut payload, true)?;
+
+    assert_eq!(decoded.round, round);
+    assert_eq!(
+        decoded.paired_with_sequence_number,
+        paired_with_sequence_number
+    );
+    assert_eq!(decoded.address, address);
+    assert!(!payload.has_remaining());
+
+    Ok(())
+}
+
+#[test]
+fn remove_address_uses_production_codec() -> Result<(), Box<dyn Error>> {
+    let sequence = VarInt::from_u32(42);
+    let frame = RemoveAddress::new(sequence);
+
+    let mut encoded = BytesMut::new();
+    frame.try_encode(&mut encoded)?;
+
+    let mut payload = payload_after_frame_type(encoded, 0x3d7e94)?;
+    let decoded = RemoveAddress::decode(&mut payload)?;
+
+    assert_eq!(decoded.sequence, sequence);
+    assert!(!payload.has_remaining());
+
+    Ok(())
+}
+
+#[test]
+fn punch_me_now_round_ordering_uses_decoded_frame_rounds() -> Result<(), Box<dyn Error>> {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 30), 9002));
+    let current = PunchMeNow::new(VarInt::from_u32(5), VarInt::from_u32(42), address);
+    let newer = PunchMeNow::new(VarInt::from_u32(10), VarInt::from_u32(42), address);
+
+    let mut encoded_current = BytesMut::new();
+    current.try_encode_rfc(&mut encoded_current)?;
+    let mut current_payload = payload_after_frame_type(encoded_current, 0x3d7e92)?;
+    let decoded_current = PunchMeNow::decode_rfc(&mut current_payload, false)?;
+
+    let mut encoded_newer = BytesMut::new();
+    newer.try_encode_rfc(&mut encoded_newer)?;
+    let mut newer_payload = payload_after_frame_type(encoded_newer, 0x3d7e92)?;
+    let decoded_newer = PunchMeNow::decode_rfc(&mut newer_payload, false)?;
+
+    assert!(decoded_newer.round > decoded_current.round);
+
+    Ok(())
 }
