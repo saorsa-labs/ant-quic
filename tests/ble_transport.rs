@@ -12,8 +12,8 @@
 //! # Hardware Requirements
 //!
 //! Some tests require BLE hardware and are marked with `#[ignore]`.
-//! Default builds include BLE support; stripped builds can run them with:
-//! `cargo test --features ble -- --ignored`
+//! Enable BLE-specific tests with:
+//! `cargo test --workspace --features ble --test ble_transport`
 //!
 //! # Platform Support
 //!
@@ -21,22 +21,24 @@
 //! - **macOS**: Core Bluetooth via btleplug
 //! - **Windows**: WinRT via btleplug
 
-#![cfg(feature = "ble")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[cfg(feature = "ble")]
 use ant_quic::transport::{
     ANT_QUIC_SERVICE_UUID, BleConfig, BleConnection, BleConnectionState, BleTransport,
     CCCD_DISABLE, CCCD_ENABLE_INDICATION, CCCD_ENABLE_NOTIFICATION, CCCD_UUID,
     CharacteristicHandle, ConnectionPoolStats, DiscoveredDevice, RX_CHARACTERISTIC_UUID,
-    ResumeToken, ScanState, TX_CHARACTERISTIC_UUID, TransportCapabilities, TransportProvider,
-    TransportType,
+    ResumeToken, ScanState, TX_CHARACTERISTIC_UUID, TransportProvider,
 };
+use ant_quic::transport::{ProtocolEngine, TransportAddr, TransportCapabilities, TransportType};
+#[cfg(feature = "ble")]
 use std::time::Duration;
 
 // ============================================================================
 // GATT Constants Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_service_uuid_format() {
     // Verify the service UUID is in correct format
@@ -56,6 +58,7 @@ fn test_service_uuid_format() {
     );
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_characteristic_uuids_are_distinct() {
     // TX and RX must have different UUIDs
@@ -82,6 +85,7 @@ fn test_characteristic_uuids_are_distinct() {
     );
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_cccd_uuid_is_bluetooth_sig_standard() {
     // CCCD UUID should be the Bluetooth SIG standard 0x2902
@@ -93,6 +97,7 @@ fn test_cccd_uuid_is_bluetooth_sig_standard() {
     assert_eq!(CCCD_UUID[3], 0x02, "CCCD should have 0x02 at position 3");
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_cccd_values() {
     // Verify CCCD enable/disable values per Bluetooth spec
@@ -113,6 +118,7 @@ fn test_cccd_values() {
 // BleConnection State Machine Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_ble_connection_initial_state() {
     let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -124,6 +130,7 @@ async fn test_ble_connection_initial_state() {
     assert!(conn.connection_duration().is_none());
 }
 
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_ble_connection_state_transitions() {
     let device_id = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
@@ -151,6 +158,7 @@ async fn test_ble_connection_state_transitions() {
     assert!(!conn.is_connected().await);
 }
 
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_ble_connection_invalid_transitions() {
     let device_id = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
@@ -161,6 +169,7 @@ async fn test_ble_connection_invalid_transitions() {
     assert!(result.is_err(), "Cannot disconnect from Discovered state");
 }
 
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_ble_connection_activity_tracking() {
     let device_id = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
@@ -184,6 +193,7 @@ async fn test_ble_connection_activity_tracking() {
     );
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_ble_connection_state_display() {
     assert_eq!(format!("{}", BleConnectionState::Discovered), "discovered");
@@ -203,6 +213,7 @@ fn test_ble_connection_state_display() {
 // CharacteristicHandle Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_characteristic_handle_tx() {
     let tx = CharacteristicHandle::tx();
@@ -216,6 +227,7 @@ fn test_characteristic_handle_tx() {
     assert!(!tx.indicate, "TX should not support indicate");
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_characteristic_handle_rx() {
     let rx = CharacteristicHandle::rx();
@@ -230,6 +242,7 @@ fn test_characteristic_handle_rx() {
 // BleConfig Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_ble_config_default() {
     let config = BleConfig::default();
@@ -248,6 +261,7 @@ fn test_ble_config_default() {
 // ResumeToken Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_resume_token_serialization() {
     let token = ResumeToken {
@@ -276,6 +290,7 @@ fn test_resume_token_serialization() {
 // DiscoveredDevice Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_discovered_device_creation() {
     let device_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
@@ -288,6 +303,7 @@ fn test_discovered_device_creation() {
     assert!(device.age() < Duration::from_secs(1));
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_discovered_device_is_recent() {
     let device = DiscoveredDevice::new([0; 6]);
@@ -299,6 +315,7 @@ fn test_discovered_device_is_recent() {
     assert!(!device.is_recent(Duration::ZERO));
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_discovered_device_update() {
     let mut device = DiscoveredDevice::new([0xAA; 6]);
@@ -314,6 +331,7 @@ fn test_discovered_device_update() {
 // ScanState Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_scan_state_display() {
     assert_eq!(format!("{}", ScanState::Idle), "idle");
@@ -321,6 +339,7 @@ fn test_scan_state_display() {
     assert_eq!(format!("{}", ScanState::Stopping), "stopping");
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_scan_state_default() {
     assert_eq!(ScanState::default(), ScanState::Idle);
@@ -354,6 +373,7 @@ fn test_ble_capabilities() {
 // ConnectionPoolStats Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_connection_pool_stats_default() {
     let stats = ConnectionPoolStats::default();
@@ -366,6 +386,7 @@ fn test_connection_pool_stats_default() {
     assert!(stats.oldest_idle.is_none());
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_connection_pool_stats_capacity() {
     let stats = ConnectionPoolStats {
@@ -380,6 +401,7 @@ fn test_connection_pool_stats_capacity() {
     assert!(stats.has_capacity(), "3 < 5 should have capacity");
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_connection_pool_stats_no_capacity() {
     let stats = ConnectionPoolStats {
@@ -401,6 +423,7 @@ fn test_connection_pool_stats_no_capacity() {
 /// Test that BleTransport can be created with default config
 ///
 /// This test requires BLE hardware.
+#[cfg(feature = "ble")]
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_ble_transport_creation() {
@@ -420,6 +443,7 @@ async fn test_ble_transport_creation() {
 }
 
 /// Test that BleTransport can be created with custom config
+#[cfg(feature = "ble")]
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_ble_transport_with_config() {
@@ -440,6 +464,7 @@ async fn test_ble_transport_with_config() {
 }
 
 /// Test scanning for BLE devices
+#[cfg(feature = "ble")]
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_ble_transport_scanning() {
@@ -478,6 +503,7 @@ async fn test_ble_transport_scanning() {
 }
 
 /// Test connection to a BLE device
+#[cfg(feature = "ble")]
 #[tokio::test]
 #[ignore = "requires BLE hardware and nearby ant-quic peer"]
 async fn test_ble_transport_connection() {
@@ -523,6 +549,7 @@ async fn test_ble_transport_connection() {
 }
 
 /// Test send/receive data over BLE
+#[cfg(feature = "ble")]
 #[tokio::test]
 #[ignore = "requires BLE hardware and nearby ant-quic peer"]
 async fn test_ble_transport_data_transfer() {
@@ -549,6 +576,7 @@ async fn test_ble_transport_data_transfer() {
 // ============================================================================
 
 /// Test connection pool eviction
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_connection_pool_eviction_logic() {
     // Test the LRU eviction logic without real BLE hardware
@@ -578,6 +606,7 @@ async fn test_connection_pool_eviction_logic() {
 }
 
 /// Test session resumption token size is efficient
+#[cfg(feature = "ble")]
 #[test]
 fn test_resume_token_efficiency() {
     // Session token should be much smaller than full PQC handshake
@@ -602,8 +631,6 @@ fn test_resume_token_efficiency() {
 /// Test that BLE capabilities indicate constrained engine
 #[test]
 fn test_ble_uses_constrained_engine() {
-    use ant_quic::transport::ProtocolEngine;
-
     let caps = TransportCapabilities::ble();
     let engine = ProtocolEngine::for_transport(&caps);
 
@@ -617,8 +644,6 @@ fn test_ble_uses_constrained_engine() {
 /// Test BLE address format
 #[test]
 fn test_ble_address_format() {
-    use ant_quic::transport::TransportAddr;
-
     // Create a BLE address
     let device_id = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
     let addr = TransportAddr::ble(device_id, None);
@@ -638,6 +663,7 @@ fn test_ble_address_format() {
 // Session Cache Tests
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_session_cache_eviction_criteria() {
     // Sessions should expire after configured duration
@@ -655,7 +681,7 @@ fn test_session_cache_eviction_criteria() {
 // Platform-Specific Tests
 // ============================================================================
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "ble", target_os = "linux"))]
 #[test]
 fn test_linux_bluez_support() {
     // Verify we're compiling with btleplug's Linux backend
@@ -663,7 +689,7 @@ fn test_linux_bluez_support() {
     println!("Linux BlueZ backend enabled");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "ble", target_os = "macos"))]
 #[test]
 fn test_macos_core_bluetooth_support() {
     // Verify we're compiling with btleplug's macOS backend
@@ -671,7 +697,7 @@ fn test_macos_core_bluetooth_support() {
     println!("macOS Core Bluetooth backend enabled");
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "ble", target_os = "windows"))]
 #[test]
 fn test_windows_winrt_support() {
     // Verify we're compiling with btleplug's Windows backend
@@ -683,6 +709,7 @@ fn test_windows_winrt_support() {
 // Edge Cases and Error Handling
 // ============================================================================
 
+#[cfg(feature = "ble")]
 #[tokio::test]
 async fn test_connection_to_invalid_device_id() {
     // All-zero device ID should be rejected or handled gracefully
@@ -693,6 +720,7 @@ async fn test_connection_to_invalid_device_id() {
     assert_eq!(conn.state().await, BleConnectionState::Discovered);
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_discovered_device_stale_detection() {
     let device = DiscoveredDevice::new([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
@@ -706,6 +734,7 @@ fn test_discovered_device_stale_detection() {
     assert!(age < Duration::from_secs(1));
 }
 
+#[cfg(feature = "ble")]
 #[test]
 fn test_connection_state_debug_formatting() {
     let device_id = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01];
