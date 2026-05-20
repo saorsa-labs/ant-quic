@@ -32,6 +32,19 @@ fn parse_local_identity_peer_id(line: &str) -> Option<String> {
     }
 }
 
+fn parse_peer_connected_peer_ids(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).ok()?;
+            if event.get("event")?.as_str()? != "peer_connected" {
+                return None;
+            }
+            event.get("peer_id")?.as_str().map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 struct ListenerProcess {
     child: Option<Child>,
     stdout_handle: Option<JoinHandle<String>>,
@@ -242,10 +255,23 @@ fn cli_connect_peer_id_smoke() {
     );
 
     let connector_stdout = String::from_utf8_lossy(&connector.stdout);
+    let connector_stderr = String::from_utf8_lossy(&connector.stderr);
+    let expected_peer_id = &peer_id[..16];
+    let connected_peer_ids = parse_peer_connected_peer_ids(&connector_stdout);
     assert!(
-        connector_stdout.contains("\"event\":\"peer_connected\""),
-        "peer-id connector stdout should contain peer_connected JSON event; stdout={} stderr={}",
+        !connector_stderr.contains(&format!("Failed to connect to peer {peer_id}")),
+        "peer-id connector reported explicit peer-id failure; stdout={} stderr={}",
         connector_stdout,
-        String::from_utf8_lossy(&connector.stderr)
+        connector_stderr
+    );
+    assert!(
+        connected_peer_ids
+            .iter()
+            .any(|connected_peer_id| connected_peer_id == expected_peer_id),
+        "peer-id connector stdout should contain peer_connected JSON event for {}; connected_peer_ids={:?} stdout={} stderr={}",
+        expected_peer_id,
+        connected_peer_ids,
+        connector_stdout,
+        connector_stderr
     );
 }
