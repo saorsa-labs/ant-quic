@@ -65,12 +65,11 @@ async fn wait_for_peer_event(
             return event;
         }
 
-        if start.elapsed() >= EVENT_TIMEOUT {
-            panic!(
-                "timed out waiting for peer event {label}; seen={:?}",
-                events.lock().unwrap().clone()
-            );
-        }
+        assert!(
+            start.elapsed() < EVENT_TIMEOUT,
+            "timed out waiting for peer event {label}; seen={:?}",
+            events.lock().unwrap().clone()
+        );
 
         sleep(Duration::from_millis(20)).await;
     }
@@ -94,10 +93,41 @@ async fn wait_for_all_peer_event(
             return event;
         }
 
+        assert!(
+            start.elapsed() < EVENT_TIMEOUT,
+            "timed out waiting for all-peer event {label}; seen={:?}",
+            events.lock().unwrap().clone()
+        );
+
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_peer_stream_parity(
+    label: &str,
+    peer_events: &PeerEventStore,
+    all_peer_events: &AllPeerEventStore,
+    peer_id: PeerId,
+) {
+    let start = Instant::now();
+    loop {
+        let peer_snapshot = peer_events.lock().unwrap().clone();
+        let all_peer_snapshot = all_peer_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(observed_peer_id, _)| *observed_peer_id == peer_id)
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+
+        if peer_snapshot == all_peer_snapshot {
+            return;
+        }
+
         if start.elapsed() >= EVENT_TIMEOUT {
-            panic!(
-                "timed out waiting for all-peer event {label}; seen={:?}",
-                events.lock().unwrap().clone()
+            assert_eq!(
+                peer_snapshot, all_peer_snapshot,
+                "timed out waiting for peer stream parity {label}"
             );
         }
 
@@ -403,6 +433,13 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     assert_eq!(closed_live_all, closed_live);
 
     sleep(Duration::from_millis(50)).await;
+    wait_for_peer_stream_parity(
+        "receiver lifecycle stream",
+        &peer_events,
+        &all_peer_events,
+        receiver_id,
+    )
+    .await;
 
     sender.shutdown().await;
     receiver.shutdown().await;
