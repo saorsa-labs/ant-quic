@@ -23,7 +23,7 @@ fn run_suite(suite: &str, max_duration: Duration) {
 
     let script = script_path();
     assert!(
-        script.exists(),
+        script.is_file(),
         "local runner script not found: {}",
         script.display()
     );
@@ -50,21 +50,31 @@ fn run_suite(suite: &str, max_duration: Duration) {
 
     assert!(
         status.success(),
-        "local suite '{}' failed. Inspect docker/results and docker/logs for details",
+        "local suite '{}' failed. Inspect the runner output above for details",
         suite
+    );
+}
+
+#[test]
+fn local_nat_runner_script_exists() {
+    let script = script_path();
+    assert!(
+        script.is_file(),
+        "local runner script not found: {}",
+        script.display()
     );
 }
 
 #[test]
 #[ignore]
 fn local_nat_smoke() {
-    // Quick sanity: basic connectivity to bootstrap
+    // Quick sanity: NAT traversal frame/RFC basics.
     run_suite("smoke", Duration::from_secs(5 * 60));
 }
 
 #[test]
 #[ignore]
 fn local_nat_core() {
-    // Core NAT traversal matrix (may take a bit longer locally)
+    // Core simulated NAT traversal scenarios.
     run_suite("nat", Duration::from_secs(15 * 60));
 }
