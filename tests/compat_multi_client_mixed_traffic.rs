@@ -26,7 +26,10 @@ use ant_quic::{
 use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
 
 const CLIENT_COUNT: usize = 3;
 const DATAGRAMS_PER_CLIENT: usize = 8;
@@ -457,17 +460,19 @@ async fn run_select_loop_client(
 async fn accept_bi_cancellation_is_safe() {
     let (server, server_addr, chain) = make_server().await;
     let chain = Arc::new(chain);
+    let cancellation_ready = Arc::new(Notify::new());
 
+    let server_cancellation_ready = Arc::clone(&cancellation_ready);
     let server_task = tokio::spawn(async move {
-        run_server_with_cancellable_accept(server).await;
+        run_server_with_cancellable_accept(server, server_cancellation_ready).await;
     });
 
-    run_cancellation_client(server_addr, chain).await;
+    run_cancellation_client(server_addr, chain, cancellation_ready).await;
 
     server_task.await.expect("cancellation server panicked");
 }
 
-async fn run_server_with_cancellable_accept(endpoint: Endpoint) {
+async fn run_server_with_cancellable_accept(endpoint: Endpoint, cancellation_ready: Arc<Notify>) {
     let incoming = timeout(HANDSHAKE_TIMEOUT, endpoint.accept())
         .await
         .expect("cancellation server accept timeout")
@@ -477,12 +482,17 @@ async fn run_server_with_cancellable_accept(endpoint: Endpoint) {
         .expect("cancellation server handshake timeout")
         .expect("cancellation server handshake failed");
 
-    handle_cancellable_accept_connection(conn).await;
+    handle_cancellable_accept_connection(conn, cancellation_ready).await;
 }
 
-async fn handle_cancellable_accept_connection(conn: Connection) {
+async fn handle_cancellable_accept_connection(conn: Connection, cancellation_ready: Arc<Notify>) {
     for seq in 0..STREAM_MESSAGES_PER_CLIENT {
-        let (mut send, mut recv) = accept_with_cancellations(&conn).await;
+        let (mut send, mut recv, cancellations) =
+            accept_with_cancellations(&conn, &cancellation_ready).await;
+        assert_eq!(
+            cancellations, ACCEPT_CANCELLATIONS_PER_STREAM,
+            "accept_bi should be cancelled the configured number of times"
+        );
 
         let payload = read_stream_bytes(
             &mut recv,
@@ -507,19 +517,28 @@ async fn handle_cancellable_accept_connection(conn: Connection) {
     let _ = conn.closed().await;
 }
 
-async fn accept_with_cancellations(conn: &Connection) -> (SendStream, RecvStream) {
+async fn accept_with_cancellations(
+    conn: &Connection,
+    cancellation_ready: &Notify,
+) -> (SendStream, RecvStream, usize) {
     let mut cancellations = 0;
     loop {
         let fut = conn.accept_bi();
         tokio::pin!(fut);
         tokio::select! {
             res = &mut fut => {
-                return res.expect("cancellation accept_bi result");
+                let (send, recv) = res.expect("cancellation accept_bi result");
+                return (send, recv, cancellations);
             }
             _ = sleep(SELECT_LOOP_SPIN_DELAY) => {
                 cancellations += 1;
                 if cancellations >= ACCEPT_CANCELLATIONS_PER_STREAM {
-                    return conn.accept_bi().await.expect("accept after cancellations");
+                    cancellation_ready.notify_one();
+                    let (send, recv) = conn
+                        .accept_bi()
+                        .await
+                        .expect("accept after cancellations");
+                    return (send, recv, cancellations);
                 }
             }
         }
@@ -529,6 +548,7 @@ async fn accept_with_cancellations(conn: &Connection) -> (SendStream, RecvStream
 async fn run_cancellation_client(
     server_addr: SocketAddr,
     chain: Arc<Vec<CertificateDer<'static>>>,
+    cancellation_ready: Arc<Notify>,
 ) {
     let mut client = Endpoint::client(([127, 0, 0, 1], 0).into()).expect("cancellation client ep");
     client.set_default_client_config(client_config(chain.as_slice()));
@@ -542,7 +562,7 @@ async fn run_cancellation_client(
         .expect("cancellation client connect failed");
 
     for seq in 0..STREAM_MESSAGES_PER_CLIENT {
-        sleep(Duration::from_millis(2)).await;
+        cancellation_ready.notified().await;
         let (mut send, mut recv) = conn.open_bi().await.expect("cancellation client open_bi");
         let payload = format!("cancel-client-stream-{seq}");
         timeout(DATAGRAM_TIMEOUT, send.write_all(payload.as_bytes()))
