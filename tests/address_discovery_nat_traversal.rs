@@ -55,7 +55,7 @@ async fn test_multiple_address_discovery_sources() {
     info!("Testing multiple address discovery sources");
 
     // Simulate client connecting to multiple bootstrap nodes
-    let bootstraps = vec![
+    let bootstraps = [
         (
             SocketAddr::from(([185, 199, 108, 153], 443)),
             SocketAddr::from(([203, 0, 113, 50], 45678)),
@@ -119,7 +119,7 @@ async fn test_symmetric_nat_address_discovery() {
     );
 
     // Predict likely ports for new connections
-    let predicted_ports = vec![
+    let predicted_ports = [
         base_port + port_increment * 3, // 45714
         base_port + port_increment * 4, // 45726
         base_port + port_increment * 5, // 45738
@@ -181,7 +181,7 @@ async fn test_connection_success_improvement() {
     info!("Testing connection success rate improvement");
 
     // Simulate connection attempts with and without address discovery
-    let scenarios = vec![
+    let scenarios = [
         ("Without address discovery", false, 0.6), // 60% success
         ("With address discovery", true, 0.95),    // 95% success
     ];
@@ -276,7 +276,7 @@ async fn test_address_discovery_edge_cases() {
 
     // Test 1: Invalid addresses
     debug!("Test 1: Invalid address handling");
-    let invalid_addrs = vec![
+    let invalid_addrs = [
         SocketAddr::from(([0, 0, 0, 0], 0)),          // Unspecified
         SocketAddr::from(([255, 255, 255, 255], 80)), // Broadcast
         SocketAddr::from(([224, 0, 0, 1], 1234)),     // Multicast
