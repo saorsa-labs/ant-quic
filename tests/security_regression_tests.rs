@@ -13,8 +13,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint};
-use std::time::Duration;
+use ant_quic::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint, NatTraversalError};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 /// Helper to create a basic peer config for testing
 /// v0.13.0+: No role - all nodes are symmetric P2P nodes
@@ -66,6 +69,60 @@ fn test_server_config() -> NatTraversalConfig {
     }
 }
 
+fn assert_endpoint_bound(endpoint: &NatTraversalEndpoint, expected_ip: IpAddr) -> SocketAddr {
+    let quic_ep = endpoint
+        .get_endpoint()
+        .expect("endpoint should expose inner QUIC endpoint");
+    let addr = quic_ep
+        .local_addr()
+        .expect("endpoint should have a local socket address");
+
+    assert_ne!(addr.port(), 0, "endpoint should bind a non-zero port");
+    assert_eq!(addr.ip(), expected_ip, "endpoint should bind expected IP");
+
+    addr
+}
+
+fn is_udp_bind_blocked(error: &NatTraversalError) -> bool {
+    matches!(
+        error,
+        NatTraversalError::NetworkError(message)
+            if message.contains("Failed to bind UDP socket")
+                && (message.contains("Operation not permitted")
+                    || message.contains("Permission denied"))
+    )
+}
+
+fn endpoint_or_skip_udp_blocked(
+    result: Result<NatTraversalEndpoint, NatTraversalError>,
+    context: &str,
+) -> Option<NatTraversalEndpoint> {
+    match result {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            assert!(
+                is_udp_bind_blocked(&error),
+                "{context} failed before endpoint construction: {error}"
+            );
+            println!("Skipping {context}: UDP bind blocked by test environment: {error}");
+            None
+        }
+    }
+}
+
+fn assert_config_error_contains(
+    result: &Result<NatTraversalEndpoint, NatTraversalError>,
+    expected_fragment: &str,
+) {
+    assert!(
+        matches!(
+            result,
+            Err(NatTraversalError::ConfigError(message)) if message.contains(expected_fragment)
+        ),
+        "invalid config should fail with ConfigError containing {expected_fragment}"
+    );
+}
+
 /// Test that endpoint creation with None bind_addr doesn't panic
 /// Regression test for commit 6e633cd9 - protocol obfuscation improvements
 #[tokio::test]
@@ -75,13 +132,12 @@ async fn test_random_port_binding_no_panic() {
 
     let config = test_peer_config(); // bind_addr is None
 
-    // This should not panic, even if random port selection fails
-    let result = NatTraversalEndpoint::new(config, None, None).await;
-
-    // Either success or failure is fine - the key is no panic
-    match result {
-        Ok(_) => println!("✓ Random port binding succeeded"),
-        Err(e) => println!("✓ Random port binding failed gracefully: {e}"),
+    if let Some(endpoint) = endpoint_or_skip_udp_blocked(
+        NatTraversalEndpoint::new(config, None, None).await,
+        "random port binding",
+    ) {
+        let addr = assert_endpoint_bound(&endpoint, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        println!("✓ Random port binding succeeded: {addr}");
     }
 }
 
@@ -114,11 +170,7 @@ async fn test_error_handling_no_panic() {
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
-    // Should either succeed or fail gracefully
-    match result1 {
-        Ok(_) => println!("✓ Zero timeout handled successfully"),
-        Err(e) => println!("✓ Zero timeout rejected safely: {e}"),
-    }
+    assert_config_error_contains(&result1, "coordination_timeout");
 
     // Test 2: Zero max candidates
     let config2 = NatTraversalConfig {
@@ -143,10 +195,7 @@ async fn test_error_handling_no_panic() {
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
-    match result2 {
-        Ok(_) => println!("✓ Zero candidates handled successfully"),
-        Err(e) => println!("✓ Zero candidates rejected safely: {e}"),
-    }
+    assert_config_error_contains(&result2, "max_candidates");
 }
 
 /// Test concurrent endpoint creation doesn't cause race conditions
@@ -234,12 +283,12 @@ async fn test_malformed_config_handling() {
         additional_bind_addrs: Vec::new(),
     };
 
-    let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
-
-    // Should handle gracefully
-    match result {
-        Ok(_) => println!("✓ No peers config accepted (implementation choice)"),
-        Err(e) => println!("✓ No peers config rejected safely: {e}"),
+    if let Some(endpoint) = endpoint_or_skip_udp_blocked(
+        NatTraversalEndpoint::new(no_peers_config, None, None).await,
+        "no peers config",
+    ) {
+        let addr = assert_endpoint_bound(&endpoint, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        println!("✓ No peers config accepted: {addr}");
     }
 
     // Test extremely large values that could cause overflow
@@ -265,11 +314,7 @@ async fn test_malformed_config_handling() {
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
-
-    match result2 {
-        Ok(_) => println!("✓ Extreme values handled successfully"),
-        Err(e) => println!("✓ Extreme values rejected safely: {e}"),
-    }
+    assert_config_error_contains(&result2, "max_candidates");
 }
 
 /// Test input sanitization for potential security issues
@@ -373,28 +418,12 @@ mod specific_regression_tests {
             additional_bind_addrs: Vec::new(),
         };
 
-        // Should not panic and should handle random port selection
-        let result = NatTraversalEndpoint::new(config_with_none, None, None).await;
-
-        match result {
-            Ok(endpoint) => {
-                // If we can get the endpoint, verify it has a proper address
-                if let Some(quic_ep) = endpoint.get_endpoint()
-                    && let Ok(addr) = quic_ep.local_addr()
-                {
-                    assert_ne!(addr.port(), 0, "Should have assigned port");
-                    assert_eq!(
-                        addr.ip().to_string(),
-                        "0.0.0.0",
-                        "Should bind to all interfaces"
-                    );
-                    println!("✓ Random port binding successful: {addr}");
-                }
-            }
-            Err(e) => {
-                // Error is acceptable in test environment
-                println!("✓ Random port binding handled error safely: {e}");
-            }
+        if let Some(endpoint) = endpoint_or_skip_udp_blocked(
+            NatTraversalEndpoint::new(config_with_none, None, None).await,
+            "protocol obfuscation random port binding",
+        ) {
+            let addr = assert_endpoint_bound(&endpoint, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            println!("✓ Random port binding successful: {addr}");
         }
     }
 
@@ -425,15 +454,7 @@ mod specific_regression_tests {
             additional_bind_addrs: Vec::new(),
         };
 
-        // Should not panic, even if configuration is inconsistent
         let result = NatTraversalEndpoint::new(problematic_config, None, None).await;
-
-        match result {
-            Ok(_) => println!("✓ Problematic config handled successfully"),
-            Err(e) => println!("✓ Problematic config rejected with proper error: {e}"),
-        }
-
-        // The key test is that we didn't panic
-        println!("✓ Robust error handling regression test passed");
+        assert_config_error_contains(&result, "max_candidates");
     }
 }
