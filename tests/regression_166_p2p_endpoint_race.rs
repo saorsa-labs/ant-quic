@@ -27,7 +27,7 @@
 
 use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, PqcConfig};
 use std::{
-    collections::HashSet,
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -183,37 +183,52 @@ async fn p2p_endpoint_send_surfaces_all_short_streams_under_concurrent_large_sen
         .iter()
         .filter(|(len, _)| *len >= LARGE_PAYLOAD_LEN)
         .count();
-    let short_seqs: HashSet<u32> = received
-        .iter()
-        .filter(|(len, _)| *len == SHORT_PAYLOAD_LEN)
-        .map(|(_, seq)| *seq)
-        .collect();
+    let mut short_seq_counts = BTreeMap::<u32, usize>::new();
+    for (_, seq) in received.iter().filter(|(len, _)| *len == SHORT_PAYLOAD_LEN) {
+        *short_seq_counts.entry(*seq).or_default() += 1;
+    }
     let missing: Vec<u32> = (1u32..=BURST_SHORT as u32)
-        .filter(|s| !short_seqs.contains(s))
+        .filter(|s| !short_seq_counts.contains_key(s))
         .collect();
+    let duplicates: Vec<(u32, usize)> = short_seq_counts
+        .iter()
+        .filter_map(|(seq, count)| (*count != 1).then_some((*seq, *count)))
+        .collect();
+    let short_count: usize = short_seq_counts.values().sum();
 
     println!(
-        "p2p reproducer summary: received.len()={} large_count={} short_count={} missing_seqs={:?}",
+        "p2p reproducer summary: received.len()={} large_count={} short_count={} short_unique={} missing_seqs={:?} duplicates={:?}",
         received.len(),
         large_count,
-        short_seqs.len(),
-        missing
+        short_count,
+        short_seq_counts.len(),
+        missing,
+        duplicates
     );
 
     let _ = timeout(Duration::from_secs(2), Arc::clone(&server).shutdown()).await;
 
     assert_eq!(
+        received.len(),
+        BURST_SHORT + 1,
+        "server should have received exactly {} application messages; got {} ({received:?})",
+        BURST_SHORT + 1,
+        received.len()
+    );
+    assert_eq!(
         large_count, 1,
         "server should have received exactly one large payload; got {large_count}"
     );
     assert_eq!(
-        short_seqs.len(),
-        BURST_SHORT,
-        "server should have received all {BURST_SHORT} short streams; got {} (missing: {missing:?})",
-        short_seqs.len()
+        short_count, BURST_SHORT,
+        "server should have received exactly {BURST_SHORT} short streams; got {short_count} (missing: {missing:?}, duplicates: {duplicates:?})"
     );
     assert!(
         missing.is_empty(),
         "no short-stream sequence numbers should be missing; missing={missing:?}"
+    );
+    assert!(
+        duplicates.is_empty(),
+        "short-stream sequence numbers should be delivered exactly once; duplicates={duplicates:?}"
     );
 }
