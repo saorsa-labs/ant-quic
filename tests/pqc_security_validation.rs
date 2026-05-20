@@ -6,17 +6,42 @@ use ant_quic::crypto::pqc::{
     MlDsaOperations, MlKemOperations,
     ml_dsa::MlDsa65,
     ml_kem::MlKem768,
-    security_validation::{SecurityValidator, run_security_validation},
+    security_validation::{EntropyQuality, SecurityValidator, Severity, run_security_validation},
     types::{MlDsaSignature, MlKemCiphertext, MlKemPublicKey},
 };
 use std::time::Instant;
+
+const MIN_PASSING_SECURITY_SCORE: u8 = 70;
+
 #[test]
 fn test_basic_security_validation() {
     let report = run_security_validation();
 
-    // Basic sanity checks
-    assert!(report.security_score <= 100);
+    assert!(report.passed, "security validation failed: {report:#?}");
+    assert!((MIN_PASSING_SECURITY_SCORE..=100).contains(&report.security_score));
+    assert_eq!(report.entropy_quality, EntropyQuality::Good);
     assert!(report.nist_compliance.parameters_valid);
+    assert!(report.nist_compliance.key_sizes_correct);
+    assert!(report.nist_compliance.algorithm_approved);
+    assert!(report.nist_compliance.implementation_compliant);
+    assert!(
+        report.nist_compliance.issues.is_empty(),
+        "unexpected NIST compliance issues: {:?}",
+        report.nist_compliance.issues
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .all(|issue| issue.severity < Severity::High),
+        "unexpected high or critical security issues: {:?}",
+        report.issues
+    );
+    assert!(
+        report.issues.is_empty(),
+        "unexpected security issues: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -356,28 +381,36 @@ fn test_memory_zeroing_simulation() {
 fn test_security_validator_comprehensive() {
     let mut validator = SecurityValidator::new();
 
-    // Add diverse entropy samples to get better entropy quality
-    let entropy_samples = vec![
-        vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
-        vec![0xAA, 0x55, 0xFF, 0x00, 0x33, 0xCC, 0x66, 0x99],
-        vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
-    ];
-
-    for sample in entropy_samples {
-        validator.record_entropy(&sample);
-    }
+    let entropy_sample: Vec<u8> = (0u8..=255).collect();
+    validator.record_entropy(&entropy_sample);
 
     let report = validator.generate_report();
 
-    // Check basic report fields
+    assert!(report.passed, "security validation failed: {report:#?}");
+    assert!((MIN_PASSING_SECURITY_SCORE..=100).contains(&report.security_score));
+    assert_eq!(report.entropy_quality, EntropyQuality::Excellent);
     assert!(report.nist_compliance.parameters_valid);
-    // Don't require specific entropy quality - implementation may vary
-    assert!(report.security_score <= 100);
-
-    // Focus on basic functionality rather than specific thresholds
-    println!("Security score: {}", report.security_score);
-    println!("Entropy quality: {:?}", report.entropy_quality);
-    println!("Issues: {}", report.issues.len());
+    assert!(report.nist_compliance.key_sizes_correct);
+    assert!(report.nist_compliance.algorithm_approved);
+    assert!(report.nist_compliance.implementation_compliant);
+    assert!(
+        report.nist_compliance.issues.is_empty(),
+        "unexpected NIST compliance issues: {:?}",
+        report.nist_compliance.issues
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .all(|issue| issue.severity < Severity::High),
+        "unexpected high or critical security issues: {:?}",
+        report.issues
+    );
+    assert!(
+        report.issues.is_empty(),
+        "unexpected security issues: {:?}",
+        report.issues
+    );
 }
 
 #[test]
