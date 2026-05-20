@@ -164,14 +164,10 @@ async fn validate_node(
     validation: BootstrapValidationConfig,
 ) -> BootstrapValidationResult {
     let start = Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(validation.per_node_timeout_seconds),
-        validate_node_inner(&node, &validation),
-    )
-    .await;
+    let result = validate_node_inner(&node, &validation).await;
 
     match result {
-        Ok(Ok((connected_peers, external_addr))) => {
+        Ok((connected_peers, external_addr)) => {
             let success = connected_peers > 0
                 && (!validation.require_external_address || external_addr.is_some());
             BootstrapValidationResult {
@@ -187,7 +183,7 @@ async fn validate_node(
                 },
             }
         }
-        Ok(Err(error)) => BootstrapValidationResult {
+        Err(error) => BootstrapValidationResult {
             node,
             success: false,
             connected_peers: 0,
@@ -195,14 +191,47 @@ async fn validate_node(
             elapsed_ms: start.elapsed().as_millis(),
             error: Some(error),
         },
-        Err(_) => BootstrapValidationResult {
-            node,
-            success: false,
-            connected_peers: 0,
-            external_addr: None,
-            elapsed_ms: start.elapsed().as_millis(),
-            error: Some("validation timed out".to_string()),
-        },
+    }
+}
+
+fn remaining_validation_time(deadline: tokio::time::Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+}
+
+async fn connect_known_peers_with_deadline<Connect, ConnectError, Shutdown, ShutdownFuture>(
+    connect_timeout: Duration,
+    validation_deadline: tokio::time::Instant,
+    connect: Connect,
+    shutdown: Shutdown,
+) -> Result<usize, String>
+where
+    Connect: std::future::Future<Output = Result<usize, ConnectError>>,
+    ConnectError: ToString,
+    Shutdown: FnOnce() -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = ()>,
+{
+    let Some(remaining) = remaining_validation_time(validation_deadline) else {
+        shutdown().await;
+        return Err("validation timed out".to_string());
+    };
+    let timeout_error = if remaining <= connect_timeout {
+        "validation timed out"
+    } else {
+        "connect_known_peers timed out"
+    };
+
+    match tokio::time::timeout(connect_timeout.min(remaining), connect).await {
+        Ok(Ok(count)) => Ok(count),
+        Ok(Err(error)) => {
+            shutdown().await;
+            Err(error.to_string())
+        }
+        Err(_) => {
+            shutdown().await;
+            Err(timeout_error.to_string())
+        }
     }
 }
 
@@ -210,6 +239,8 @@ async fn validate_node_inner(
     node: &BootstrapNode,
     validation: &BootstrapValidationConfig,
 ) -> Result<(usize, Option<SocketAddr>), String> {
+    let per_node_timeout = Duration::from_secs(validation.per_node_timeout_seconds);
+    let validation_deadline = tokio::time::Instant::now() + per_node_timeout;
     let config = P2pConfig::builder()
         .bind_addr(
             "[::]:0"
@@ -221,27 +252,20 @@ async fn validate_node_inner(
         .build()
         .map_err(|error| error.to_string())?;
 
-    let endpoint = P2pEndpoint::new(config)
+    let endpoint_timeout = remaining_validation_time(validation_deadline)
+        .ok_or_else(|| "validation timed out".to_string())?;
+    let endpoint = tokio::time::timeout(endpoint_timeout, P2pEndpoint::new(config))
         .await
+        .map_err(|_| "validation timed out".to_string())?
         .map_err(|error| error.to_string())?;
 
-    let connect_result = tokio::time::timeout(
+    let connected = connect_known_peers_with_deadline(
         Duration::from_secs(validation.connect_timeout_seconds),
+        validation_deadline,
         endpoint.connect_known_peers(),
+        || endpoint.shutdown(),
     )
-    .await;
-
-    let connected = match connect_result {
-        Ok(Ok(count)) => count,
-        Ok(Err(error)) => {
-            endpoint.shutdown().await;
-            return Err(error.to_string());
-        }
-        Err(_) => {
-            endpoint.shutdown().await;
-            return Err("connect_known_peers timed out".to_string());
-        }
-    };
+    .await?;
 
     let external_addr = endpoint.external_addr();
     endpoint.shutdown().await;
@@ -316,6 +340,10 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn node(name: &str) -> BootstrapNode {
         BootstrapNode {
@@ -346,6 +374,28 @@ mod tests {
             per_node_timeout_seconds: 20,
             require_external_address: true,
         }
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_shutdown_on_validation_timeout() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdowns_for_future = Arc::clone(&shutdowns);
+        let error = connect_known_peers_with_deadline(
+            Duration::from_secs(10),
+            tokio::time::Instant::now() + Duration::from_millis(1),
+            std::future::pending::<Result<usize, String>>(),
+            move || {
+                let shutdowns = Arc::clone(&shutdowns_for_future);
+                async move {
+                    shutdowns.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .err();
+
+        assert_eq!(error.as_deref(), Some("validation timed out"));
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
 
     #[test]
