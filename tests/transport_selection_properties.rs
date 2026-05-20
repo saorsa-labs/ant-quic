@@ -22,6 +22,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+const ALL_TRANSPORT_TYPES: [TransportType; 7] = [
+    TransportType::Udp,
+    TransportType::Ble,
+    TransportType::LoRa,
+    TransportType::Serial,
+    TransportType::Ax25,
+    TransportType::I2p,
+    TransportType::Yggdrasil,
+];
+
 /// Mock transport provider with controllable capabilities and online state
 #[derive(Clone, Debug)]
 struct MockTransportProvider {
@@ -158,15 +168,29 @@ fn arb_transport_capabilities() -> impl Strategy<Value = TransportCapabilities> 
     ]
 }
 
+/// Strategy for generating transport types
+fn arb_transport_type() -> impl Strategy<Value = TransportType> {
+    prop_oneof![
+        Just(TransportType::Udp),
+        Just(TransportType::Ble),
+        Just(TransportType::LoRa),
+        Just(TransportType::Serial),
+        Just(TransportType::Ax25),
+        Just(TransportType::I2p),
+        Just(TransportType::Yggdrasil),
+    ]
+}
+
 /// Strategy for generating a mock transport provider
 fn arb_mock_transport() -> impl Strategy<Value = MockTransportProvider> {
     (
         "[a-z]{3,10}",                // name
+        arb_transport_type(),         // transport_type
         any::<bool>(),                // is_online
         arb_transport_capabilities(), // capabilities
     )
-        .prop_map(|(name, is_online, capabilities)| {
-            MockTransportProvider::new(name, TransportType::Udp, capabilities, is_online)
+        .prop_map(|(name, transport_type, is_online, capabilities)| {
+            MockTransportProvider::new(name, transport_type, capabilities, is_online)
         })
 }
 
@@ -300,21 +324,34 @@ proptest! {
     fn prop_transport_type_filtering_correct(transports in arb_transport_list()) {
         let mut registry = TransportRegistry::new();
 
-        // Register all transports (all are UDP in our mock)
+        // Register all transports
         for transport in &transports {
             registry.register(Arc::new(transport.clone()));
         }
 
-        // Query by UDP type
-        let udp_providers = registry.providers_by_type(TransportType::Udp);
+        for transport_type in ALL_TRANSPORT_TYPES {
+            let filtered_providers = registry.providers_by_type(transport_type);
+            let expected_names: Vec<_> = transports
+                .iter()
+                .filter(|transport| transport.transport_type() == transport_type)
+                .map(|transport| transport.name())
+                .collect();
+            let actual_names: Vec<_> = filtered_providers
+                .iter()
+                .map(|provider| provider.name())
+                .collect();
 
-        // All returned providers must be UDP
-        for provider in &udp_providers {
-            prop_assert_eq!(provider.transport_type(), TransportType::Udp);
+            prop_assert_eq!(
+                actual_names,
+                expected_names,
+                "providers_by_type({}) returned unexpected providers",
+                transport_type
+            );
+
+            for provider in &filtered_providers {
+                prop_assert_eq!(provider.transport_type(), transport_type);
+            }
         }
-
-        // Should return all providers since all are UDP
-        prop_assert_eq!(udp_providers.len(), transports.len());
     }
 
     /// Property: Online state transitions maintain invariants
