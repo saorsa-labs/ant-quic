@@ -86,86 +86,78 @@ fn test_timing_side_channel_ml_dsa() {
     let message = b"test message for signing";
 
     // Test basic functionality first
-    match ml_dsa.sign(&secret_key, message) {
-        Ok(signature) => {
-            // If signing works, test verification
-            assert!(
-                ml_dsa
-                    .verify(&public_key, message, &signature)
-                    .unwrap_or(false)
-            );
-        }
-        Err(_) => {
-            // If signing fails, skip timing analysis but don't fail the test
-            println!("ML-DSA signing not available - skipping timing test");
-            return;
-        }
-    }
+    let signature = ml_dsa
+        .sign(&secret_key, message)
+        .expect("ML-DSA signing must be available for timing validation");
+    assert!(
+        ml_dsa
+            .verify(&public_key, message, &signature)
+            .expect("ML-DSA verification must succeed for timing validation"),
+        "ML-DSA signature failed verification before timing validation"
+    );
 
-    // If we get here, signing works, so we can do timing analysis
     const ITERATIONS: usize = 10; // Reduced for robustness
     let mut timings = Vec::new();
 
     for _ in 0..ITERATIONS {
         let start = Instant::now();
         // Perform signing
-        if let Ok(_signature) = ml_dsa.sign(&secret_key, message) {
-            timings.push(start.elapsed());
-        }
+        let _signature = ml_dsa
+            .sign(&secret_key, message)
+            .expect("ML-DSA signing must remain available during timing validation");
+        timings.push(start.elapsed());
     }
 
-    if !timings.is_empty() {
-        // Calculate timing variance
-        let mean = timings.iter().map(|d| d.as_nanos() as f64).sum::<f64>() / timings.len() as f64;
-        let variance = timings
-            .iter()
-            .map(|d| {
-                let diff = d.as_nanos() as f64 - mean;
-                diff * diff
-            })
-            .sum::<f64>()
-            / timings.len() as f64;
+    // Calculate timing variance
+    let mean = timings.iter().map(|d| d.as_nanos() as f64).sum::<f64>() / timings.len() as f64;
+    let variance = timings
+        .iter()
+        .map(|d| {
+            let diff = d.as_nanos() as f64 - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / timings.len() as f64;
 
-        let cv = (variance.sqrt() / mean) * 100.0;
+    let cv = (variance.sqrt() / mean) * 100.0;
 
-        let max_cv = if cfg!(debug_assertions) { 100.0 } else { 50.0 };
+    let max_cv = if cfg!(debug_assertions) { 100.0 } else { 50.0 };
 
-        // Timing should be relatively consistent (debug builds are noisier).
-        assert!(cv < max_cv, "ML-DSA timing variance too high: {cv:.2}%");
-    }
+    // Timing should be relatively consistent (debug builds are noisier).
+    assert!(cv < max_cv, "ML-DSA timing variance too high: {cv:.2}%");
 }
 
 #[test]
-fn test_deterministic_signatures() {
-    // ML-DSA should produce deterministic signatures
+fn test_repeated_signatures_verify() {
+    // ML-DSA signing may be randomized, but every produced signature must verify.
     let ml_dsa = MlDsa65::new();
     let (public_key, secret_key) = ml_dsa.generate_keypair().unwrap();
-    let message = b"deterministic test message";
+    let message = b"repeated signature test message";
 
-    // Test that signing works - if it fails due to caching issues,
-    // we'll focus on the fundamental contract rather than implementation details
-    match ml_dsa.sign(&secret_key, message) {
-        Ok(sig1) => {
-            // If signing works, test deterministic property
-            if let Ok(sig2) = ml_dsa.sign(&secret_key, message) {
-                // In theory, ML-DSA should be deterministic
-                // But implementation may vary - just test basic functionality
-                println!(
-                    "Signature 1 len: {}, Signature 2 len: {}",
-                    sig1.as_bytes().len(),
-                    sig2.as_bytes().len()
-                );
+    let sig1 = ml_dsa
+        .sign(&secret_key, message)
+        .expect("ML-DSA signing must be available for repeated signature validation");
+    let sig2 = ml_dsa
+        .sign(&secret_key, message)
+        .expect("ML-DSA signing must be repeatable for repeated signature validation");
 
-                // Test that verification works
-                assert!(ml_dsa.verify(&public_key, message, &sig1).unwrap_or(false));
-            }
-        }
-        Err(_) => {
-            // If signing fails due to implementation issues, that's acceptable for this test
-            // The important thing is that key generation worked
-            println!("Signing failed - possibly due to key caching implementation issues");
-        }
-    }
+    assert_eq!(
+        sig1.as_bytes().len(),
+        sig2.as_bytes().len(),
+        "ML-DSA repeated signatures must have a stable encoded length"
+    );
+    assert!(
+        ml_dsa
+            .verify(&public_key, message, &sig1)
+            .expect("ML-DSA first repeated signature verification must not error"),
+        "ML-DSA first repeated signature failed verification"
+    );
+    assert!(
+        ml_dsa
+            .verify(&public_key, message, &sig2)
+            .expect("ML-DSA second repeated signature verification must not error"),
+        "ML-DSA second repeated signature failed verification"
+    );
 }
 
 #[test]
@@ -296,43 +288,38 @@ fn test_signature_malleability() {
     let (public_key, secret_key) = ml_dsa.generate_keypair().unwrap();
     let message = b"test message";
 
-    // Test basic functionality first
-    match ml_dsa.sign(&secret_key, message) {
-        Ok(signature) => {
-            // Verify original signature
-            assert!(
-                ml_dsa
-                    .verify(&public_key, message, &signature)
-                    .unwrap_or(false)
-            );
+    let signature = ml_dsa
+        .sign(&secret_key, message)
+        .expect("ML-DSA signing must be available for malleability validation");
 
-            // Modify signature slightly
-            let original_bytes = signature.as_bytes();
-            let mut modified_bytes = original_bytes.to_vec();
-            modified_bytes[0] ^= 0x01; // Flip one bit
+    assert!(
+        ml_dsa
+            .verify(&public_key, message, &signature)
+            .expect("ML-DSA original signature verification must not error"),
+        "ML-DSA original signature failed verification"
+    );
 
-            if let Ok(modified_sig) = MlDsaSignature::from_bytes(&modified_bytes) {
-                // Modified signature should fail verification
-                assert!(
-                    !ml_dsa
-                        .verify(&public_key, message, &modified_sig)
-                        .unwrap_or(true)
-                );
+    // Modify signature slightly
+    let original_bytes = signature.as_bytes();
+    let mut modified_bytes = original_bytes.to_vec();
+    modified_bytes[0] ^= 0x01; // Flip one bit
+    let modified_sig = MlDsaSignature::from_bytes(&modified_bytes)
+        .expect("modified ML-DSA signature bytes should preserve the signature length");
 
-                // Test message modification
-                let modified_message = b"test message!";
-                assert!(
-                    !ml_dsa
-                        .verify(&public_key, modified_message, &signature)
-                        .unwrap_or(true)
-                );
-            }
-        }
-        Err(_) => {
-            // If signing fails, that's acceptable for this test
-            println!("ML-DSA signing not available - skipping malleability test");
-        }
-    }
+    assert!(
+        !ml_dsa
+            .verify(&public_key, message, &modified_sig)
+            .expect("ML-DSA modified signature verification must not error"),
+        "ML-DSA modified signature unexpectedly verified"
+    );
+
+    let modified_message = b"test message!";
+    assert!(
+        !ml_dsa
+            .verify(&public_key, modified_message, &signature)
+            .expect("ML-DSA modified message verification must not error"),
+        "ML-DSA signature unexpectedly verified for a modified message"
+    );
 }
 
 #[test]
