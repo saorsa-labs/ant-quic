@@ -26,7 +26,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, PeerId, PqcConfig};
+use ant_quic::{
+    ConnectionCloseReason, NatConfig, P2pConfig, P2pEndpoint, PeerId, PeerLifecycleEvent, PqcConfig,
+};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -41,6 +43,7 @@ use tokio::{
 const STREAMS_PER_DIRECTION: u32 = 120;
 const PAYLOAD_LEN: usize = 48; // 4-byte seq + 4-byte from-index + 40-byte filler
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REPLACEMENT_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
@@ -81,6 +84,62 @@ fn decode_payload(data: &[u8]) -> Option<(u32, u32)> {
     Some((seq, from_idx))
 }
 
+fn drain_lifecycle_events(
+    receivers: &mut [tokio::sync::broadcast::Receiver<(PeerId, PeerLifecycleEvent)>],
+) -> Vec<(usize, PeerId, PeerLifecycleEvent)> {
+    let mut events = Vec::new();
+    for (node_idx, receiver) in receivers.iter_mut().enumerate() {
+        loop {
+            match receiver.try_recv() {
+                Ok((peer_id, event)) => events.push((node_idx, peer_id, event)),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    assert_eq!(
+                        skipped, 0,
+                        "node{node_idx} lifecycle receiver lagged by {skipped} events"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    events
+}
+
+fn is_replacement_event(event: &PeerLifecycleEvent) -> bool {
+    matches!(
+        event,
+        PeerLifecycleEvent::Replaced { .. }
+            | PeerLifecycleEvent::Closing {
+                reason: ConnectionCloseReason::Superseded,
+                ..
+            }
+            | PeerLifecycleEvent::Closed {
+                reason: ConnectionCloseReason::Superseded,
+                ..
+            }
+    )
+}
+
+async fn collect_lifecycle_events_until_replacement(
+    receivers: &mut [tokio::sync::broadcast::Receiver<(PeerId, PeerLifecycleEvent)>],
+) -> Vec<(usize, PeerId, PeerLifecycleEvent)> {
+    let start = tokio::time::Instant::now();
+    let mut events = Vec::new();
+    loop {
+        events.extend(drain_lifecycle_events(receivers));
+        if events
+            .iter()
+            .any(|(_, _, event)| is_replacement_event(event))
+            || start.elapsed() >= REPLACEMENT_EVENT_TIMEOUT
+        {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Three-peer mesh. Each peer knows both others. All peers run accept
 /// loops. Then every peer connects to every other peer concurrently so
 /// the simultaneous-open path is exercised. Finally every peer sends
@@ -108,6 +167,10 @@ async fn mesh_churn_preserves_every_acked_stream() {
         .map(|n| normalize_local_addr(n.local_addr().expect("local_addr")))
         .collect();
     let peer_ids: Vec<PeerId> = nodes.iter().map(|n| n.peer_id()).collect();
+    let mut lifecycle_receivers: Vec<_> = nodes
+        .iter()
+        .map(|node| node.subscribe_all_peer_events())
+        .collect();
 
     // Accept loops. Each node accepts concurrently; redundant accepts
     // (simultaneous-open second-connection path) exercise the
@@ -174,14 +237,48 @@ async fn mesh_churn_preserves_every_acked_stream() {
             }
             let node = Arc::clone(node);
             let peer_addr = *peer_addr;
-            connect_tasks.push(tokio::spawn(async move {
-                let _ = timeout(CONNECT_TIMEOUT, node.connect_addr(peer_addr)).await;
-            }));
+            connect_tasks.push((
+                i,
+                j,
+                tokio::spawn(async move {
+                    timeout(CONNECT_TIMEOUT, node.connect_addr(peer_addr)).await
+                }),
+            ));
         }
     }
-    for t in connect_tasks {
-        let _ = t.await;
+    for (from_idx, to_idx, task) in connect_tasks {
+        let join_result = task.await;
+        assert!(
+            join_result.is_ok(),
+            "connect task node{from_idx}->node{to_idx} join failed: {:?}",
+            join_result.as_ref().err()
+        );
+        let connect_result = join_result.expect("connect task join result checked");
+        assert!(
+            connect_result.is_ok(),
+            "connect node{from_idx}->node{to_idx} timed out after {CONNECT_TIMEOUT:?}"
+        );
+        let connect_result = connect_result.expect("connect timeout result checked");
+        assert!(
+            connect_result.is_ok(),
+            "connect node{from_idx}->node{to_idx} failed: {:?}",
+            connect_result.as_ref().err()
+        );
+        let peer_conn = connect_result.expect("connect result checked");
+        assert_eq!(
+            peer_conn.peer_id, peer_ids[to_idx],
+            "connect node{from_idx}->node{to_idx} reached unexpected peer"
+        );
     }
+
+    let lifecycle_events =
+        collect_lifecycle_events_until_replacement(&mut lifecycle_receivers).await;
+    assert!(
+        lifecycle_events
+            .iter()
+            .any(|(_, _, event)| is_replacement_event(event)),
+        "simultaneous-open precondition was not observed: no replacement/superseded lifecycle event after mutual connects; events={lifecycle_events:?}"
+    );
 
     // Allow authentication + reader tasks to settle before the send
     // storm. This is deliberately short so the first few messages can
