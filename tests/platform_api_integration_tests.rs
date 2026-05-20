@@ -7,6 +7,38 @@
 
 use ant_quic::candidate_discovery::NetworkInterfaceDiscovery;
 
+fn is_skip_worthy_platform_monitoring_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+
+    error.contains("permission denied")
+        || error.contains("access is denied")
+        || error.contains("operation not permitted")
+        || error.contains("privilege is not held")
+        || error.contains("cap_net_admin")
+        || error.contains("dynamic store access failed: failed to create scdynamicstore")
+        || (error.contains("network change notification failed")
+            && (error.contains("code 5") || error.contains("code 1314")))
+}
+
+#[test]
+fn test_monitoring_error_skip_classification_is_restrictive() {
+    assert!(is_skip_worthy_platform_monitoring_error(
+        "Failed to create netlink socket: Operation not permitted (os error 1)"
+    ));
+    assert!(is_skip_worthy_platform_monitoring_error(
+        "Network change notification failed with code 5"
+    ));
+    assert!(is_skip_worthy_platform_monitoring_error(
+        "Dynamic store access failed: Failed to create SCDynamicStore"
+    ));
+    assert!(!is_skip_worthy_platform_monitoring_error(
+        "Dynamic store configuration failed"
+    ));
+    assert!(!is_skip_worthy_platform_monitoring_error(
+        "Message receive failed: invalid netlink frame"
+    ));
+}
+
 #[cfg(target_os = "windows")]
 mod windows_tests {
     use super::*;
@@ -69,17 +101,20 @@ mod windows_tests {
     fn test_windows_network_change_monitoring() {
         let mut discovery = WindowsInterfaceDiscovery::new();
 
-        // Initialize monitoring
-        if let Err(e) = discovery.start_scan() {
-            if e.contains("permission") {
-                println!("Skipping monitoring test due to permissions");
-                return;
+        match discovery.enable_change_monitoring() {
+            Ok(()) => {
+                let changed = discovery.check_network_changes();
+                println!("Windows network changes detected: {changed}");
+            }
+            Err(e) => {
+                let error = e.to_string();
+                assert!(
+                    is_skip_worthy_platform_monitoring_error(&error),
+                    "Windows network monitoring setup failed unexpectedly: {error}"
+                );
+                println!("Skipping monitoring test due to environment error: {error}");
             }
         }
-
-        // In a real scenario, we would trigger network changes
-        // For now, just verify the monitoring system initializes
-        assert!(true, "Windows network monitoring initialized");
     }
 
     #[test]
@@ -196,16 +231,22 @@ mod linux_tests {
                         println!("Network changes detected: {}", changes);
                     }
                     Err(e) => {
-                        println!("Error checking network changes: {:?}", e);
+                        let error = e.to_string();
+                        assert!(
+                            is_skip_worthy_platform_monitoring_error(&error),
+                            "Linux netlink monitoring check failed unexpectedly: {error}"
+                        );
+                        println!("Skipping monitoring check due to environment error: {error}");
                     }
                 }
             }
             Err(e) => {
-                // Might fail on some CI environments
-                println!(
-                    "Netlink initialization failed (may be normal on CI): {:?}",
-                    e
+                let error = e.to_string();
+                assert!(
+                    is_skip_worthy_platform_monitoring_error(&error),
+                    "Linux netlink initialization failed unexpectedly: {error}"
                 );
+                println!("Skipping netlink monitoring due to environment error: {error}");
             }
         }
     }
@@ -341,16 +382,22 @@ mod macos_tests {
         match discovery.enable_change_monitoring() {
             Ok(_) => {
                 println!("macOS network monitoring initialized");
+                assert!(
+                    discovery.sc_store.is_some(),
+                    "Dynamic store should be initialized for monitoring"
+                );
 
                 // Check if monitoring detects changes
                 let changed = discovery.check_network_changes();
                 println!("Network changes detected: {}", changed);
             }
             Err(e) => {
-                println!(
-                    "Network monitoring setup failed (may be normal on CI): {:?}",
-                    e
+                let error = e.to_string();
+                assert!(
+                    is_skip_worthy_platform_monitoring_error(&error),
+                    "macOS network monitoring setup failed unexpectedly: {error}"
                 );
+                println!("Skipping monitoring test due to environment error: {error}");
             }
         }
     }

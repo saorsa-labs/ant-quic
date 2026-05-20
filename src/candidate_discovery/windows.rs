@@ -175,7 +175,7 @@ struct AdapterConfig {
 /// Windows IP Helper API error types
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-enum WindowsNetworkError {
+pub enum WindowsNetworkError {
     /// API call failed
     ApiCallFailed {
         function: &'static str,
