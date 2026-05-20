@@ -13,6 +13,18 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DOCKER_COMPOSE_PATH: &str = "docker/nat-emulation/docker-compose.yml";
+const NAT_EMULATION_EXTERNAL_IFACE: &str = "eth1";
+const NAT_EMULATION_CONTAINERS: &[&str] = &[
+    "nat-fullcone",
+    "nat-restricted",
+    "nat-portrestricted",
+    "nat-symmetric",
+    "nat-cgnat",
+    "nat-doublenat-outer",
+    "nat-doublenat-inner",
+    "nat-hairpin",
+];
 const ANT_QUIC_LISTEN_ADDR: &str = "0.0.0.0:9000";
 const LISTENER_PID_FILE: &str = "/tmp/ant-quic-listener.pid";
 const LISTENER_LOG_FILE: &str = "/tmp/ant-quic-listener.log";
@@ -106,7 +118,7 @@ impl Default for DockerNatTestRunner {
 impl DockerNatTestRunner {
     pub fn new() -> Self {
         Self {
-            docker_compose_path: "docker/docker-compose.yml".to_string(),
+            docker_compose_path: DOCKER_COMPOSE_PATH.to_string(),
             test_results: Vec::new(),
             container_logs: HashMap::new(),
         }
@@ -115,6 +127,8 @@ impl DockerNatTestRunner {
     /// Run all Docker-based NAT tests
     pub async fn run_all_tests(&mut self) -> Result<()> {
         println!("Starting Docker NAT integration tests...");
+
+        self.validate_assets()?;
 
         // Start Docker environment
         self.start_docker_environment().await?;
@@ -138,6 +152,17 @@ impl DockerNatTestRunner {
 
         // Cleanup
         self.cleanup_docker_environment().await?;
+
+        Ok(())
+    }
+
+    fn validate_assets(&self) -> Result<()> {
+        if !std::path::Path::new(self.docker_compose_path.as_str()).is_file() {
+            anyhow::bail!(
+                "Docker NAT test compose file is missing: {}",
+                self.docker_compose_path
+            );
+        }
 
         Ok(())
     }
@@ -412,21 +437,76 @@ impl DockerNatTestRunner {
 
     /// Apply network profile to containers
     async fn apply_network_profile(&self, profile: &str) -> Result<()> {
-        let script_path = "docker/scripts/network-conditions.sh";
+        let profile_args = network_profile_tc_args(profile)?;
+        let mut applied = 0;
 
-        let cmd = format!("{script_path} apply {profile}");
-        let mut command = Command::new("bash");
-        command.args([script_path, "apply", profile]);
+        for &container in NAT_EMULATION_CONTAINERS {
+            let inspect_cmd = format!("docker inspect {container}");
+            let mut inspect = Command::new("docker");
+            inspect.args(["inspect", "-f", "{{.State.Running}}", container]);
 
-        let output = command_output_with_timeout(command, &cmd, DOCKER_COMMAND_TIMEOUT)
-            .await
-            .context("Failed to apply network profile")?;
+            let inspect_output =
+                command_output_with_timeout(inspect, &inspect_cmd, DOCKER_COMMAND_TIMEOUT).await?;
+            if !inspect_output.status.success()
+                || String::from_utf8_lossy(&inspect_output.stdout).trim() != "true"
+            {
+                continue;
+            }
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to apply network profile: {}",
-                String::from_utf8_lossy(&output.stderr)
+            let clear_cmd = format!(
+                "docker exec {container} tc qdisc del dev {NAT_EMULATION_EXTERNAL_IFACE} root"
             );
+            let mut clear = Command::new("docker");
+            clear.args([
+                "exec",
+                container,
+                "tc",
+                "qdisc",
+                "del",
+                "dev",
+                NAT_EMULATION_EXTERNAL_IFACE,
+                "root",
+            ]);
+            let _ = command_output_with_timeout(clear, &clear_cmd, DOCKER_COMMAND_TIMEOUT).await;
+
+            if !profile_args.is_empty() {
+                let mut args = vec![
+                    "exec",
+                    container,
+                    "tc",
+                    "qdisc",
+                    "add",
+                    "dev",
+                    NAT_EMULATION_EXTERNAL_IFACE,
+                    "root",
+                    "netem",
+                ];
+                args.extend(profile_args);
+
+                let apply_cmd = format!(
+                    "docker exec {container} tc qdisc add dev {NAT_EMULATION_EXTERNAL_IFACE} root netem {}",
+                    profile_args.join(" ")
+                );
+                let mut apply = Command::new("docker");
+                apply.args(args);
+
+                let output = command_output_with_timeout(apply, &apply_cmd, DOCKER_COMMAND_TIMEOUT)
+                    .await
+                    .context("Failed to apply network profile")?;
+
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "Failed to apply network profile {profile} to {container}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+
+            applied += 1;
+        }
+
+        if applied == 0 {
+            anyhow::bail!("No running NAT emulation containers found for profile: {profile}");
         }
 
         Ok(())
@@ -569,6 +649,18 @@ impl DockerNatTestRunner {
     }
 }
 
+fn network_profile_tc_args(profile: &str) -> Result<&'static [&'static str]> {
+    match profile {
+        "normal" => Ok(&[]),
+        "satellite" => Ok(&["delay", "600ms", "50ms", "loss", "0.1%"]),
+        "lossy_wifi" => Ok(&["delay", "50ms", "20ms", "loss", "5%"]),
+        "congested" => Ok(&["delay", "120ms", "30ms", "loss", "1%", "rate", "1mbit"]),
+        "3g" => Ok(&["delay", "150ms", "40ms", "loss", "1%", "rate", "1.5mbit"]),
+        "4g" => Ok(&["delay", "60ms", "15ms", "loss", "0.2%", "rate", "10mbit"]),
+        _ => anyhow::bail!("Unknown network profile: {profile}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +684,32 @@ mod tests {
         assert!(scenarios.iter().any(|s| s.name.contains("symmetric")));
         assert!(scenarios.iter().any(|s| s.name.contains("cgnat")));
         assert!(scenarios.iter().any(|s| s.network_profile != "normal"));
+    }
+
+    #[test]
+    fn configured_docker_nat_assets_exist() {
+        let runner = DockerNatTestRunner::new();
+
+        assert!(
+            std::path::Path::new(runner.docker_compose_path.as_str()).is_file(),
+            "missing Docker compose file: {}",
+            runner.docker_compose_path
+        );
+        runner
+            .validate_assets()
+            .expect("configured Docker NAT assets should exist");
+    }
+
+    #[test]
+    fn scenario_network_profiles_are_supported() {
+        let runner = DockerNatTestRunner::new();
+
+        for scenario in runner.create_test_scenarios() {
+            network_profile_tc_args(&scenario.network_profile)
+                .expect("scenario uses a supported network profile");
+        }
+
+        assert!(network_profile_tc_args("unknown").is_err());
     }
 
     #[cfg(unix)]
