@@ -271,6 +271,11 @@ impl EndpointConfig {
         self
     }
 
+    /// Get the current Post-Quantum Cryptography configuration.
+    pub fn get_pqc_config(&self) -> Option<&crate::crypto::pqc::PqcConfig> {
+        self.pqc_config.as_ref()
+    }
+
     /// Set port configuration for endpoint binding
     ///
     /// Configure port binding strategy, IP mode (IPv4/IPv6), socket options,

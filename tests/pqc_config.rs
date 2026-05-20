@@ -60,8 +60,7 @@ fn test_pqc_config_integration_with_endpoint() {
     // Set PQC config
     endpoint_config.pqc_config(pqc_config.clone());
 
-    // Verify it was set (we can't directly access it due to pub(crate), but this tests compilation)
-    // In a real scenario, the endpoint would use this config during connection establishment
+    assert_eq!(endpoint_config.get_pqc_config(), Some(&pqc_config));
 }
 
 #[test]
