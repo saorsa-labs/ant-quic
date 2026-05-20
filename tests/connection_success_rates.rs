@@ -1,66 +1,117 @@
-//! Tests to verify improved connection success rates with QUIC Address Discovery
+//! Regression tests for connection-success inputs from QUIC Address Discovery.
 //!
-//! These tests measure the improvement in connection establishment success
-//! when using the OBSERVED_ADDRESS frame implementation.
+//! These tests drive production OBSERVED_ADDRESS frame parsing and candidate
+//! discovery through a deterministic NAT harness instead of generating
+//! synthetic success-rate numbers.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use ant_quic::{
+    CandidateDiscoveryManager, DiscoveryConfig, DiscoveryEvent, PeerId, VarInt,
+    frame::{decode_observed_address_frame, encode_observed_address_frame},
+};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
-/// Connection attempt result
-#[derive(Debug, Clone)]
-struct ConnectionAttempt {
-    _nat_type_client: &'static str,
-    _nat_type_peer: &'static str,
-    _with_discovery: bool,
-    success: bool,
-    time_to_connect: Duration,
-    attempts_needed: u32,
+#[derive(Debug, Clone, Copy)]
+enum NatKind {
+    FullCone,
+    PortRestrictedCone,
+    Symmetric,
 }
 
-/// Statistics for connection success rates
+#[derive(Debug)]
+struct SimulatedNat {
+    kind: NatKind,
+    external_ip: IpAddr,
+    port_base: u16,
+    mappings: HashMap<(SocketAddr, Option<SocketAddr>), SocketAddr>,
+}
+
+impl SimulatedNat {
+    fn new(kind: NatKind, external_ip: Ipv4Addr, port_base: u16) -> Self {
+        Self {
+            kind,
+            external_ip: IpAddr::V4(external_ip),
+            port_base,
+            mappings: HashMap::new(),
+        }
+    }
+
+    fn translate_outbound(&mut self, internal: SocketAddr, destination: SocketAddr) -> SocketAddr {
+        let key = match self.kind {
+            NatKind::FullCone => (internal, None),
+            NatKind::PortRestrictedCone | NatKind::Symmetric => (internal, Some(destination)),
+        };
+
+        let next_port = match self.kind {
+            NatKind::FullCone | NatKind::Symmetric => self.port_base + self.mappings.len() as u16,
+            NatKind::PortRestrictedCone => self.port_base + internal.port() % 1000,
+        };
+
+        *self
+            .mappings
+            .entry(key)
+            .or_insert(SocketAddr::new(self.external_ip, next_port))
+    }
+
+    fn allows_inbound(
+        &self,
+        external: SocketAddr,
+        internal: SocketAddr,
+        source: SocketAddr,
+    ) -> bool {
+        match self.kind {
+            NatKind::FullCone => {
+                self.mappings
+                    .iter()
+                    .any(|((mapped_internal, _), mapped_external)| {
+                        mapped_internal == &internal && mapped_external == &external
+                    })
+            }
+            NatKind::PortRestrictedCone | NatKind::Symmetric => {
+                self.mappings.get(&(internal, Some(source))) == Some(&external)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NatScenario {
+    name: &'static str,
+    client_nat: NatKind,
+    peer_nat: NatKind,
+    direct_success_with_discovery: bool,
+}
+
+#[derive(Debug)]
+struct DiscoveryOutcome {
+    observed_address: SocketAddr,
+    candidates: Vec<SocketAddr>,
+    frames_processed: u32,
+}
+
+#[derive(Debug)]
+struct ConnectionOutcome {
+    success: bool,
+    client_discovery: DiscoveryOutcome,
+    peer_discovery: DiscoveryOutcome,
+}
+
 #[derive(Debug, Default)]
 struct ConnectionStats {
     total_attempts: u32,
     successful_connections: u32,
-    failed_connections: u32,
-    average_time_to_connect: Duration,
-    min_time_to_connect: Duration,
-    max_time_to_connect: Duration,
-    average_attempts_per_connection: f64,
 }
 
 impl ConnectionStats {
-    fn add_attempt(&mut self, attempt: &ConnectionAttempt) {
+    fn add_result(&mut self, success: bool) {
         self.total_attempts += 1;
-
-        if attempt.success {
+        if success {
             self.successful_connections += 1;
-
-            // Update timing stats
-            if self.min_time_to_connect == Duration::ZERO
-                || attempt.time_to_connect < self.min_time_to_connect
-            {
-                self.min_time_to_connect = attempt.time_to_connect;
-            }
-            if attempt.time_to_connect > self.max_time_to_connect {
-                self.max_time_to_connect = attempt.time_to_connect;
-            }
-
-            // Update average
-            let total_time =
-                self.average_time_to_connect * self.successful_connections.saturating_sub(1);
-            self.average_time_to_connect =
-                (total_time + attempt.time_to_connect) / self.successful_connections;
-
-            // Update attempts average
-            self.average_attempts_per_connection = (self.average_attempts_per_connection
-                * (self.successful_connections - 1) as f64
-                + attempt.attempts_needed as f64)
-                / self.successful_connections as f64;
-        } else {
-            self.failed_connections += 1;
         }
     }
 
@@ -73,319 +124,243 @@ impl ConnectionStats {
     }
 }
 
-/// Test connection success rates with various NAT scenarios
-#[tokio::test]
-async fn test_connection_success_improvement() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=info")
-        .try_init();
+fn discover_observed_address(
+    enabled: bool,
+    peer_id: PeerId,
+    sequence_number: VarInt,
+    observed_address: SocketAddr,
+) -> DiscoveryOutcome {
+    let mut manager = CandidateDiscoveryManager::new(DiscoveryConfig {
+        min_discovery_time: Duration::ZERO,
+        ..DiscoveryConfig::default()
+    });
+    manager
+        .start_discovery(peer_id, Vec::new())
+        .expect("discovery session should start");
 
-    info!("Testing connection success rate improvements with QUIC Address Discovery");
+    let frames_processed = if enabled {
+        let encoded = encode_observed_address_frame(sequence_number, observed_address)
+            .expect("OBSERVED_ADDRESS encoder should accept the simulated address");
+        let (decoded_sequence, decoded_address) = decode_observed_address_frame(&encoded)
+            .expect("OBSERVED_ADDRESS decoder should parse encoded observation");
 
-    // Simulate connection attempts with different NAT combinations
-    let nat_scenarios = vec![
-        // (Client NAT, Peer NAT, Base success rate without discovery, Expected improvement)
-        ("Full Cone", "Full Cone", 0.95, 1.00), // Already good, minor improvement
-        ("Full Cone", "Restricted", 0.80, 0.95), // Significant improvement
-        ("Restricted", "Restricted", 0.60, 0.85), // Major improvement
-        ("Port Restricted", "Full Cone", 0.70, 0.90), // Good improvement
-        ("Port Restricted", "Port Restricted", 0.40, 0.75), // Huge improvement
-        ("Symmetric", "Full Cone", 0.50, 0.80), // Large improvement
-        ("Symmetric", "Restricted", 0.30, 0.65), // Major improvement
-        ("Symmetric", "Symmetric", 0.10, 0.40), // Still challenging but improved
-        ("CGNAT", "Full Cone", 0.40, 0.70),     // Good improvement
-        ("CGNAT", "CGNAT", 0.05, 0.25),         // Very challenging but improved
-    ];
+        assert_eq!(decoded_sequence, sequence_number);
+        assert_eq!(decoded_address, observed_address);
+        assert!(
+            manager
+                .accept_quic_discovered_address(peer_id, decoded_address)
+                .expect("discovery manager should accept decoded OBSERVED_ADDRESS"),
+            "decoded OBSERVED_ADDRESS should insert a new candidate"
+        );
+        1
+    } else {
+        0
+    };
 
-    let mut stats_without_discovery = ConnectionStats::default();
-    let mut stats_with_discovery = ConnectionStats::default();
+    let events = manager.poll_discovery_progress(peer_id);
+    let status = manager
+        .get_discovery_status(peer_id)
+        .expect("discovery status should exist");
 
-    // Run simulated connection attempts
-    let attempts_per_scenario = 100;
-
-    for (client_nat, peer_nat, base_rate, improved_rate) in &nat_scenarios {
-        info!("Testing {} <-> {}", client_nat, peer_nat);
-
-        // Test without address discovery
-        for i in 0..attempts_per_scenario {
-            let success = (i as f64 / attempts_per_scenario as f64) < *base_rate;
-            let time_to_connect = if success {
-                Duration::from_millis(500 + (i % 5) * 1000) // 0.5-5.5 seconds
-            } else {
-                Duration::from_secs(10) // Timeout
-            };
-            let attempts_needed = if success { 1 + (i % 3) as u32 } else { 5 };
-
-            let attempt = ConnectionAttempt {
-                _nat_type_client: client_nat,
-                _nat_type_peer: peer_nat,
-                _with_discovery: false,
-                success,
-                time_to_connect,
-                attempts_needed,
-            };
-
-            stats_without_discovery.add_attempt(&attempt);
-        }
-
-        // Test with address discovery
-        for i in 0..attempts_per_scenario {
-            let success = (i as f64 / attempts_per_scenario as f64) < *improved_rate;
-            let time_to_connect = if success {
-                Duration::from_millis(100 + (i % 3) * 100) // 0.1-0.4 seconds
-            } else {
-                Duration::from_secs(10) // Timeout
-            };
-            let attempts_needed = if success { 1 } else { 3 };
-
-            let attempt = ConnectionAttempt {
-                _nat_type_client: client_nat,
-                _nat_type_peer: peer_nat,
-                _with_discovery: true,
-                success,
-                time_to_connect,
-                attempts_needed,
-            };
-
-            stats_with_discovery.add_attempt(&attempt);
-        }
+    if enabled {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                DiscoveryEvent::ServerReflexiveCandidateDiscovered { candidate, .. }
+                    if candidate.address == observed_address
+            )),
+            "decoded OBSERVED_ADDRESS should surface as a server-reflexive candidate"
+        );
+        assert_eq!(
+            status.statistics.server_reflexive_candidates_found, 1,
+            "decoded OBSERVED_ADDRESS should update discovery statistics"
+        );
+    } else {
+        assert!(
+            events.is_empty(),
+            "disabled discovery should emit no server-reflexive candidate events"
+        );
+        assert_eq!(
+            status.statistics.server_reflexive_candidates_found, 0,
+            "disabled discovery should not record server-reflexive candidates"
+        );
     }
 
-    // Report results
-    info!("\n=== Connection Success Rate Results ===");
+    DiscoveryOutcome {
+        observed_address,
+        candidates: status
+            .discovered_candidates
+            .into_iter()
+            .map(|candidate| candidate.address)
+            .collect(),
+        frames_processed,
+    }
+}
 
-    info!("\nWithout Address Discovery:");
-    info!(
-        "  Success rate: {:.1}%",
-        stats_without_discovery.success_rate() * 100.0
+fn attempt_direct_connection(
+    client_nat: &mut SimulatedNat,
+    peer_nat: &mut SimulatedNat,
+    client_internal: SocketAddr,
+    peer_internal: SocketAddr,
+    client_advertised: SocketAddr,
+    peer_advertised: SocketAddr,
+) -> bool {
+    let client_source = client_nat.translate_outbound(client_internal, peer_advertised);
+    let peer_source = peer_nat.translate_outbound(peer_internal, client_advertised);
+
+    let client_receives =
+        client_nat.allows_inbound(client_advertised, client_internal, peer_source);
+    let peer_receives = peer_nat.allows_inbound(peer_advertised, peer_internal, client_source);
+
+    client_receives && peer_receives
+}
+
+fn run_scenario(scenario: NatScenario, discovery_enabled: bool) -> ConnectionOutcome {
+    let mut client_nat =
+        SimulatedNat::new(scenario.client_nat, Ipv4Addr::new(93, 184, 216, 50), 40_000);
+    let mut peer_nat =
+        SimulatedNat::new(scenario.peer_nat, Ipv4Addr::new(94, 184, 216, 200), 50_000);
+
+    let bootstrap = SocketAddr::from(([185, 199, 108, 153], 44_443));
+    let client_internal = SocketAddr::from(([192, 168, 1, 100], 60_000));
+    let peer_internal = SocketAddr::from(([10, 0, 0, 50], 60_001));
+
+    let client_observed = client_nat.translate_outbound(client_internal, bootstrap);
+    let peer_observed = peer_nat.translate_outbound(peer_internal, bootstrap);
+
+    let client_discovery = discover_observed_address(
+        discovery_enabled,
+        PeerId([0xC1; 32]),
+        VarInt::from_u32(1),
+        client_observed,
     );
-    info!(
-        "  Average time to connect: {:?}",
-        stats_without_discovery.average_time_to_connect
-    );
-    info!(
-        "  Average attempts needed: {:.1}",
-        stats_without_discovery.average_attempts_per_connection
-    );
-    info!(
-        "  Total: {}/{} successful",
-        stats_without_discovery.successful_connections, stats_without_discovery.total_attempts
+    let peer_discovery = discover_observed_address(
+        discovery_enabled,
+        PeerId([0xC2; 32]),
+        VarInt::from_u32(2),
+        peer_observed,
     );
 
-    info!("\nWith Address Discovery:");
-    info!(
-        "  Success rate: {:.1}%",
-        stats_with_discovery.success_rate() * 100.0
-    );
-    info!(
-        "  Average time to connect: {:?}",
-        stats_with_discovery.average_time_to_connect
-    );
-    info!(
-        "  Average attempts needed: {:.1}",
-        stats_with_discovery.average_attempts_per_connection
-    );
-    info!(
-        "  Total: {}/{} successful",
-        stats_with_discovery.successful_connections, stats_with_discovery.total_attempts
+    let client_advertised = client_discovery
+        .candidates
+        .first()
+        .copied()
+        .unwrap_or(client_internal);
+    let peer_advertised = peer_discovery
+        .candidates
+        .first()
+        .copied()
+        .unwrap_or(peer_internal);
+
+    let success = attempt_direct_connection(
+        &mut client_nat,
+        &mut peer_nat,
+        client_internal,
+        peer_internal,
+        client_advertised,
+        peer_advertised,
     );
 
-    let improvement = stats_with_discovery.success_rate() - stats_without_discovery.success_rate();
-    info!("\nImprovement: +{:.1}% success rate", improvement * 100.0);
+    ConnectionOutcome {
+        success,
+        client_discovery,
+        peer_discovery,
+    }
+}
 
-    let time_improvement = stats_without_discovery.average_time_to_connect.as_millis() as f64
-        / stats_with_discovery.average_time_to_connect.as_millis() as f64;
-    info!(
-        "Connection time improvement: {:.1}x faster",
-        time_improvement
+#[test]
+fn observed_address_frames_drive_connection_success_rate_inputs() {
+    let scenarios = [
+        NatScenario {
+            name: "full cone peers",
+            client_nat: NatKind::FullCone,
+            peer_nat: NatKind::FullCone,
+            direct_success_with_discovery: true,
+        },
+        NatScenario {
+            name: "port restricted peers",
+            client_nat: NatKind::PortRestrictedCone,
+            peer_nat: NatKind::PortRestrictedCone,
+            direct_success_with_discovery: true,
+        },
+        NatScenario {
+            name: "symmetric peers",
+            client_nat: NatKind::Symmetric,
+            peer_nat: NatKind::Symmetric,
+            direct_success_with_discovery: false,
+        },
+    ];
+
+    let mut without_discovery = ConnectionStats::default();
+    let mut with_discovery = ConnectionStats::default();
+
+    for scenario in scenarios {
+        let disabled = run_scenario(scenario, false);
+        assert!(
+            disabled.client_discovery.candidates.is_empty(),
+            "{} should have no client candidates without OBSERVED_ADDRESS",
+            scenario.name
+        );
+        assert!(
+            disabled.peer_discovery.candidates.is_empty(),
+            "{} should have no peer candidates without OBSERVED_ADDRESS",
+            scenario.name
+        );
+        assert_eq!(
+            disabled.client_discovery.frames_processed + disabled.peer_discovery.frames_processed,
+            0,
+            "{} should process no OBSERVED_ADDRESS frames when discovery is disabled",
+            scenario.name
+        );
+        assert!(
+            !disabled.success,
+            "{} should not connect through NATs with only private local addresses",
+            scenario.name
+        );
+        without_discovery.add_result(disabled.success);
+
+        let enabled = run_scenario(scenario, true);
+        assert!(
+            enabled
+                .client_discovery
+                .candidates
+                .contains(&enabled.client_discovery.observed_address),
+            "{} should record the client OBSERVED_ADDRESS as a connection candidate",
+            scenario.name
+        );
+        assert!(
+            enabled
+                .peer_discovery
+                .candidates
+                .contains(&enabled.peer_discovery.observed_address),
+            "{} should record the peer OBSERVED_ADDRESS as a connection candidate",
+            scenario.name
+        );
+        assert_eq!(
+            enabled.client_discovery.frames_processed + enabled.peer_discovery.frames_processed,
+            2,
+            "{} should process both OBSERVED_ADDRESS frames",
+            scenario.name
+        );
+        assert_eq!(
+            enabled.success, scenario.direct_success_with_discovery,
+            "{} direct-connection result should follow the NAT mapping produced by real observed candidates",
+            scenario.name
+        );
+        with_discovery.add_result(enabled.success);
+    }
+
+    assert_eq!(
+        without_discovery.success_rate(),
+        0.0,
+        "without OBSERVED_ADDRESS candidates, the harness should have no direct NAT successes"
     );
-
-    // Verify significant improvement
     assert!(
-        improvement > 0.2,
-        "Expected at least 20% improvement in success rate"
+        with_discovery.success_rate() > without_discovery.success_rate(),
+        "OBSERVED_ADDRESS-derived candidates should improve deterministic connection success"
     );
-    assert!(
-        time_improvement > 2.0,
-        "Expected at least 2x faster connection times"
-    );
-}
-
-/// Test success rates by NAT type
-#[tokio::test]
-async fn test_success_by_nat_type() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=info")
-        .try_init();
-
-    info!("Testing success rates by NAT type");
-
-    let nat_types = vec![
-        "Full Cone",
-        "Restricted",
-        "Port Restricted",
-        "Symmetric",
-        "CGNAT",
-    ];
-
-    for nat_type in &nat_types {
-        let mut stats = ConnectionStats::default();
-
-        // Test this NAT type against all other types
-        for peer_nat in &nat_types {
-            // Simulate success based on NAT difficulty
-            let difficulty_score = nat_difficulty(nat_type) + nat_difficulty(peer_nat);
-            let success_rate = 1.0 - (difficulty_score as f64 / 10.0);
-
-            for i in 0..20 {
-                let success = (i as f64 / 20.0) < success_rate;
-                let attempt = ConnectionAttempt {
-                    _nat_type_client: nat_type,
-                    _nat_type_peer: peer_nat,
-                    _with_discovery: true,
-                    success,
-                    time_to_connect: Duration::from_millis(if success { 200 } else { 5000 }),
-                    attempts_needed: 1,
-                };
-                stats.add_attempt(&attempt);
-            }
-        }
-
-        info!(
-            "{} NAT success rate: {:.1}%",
-            nat_type,
-            stats.success_rate() * 100.0
-        );
-    }
-}
-
-fn nat_difficulty(nat_type: &str) -> u32 {
-    match nat_type {
-        "Full Cone" => 1,
-        "Restricted" => 2,
-        "Port Restricted" => 3,
-        "Symmetric" => 4,
-        "CGNAT" => 5,
-        _ => 3,
-    }
-}
-
-/// Test connection establishment time improvements
-#[tokio::test]
-async fn test_connection_time_improvement() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=info")
-        .try_init();
-
-    info!("Testing connection establishment time improvements");
-
-    // Measure connection times with different discovery states
-    let scenarios = vec![
-        ("No discovery - port scanning", Duration::from_secs(5)),
-        (
-            "Partial discovery - some ports known",
-            Duration::from_millis(1500),
-        ),
-        (
-            "Full discovery - exact address known",
-            Duration::from_millis(200),
-        ),
-    ];
-
-    for (scenario, expected_time) in scenarios {
-        let start = Instant::now();
-
-        // Simulate connection establishment
-        tokio::time::sleep(expected_time).await;
-
-        let elapsed = start.elapsed();
-        info!("{}: {:?}", scenario, elapsed);
-
-        // Verify timing is as expected
-        assert!(elapsed >= expected_time);
-        assert!(elapsed < expected_time + Duration::from_millis(100)); // Allow small variance
-    }
-}
-
-/// Test retry behavior improvements
-#[tokio::test]
-async fn test_retry_behavior_improvement() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=debug")
-        .try_init();
-
-    info!("Testing retry behavior improvements");
-
-    // Without discovery: many retries with different ports
-    let retries_without_discovery = vec![
-        (1, false, "Trying port 50000"),
-        (2, false, "Trying port 50001"),
-        (3, false, "Trying port 50002"),
-        (4, false, "Trying port 50003"),
-        (5, true, "Found working port 50004"),
-    ];
-
-    // With discovery: fewer retries, correct port known
-    let retries_with_discovery = vec![(1, true, "Using discovered port 45678")];
-
-    debug!("Without address discovery:");
-    for (attempt, success, description) in &retries_without_discovery {
-        debug!(
-            "  Attempt {}: {} - {}",
-            attempt,
-            if *success { "SUCCESS" } else { "FAILED" },
-            description
-        );
-    }
-
-    debug!("With address discovery:");
-    for (attempt, success, description) in &retries_with_discovery {
-        debug!(
-            "  Attempt {}: {} - {}",
-            attempt,
-            if *success { "SUCCESS" } else { "FAILED" },
-            description
-        );
-    }
-
-    // Verify improvement
-    assert_eq!(retries_without_discovery.len(), 5);
-    assert_eq!(retries_with_discovery.len(), 1);
-}
-
-/// Test overall system improvement metrics
-#[tokio::test]
-async fn test_overall_improvement_metrics() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=info")
-        .try_init();
-
-    info!("Testing overall system improvement metrics");
-
-    // Define key metrics
-    let metrics = vec![
-        ("Connection success rate", 55.0, 82.0, "%"),
-        ("Average time to connect", 3200.0, 450.0, "ms"),
-        ("Failed connection attempts", 45.0, 18.0, "%"),
-        ("Network bandwidth used", 12.5, 3.2, "KB"),
-        ("CPU usage during connection", 25.0, 8.0, "%"),
-    ];
-
-    info!("\n=== Overall System Improvements ===");
-    for (metric, without, with, unit) in metrics {
-        let improvement = if without > with {
-            ((without - with) / without) * 100.0
-        } else {
-            ((with - without) / without) * 100.0
-        };
-
-        info!(
-            "{:30} | Without: {:>8.1}{} | With: {:>8.1}{} | Improvement: {:>5.1}%",
-            metric, without, unit, with, unit, improvement
-        );
-    }
-
-    info!(
-        "\nConclusion: QUIC Address Discovery provides significant improvements across all metrics"
+    assert_eq!(
+        with_discovery.successful_connections, 2,
+        "full-cone and port-restricted scenarios should connect; symmetric NAT remains hard"
     );
 }
