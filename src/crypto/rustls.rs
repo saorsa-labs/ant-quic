@@ -689,7 +689,7 @@ pub(crate) fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// Create a CryptoProvider with PQC support
 ///
 /// v0.13.0+: PQC is always enabled. This function creates a provider that uses
-/// PQC key exchange groups (ML-KEM-768 or hybrid groups containing ML-KEM).
+/// PQC key exchange groups (pure ML-KEM only).
 /// Classical algorithms like X25519 are excluded.
 ///
 /// If no `PqcConfig` is provided, a default configuration with both ML-KEM and

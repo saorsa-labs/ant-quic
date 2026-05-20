@@ -123,12 +123,11 @@ fn create_pqc_provider(config: &PqcConfig) -> Result<Arc<CryptoProvider>, PqcErr
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
 
     if config.ml_kem_enabled {
-        // v0.2: Use ML-KEM-containing groups from available providers
-        // Prefer pure ML-KEM, accept hybrid if pure isn't available yet
+        // v0.2: Use only pure ML-KEM groups from available providers.
         let mlkem_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = provider
             .kx_groups
             .iter()
-            .filter(|g| is_mlkem_kx_group(g.name()))
+            .filter(|g| is_pure_pqc_kx_group(g.name()))
             .copied()
             .collect();
 
@@ -138,7 +137,7 @@ fn create_pqc_provider(config: &PqcConfig) -> Result<Arc<CryptoProvider>, PqcErr
             let pq_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = pq_provider
                 .kx_groups
                 .iter()
-                .filter(|g| is_mlkem_kx_group(g.name()))
+                .filter(|g| is_pure_pqc_kx_group(g.name()))
                 .copied()
                 .collect();
 
@@ -185,35 +184,11 @@ fn is_pure_pqc_kx_group(group: rustls::NamedGroup) -> bool {
     matches!(group_code, MLKEM512 | MLKEM768 | MLKEM1024)
 }
 
-/// Check if a NamedGroup contains ML-KEM (pure or hybrid)
-///
-/// v0.2: We accept ML-KEM-containing groups. Currently rustls only provides
-/// hybrid groups (X25519MLKEM768), but we'll prefer pure when available.
-/// The key point is that any ML-KEM group provides quantum resistance.
-fn is_mlkem_kx_group(group: rustls::NamedGroup) -> bool {
-    // Pure ML-KEM groups
-    if is_pure_pqc_kx_group(group) {
-        return true;
-    }
-
-    // Hybrid ML-KEM groups (transitional - still provide PQC protection)
-    // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
-    const SECP256R1MLKEM768: u16 = 0x11EB;
-    const X25519MLKEM768: u16 = 0x11EC;
-    const SECP384R1MLKEM1024: u16 = 0x11ED;
-
-    let group_code = u16::from(group);
-    matches!(
-        group_code,
-        SECP256R1MLKEM768 | X25519MLKEM768 | SECP384R1MLKEM1024
-    )
-}
-
 /// Check if a NamedGroup is a valid PQC group
 ///
-/// v0.2: Accepts ML-KEM-containing groups (pure preferred, hybrid accepted)
+/// v0.2: Accepts only pure ML-KEM groups.
 fn is_pqc_kx_group(group: rustls::NamedGroup) -> bool {
-    is_mlkem_kx_group(group)
+    is_pure_pqc_kx_group(group)
 }
 
 /// Check if a negotiated group is a PQC group (for validation)
@@ -223,8 +198,7 @@ pub fn is_pqc_group(group: rustls::NamedGroup) -> bool {
 
 /// Validate that a connection used PQC algorithms
 ///
-/// v0.2: Accepts ML-KEM-containing groups (pure or hybrid).
-/// Any ML-KEM group provides quantum resistance for key exchange.
+/// v0.2: Accepts only pure ML-KEM groups.
 pub fn validate_negotiated_group(negotiated_group: rustls::NamedGroup) -> Result<(), PqcError> {
     if !is_pqc_kx_group(negotiated_group) {
         return Err(PqcError::NegotiationFailed(format!(
@@ -248,17 +222,16 @@ mod tests {
             .expect("Failed to build config");
 
         let result = create_pqc_provider(&config);
-        // v0.2: Should succeed with ML-KEM groups
-        assert!(result.is_ok(), "Provider creation should succeed");
-
-        let provider = result.unwrap();
-        // All key exchange groups should contain ML-KEM (pure or hybrid)
-        for group in provider.kx_groups.iter() {
-            assert!(
-                is_pqc_kx_group(group.name()),
-                "Provider should only have ML-KEM groups, found {:?}",
-                group.name()
-            );
+        // Provider creation may fail if the active rustls providers do not
+        // expose pure ML-KEM groups, but it must never fall back to hybrids.
+        if let Ok(provider) = result {
+            for group in provider.kx_groups.iter() {
+                assert!(
+                    is_pure_pqc_kx_group(group.name()),
+                    "Provider should only have pure ML-KEM groups, found {:?}",
+                    group.name()
+                );
+            }
         }
     }
 
@@ -292,17 +265,17 @@ mod tests {
         let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x0202));
         assert!(result.is_ok(), "ML-KEM-1024 should be accepted");
 
-        // v0.2: Hybrid ML-KEM groups are accepted (still provide PQC protection)
+        // Hybrid ML-KEM groups are rejected by the pure-PQC contract.
         let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x11EC));
         assert!(
-            result.is_ok(),
-            "X25519MLKEM768 should be accepted (contains ML-KEM)"
+            result.is_err(),
+            "X25519MLKEM768 should be rejected (hybrid)"
         );
 
         let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x11EB));
         assert!(
-            result.is_ok(),
-            "SecP256r1MLKEM768 should be accepted (contains ML-KEM)"
+            result.is_err(),
+            "SecP256r1MLKEM768 should be rejected (hybrid)"
         );
     }
 
@@ -325,17 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_mlkem_kx_group() {
-        // v0.2: is_pqc_kx_group accepts any ML-KEM-containing group
+    fn test_is_pqc_kx_group() {
+        // v0.2: is_pqc_kx_group accepts only pure ML-KEM groups.
         // Pure ML-KEM groups
         assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x0200))); // Pure ML-KEM-512
         assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x0201))); // Pure ML-KEM-768
         assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x0202))); // Pure ML-KEM-1024
 
-        // Hybrid ML-KEM groups (accepted - contain ML-KEM)
-        assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11EC))); // X25519MLKEM768
-        assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11EB))); // SecP256r1MLKEM768
-        assert!(is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11ED))); // SecP384r1MLKEM1024
+        // Hybrid ML-KEM groups (rejected - not pure PQC)
+        assert!(!is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11EC))); // X25519MLKEM768
+        assert!(!is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11EB))); // SecP256r1MLKEM768
+        assert!(!is_pqc_kx_group(rustls::NamedGroup::Unknown(0x11ED))); // SecP384r1MLKEM1024
 
         // Classical groups (rejected - no ML-KEM)
         assert!(!is_pqc_kx_group(rustls::NamedGroup::X25519));

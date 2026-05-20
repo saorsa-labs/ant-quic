@@ -68,7 +68,7 @@ fn test_validate_negotiated_group_secp256r1() {
     assert!(result.is_err(), "SECP256R1 should be rejected in v0.13.0+");
 }
 
-/// Test ML-KEM group validation (v0.2: ML-KEM-containing groups)
+/// Test ML-KEM group validation (v0.2: pure ML-KEM groups only)
 #[test]
 fn test_validate_negotiated_group_ml_kem() {
     // Pure ML-KEM groups should be accepted
@@ -81,11 +81,23 @@ fn test_validate_negotiated_group_ml_kem() {
     let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x0202));
     assert!(result.is_ok(), "ML-KEM-1024 (0x0202) should be accepted");
 
-    // v0.2: Hybrid ML-KEM groups are accepted (still provide PQC protection)
+    // Hybrid ML-KEM groups must be rejected by the pure-PQC contract.
     let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x11EC));
     assert!(
-        result.is_ok(),
-        "X25519MLKEM768 should be accepted (contains ML-KEM)"
+        result.is_err(),
+        "X25519MLKEM768 should be rejected (hybrid)"
+    );
+
+    let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x11EB));
+    assert!(
+        result.is_err(),
+        "SecP256r1MLKEM768 should be rejected (hybrid)"
+    );
+
+    let result = validate_negotiated_group(rustls::NamedGroup::Unknown(0x11ED));
+    assert!(
+        result.is_err(),
+        "SecP384r1MLKEM1024 should be rejected (hybrid)"
     );
 }
 
@@ -102,9 +114,10 @@ fn test_is_pqc_group() {
     assert!(is_pqc_group(rustls::NamedGroup::Unknown(0x0201))); // ML-KEM-768
     assert!(is_pqc_group(rustls::NamedGroup::Unknown(0x0202))); // ML-KEM-1024
 
-    // v0.2: Hybrid ML-KEM groups are accepted (provide PQC protection)
-    assert!(is_pqc_group(rustls::NamedGroup::Unknown(0x11EC))); // X25519MLKEM768
-    assert!(is_pqc_group(rustls::NamedGroup::Unknown(0x11EB))); // SecP256r1MLKEM768
+    // Hybrid ML-KEM groups should return false.
+    assert!(!is_pqc_group(rustls::NamedGroup::Unknown(0x11EC))); // X25519MLKEM768
+    assert!(!is_pqc_group(rustls::NamedGroup::Unknown(0x11EB))); // SecP256r1MLKEM768
+    assert!(!is_pqc_group(rustls::NamedGroup::Unknown(0x11ED))); // SecP384r1MLKEM1024
 }
 
 /// Test that provider only includes PQC groups
@@ -172,10 +185,22 @@ fn test_validate_pqc_connection() {
     let result = validate_pqc_connection(rustls::NamedGroup::Unknown(0x0202));
     assert!(result.is_ok(), "ML-KEM-1024 should be accepted");
 
-    // v0.2: Hybrid ML-KEM groups are accepted (provide PQC protection)
+    // Hybrid ML-KEM groups must be rejected by the pure-PQC contract.
     let result = validate_pqc_connection(rustls::NamedGroup::Unknown(0x11EC));
     assert!(
-        result.is_ok(),
-        "X25519MLKEM768 should be accepted (contains ML-KEM)"
+        result.is_err(),
+        "X25519MLKEM768 should be rejected (hybrid)"
+    );
+
+    let result = validate_pqc_connection(rustls::NamedGroup::Unknown(0x11EB));
+    assert!(
+        result.is_err(),
+        "SecP256r1MLKEM768 should be rejected (hybrid)"
+    );
+
+    let result = validate_pqc_connection(rustls::NamedGroup::Unknown(0x11ED));
+    assert!(
+        result.is_err(),
+        "SecP384r1MLKEM1024 should be rejected (hybrid)"
     );
 }
