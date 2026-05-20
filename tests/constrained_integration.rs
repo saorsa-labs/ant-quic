@@ -73,7 +73,7 @@ fn test_handshake_simulation() {
     };
 
     // Client sends SYN
-    let (_conn_id, syn_packets) = client.connect(&server_addr).unwrap();
+    let (conn_id, syn_packets) = client.connect(&server_addr).unwrap();
     assert_eq!(syn_packets.len(), 1);
 
     // Server receives SYN and sends SYN-ACK
@@ -92,21 +92,48 @@ fn test_handshake_simulation() {
 
     // Connection should be established on client side
     // (We can check events for ConnectionEstablished)
-    let mut _client_established = false;
+    let mut client_established = false;
     while let Some(event) = client.next_event() {
         if matches!(
             event,
             ant_quic::constrained::AdapterEvent::ConnectionEstablished { .. }
         ) {
-            _client_established = true;
+            client_established = true;
         }
     }
+    assert!(
+        client_established,
+        "Client should emit ConnectionEstablished"
+    );
+    assert_eq!(
+        client.connection_state(conn_id),
+        Some(ant_quic::constrained::ConnectionState::Established)
+    );
 
     // Note: Full handshake completion requires server to receive the final ACK
     // which happens when we process the ack_packets on server
-    if !ack_packets.is_empty() {
-        let _ = server.process_incoming(&client_addr, &ack_packets[0].data);
+    assert!(!ack_packets.is_empty(), "Client should send final ACK");
+    server
+        .process_incoming(&client_addr, &ack_packets[0].data)
+        .unwrap();
+
+    let mut server_established = false;
+    while let Some(event) = server.next_event() {
+        if matches!(
+            event,
+            ant_quic::constrained::AdapterEvent::ConnectionEstablished { .. }
+        ) {
+            server_established = true;
+        }
     }
+    assert!(
+        server_established,
+        "Server should emit ConnectionEstablished"
+    );
+    assert_eq!(
+        server.connection_state(conn_id),
+        Some(ant_quic::constrained::ConnectionState::Established)
+    );
 }
 
 /// Test transport wrapper with handle cloning
@@ -214,9 +241,16 @@ fn test_data_transfer() {
     let ack = client
         .process_incoming(&server_addr, &syn_ack[0].data)
         .unwrap();
-    if !ack.is_empty() {
-        let _ = server.process_incoming(&client_addr, &ack[0].data);
-    }
+    assert!(!ack.is_empty(), "Client should send final ACK");
+    server.process_incoming(&client_addr, &ack[0].data).unwrap();
+    assert_eq!(
+        client.connection_state(conn_id),
+        Some(ant_quic::constrained::ConnectionState::Established)
+    );
+    assert_eq!(
+        server.connection_state(conn_id),
+        Some(ant_quic::constrained::ConnectionState::Established)
+    );
 
     // Send data from client
     let test_data = b"Hello, constrained world!";
@@ -224,17 +258,11 @@ fn test_data_transfer() {
     assert!(!data_packets.is_empty(), "Should have data packet");
 
     // Server processes data packet
-    let response = server.process_incoming(&client_addr, &data_packets[0].data);
-    assert!(response.is_ok());
-
-    // Check for DataReceived event on server
-    let mut _data_received = false;
-    while let Some(event) = server.next_event() {
-        if let ant_quic::constrained::AdapterEvent::DataReceived { data, .. } = event {
-            assert_eq!(data.as_slice(), test_data);
-            _data_received = true;
-        }
-    }
+    let response = server
+        .process_incoming(&client_addr, &data_packets[0].data)
+        .unwrap();
+    assert!(!response.is_empty(), "Server should ACK data packet");
+    assert_eq!(server.recv(conn_id).as_deref(), Some(test_data.as_slice()));
 }
 
 /// Test connection close
@@ -526,10 +554,7 @@ async fn wait_for_peer_disconnected(
         }
     })
     .await;
-    match result {
-        Ok(found) => found,
-        Err(_) => false,
-    }
+    result.unwrap_or_default()
 }
 
 async fn wait_for_data_received(
