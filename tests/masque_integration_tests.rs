@@ -16,6 +16,8 @@
 //! - Migration coordinator
 //! - NAT traversal API integration
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
