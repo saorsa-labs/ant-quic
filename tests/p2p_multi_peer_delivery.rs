@@ -2,7 +2,7 @@
 
 mod support;
 
-use ant_quic::PeerId;
+use ant_quic::{P2pEndpoint, PeerId};
 use std::collections::HashSet;
 use std::time::Duration;
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
@@ -10,6 +10,15 @@ use tokio::time::{sleep, timeout};
 
 const PEER_COUNT: usize = 3;
 const MESSAGES_PER_PEER: usize = 8;
+const EXTRA_DELIVERY_QUIET_PERIOD: Duration = Duration::from_millis(200);
+
+async fn assert_no_extra_message(node: &P2pEndpoint, context: &str) {
+    let extra = timeout(EXTRA_DELIVERY_QUIET_PERIOD, node.recv()).await;
+    assert!(
+        extra.is_err(),
+        "{context} received extra application payload during quiet period: {extra:?}"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn symmetric_peer_mesh_delivers_all_messages_from_multiple_connected_peers() {
@@ -82,6 +91,7 @@ async fn symmetric_peer_mesh_delivers_all_messages_from_multiple_connected_peers
     }
 
     assert_eq!(seen, expected);
+    assert_no_extra_message(&hub, "hub").await;
 
     // The same established peer connections should work in the reverse direction too.
     for (index, peer, peer_id) in &peers {
@@ -95,6 +105,7 @@ async fn symmetric_peer_mesh_delivers_all_messages_from_multiple_connected_peers
             .expect("peer recv");
         assert_eq!(from, hub_id);
         assert_eq!(payload, ack.as_bytes());
+        assert_no_extra_message(peer, "peer").await;
     }
 
     for (_, peer, _) in peers {
