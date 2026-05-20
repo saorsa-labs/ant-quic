@@ -91,16 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let implementations = matrix["implementations"]
         .as_mapping()
         .ok_or("Invalid matrix format: missing implementations")?;
+    let category = validate_category_filter(&matrix, args.category.as_deref())?;
 
     info!("Found {} implementations to test", implementations.len());
+    if let Some(category) = category {
+        info!("Filtering tests by category: {}", category);
+    }
 
     for (impl_name, impl_data) in implementations {
         let name = impl_name.as_str().unwrap_or("unknown");
 
-        // Skip if specific implementation requested and this isn't it
-        if let Some(ref target) = args.implementation
-            && name != target
-        {
+        if !should_test_implementation(&matrix, name, args.implementation.as_deref(), category) {
             continue;
         }
 
@@ -213,6 +214,61 @@ async fn test_endpoint(
     connection.close(0u32.into(), b"test complete");
 
     Ok(duration)
+}
+
+fn validate_category_filter<'a>(
+    matrix: &serde_yaml::Value,
+    category: Option<&'a str>,
+) -> Result<Option<&'a str>, Box<dyn std::error::Error>> {
+    let Some(category) = category else {
+        return Ok(None);
+    };
+
+    let categories = matrix["test_categories"]
+        .as_mapping()
+        .ok_or("Invalid matrix format: missing test_categories")?;
+
+    if categories
+        .keys()
+        .any(|category_name| category_name.as_str() == Some(category))
+    {
+        Ok(Some(category))
+    } else {
+        Err(format!("Unknown test category: {category}").into())
+    }
+}
+
+fn should_test_implementation(
+    matrix: &serde_yaml::Value,
+    implementation_name: &str,
+    implementation_filter: Option<&str>,
+    category_filter: Option<&str>,
+) -> bool {
+    if let Some(target) = implementation_filter
+        && implementation_name != target
+    {
+        return false;
+    }
+
+    let Some(category) = category_filter else {
+        return true;
+    };
+
+    implementation_has_expected_outcome(matrix, implementation_name, category)
+}
+
+fn implementation_has_expected_outcome(
+    matrix: &serde_yaml::Value,
+    implementation_name: &str,
+    category: &str,
+) -> bool {
+    matrix["expected_outcomes"]["ant_quic_client"][implementation_name]
+        .as_mapping()
+        .is_some_and(|outcomes| {
+            outcomes
+                .keys()
+                .any(|outcome_category| outcome_category.as_str() == Some(category))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,8 +401,8 @@ mod tests {
     use std::net::{IpAddr, Ipv6Addr};
 
     #[test]
-    fn parses_hostname_endpoint_without_resolution() {
-        let parsed = parse_endpoint("www.google.com:443").unwrap();
+    fn parses_hostname_endpoint_without_resolution() -> Result<(), Box<dyn std::error::Error>> {
+        let parsed = parse_endpoint("www.google.com:443")?;
 
         assert_eq!(
             parsed,
@@ -355,11 +411,13 @@ mod tests {
                 port: 443,
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn parses_bracketed_ipv6_endpoint_without_truncating_server_name() {
-        let resolved = resolve_endpoint("[2001:db8::1]:4433").unwrap();
+    fn parses_bracketed_ipv6_endpoint_without_truncating_server_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolved = resolve_endpoint("[2001:db8::1]:4433")?;
 
         assert_eq!(resolved.server_name, "2001:db8::1");
         assert_eq!(
@@ -369,6 +427,7 @@ mod tests {
                 4433
             )
         );
+        Ok(())
     }
 
     #[test]
@@ -379,5 +438,26 @@ mod tests {
             bind_addr_for_remote(remote),
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         );
+    }
+
+    #[test]
+    fn category_filter_selects_matching_implementations() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let matrix: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../../tests/interop/interop-matrix.yaml"))?;
+        let category = validate_category_filter(&matrix, Some("nat_traversal"))?;
+
+        assert!(should_test_implementation(
+            &matrix, "picoquic", None, category
+        ));
+        assert!(!should_test_implementation(
+            &matrix, "google", None, category
+        ));
+
+        let Some(error) = validate_category_filter(&matrix, Some("missing")).err() else {
+            return Err("expected unknown category error".into());
+        };
+        assert_eq!(error.to_string(), "Unknown test category: missing");
+        Ok(())
     }
 }
