@@ -786,6 +786,9 @@ pub struct P2pEndpoint {
     /// Probe single-flight/cache state keyed by peer.
     probe_flights: Arc<TokioMutex<HashMap<ProbeFlightKey, ProbeFlightState>>>,
 
+    /// Cumulative active probe request envelopes successfully emitted.
+    active_probe_requests_sent: Arc<AtomicU64>,
+
     /// Global low-priority budget for explicit liveness probes.
     probe_semaphore: Arc<Semaphore>,
 
@@ -2946,6 +2949,7 @@ impl P2pEndpoint {
         let ack_liveness = Arc::new(AckLivenessTracker::default());
         let ack_request_dedupe = Arc::new(AckRequestDedupeCache::default());
         let probe_flights = Arc::new(TokioMutex::new(HashMap::new()));
+        let active_probe_requests_sent = Arc::new(AtomicU64::new(0));
         let probe_semaphore = Arc::new(Semaphore::new(PROBE_GLOBAL_CONCURRENCY));
         let (peer_event_tx, _) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
         let peer_event_channels = Arc::new(ParkingRwLock::new(HashMap::new()));
@@ -2986,6 +2990,7 @@ impl P2pEndpoint {
             ack_liveness,
             ack_request_dedupe,
             probe_flights,
+            active_probe_requests_sent,
             probe_semaphore,
             peer_event_tx,
             peer_event_channels,
@@ -7063,6 +7068,8 @@ impl P2pEndpoint {
             }
             return Err(error);
         }
+        self.active_probe_requests_sent
+            .fetch_add(1, Ordering::Relaxed);
 
         note_peer_activity(
             &self.connected_peers,
@@ -7237,6 +7244,12 @@ impl P2pEndpoint {
             data_tx_capacity: capacity,
             data_tx_high_water_count: self.data_tx_diagnostics.high_water_count(),
         }
+    }
+
+    /// Returns the cumulative number of active probe request envelopes emitted.
+    #[doc(hidden)]
+    pub fn active_probe_request_count_for_test(&self) -> u64 {
+        self.active_probe_requests_sent.load(Ordering::Relaxed)
     }
 
     /// Snapshot GSO bundle send diagnostics (X0X-0043).
@@ -9060,6 +9073,7 @@ impl Clone for P2pEndpoint {
             ack_liveness: Arc::clone(&self.ack_liveness),
             ack_request_dedupe: Arc::clone(&self.ack_request_dedupe),
             probe_flights: Arc::clone(&self.probe_flights),
+            active_probe_requests_sent: Arc::clone(&self.active_probe_requests_sent),
             probe_semaphore: Arc::clone(&self.probe_semaphore),
             peer_event_tx: self.peer_event_tx.clone(),
             peer_event_channels: Arc::clone(&self.peer_event_channels),

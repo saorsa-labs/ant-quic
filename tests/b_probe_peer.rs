@@ -3,9 +3,10 @@
 mod support;
 
 use ant_quic::{EndpointError, P2pEvent};
+use std::sync::Arc;
 use std::time::Duration;
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
-use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::{Barrier, broadcast::error::TryRecvError};
 use tokio::time::{sleep, timeout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -26,14 +27,20 @@ async fn probe_peer_returns_rtt_on_healthy_connection() {
         .expect("initial connect");
     sleep(Duration::from_millis(150)).await;
 
+    let active_probe_count_before = sender.active_probe_request_count_for_test();
     let rtt = sender
         .probe_peer(&receiver_id, Duration::from_secs(2))
         .await
         .expect("probe_peer should succeed on live connection");
 
     assert!(
-        rtt < Duration::from_secs(1),
+        rtt > Duration::ZERO && rtt < Duration::from_secs(1),
         "probe RTT on localhost {rtt:?} should be well under 1s"
+    );
+    assert_eq!(
+        sender.active_probe_request_count_for_test(),
+        active_probe_count_before + 1,
+        "healthy probe must emit exactly one active probe request"
     );
 
     sender.shutdown().await;
@@ -60,21 +67,31 @@ async fn concurrent_probe_burst_is_coalesced() {
         .expect("initial connect");
     sleep(Duration::from_millis(150)).await;
 
+    let active_probe_count_before = sender.active_probe_request_count_for_test();
+    let barrier = Arc::new(Barrier::new(33));
     let mut tasks = Vec::new();
     for _ in 0..32 {
         let sender = sender.clone();
+        let barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
             sender
                 .probe_peer(&receiver_id, Duration::from_secs(2))
                 .await
         }));
     }
+    barrier.wait().await;
 
     for task in tasks {
         task.await
             .expect("probe task join")
             .expect("coalesced probe should succeed");
     }
+    assert_eq!(
+        sender.active_probe_request_count_for_test(),
+        active_probe_count_before + 1,
+        "32 concurrent callers must coalesce into one active probe request"
+    );
 
     sender.shutdown().await;
     receiver.shutdown().await;
@@ -112,11 +129,17 @@ async fn recent_ack_activity_suppresses_active_probe() {
     assert_eq!(peer_id, sender_id);
     assert_eq!(payload, b"recent ack activity");
 
+    let active_probe_count_before = sender.active_probe_request_count_for_test();
     let rtt = sender
         .probe_peer(&receiver_id, Duration::from_secs(2))
         .await
         .expect("recent ACK activity should satisfy liveness");
     assert_eq!(rtt, Duration::ZERO);
+    assert_eq!(
+        sender.active_probe_request_count_for_test(),
+        active_probe_count_before,
+        "recent ACK activity should suppress active probe requests"
+    );
 
     sender.shutdown().await;
     receiver.shutdown().await;
@@ -126,7 +149,8 @@ async fn recent_ack_activity_suppresses_active_probe() {
 
 /// Probe traffic must NEVER surface via `recv()` or `P2pEvent::DataReceived`.
 ///
-/// Drive 128 probe round-trips then assert:
+/// Drive active probe traffic plus repeated `probe_peer` calls, then assert:
+///   - at least one active probe request envelope was emitted
 ///   - zero `DataReceived` events were emitted
 ///   - zero payloads were delivered to `recv()`
 ///   - a subsequent real send is still delivered correctly (probe envelope
@@ -152,6 +176,7 @@ async fn probes_are_invisible_to_application_pipeline() {
 
     let mut receiver_events = receiver.subscribe();
 
+    let active_probe_count_before = sender.active_probe_request_count_for_test();
     const PROBE_COUNT: usize = 128;
     for _ in 0..PROBE_COUNT {
         sender
@@ -159,6 +184,10 @@ async fn probes_are_invisible_to_application_pipeline() {
             .await
             .expect("probe_peer should succeed");
     }
+    assert!(
+        sender.active_probe_request_count_for_test() > active_probe_count_before,
+        "invisibility check must include active probe traffic"
+    );
 
     // After probes, assert nothing surfaced on the receive channel.
     let try_recv = timeout(Duration::from_millis(200), receiver.recv()).await;
