@@ -24,6 +24,53 @@ fn create_test_peer_id(id: u8) -> PeerId {
     PeerId(bytes)
 }
 
+fn localhost_bind_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+}
+
+fn valid_endpoint_config(known_peers: Vec<SocketAddr>) -> NatTraversalConfig {
+    NatTraversalConfig {
+        known_peers,
+        bind_addr: Some(localhost_bind_addr()),
+        ..NatTraversalConfig::default()
+    }
+}
+
+fn is_udp_bind_blocked(error: &NatTraversalError) -> bool {
+    matches!(
+        error,
+        NatTraversalError::NetworkError(message)
+            if message.contains("Failed to bind UDP socket")
+                && message.contains("Operation not permitted")
+    )
+}
+
+async fn create_test_endpoint(known_peers: Vec<SocketAddr>) -> Option<NatTraversalEndpoint> {
+    match NatTraversalEndpoint::new(valid_endpoint_config(known_peers), None, None).await {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            assert!(
+                is_udp_bind_blocked(&error),
+                "valid NAT traversal endpoint config should construct: {error}"
+            );
+            None
+        }
+    }
+}
+
+fn assert_config_error_contains(
+    result: &Result<NatTraversalEndpoint, NatTraversalError>,
+    expected_fragment: &str,
+) {
+    assert!(
+        matches!(
+            result,
+            Err(NatTraversalError::ConfigError(message)) if message.contains(expected_fragment)
+        ),
+        "invalid config should fail with ConfigError containing {expected_fragment}"
+    );
+}
+
 #[cfg(test)]
 mod nat_traversal_api_tests {
     use super::*;
@@ -122,32 +169,34 @@ mod nat_traversal_api_tests {
     #[tokio::test]
     async fn test_nat_traversal_endpoint_creation_without_known_peers() {
         // v0.13.0+: Nodes without known peers are valid - they wait for incoming connections
-        let config = NatTraversalConfig {
-            known_peers: vec![],
-            bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![]).await else {
+            return;
         };
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available for a new endpoint");
 
-        let result = NatTraversalEndpoint::new(config, None, None).await;
-        // May succeed or fail - key is no panic
-        let _ = result;
+        assert_eq!(stats.total_bootstrap_nodes, 0);
+        assert_eq!(stats.active_sessions, 0);
+
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_nat_traversal_endpoint_creation_with_known_peers() {
         // v0.13.0+: Node with known peers can connect to the network
         let known_peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 8080);
-        let config = NatTraversalConfig {
-            known_peers: vec![known_peer_addr],
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![known_peer_addr]).await else {
+            return;
         };
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available for a new endpoint");
 
-        // This will likely fail due to TLS configuration, but should pass basic validation
-        let result = NatTraversalEndpoint::new(config, None, None).await;
-        if let Err(e) = result {
-            // Should not fail due to "bootstrap node" validation (removed in v0.13.0+)
-            assert!(!e.to_string().contains("bootstrap node"));
-        }
+        assert_eq!(stats.total_bootstrap_nodes, 1);
+        assert_eq!(stats.active_sessions, 0);
+
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test]
@@ -156,29 +205,33 @@ mod nat_traversal_api_tests {
         let known_peer_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 8080);
         let known_peer_addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), 8080);
 
-        let config = NatTraversalConfig {
-            known_peers: vec![known_peer_addr1],
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![known_peer_addr1]).await else {
+            return;
         };
 
-        // Try to create endpoint - may fail due to TLS but we can test the concept
-        if let Ok(endpoint) = NatTraversalEndpoint::new(config, None, None).await {
-            // Test adding known peer
-            let result = endpoint.add_bootstrap_node(known_peer_addr2);
-            assert!(result.is_ok());
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available before peer updates");
+        assert_eq!(stats.total_bootstrap_nodes, 1);
 
-            // Test removing known peer
-            let result = endpoint.remove_bootstrap_node(known_peer_addr1);
-            assert!(result.is_ok());
+        endpoint
+            .add_bootstrap_node(known_peer_addr2)
+            .expect("adding a known peer should succeed");
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available after adding a peer");
+        assert_eq!(stats.total_bootstrap_nodes, 2);
 
-            // Test getting statistics
-            let stats = endpoint.get_statistics();
-            assert!(stats.is_ok());
+        endpoint
+            .remove_bootstrap_node(known_peer_addr1)
+            .expect("removing a known peer should succeed");
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available after removing a peer");
+        assert_eq!(stats.total_bootstrap_nodes, 1);
+        assert_eq!(stats.active_sessions, 0);
 
-            if let Ok(stats) = stats {
-                assert_eq!(stats.active_sessions, 0); // No active sessions yet
-            }
-        }
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 }
 
@@ -247,36 +300,18 @@ mod functional_tests {
             additional_bind_addrs: Vec::new(),
         };
 
-        // May fail due to zero values or other validation
         let result = NatTraversalEndpoint::new(zero_values_config, None, None).await;
-        // Just ensure no panic
-        let _ = result;
+        assert_config_error_contains(&result, "max_candidates");
 
-        // Test valid configuration
-        let valid_config = NatTraversalConfig {
-            known_peers: vec![],
-            max_candidates: 8,
-            coordination_timeout: Duration::from_secs(10),
-            enable_symmetric_nat: true,
-            enable_relay_fallback: true,
-            max_concurrent_attempts: 3,
-            bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-            prefer_rfc_nat_traversal: false,
-            pqc: None,
-            timeouts: TimeoutConfig::default(),
-            identity_key: None,
-            relay_nodes: vec![],
-            enable_relay_service: true,
-            allow_ipv4_mapped: true,
-            transport_registry: None,
-            max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
-            max_concurrent_uni_streams: 100,
-            additional_bind_addrs: Vec::new(),
+        let Some(endpoint) = create_test_endpoint(vec![]).await else {
+            return;
         };
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available for a valid endpoint");
+        assert_eq!(stats.active_sessions, 0);
 
-        let result = NatTraversalEndpoint::new(valid_config, None, None).await;
-        // May succeed or fail - key is no panic
-        let _ = result;
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 }
 
@@ -337,65 +372,56 @@ mod nat_traversal_integration_tests {
     async fn test_nat_traversal_initiation() {
         // v0.13.0+: All nodes are symmetric P2P nodes
         let known_peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 8080);
-        let config = NatTraversalConfig {
-            known_peers: vec![known_peer_addr],
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![known_peer_addr]).await else {
+            return;
         };
+        let target_peer = create_test_peer_id(42);
 
-        if let Ok(endpoint) = NatTraversalEndpoint::new(config, None, None).await {
-            let target_peer = create_test_peer_id(42);
+        endpoint
+            .initiate_nat_traversal(target_peer, known_peer_addr)
+            .expect("NAT traversal initiation should create a session");
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available after NAT traversal initiation");
+        assert_eq!(stats.active_sessions, 1);
 
-            // Test NAT traversal initiation
-            let result = endpoint.initiate_nat_traversal(target_peer, known_peer_addr);
-            // This might fail due to missing implementation details, but should not panic
-            let _ = result;
-        }
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_polling_without_active_sessions() {
         // v0.13.0+: Symmetric node configuration
-        let config = NatTraversalConfig {
-            known_peers: vec![],
-            bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![]).await else {
+            return;
         };
+        let now = std::time::Instant::now();
 
-        if let Ok(endpoint) = NatTraversalEndpoint::new(config, None, None).await {
-            let now = std::time::Instant::now();
+        let _events = endpoint
+            .poll(now)
+            .expect("polling a new endpoint should succeed");
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available after polling");
+        assert_eq!(stats.active_sessions, 0);
 
-            // Polling with no active sessions should not panic
-            let result = endpoint.poll(now);
-            assert!(result.is_ok());
-
-            // Polling may produce discovery events even without active sessions
-            // (e.g., local address discovery happens on startup)
-            if let Ok(events) = result {
-                // Just verify we got some result - events are not necessarily empty
-                let _ = events;
-            }
-        }
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_statistics_without_activity() {
         // v0.13.0+: Symmetric node configuration
-        let config = NatTraversalConfig {
-            known_peers: vec![],
-            bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![]).await else {
+            return;
         };
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available for a new endpoint");
 
-        if let Ok(endpoint) = NatTraversalEndpoint::new(config, None, None).await {
-            let stats = endpoint.get_statistics();
-            assert!(stats.is_ok());
+        assert_eq!(stats.active_sessions, 0);
+        assert_eq!(stats.successful_coordinations, 0);
+        assert!(stats.average_coordination_time > Duration::ZERO);
 
-            if let Ok(stats) = stats {
-                assert_eq!(stats.active_sessions, 0);
-                assert_eq!(stats.successful_coordinations, 0);
-                assert!(stats.average_coordination_time > Duration::ZERO);
-            }
-        }
+        endpoint.shutdown().await.expect("shutdown should succeed");
     }
 }
 
@@ -500,15 +526,14 @@ mod relay_functionality_tests {
         // v0.13.0+: Test various configuration scenarios
 
         // Node with no known peers is valid (waits for incoming connections)
-        let no_peers_config = NatTraversalConfig {
-            known_peers: vec![],
-            bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-            ..NatTraversalConfig::default()
+        let Some(endpoint) = create_test_endpoint(vec![]).await else {
+            return;
         };
-
-        let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
-        // May succeed or fail - key is no panic
-        let _ = result;
+        let stats = endpoint
+            .get_statistics()
+            .expect("statistics should be available for a valid no-peer endpoint");
+        assert_eq!(stats.total_bootstrap_nodes, 0);
+        endpoint.shutdown().await.expect("shutdown should succeed");
 
         // Test configuration with zero values (edge cases)
         let zero_values_config = NatTraversalConfig {
@@ -532,7 +557,7 @@ mod relay_functionality_tests {
             additional_bind_addrs: Vec::new(),
         };
 
-        // This might be accepted or rejected depending on implementation
-        let _result = NatTraversalEndpoint::new(zero_values_config, None, None).await;
+        let result = NatTraversalEndpoint::new(zero_values_config, None, None).await;
+        assert_config_error_contains(&result, "max_candidates");
     }
 }
