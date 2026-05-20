@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 // Copyright 2024 Saorsa Labs Ltd.
 //
 // This Saorsa Network Software is licensed under the General Public License (GPL), version 3.
