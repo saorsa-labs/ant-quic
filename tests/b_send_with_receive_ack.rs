@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 mod support;
 
@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard, test_node_config};
+use tokio::sync::Barrier;
 use tokio::time::{sleep, timeout};
 
 fn ack_bucket(
@@ -278,6 +279,75 @@ async fn send_with_receive_ack_with_request_id_dedupes_duplicate_sends() {
     assert!(
         no_redelivery.is_err(),
         "duplicate request_id must not trigger a second recv() delivery, got {no_redelivery:?}"
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_send_with_receive_ack_with_request_id_dedupes_duplicate_sends() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    let request_id: [u8; 16] = [
+        0x48, 0xed, 0x9e, 0x42, 0xde, 0xad, 0xbe, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc,
+        0xfe,
+    ];
+    let payload = b"x0x-0066 concurrent hedge payload";
+    let duplicate_count = 4;
+    let start = Arc::new(Barrier::new(duplicate_count));
+
+    let mut tasks = Vec::new();
+    for _ in 0..duplicate_count {
+        let sender = sender.clone();
+        let start = start.clone();
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            sender
+                .send_with_receive_ack_with_request_id(
+                    &receiver_id,
+                    request_id,
+                    payload,
+                    Duration::from_secs(5),
+                )
+                .await
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .expect("send task join")
+            .expect("concurrent duplicate ACK send");
+    }
+
+    let (peer_id, delivered) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout on first delivery")
+        .expect("recv result on first delivery");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(delivered, payload);
+
+    let no_redelivery = timeout(Duration::from_millis(500), receiver.recv()).await;
+    assert!(
+        no_redelivery.is_err(),
+        "concurrent duplicate request_id must not trigger a second recv() delivery, got {no_redelivery:?}"
     );
 
     sender.shutdown().await;
