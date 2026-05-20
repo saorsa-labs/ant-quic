@@ -11,16 +11,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::{
-    ClientConfig, Endpoint, ServerConfig, TransportConfig,
+    ClientConfig, Endpoint, HighLevelConnection, ServerConfig, TransportConfig,
+    connection::address_discovery_burst_admissions_for_test,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    transport_parameters::AddressDiscoveryConfig,
 };
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
+
+const OBSERVED_ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
+const NO_OBSERVED_ADDRESS_GRACE: Duration = Duration::from_millis(300);
 
 // Ensure crypto provider is installed for tests
 fn ensure_crypto_provider() {
@@ -41,9 +46,68 @@ fn generate_test_cert() -> (
 
 fn address_discovery_transport_config() -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
-    transport_config.enable_address_discovery(true);
+    transport_config.address_discovery_config(Some(AddressDiscoveryConfig::SendAndReceive));
     transport_config.enable_pqc(false);
     Arc::new(transport_config)
+}
+
+fn no_address_discovery_transport_config() -> Arc<TransportConfig> {
+    let mut transport_config = TransportConfig::default();
+    transport_config.address_discovery_config(None);
+    transport_config.enable_pqc(false);
+    Arc::new(transport_config)
+}
+
+async fn wait_for_observed_addresses(
+    connection: &HighLevelConnection,
+    timeout: Duration,
+) -> Vec<SocketAddr> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let mut observed = connection.all_observed_addresses();
+        observed.sort_unstable();
+        observed.dedup();
+
+        if !observed.is_empty() || Instant::now() >= deadline {
+            return observed;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn assert_observed_addresses_include(
+    connection: &HighLevelConnection,
+    expected: SocketAddr,
+    label: &str,
+) {
+    let observed = wait_for_observed_addresses(connection, OBSERVED_ADDRESS_TIMEOUT).await;
+    let observed_frame_count = connection.stats().frame_rx.observed_address;
+
+    assert!(
+        observed.contains(&expected),
+        "{label} should receive OBSERVED_ADDRESS for {expected}; observed={observed:?}, frame_rx={observed_frame_count}"
+    );
+    assert!(
+        observed_frame_count > 0,
+        "{label} should count at least one received OBSERVED_ADDRESS frame"
+    );
+}
+
+async fn assert_no_observed_addresses(connection: &HighLevelConnection, label: &str) {
+    tokio::time::sleep(NO_OBSERVED_ADDRESS_GRACE).await;
+
+    let observed = connection.all_observed_addresses();
+    let observed_frame_count = connection.stats().frame_rx.observed_address;
+    assert!(
+        observed.is_empty(),
+        "{label} should not receive OBSERVED_ADDRESS frames; observed={observed:?}"
+    );
+    assert_eq!(
+        observed_frame_count, 0,
+        "{label} should not count received OBSERVED_ADDRESS frames"
+    );
 }
 
 /// Helper to create server and client endpoints with address discovery
@@ -101,6 +165,7 @@ async fn test_basic_address_discovery_flow() {
 
     let (server, client) = create_test_endpoints();
     let server_addr = server.local_addr().unwrap();
+    let (client_addr_tx, client_addr_rx) = tokio::sync::oneshot::channel();
 
     // Spawn server to accept connections
     let server_handle = tokio::spawn(async move {
@@ -109,17 +174,14 @@ async fn test_basic_address_discovery_flow() {
         match tokio::time::timeout(Duration::from_secs(5), server.accept()).await {
             Ok(Some(incoming)) => {
                 let connection = incoming.accept().unwrap().await.unwrap();
+                let client_addr = connection.remote_address();
+                let _ = client_addr_tx.send(client_addr);
                 info!(
                     "Server accepted connection from {}",
                     connection.remote_address()
                 );
 
-                // Server should observe client's address and may send OBSERVED_ADDRESS frames
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // In ant-quic, address discovery happens automatically
-                // Stats tracking would need to be implemented at the connection level
-                info!("Server accepted connection, address discovery is active");
+                assert_observed_addresses_include(&connection, server_addr, "server").await;
 
                 connection
             }
@@ -146,22 +208,14 @@ async fn test_basic_address_discovery_flow() {
         connection.remote_address()
     );
 
-    // Wait for potential OBSERVED_ADDRESS frames
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // In the current implementation, address discovery happens automatically
-    // at the protocol level. Applications track discovered addresses through
-    // connection events or NAT traversal APIs
-    info!("Client connection established with address discovery active");
+    let expected_client_addr = client_addr_rx.await.unwrap();
+    assert_observed_addresses_include(&connection, expected_client_addr, "client").await;
 
     // Clean up connection
     connection.close(0u32.into(), b"test complete");
 
     // Verify server connection
     let _server_conn = server_handle.await.unwrap();
-
-    // Address discovery is enabled by default in ant-quic
-    // The protocol handles OBSERVED_ADDRESS frames automatically
 
     info!("✓ Basic address discovery flow completed successfully");
 }
@@ -184,6 +238,7 @@ async fn test_multipath_address_discovery() {
 
     let (server, client) = create_test_endpoints();
     let server_addr = server.local_addr().unwrap();
+    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(2);
 
     // Server accepts connections
     let server_handle = tokio::spawn(async move {
@@ -199,6 +254,7 @@ async fn test_multipath_address_discovery() {
                         i,
                         connection.remote_address()
                     );
+                    let _ = observed_tx.send(connection.remote_address()).await;
                     connections.push(connection);
                 }
                 Ok(None) => {
@@ -212,11 +268,8 @@ async fn test_multipath_address_discovery() {
             }
         }
 
-        // Give time for address observations
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        for (i, _conn) in connections.iter().enumerate() {
-            // Address discovery statistics would be tracked internally
+        for (i, conn) in connections.iter().enumerate() {
+            assert_observed_addresses_include(conn, server_addr, "multipath server").await;
             info!("Connection {} active with address discovery", i);
         }
 
@@ -235,15 +288,36 @@ async fn test_multipath_address_discovery() {
         client_connections.push(connection);
     }
 
-    // Wait for address discovery
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut expected_client_addrs = vec![];
+    for _ in 0..client_connections.len() {
+        let expected = tokio::time::timeout(Duration::from_secs(3), observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        expected_client_addrs.push(expected);
+    }
 
     // Check discovered addresses on each path
+    let mut observed_client_addrs = vec![];
     for (i, conn) in client_connections.iter().enumerate() {
-        // Address discovery happens at the protocol level
-        info!("Client connection {} established with address discovery", i);
+        let observed = wait_for_observed_addresses(conn, OBSERVED_ADDRESS_TIMEOUT).await;
+        assert!(
+            !observed.is_empty(),
+            "client connection {i} should receive at least one OBSERVED_ADDRESS"
+        );
+        assert!(
+            conn.stats().frame_rx.observed_address > 0,
+            "client connection {i} should count received OBSERVED_ADDRESS frames"
+        );
+        observed_client_addrs.extend(observed);
         // Clean up connection
         conn.close(0u32.into(), b"test complete");
+    }
+    for expected in expected_client_addrs {
+        assert!(
+            observed_client_addrs.contains(&expected),
+            "multipath client observations should include {expected}; observed={observed_client_addrs:?}"
+        );
     }
 
     let server_conns = server_handle.await.unwrap();
@@ -264,8 +338,13 @@ async fn test_address_discovery_rate_limiting() {
         .try_init();
 
     info!("Starting rate limiting test");
+    assert_eq!(
+        address_discovery_burst_admissions_for_test(15),
+        10,
+        "production OBSERVED_ADDRESS burst limiter should cap immediate observations"
+    );
 
-    // Create endpoints with low rate limit
+    // Create endpoints with the default address discovery rate limit.
     let (cert, key) = generate_test_cert();
 
     let mut server_crypto = rustls::ServerConfig::builder()
@@ -283,12 +362,14 @@ async fn test_address_discovery_rate_limiting() {
     let server = Endpoint::server(server_config, server_addr).unwrap();
 
     let server_addr = server.local_addr().unwrap();
+    let (client_addr_tx, client_addr_rx) = tokio::sync::oneshot::channel();
 
     // Server that tries to trigger many observations
     let server_handle = tokio::spawn(async move {
         match tokio::time::timeout(Duration::from_secs(5), server.accept()).await {
             Ok(Some(incoming)) => {
                 let connection = incoming.accept().unwrap().await.unwrap();
+                let _ = client_addr_tx.send(connection.remote_address());
 
                 // Try to trigger multiple observations quickly
                 for i in 0..10 {
@@ -298,8 +379,6 @@ async fn test_address_discovery_rate_limiting() {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
 
-                // Rate limiting is enforced at the protocol level
-                // With the configured rate of 2/sec, observations are automatically limited
                 info!("Rate limiting is enforced by the protocol implementation");
 
                 connection
@@ -334,6 +413,13 @@ async fn test_address_discovery_rate_limiting() {
         .unwrap()
         .await
         .unwrap();
+    let expected_client_addr = client_addr_rx.await.unwrap();
+    assert_observed_addresses_include(&connection, expected_client_addr, "rate-limited client")
+        .await;
+    assert!(
+        connection.stats().frame_rx.observed_address <= 10,
+        "client should not receive more OBSERVED_ADDRESS frames than the burst limit"
+    );
 
     server_handle.await.unwrap();
 
@@ -375,6 +461,7 @@ async fn test_bootstrap_mode_address_discovery() {
 
     let bootstrap_addr = bootstrap.local_addr().unwrap();
     info!("Bootstrap node listening on {}", bootstrap_addr);
+    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(3);
 
     // Bootstrap node accepts connections aggressively
     let bootstrap_handle = tokio::spawn(async move {
@@ -389,6 +476,7 @@ async fn test_bootstrap_mode_address_discovery() {
                                 Ok(connection) => {
                                     let remote = connection.remote_address();
                                     info!("Bootstrap accepted connection {} from {}", i, remote);
+                                    let _ = observed_tx.send(remote).await;
 
                                     // Bootstrap nodes should send observations immediately
                                     // for new connections
@@ -413,9 +501,8 @@ async fn test_bootstrap_mode_address_discovery() {
             }
         }
 
-        // Check observation statistics
-        for addr in connections.keys() {
-            // Bootstrap nodes automatically send OBSERVED_ADDRESS frames
+        for (addr, conn) in &connections {
+            assert_observed_addresses_include(conn, bootstrap_addr, "bootstrap server").await;
             info!("Bootstrap node observing address for {}", addr);
         }
 
@@ -448,16 +535,17 @@ async fn test_bootstrap_mode_address_discovery() {
             .unwrap();
 
         info!("Client {} connected", i);
-        clients.push(connection);
+        let expected = tokio::time::timeout(Duration::from_secs(3), observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        clients.push((connection, expected));
     }
 
-    // Wait for observations
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // All clients should have discovered their addresses
-    for (i, conn) in clients.iter().enumerate() {
-        // Clients receive OBSERVED_ADDRESS frames from bootstrap nodes
-        info!("Client {} connected to bootstrap with address discovery", i);
+    for (i, (conn, expected)) in clients.iter().enumerate() {
+        assert_observed_addresses_include(conn, *expected, "bootstrap client").await;
+        info!("Client {} received bootstrap observation {}", i, expected);
         // Clean up connection
         conn.close(0u32.into(), b"test complete");
     }
@@ -489,13 +577,9 @@ async fn test_address_discovery_disabled() {
         .unwrap();
     server_crypto.alpn_protocols = vec![b"test".to_vec()];
 
-    let mut transport_config = TransportConfig::default();
-    transport_config.enable_address_discovery(false);
-    transport_config.enable_pqc(false);
-    let transport_config = Arc::new(transport_config);
+    let transport_config = no_address_discovery_transport_config();
 
-    // Create server with default settings
-    // To disable address discovery would require custom transport parameters
+    // Create server without the address discovery transport parameter.
     let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
     server_config.transport_config(transport_config.clone());
@@ -510,10 +594,7 @@ async fn test_address_discovery_disabled() {
             Ok(Some(incoming)) => {
                 let connection = incoming.accept().unwrap().await.unwrap();
 
-                // Should not send any observations
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                // When address discovery is disabled, no OBSERVED_ADDRESS frames are sent
-                info!("Address discovery disabled - no observations sent");
+                assert_no_observed_addresses(&connection, "disabled server").await;
 
                 connection
             }
@@ -550,10 +631,7 @@ async fn test_address_discovery_disabled() {
         .unwrap();
 
     // Wait to ensure no observations are sent
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // When address discovery is disabled at endpoint creation,
-    // no OBSERVED_ADDRESS frames are exchanged
+    assert_no_observed_addresses(&connection, "disabled client").await;
 
     // Clean up connection
     connection.close(0u32.into(), b"test complete");
@@ -579,6 +657,7 @@ async fn test_address_discovery_with_migration() {
 
     let (server, client) = create_test_endpoints();
     let server_addr = server.local_addr().unwrap();
+    let (client_addr_tx, client_addr_rx) = tokio::sync::oneshot::channel();
 
     // Server accepts and monitors migration
     let server_handle = tokio::spawn(async move {
@@ -586,7 +665,10 @@ async fn test_address_discovery_with_migration() {
             Ok(Some(incoming)) => {
                 let connection = incoming.await.unwrap();
                 let initial_remote = connection.remote_address();
+                let _ = client_addr_tx.send(initial_remote);
                 info!("Server: Initial client address: {}", initial_remote);
+                assert_observed_addresses_include(&connection, server_addr, "migration server")
+                    .await;
 
                 // Monitor for path changes
                 let mut path_changes = 0;
@@ -628,6 +710,8 @@ async fn test_address_discovery_with_migration() {
         .unwrap();
 
     info!("Client: Connected from {:?}", connection.local_ip());
+    let expected_client_addr = client_addr_rx.await.unwrap();
+    assert_observed_addresses_include(&connection, expected_client_addr, "migration client").await;
 
     // Simulate network change by rebinding (if supported)
     // In real scenarios, this might happen when switching networks
@@ -677,6 +761,7 @@ async fn test_nat_traversal_integration() {
         Endpoint::server(bootstrap_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
 
     let bootstrap_addr = bootstrap.local_addr().unwrap();
+    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(5);
 
     // Bootstrap node helps clients discover addresses
     tokio::spawn(async move {
@@ -686,12 +771,12 @@ async fn test_nat_traversal_integration() {
             match tokio::time::timeout(Duration::from_secs(3), bootstrap.accept()).await {
                 Ok(Some(incoming)) => {
                     connection_count += 1;
+                    let observed_tx = observed_tx.clone();
                     tokio::spawn(async move {
                         if let Ok(connection) = incoming.accept().unwrap().await {
-                            info!(
-                                "Bootstrap: Helping {} discover address",
-                                connection.remote_address()
-                            );
+                            let remote = connection.remote_address();
+                            let _ = observed_tx.send(remote).await;
+                            info!("Bootstrap: Helping {} discover address", remote);
                             // Keep connection alive
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
@@ -732,6 +817,10 @@ async fn test_nat_traversal_integration() {
         .unwrap()
         .await
         .unwrap();
+    let expected_a = tokio::time::timeout(Duration::from_secs(3), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
 
     // Client B
     let mut client_b = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
@@ -747,12 +836,13 @@ async fn test_nat_traversal_integration() {
         .unwrap()
         .await
         .unwrap();
+    let expected_b = tokio::time::timeout(Duration::from_secs(3), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
 
-    // Wait for address discovery
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Both clients receive OBSERVED_ADDRESS frames from bootstrap
-    // These discovered addresses are used internally for NAT traversal
+    assert_observed_addresses_include(&conn_a, expected_a, "NAT client A").await;
+    assert_observed_addresses_include(&conn_b, expected_b, "NAT client B").await;
 
     info!("Client A connected through bootstrap with address discovery");
     info!("Client B connected through bootstrap with address discovery");
