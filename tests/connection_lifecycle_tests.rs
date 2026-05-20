@@ -64,9 +64,13 @@ fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
         .expect("Failed to build test config")
 }
 
-/// Shutdown a node with timeout to prevent test hangs.
+/// Shutdown a node with timeout and fail the test if cleanup hangs.
 async fn shutdown_with_timeout(node: P2pEndpoint) {
-    let _ = timeout(SHUTDOWN_TIMEOUT, node.shutdown()).await;
+    let shutdown_result = timeout(SHUTDOWN_TIMEOUT, node.shutdown()).await;
+    assert!(
+        shutdown_result.is_ok(),
+        "shutdown should complete within {SHUTDOWN_TIMEOUT:?}"
+    );
 }
 
 // ============================================================================
