@@ -39,13 +39,17 @@ async fn send_returns_without_waiting_on_peer_ack() {
     // Do not call `recv()` on the receiver yet. Under the old behaviour this
     // would cause `send` to wait up to 5 s on `stopped()` per call.
     let start = Instant::now();
-    for i in 0..32u32 {
-        let payload = format!("fire-and-forget {i}");
-        sender
-            .send(&receiver_id, payload.as_bytes())
-            .await
-            .expect("send should not wait on peer ACK");
-    }
+    timeout(Duration::from_secs(2), async {
+        for i in 0..32u32 {
+            let payload = format!("fire-and-forget {i}");
+            sender
+                .send(&receiver_id, payload.as_bytes())
+                .await
+                .expect("send should not wait on peer ACK");
+        }
+    })
+    .await
+    .expect("send loop timed out before completing");
     let elapsed = start.elapsed();
 
     assert!(
