@@ -39,7 +39,6 @@ exclude = [
     "target/",
     "scripts/",
     "tests/data/large_files/",
-    "benches/",
     "examples/chat_demo.rs",
     "examples/dashboard_demo.rs",
     "examples/simple_chat.rs",
