@@ -213,8 +213,8 @@ async fn run_client(server_addr: SocketAddr, chain: Arc<Vec<CertificateDer<'stat
     // datagrams, but at that point the server's in-order stream queue
     // must contain all of them).
     for (idx, jh) in burst.into_iter().enumerate() {
-        jh.await
-            .unwrap_or_else(|e| panic!("short write {idx}: {e}"));
+        let task_result = jh.await;
+        assert!(task_result.is_ok(), "short write {idx}: {task_result:?}");
     }
 
     // Now finish the slow stream.
@@ -248,7 +248,9 @@ async fn accept_uni_surfaces_all_streams_during_concurrent_slow_read() {
     });
 
     timeout(OVERALL_TIMEOUT, async {
-        let _ = tokio::join!(client_task, server_task);
+        let (client_result, server_result) = tokio::join!(client_task, server_task);
+        client_result.expect("client task");
+        server_result.expect("server task");
     })
     .await
     .expect("test timed out — one side hung");
