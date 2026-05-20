@@ -6,8 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::VarInt;
-use ant_quic::coding::BufExt;
-use bytes::{Buf, BufMut, BytesMut};
+use ant_quic::coding::{BufExt, UnexpectedEnd};
+use ant_quic::frame::nat_traversal_unified::{AddAddress, PunchMeNow, RemoveAddress};
+use bytes::BytesMut;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 // Frame type constants from the RFC
@@ -17,211 +18,57 @@ const FRAME_TYPE_PUNCH_ME_NOW_IPV4: u64 = 0x3d7e92;
 const FRAME_TYPE_PUNCH_ME_NOW_IPV6: u64 = 0x3d7e93;
 const FRAME_TYPE_REMOVE_ADDRESS: u64 = 0x3d7e94;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedNatTraversalFrame {
+    AddAddress(AddAddress),
+    PunchMeNow(PunchMeNow),
+    RemoveAddress(RemoveAddress),
+}
+
+fn decode_nat_traversal_frame(
+    data: &[u8],
+) -> Result<Option<DecodedNatTraversalFrame>, UnexpectedEnd> {
+    let mut buf = BytesMut::from(data);
+    let frame_type = buf.get_var()?;
+
+    match frame_type {
+        FRAME_TYPE_ADD_ADDRESS_IPV4 => AddAddress::decode_auto(&mut buf, false)
+            .map(DecodedNatTraversalFrame::AddAddress)
+            .map(Some),
+        FRAME_TYPE_ADD_ADDRESS_IPV6 => AddAddress::decode_auto(&mut buf, true)
+            .map(DecodedNatTraversalFrame::AddAddress)
+            .map(Some),
+        FRAME_TYPE_PUNCH_ME_NOW_IPV4 => PunchMeNow::decode_auto(&mut buf, false)
+            .map(DecodedNatTraversalFrame::PunchMeNow)
+            .map(Some),
+        FRAME_TYPE_PUNCH_ME_NOW_IPV6 => PunchMeNow::decode_auto(&mut buf, true)
+            .map(DecodedNatTraversalFrame::PunchMeNow)
+            .map(Some),
+        FRAME_TYPE_REMOVE_ADDRESS => RemoveAddress::decode(&mut buf)
+            .map(DecodedNatTraversalFrame::RemoveAddress)
+            .map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// Fuzz target for ADD_ADDRESS frame parsing
 pub fn fuzz_add_address_frame(data: &[u8]) {
-    if data.len() < 4 {
-        return; // Need at least frame type
-    }
-
-    let mut buf = BytesMut::from(data);
-
-    // Extract frame type
-    match buf.get_u32() as u64 {
-        FRAME_TYPE_ADD_ADDRESS_IPV4 => {
-            fuzz_add_address_ipv4(&mut buf);
-        }
-        FRAME_TYPE_ADD_ADDRESS_IPV6 => {
-            fuzz_add_address_ipv6(&mut buf);
-        }
-        _ => {
-            // Invalid frame type, should be handled gracefully
-        }
-    };
-}
-
-/// Fuzz ADD_ADDRESS IPv4 frame parsing
-fn fuzz_add_address_ipv4(buf: &mut BytesMut) {
-    // Try to parse sequence number
-    let seq_result = buf.get_var();
-    if seq_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _sequence = seq_result.unwrap();
-
-    // Try to parse IPv4 address and port
-    if buf.remaining() < 6 {
-        return; // Not enough data
-    }
-
-    let _addr_bytes = buf.split_to(4);
-    let _port = buf.get_u16();
-
-    // Any remaining data should be handled gracefully
-}
-
-/// Fuzz ADD_ADDRESS IPv6 frame parsing
-fn fuzz_add_address_ipv6(buf: &mut BytesMut) {
-    // Try to parse sequence number
-    let seq_result = buf.get_var();
-    if seq_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _sequence = seq_result.unwrap();
-
-    // Try to parse IPv6 address and port
-    if buf.remaining() < 18 {
-        return; // Not enough data
-    }
-
-    let _addr_bytes = buf.split_to(16);
-    let _port = buf.get_u16();
-
-    // Any remaining data should be handled gracefully
+    let _ = decode_nat_traversal_frame(data);
 }
 
 /// Fuzz target for PUNCH_ME_NOW frame parsing
 pub fn fuzz_punch_me_now_frame(data: &[u8]) {
-    if data.len() < 4 {
-        return; // Need at least frame type
-    }
-
-    let mut buf = BytesMut::from(data);
-
-    // Extract frame type
-    match buf.get_u32() as u64 {
-        FRAME_TYPE_PUNCH_ME_NOW_IPV4 => {
-            fuzz_punch_me_now_ipv4(&mut buf);
-        }
-        FRAME_TYPE_PUNCH_ME_NOW_IPV6 => {
-            fuzz_punch_me_now_ipv6(&mut buf);
-        }
-        _ => {
-            // Invalid frame type, should be handled gracefully
-        }
-    };
-}
-
-/// Fuzz PUNCH_ME_NOW IPv4 frame parsing
-fn fuzz_punch_me_now_ipv4(buf: &mut BytesMut) {
-    // Try to parse round number
-    let round_result = buf.get_var();
-    if round_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _round = round_result.unwrap();
-
-    // Try to parse paired sequence number
-    let seq_result = buf.get_var();
-    if seq_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _paired_sequence = seq_result.unwrap();
-
-    // Try to parse IPv4 address and port
-    if buf.remaining() < 6 {
-        return; // Not enough data
-    }
-
-    let _addr_bytes = buf.split_to(4);
-    let _port = buf.get_u16();
-
-    // Any remaining data should be handled gracefully
-}
-
-/// Fuzz PUNCH_ME_NOW IPv6 frame parsing
-fn fuzz_punch_me_now_ipv6(buf: &mut BytesMut) {
-    // Try to parse round number
-    let round_result = buf.get_var();
-    if round_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _round = round_result.unwrap();
-
-    // Try to parse paired sequence number
-    let seq_result = buf.get_var();
-    if seq_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _paired_sequence = seq_result.unwrap();
-
-    // Try to parse IPv6 address and port
-    if buf.remaining() < 18 {
-        return; // Not enough data
-    }
-
-    let _addr_bytes = buf.split_to(16);
-    let _port = buf.get_u16();
-
-    // Any remaining data should be handled gracefully
+    let _ = decode_nat_traversal_frame(data);
 }
 
 /// Fuzz target for REMOVE_ADDRESS frame parsing
 pub fn fuzz_remove_address_frame(data: &[u8]) {
-    if data.len() < 4 {
-        return; // Need at least frame type
-    }
-
-    let mut buf = BytesMut::from(data);
-
-    // Extract frame type
-    let frame_type = buf.get_u32() as u64;
-    if frame_type != FRAME_TYPE_REMOVE_ADDRESS {
-        return; // Invalid frame type
-    }
-
-    // Try to parse sequence number
-    let seq_result = buf.get_var();
-    if seq_result.is_err() {
-        return; // Invalid VarInt, should be handled gracefully
-    }
-
-    let _sequence = seq_result.unwrap();
-
-    // Any remaining data should be handled gracefully
+    let _ = decode_nat_traversal_frame(data);
 }
 
 /// Fuzz target for general frame parsing with arbitrary data
 pub fn fuzz_frame_parsing(data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-
-    let mut buf = BytesMut::from(data);
-
-    // Try to extract what might be a frame type
-    if buf.remaining() < 4 {
-        return;
-    }
-
-    let potential_frame_type = buf.get_u32() as u64;
-
-    // Test different frame types
-    match potential_frame_type {
-        FRAME_TYPE_ADD_ADDRESS_IPV4 => fuzz_add_address_ipv4(&mut buf),
-        FRAME_TYPE_ADD_ADDRESS_IPV6 => fuzz_add_address_ipv6(&mut buf),
-        FRAME_TYPE_PUNCH_ME_NOW_IPV4 => fuzz_punch_me_now_ipv4(&mut buf),
-        FRAME_TYPE_PUNCH_ME_NOW_IPV6 => fuzz_punch_me_now_ipv6(&mut buf),
-        FRAME_TYPE_REMOVE_ADDRESS => fuzz_remove_address_frame(data), // Restart with full data
-        _ => {
-            // Unknown frame type - test robustness
-            // Try to parse as if it were any of the known frame types
-            let mut test_buf = BytesMut::from(data);
-            test_buf.advance(4); // Skip frame type
-
-            // Try parsing as each frame type to ensure no panics
-            fuzz_add_address_ipv4(&mut test_buf.clone());
-            fuzz_add_address_ipv6(&mut test_buf.clone());
-            fuzz_punch_me_now_ipv4(&mut test_buf.clone());
-            fuzz_punch_me_now_ipv6(&mut test_buf.clone());
-            fuzz_remove_address_frame(data);
-        }
-    }
+    let _ = decode_nat_traversal_frame(data);
 }
 
 /// Fuzz target for VarInt parsing (critical for frame parsing)
@@ -276,33 +123,46 @@ pub fn fuzz_address_parsing(data: &[u8]) {
 mod tests {
     use super::*;
 
+    fn encoded_frame(frame: &DecodedNatTraversalFrame) -> BytesMut {
+        let mut buf = BytesMut::new();
+        match frame {
+            DecodedNatTraversalFrame::AddAddress(frame) => frame.encode_rfc(&mut buf),
+            DecodedNatTraversalFrame::PunchMeNow(frame) => frame.encode_rfc(&mut buf),
+            DecodedNatTraversalFrame::RemoveAddress(frame) => frame.encode(&mut buf),
+        }
+        buf
+    }
+
     #[test]
     fn test_fuzz_targets_with_valid_data() {
-        // Test with valid ADD_ADDRESS IPv4 frame
-        let mut valid_data = BytesMut::new();
-        valid_data.put_u32(FRAME_TYPE_ADD_ADDRESS_IPV4 as u32);
-        valid_data.put_u8(0x2a); // sequence = 42
-        valid_data.extend_from_slice(&[192, 168, 1, 100]); // IPv4
-        valid_data.put_u16(8080); // port
+        let valid_frames = [
+            DecodedNatTraversalFrame::AddAddress(AddAddress::new(
+                VarInt::from_u32(42),
+                "192.168.1.100:8080".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::AddAddress(AddAddress::new(
+                VarInt::from_u32(999),
+                "[2001:db8::1]:9000".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::PunchMeNow(PunchMeNow::new(
+                VarInt::from_u32(5),
+                VarInt::from_u32(42),
+                "10.0.0.1:1234".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::PunchMeNow(PunchMeNow::new(
+                VarInt::from_u32(7),
+                VarInt::from_u32(999),
+                "[2001:db8::5]:9001".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::RemoveAddress(RemoveAddress::new(VarInt::from_u32(42))),
+        ];
 
-        fuzz_add_address_frame(&valid_data);
+        for frame in valid_frames {
+            let data = encoded_frame(&frame);
 
-        // Test with valid PUNCH_ME_NOW IPv4 frame
-        let mut valid_punch_data = BytesMut::new();
-        valid_punch_data.put_u32(FRAME_TYPE_PUNCH_ME_NOW_IPV4 as u32);
-        valid_punch_data.put_u8(0x05); // round = 5
-        valid_punch_data.put_u8(0x2a); // sequence = 42
-        valid_punch_data.extend_from_slice(&[10, 0, 0, 1]); // IPv4
-        valid_punch_data.put_u16(1234); // port
-
-        fuzz_punch_me_now_frame(&valid_punch_data);
-
-        // Test with valid REMOVE_ADDRESS frame
-        let mut valid_remove_data = BytesMut::new();
-        valid_remove_data.put_u32(FRAME_TYPE_REMOVE_ADDRESS as u32);
-        valid_remove_data.put_u8(0x2a); // sequence = 42
-
-        fuzz_remove_address_frame(&valid_remove_data);
+            assert_eq!(decode_nat_traversal_frame(&data), Ok(Some(frame.clone())));
+            fuzz_frame_parsing(&data);
+        }
     }
 
     #[test]
@@ -333,5 +193,30 @@ mod tests {
         // Test with empty data
         let empty_data = vec![];
         fuzz_frame_parsing(&empty_data);
+    }
+
+    #[test]
+    fn test_production_decoders_reject_truncated_frames() {
+        let valid_frames = [
+            DecodedNatTraversalFrame::AddAddress(AddAddress::new(
+                VarInt::from_u32(42),
+                "192.168.1.100:8080".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::PunchMeNow(PunchMeNow::new(
+                VarInt::from_u32(5),
+                VarInt::from_u32(42),
+                "10.0.0.1:1234".parse().unwrap(),
+            )),
+            DecodedNatTraversalFrame::RemoveAddress(RemoveAddress::new(VarInt::from_u32(42))),
+        ];
+
+        for frame in valid_frames {
+            let data = encoded_frame(&frame);
+
+            for len in 0..data.len() {
+                assert_eq!(decode_nat_traversal_frame(&data[..len]), Err(UnexpectedEnd));
+                fuzz_frame_parsing(&data[..len]);
+            }
+        }
     }
 }
