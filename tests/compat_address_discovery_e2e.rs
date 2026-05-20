@@ -89,7 +89,7 @@ fn create_server_endpoint() -> Endpoint {
 
     // Configure endpoint with smaller MTU for Windows compatibility
     #[cfg(target_os = "windows")]
-    let mut endpoint_config = {
+    let endpoint_config = {
         let mut config = EndpointConfig::default();
         // Use smaller MTU on Windows to avoid buffer size issues
         // This prevents WSAEMSGSIZE (error 10040) on Windows CI
@@ -112,7 +112,7 @@ fn create_client_endpoint() -> Endpoint {
 
     // Configure endpoint with smaller MTU for Windows compatibility
     #[cfg(target_os = "windows")]
-    let mut endpoint_config = {
+    let endpoint_config = {
         let mut config = EndpointConfig::default();
         // Use smaller MTU on Windows to avoid buffer size issues
         config.max_udp_payload_size(1200).unwrap();
