@@ -166,6 +166,20 @@ mod tests {
     }
 
     #[test]
+    fn test_varint_encoded_frame_types_reach_payload_decoders() {
+        let frame_types = [
+            [0x80, 0x3d, 0x7e, 0x90], // ADD_ADDRESS_IPV4
+            [0x80, 0x3d, 0x7e, 0x92], // PUNCH_ME_NOW_IPV4
+            [0x80, 0x3d, 0x7e, 0x94], // REMOVE_ADDRESS
+        ];
+
+        for frame_type in frame_types {
+            assert_eq!(decode_nat_traversal_frame(&frame_type), Err(UnexpectedEnd));
+            fuzz_frame_parsing(&frame_type);
+        }
+    }
+
+    #[test]
     fn test_fuzz_targets_with_invalid_data() {
         // Test with completely invalid data
         let invalid_data = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00];
