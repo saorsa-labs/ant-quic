@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::unified_config::{AutoConnectPolicy, DiscoveryPolicy};
-use ant_quic::{Node, P2pConfig, P2pEndpoint, PeerConnection, PeerId};
+use ant_quic::{Node, P2pConfig, P2pEndpoint, PeerConnection, PeerId, Side};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -66,6 +66,19 @@ async fn assert_connected_peer_set(node: &Node, expected: &[PeerId], label: &str
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn assert_single_connected_peer(
+    node: &Node,
+    expected_peer_id: PeerId,
+    label: &str,
+) -> PeerConnection {
+    assert_connected_peer_set(node, &[expected_peer_id], label).await;
+    node.connected_peers()
+        .await
+        .into_iter()
+        .find(|peer| peer.peer_id == expected_peer_id)
+        .expect("connected peer set should contain expected peer")
 }
 
 /// Test that calling connect_addr() twice to the same address returns the
@@ -665,42 +678,89 @@ async fn test_simultaneous_connect_repeated() {
     }
 }
 
-/// Test that the PeerId-based tiebreaker is deterministic.
-/// Both sides should agree on which connection to keep.
-#[tokio::test]
+/// Test that the simultaneous-connect tiebreaker is deterministic.
+/// Both sides should agree on which side of the retained connection to keep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_tiebreaker_deterministic() {
     let node_a = create_localhost_node().await;
     let node_b = create_localhost_node().await;
 
     let peer_id_a = node_a.peer_id();
     let peer_id_b = node_b.peer_id();
+    let addr_a = normalize_local_addr(node_a.local_addr().expect("node_a should have address"));
+    let addr_b = normalize_local_addr(node_b.local_addr().expect("node_b should have address"));
 
-    // The node with the lower PeerId should keep its Client connection.
-    // This means the node with the lower PeerId "wins" as the initiator.
-    let lower_is_a = peer_id_a < peer_id_b;
-    println!(
-        "PeerId comparison: A={:?}... B={:?}... lower_is_a={}",
-        &peer_id_a.0[..4],
-        &peer_id_b.0[..4],
-        lower_is_a
-    );
-
-    // The tiebreaker rule is deterministic and doesn't depend on timing.
-    // Both sides can independently compute which connection to keep.
-    // This test just verifies the PeerIds are different and ordered.
     assert_ne!(
         peer_id_a, peer_id_b,
         "Two nodes should have different peer IDs"
     );
 
-    // Verify ordering is total (one is strictly less than the other)
+    let accept_a = tokio::spawn({
+        let node = node_a.clone();
+        async move {
+            for _ in 0..3 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    let accept_b = tokio::spawn({
+        let node = node_b.clone();
+        async move {
+            for _ in 0..3 {
+                match timeout(Duration::from_secs(5), node.accept()).await {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (result_a, result_b) = tokio::join!(
+        timeout(Duration::from_secs(10), node_a.connect_addr(addr_b)),
+        timeout(Duration::from_secs(10), node_b.connect_addr(addr_a)),
+    );
+
+    let conn_a_to_b = result_a
+        .expect("A→B should not time out")
+        .expect("A→B should succeed");
+    let conn_b_to_a = result_b
+        .expect("B→A should not time out")
+        .expect("B→A should succeed");
+
+    assert_eq!(
+        conn_a_to_b.peer_id, peer_id_b,
+        "A's connection should point to B's peer ID"
+    );
+    assert_eq!(
+        conn_b_to_a.peer_id, peer_id_a,
+        "B's connection should point to A's peer ID"
+    );
+
+    let retained_a =
+        assert_single_connected_peer(&node_a, peer_id_b, "node_a after tiebreaker").await;
+    let retained_b =
+        assert_single_connected_peer(&node_b, peer_id_a, "node_b after tiebreaker").await;
+
     assert!(
-        peer_id_a != peer_id_b,
-        "PeerIds should have a strict total order"
+        matches!(
+            (retained_a.side, retained_b.side),
+            (Side::Client, Side::Server) | (Side::Server, Side::Client)
+        ),
+        "tiebreaker should leave both endpoints with opposite sides of one retained connection, got A={:?}, B={:?}",
+        retained_a.side,
+        retained_b.side
     );
 
     node_a.shutdown().await;
     node_b.shutdown().await;
+    let _ = accept_a.await;
+    let _ = accept_b.await;
 }
 
 // ============================================================================
