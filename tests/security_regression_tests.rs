@@ -16,6 +16,7 @@
 use ant_quic::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint, NatTraversalError};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -234,23 +235,40 @@ async fn test_concurrent_creation_safety() {
 
 /// Test statistics access doesn't panic with concurrent access
 /// Tests mutex safety in statistics gathering
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_statistics_concurrent_access() {
+    const NUM_CONCURRENT: usize = 20;
+
     let config = test_server_config();
 
     let endpoint_result = NatTraversalEndpoint::new(config, None, None).await;
 
     if let Ok(endpoint) = endpoint_result {
+        let endpoint = Arc::new(endpoint);
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_CONCURRENT));
+
         // Concurrent statistics access
-        let handles: Vec<_> = (0..20)
+        let handles: Vec<_> = (0..NUM_CONCURRENT)
             .map(|_| {
-                let ep = &endpoint;
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ep.get_statistics()))
+                let ep = Arc::clone(&endpoint);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ep.get_statistics()))
+                })
             })
             .collect();
 
+        let results = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(handles),
+        )
+        .await
+        .expect("concurrent statistics calls should complete");
+
         // Check that no statistics call panicked
-        for (i, result) in handles.into_iter().enumerate() {
+        for (i, result) in results.into_iter().enumerate() {
+            let result = result.expect("statistics task should join");
             assert!(result.is_ok(), "Statistics call {i} should not panic");
         }
 
