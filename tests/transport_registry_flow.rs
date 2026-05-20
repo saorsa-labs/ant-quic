@@ -244,62 +244,126 @@ async fn test_transport_registry_flows_to_nat_traversal_endpoint() {
 /// End-to-end test with multiple transport providers, verifying concurrent send/receive.
 ///
 /// Test scenario:
-/// 1. Create registry with UDP and mock BLE transport
-/// 2. Create two P2pEndpoint instances with the multi-transport registry
-/// 3. Connect peers and exchange data
+/// 1. Create distinct per-node UDP and mock BLE transports
+/// 2. Build two per-node transport registries from NodeConfig
+/// 3. Wire peer transports and exchange datagrams through the registry
 /// 4. Verify both transports show activity in stats
 /// 5. Shut down one transport mid-test, verify failover to remaining transport
 ///
 /// This test validates:
 /// - Multiple transports can be registered and used simultaneously
-/// - Data flows correctly through multi-transport endpoints
+/// - Data flows correctly through multi-transport registries
 /// - Stats accurately reflect multi-transport activity
 /// - System gracefully handles transport failures
 #[tokio::test]
 async fn test_multi_transport_concurrent_io() {
-    use ant_quic::transport::ProviderError;
+    use ant_quic::transport::{ProviderError, TransportCapabilities};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    // Helper: Create a mock BLE transport for testing
-    #[allow(dead_code)]
-    struct MockBleTransport {
-        name: String,
-        capabilities: ant_quic::transport::TransportCapabilities,
-        online: AtomicBool,
-        local_addr: TransportAddr,
+    #[derive(Default)]
+    struct MockTransportCounters {
         bytes_sent: AtomicU64,
         bytes_received: AtomicU64,
-        inbound_tx: tokio::sync::Mutex<Option<mpsc::Sender<InboundDatagram>>>,
+        datagrams_sent: AtomicU64,
+        datagrams_received: AtomicU64,
+        send_errors: AtomicU64,
+        receive_errors: AtomicU64,
     }
 
-    impl MockBleTransport {
-        fn new() -> (Self, mpsc::Receiver<InboundDatagram>) {
-            let (tx, rx) = mpsc::channel(16);
-            let transport = Self {
-                name: "MockBLE".to_string(),
-                capabilities: ant_quic::transport::TransportCapabilities::ble(),
-                online: AtomicBool::new(true),
-                local_addr: TransportAddr::ble([0x00, 0x11, 0x22, 0x33, 0x44, 0x55], None),
-                bytes_sent: AtomicU64::new(0),
-                bytes_received: AtomicU64::new(0),
-                inbound_tx: tokio::sync::Mutex::new(Some(tx)),
+    #[derive(Clone)]
+    struct MockPeer {
+        addr: TransportAddr,
+        online: Arc<AtomicBool>,
+        counters: Arc<MockTransportCounters>,
+        subscribers: Arc<Mutex<Vec<mpsc::Sender<InboundDatagram>>>>,
+    }
+
+    struct MockDatagramTransport {
+        name: String,
+        transport_type: TransportType,
+        capabilities: TransportCapabilities,
+        online: Arc<AtomicBool>,
+        local_addr: TransportAddr,
+        counters: Arc<MockTransportCounters>,
+        peer: Mutex<Option<MockPeer>>,
+        subscribers: Arc<Mutex<Vec<mpsc::Sender<InboundDatagram>>>>,
+    }
+
+    impl MockDatagramTransport {
+        fn new(
+            name: impl Into<String>,
+            transport_type: TransportType,
+            local_addr: TransportAddr,
+            capabilities: TransportCapabilities,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                transport_type,
+                capabilities,
+                online: Arc::new(AtomicBool::new(true)),
+                local_addr,
+                counters: Arc::new(MockTransportCounters::default()),
+                peer: Mutex::new(None),
+                subscribers: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+
+        fn udp(name: &str, port: u16) -> Arc<Self> {
+            let local_addr = TransportAddr::Udp(SocketAddr::from(([127, 0, 0, 1], port)));
+            Self::new(
+                name,
+                TransportType::Udp,
+                local_addr,
+                TransportCapabilities::broadband(),
+            )
+        }
+
+        fn ble(name: &str, device_id: [u8; 6]) -> Arc<Self> {
+            Self::new(
+                name,
+                TransportType::Ble,
+                TransportAddr::ble(device_id, None),
+                TransportCapabilities::ble(),
+            )
+        }
+
+        fn connect_to(&self, peer: &Arc<Self>) {
+            assert_eq!(
+                self.transport_type, peer.transport_type,
+                "mock transports must be wired to the same transport type"
+            );
+
+            let peer = MockPeer {
+                addr: peer.local_addr.clone(),
+                online: Arc::clone(&peer.online),
+                counters: Arc::clone(&peer.counters),
+                subscribers: Arc::clone(&peer.subscribers),
             };
-            (transport, rx)
+            *self.peer.lock().expect("mock peer mutex poisoned") = Some(peer);
+        }
+
+        fn increment_send_error(&self) {
+            self.counters.send_errors.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn local_transport_addr(&self) -> TransportAddr {
+            self.local_addr.clone()
         }
     }
 
     #[async_trait::async_trait]
-    impl TransportProvider for MockBleTransport {
+    impl TransportProvider for MockDatagramTransport {
         fn name(&self) -> &str {
             &self.name
         }
 
         fn transport_type(&self) -> TransportType {
-            TransportType::Ble
+            self.transport_type
         }
 
-        fn capabilities(&self) -> &ant_quic::transport::TransportCapabilities {
+        fn capabilities(&self) -> &TransportCapabilities {
             &self.capabilities
         }
 
@@ -312,20 +376,97 @@ async fn test_multi_transport_concurrent_io() {
                 return Err(ProviderError::Offline);
             }
 
-            if dest.transport_type() != TransportType::Ble {
+            if dest.transport_type() != self.transport_type {
+                self.increment_send_error();
                 return Err(ProviderError::AddressMismatch {
-                    expected: TransportType::Ble,
+                    expected: self.transport_type,
                     actual: dest.transport_type(),
                 });
             }
 
-            self.bytes_sent
+            if data.len() > self.capabilities.mtu {
+                self.increment_send_error();
+                return Err(ProviderError::MessageTooLarge {
+                    size: data.len(),
+                    mtu: self.capabilities.mtu,
+                });
+            }
+
+            let peer = self
+                .peer
+                .lock()
+                .expect("mock peer mutex poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    self.increment_send_error();
+                    ProviderError::SendFailed {
+                        reason: "mock transport has no wired peer".to_string(),
+                    }
+                })?;
+
+            if *dest != peer.addr {
+                self.increment_send_error();
+                return Err(ProviderError::SendFailed {
+                    reason: format!("mock transport cannot reach {dest}"),
+                });
+            }
+
+            if !peer.online.load(Ordering::SeqCst) {
+                self.increment_send_error();
+                return Err(ProviderError::Offline);
+            }
+
+            let datagram = InboundDatagram {
+                data: data.to_vec(),
+                source: self.local_addr.clone(),
+                received_at: Instant::now(),
+                link_quality: None,
+            };
+
+            let delivered = {
+                let mut delivered = false;
+                let mut subscribers = peer
+                    .subscribers
+                    .lock()
+                    .expect("mock subscriber mutex poisoned");
+                subscribers.retain(|subscriber| match subscriber.try_send(datagram.clone()) {
+                    Ok(()) => {
+                        delivered = true;
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                });
+                delivered
+            };
+
+            if !delivered {
+                self.increment_send_error();
+                peer.counters.receive_errors.fetch_add(1, Ordering::SeqCst);
+                return Err(ProviderError::SendFailed {
+                    reason: "mock peer has no available inbound subscribers".to_string(),
+                });
+            }
+
+            self.counters
+                .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::SeqCst);
+            self.counters.datagrams_sent.fetch_add(1, Ordering::SeqCst);
+            peer.counters
+                .bytes_received
+                .fetch_add(data.len() as u64, Ordering::SeqCst);
+            peer.counters
+                .datagrams_received
+                .fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
         fn inbound(&self) -> mpsc::Receiver<InboundDatagram> {
-            let (_, rx) = mpsc::channel(16);
+            let (tx, rx) = mpsc::channel(16);
+            self.subscribers
+                .lock()
+                .expect("mock subscriber mutex poisoned")
+                .push(tx);
             rx
         }
 
@@ -340,92 +481,60 @@ async fn test_multi_transport_concurrent_io() {
 
         fn stats(&self) -> TransportStats {
             TransportStats {
-                bytes_sent: self.bytes_sent.load(Ordering::SeqCst),
-                bytes_received: self.bytes_received.load(Ordering::SeqCst),
-                datagrams_sent: 0,
-                datagrams_received: 0,
-                send_errors: 0,
-                receive_errors: 0,
+                bytes_sent: self.counters.bytes_sent.load(Ordering::SeqCst),
+                bytes_received: self.counters.bytes_received.load(Ordering::SeqCst),
+                datagrams_sent: self.counters.datagrams_sent.load(Ordering::SeqCst),
+                datagrams_received: self.counters.datagrams_received.load(Ordering::SeqCst),
+                send_errors: self.counters.send_errors.load(Ordering::SeqCst),
+                receive_errors: self.counters.receive_errors.load(Ordering::SeqCst),
                 current_rtt: None,
             }
         }
     }
 
-    // Step 1: Create registry with UDP and mock BLE transport
-    let udp_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let udp_transport = UdpTransport::bind(udp_addr)
-        .await
-        .expect("Failed to bind UDP transport");
-    let udp_provider: Arc<dyn TransportProvider> = Arc::new(udp_transport);
+    let node1_udp = MockDatagramTransport::udp("node1-udp", 41001);
+    let node2_udp = MockDatagramTransport::udp("node2-udp", 41002);
+    node1_udp.connect_to(&node2_udp);
+    node2_udp.connect_to(&node1_udp);
 
-    let (ble_transport, _ble_rx) = MockBleTransport::new();
-    let ble_provider: Arc<dyn TransportProvider> = Arc::new(ble_transport);
+    let node1_ble = MockDatagramTransport::ble("node1-ble", [0x00, 0x11, 0x22, 0x33, 0x44, 0x01]);
+    let node2_ble = MockDatagramTransport::ble("node2-ble", [0x00, 0x11, 0x22, 0x33, 0x44, 0x02]);
+    node1_ble.connect_to(&node2_ble);
+    node2_ble.connect_to(&node1_ble);
 
-    let mut registry = TransportRegistry::new();
-    registry.register(udp_provider.clone());
-    registry.register(ble_provider.clone());
+    let node1_udp_provider: Arc<dyn TransportProvider> = node1_udp.clone();
+    let node1_ble_provider: Arc<dyn TransportProvider> = node1_ble.clone();
+    let node2_udp_provider: Arc<dyn TransportProvider> = node2_udp.clone();
+    let node2_ble_provider: Arc<dyn TransportProvider> = node2_ble.clone();
 
-    assert_eq!(registry.len(), 2, "Registry should have 2 providers");
-    assert_eq!(
-        registry.providers_by_type(TransportType::Udp).len(),
-        1,
-        "Should have 1 UDP provider"
-    );
-    assert_eq!(
-        registry.providers_by_type(TransportType::Ble).len(),
-        1,
-        "Should have 1 BLE provider"
-    );
-
-    // Step 2: Create two P2pEndpoint instances with the multi-transport registry
-    // Note: This uses the registry through Node/P2pConfig
     let node1_config = NodeConfig::builder()
-        .transport_provider(udp_provider.clone())
-        .transport_provider(ble_provider.clone())
+        .transport_provider(node1_udp_provider.clone())
+        .transport_provider(node1_ble_provider.clone())
         .build();
-
-    let node1 = Node::with_config(node1_config)
-        .await
-        .expect("Failed to create node1");
-
-    // Verify node1 has both external transports + the internal UDP transport
-    let node1_registry = node1.transport_registry();
+    let node1_registry = node1_config.build_transport_registry();
     assert_eq!(
         node1_registry.len(),
-        3,
-        "Node1 should have 3 transports registered (internal UDP + external UDP + BLE)"
+        2,
+        "Node1 should have 2 transports registered"
     );
 
-    // Create node2 with the same transports
     let node2_config = NodeConfig::builder()
-        .transport_provider(udp_provider.clone())
-        .transport_provider(ble_provider.clone())
+        .transport_provider(node2_udp_provider.clone())
+        .transport_provider(node2_ble_provider.clone())
         .build();
-
-    let node2 = Node::with_config(node2_config)
-        .await
-        .expect("Failed to create node2");
-
-    let node2_registry = node2.transport_registry();
+    let node2_registry = node2_config.build_transport_registry();
     assert_eq!(
         node2_registry.len(),
-        3,
-        "Node2 should have 3 transports registered (internal UDP + external UDP + BLE)"
+        2,
+        "Node2 should have 2 transports registered"
     );
 
-    // Step 3: Verify transport capabilities and stats
-    // Both nodes should have access to both transports through their registries
-    println!("Node1 local address: {:?}", node1.local_addr());
-    println!("Node2 local address: {:?}", node2.local_addr());
-
-    // Verify both nodes can access their transport providers
-    // 2 UDP providers: the internal one from P2pEndpoint + the external one we registered
     let node1_udp_providers = node1_registry.providers_by_type(TransportType::Udp);
     let node1_ble_providers = node1_registry.providers_by_type(TransportType::Ble);
     assert_eq!(
         node1_udp_providers.len(),
-        2,
-        "Node1 should have 2 UDP transports (internal + external)"
+        1,
+        "Node1 should have 1 UDP transport"
     );
     assert_eq!(
         node1_ble_providers.len(),
@@ -437,8 +546,8 @@ async fn test_multi_transport_concurrent_io() {
     let node2_ble_providers = node2_registry.providers_by_type(TransportType::Ble);
     assert_eq!(
         node2_udp_providers.len(),
-        2,
-        "Node2 should have 2 UDP transports (internal + external)"
+        1,
+        "Node2 should have 1 UDP transport"
     );
     assert_eq!(
         node2_ble_providers.len(),
@@ -464,62 +573,143 @@ async fn test_multi_transport_concurrent_io() {
         "Node2 BLE transport should be online"
     );
 
-    // Step 4: Verify transport stats are accessible
-    let udp_stats = udp_provider.stats();
-    println!(
-        "UDP stats - sent: {} bytes, received: {} bytes, datagrams sent: {}, datagrams received: {}",
-        udp_stats.bytes_sent,
-        udp_stats.bytes_received,
-        udp_stats.datagrams_sent,
-        udp_stats.datagrams_received
-    );
+    let mut node2_udp_inbound = node2_udp_provider.inbound();
+    let mut node2_ble_inbound = node2_ble_provider.inbound();
+    let udp_payload = b"udp payload over mock transport";
+    let ble_payload = b"ble payload over mock transport";
+    let node2_udp_addr = node2_udp.local_transport_addr();
+    let node2_ble_addr = node2_ble.local_transport_addr();
 
-    let ble_stats = ble_provider.stats();
-    println!(
-        "BLE stats - sent: {} bytes, received: {} bytes, datagrams sent: {}, datagrams received: {}",
-        ble_stats.bytes_sent,
-        ble_stats.bytes_received,
-        ble_stats.datagrams_sent,
-        ble_stats.datagrams_received
-    );
+    tokio::try_join!(
+        node1_registry.send(udp_payload, &node2_udp_addr),
+        node1_registry.send(ble_payload, &node2_ble_addr)
+    )
+    .expect("concurrent mock transport sends should succeed");
 
-    // Verify stats structure is correct (fields are accessible)
+    let udp_datagram = tokio::time::timeout(Duration::from_secs(1), node2_udp_inbound.recv())
+        .await
+        .expect("timed out waiting for UDP datagram")
+        .expect("UDP inbound channel should stay open");
+    let ble_datagram = tokio::time::timeout(Duration::from_secs(1), node2_ble_inbound.recv())
+        .await
+        .expect("timed out waiting for BLE datagram")
+        .expect("BLE inbound channel should stay open");
+
+    assert_eq!(udp_datagram.data, udp_payload);
+    assert_eq!(udp_datagram.source, node1_udp.local_transport_addr());
+    assert_eq!(ble_datagram.data, ble_payload);
+    assert_eq!(ble_datagram.source, node1_ble.local_transport_addr());
+
+    let node1_udp_stats = node1_udp_provider.stats();
+    let node1_ble_stats = node1_ble_provider.stats();
+    let node2_udp_stats = node2_udp_provider.stats();
+    let node2_ble_stats = node2_ble_provider.stats();
+
     assert_eq!(
-        udp_stats.send_errors, 0,
-        "UDP should have no send errors initially"
+        node1_udp_stats.datagrams_sent, 1,
+        "node1 UDP should record the sent datagram"
     );
     assert_eq!(
-        ble_stats.send_errors, 0,
-        "BLE should have no send errors initially"
+        node1_udp_stats.bytes_sent,
+        udp_payload.len() as u64,
+        "node1 UDP should record sent bytes"
+    );
+    assert_eq!(
+        node1_ble_stats.datagrams_sent, 1,
+        "node1 BLE should record the sent datagram"
+    );
+    assert_eq!(
+        node1_ble_stats.bytes_sent,
+        ble_payload.len() as u64,
+        "node1 BLE should record sent bytes"
+    );
+    assert_eq!(
+        node2_udp_stats.datagrams_received, 1,
+        "node2 UDP should record the received datagram"
+    );
+    assert_eq!(
+        node2_udp_stats.bytes_received,
+        udp_payload.len() as u64,
+        "node2 UDP should record received bytes"
+    );
+    assert_eq!(
+        node2_ble_stats.datagrams_received, 1,
+        "node2 BLE should record the received datagram"
+    );
+    assert_eq!(
+        node2_ble_stats.bytes_received,
+        ble_payload.len() as u64,
+        "node2 BLE should record received bytes"
     );
 
-    // Step 5: Shut down BLE transport mid-test, verify failover to UDP
-    println!("\n=== Testing Transport Failover ===");
-    println!("Shutting down BLE transport...");
-    ble_provider.shutdown().await.expect("BLE shutdown failed");
+    node1_ble_provider
+        .shutdown()
+        .await
+        .expect("BLE shutdown failed");
     assert!(
-        !ble_provider.is_online(),
+        !node1_ble_provider.is_online(),
         "BLE should be offline after shutdown"
     );
-
-    // Verify UDP is still online
     assert!(
-        udp_provider.is_online(),
+        node1_udp_provider.is_online(),
         "UDP should still be online after BLE shutdown"
     );
 
-    // Verify registry reflects the change
-    tokio::time::sleep(Duration::from_millis(100)).await; // Give time for state to propagate
-
-    // Final verification: Check online providers count
-    // 2 UDP transports remain online: internal (from P2pEndpoint) + external
-    let online_count = node1_registry.online_providers().count();
-    assert_eq!(
-        online_count, 2,
-        "2 transports (internal + external UDP) should be online after BLE shutdown"
+    let ble_after_shutdown = node1_registry
+        .send(b"must not send over offline BLE", &node2_ble_addr)
+        .await;
+    assert!(
+        matches!(
+            ble_after_shutdown,
+            Err(ProviderError::NoProviderForAddress {
+                addr_type: TransportType::Ble
+            })
+        ),
+        "offline BLE should be removed from address-based routing"
     );
 
-    // Cleanup
-    node1.shutdown().await;
-    node2.shutdown().await;
+    let failover_payload = b"payload after ble shutdown";
+    node1_registry
+        .send(failover_payload, &node2_udp_addr)
+        .await
+        .expect("UDP fallback send should succeed after BLE shutdown");
+
+    let failover_datagram = tokio::time::timeout(Duration::from_secs(1), node2_udp_inbound.recv())
+        .await
+        .expect("timed out waiting for fallback UDP datagram")
+        .expect("UDP inbound channel should stay open");
+    assert_eq!(failover_datagram.data, failover_payload);
+    assert_eq!(failover_datagram.source, node1_udp.local_transport_addr());
+
+    let node1_udp_stats = node1_udp_provider.stats();
+    let node2_udp_stats = node2_udp_provider.stats();
+    assert_eq!(
+        node1_udp_stats.datagrams_sent, 2,
+        "node1 UDP should record initial and fallback datagrams"
+    );
+    assert_eq!(
+        node1_udp_stats.bytes_sent,
+        (udp_payload.len() + failover_payload.len()) as u64,
+        "node1 UDP should record initial and fallback bytes"
+    );
+    assert_eq!(
+        node2_udp_stats.datagrams_received, 2,
+        "node2 UDP should record initial and fallback datagrams"
+    );
+    assert_eq!(
+        node2_udp_stats.bytes_received,
+        (udp_payload.len() + failover_payload.len()) as u64,
+        "node2 UDP should record initial and fallback bytes"
+    );
+    assert_eq!(
+        node1_ble_provider.stats().datagrams_sent,
+        1,
+        "BLE should not send additional datagrams after shutdown"
+    );
+
+    let online_count = node1_registry.online_providers().count();
+    assert_eq!(
+        online_count, 1,
+        "only node1 UDP should be online after BLE shutdown"
+    );
 }
