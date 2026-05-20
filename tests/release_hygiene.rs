@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn repo_file(path: &str) -> PathBuf {
@@ -55,6 +55,19 @@ fn cargo_lock_package_version(package_name: &str) -> Result<Option<String>, Stri
     Ok(None)
 }
 
+fn is_git_worktree(repo_dir: &Path) -> bool {
+    match Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(repo_dir)
+        .output()
+    {
+        Ok(output) => {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        }
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn cargo_lock_matches_manifest_version() -> Result<(), String> {
     let manifest_version = package_version()?;
@@ -102,9 +115,14 @@ fn manifest_excludes_known_release_artifacts() -> Result<(), String> {
 
 #[test]
 fn no_orphaned_gitlinks_without_gitmodules_mapping() -> Result<(), String> {
+    let repo_dir = repo_file(".");
+    if !is_git_worktree(&repo_dir) {
+        return Ok(());
+    }
+
     let output = Command::new("git")
         .args(["ls-files", "--stage"])
-        .current_dir(repo_file("."))
+        .current_dir(&repo_dir)
         .output()
         .map_err(|error| format!("failed to run git ls-files --stage: {error}"))?;
     if !output.status.success() {
@@ -140,5 +158,28 @@ fn no_orphaned_gitlinks_without_gitmodules_mapping() -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn git_worktree_check_skips_plain_directory() -> Result<(), String> {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before unix epoch: {error}"))?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "ant-quic-release-hygiene-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir)
+        .map_err(|error| format!("failed to create temporary directory {dir:?}: {error}"))?;
+
+    assert!(
+        !is_git_worktree(&dir),
+        "plain directories should not be treated as Git worktrees"
+    );
+
+    fs::remove_dir(&dir)
+        .map_err(|error| format!("failed to remove temporary directory {dir:?}: {error}"))?;
     Ok(())
 }
