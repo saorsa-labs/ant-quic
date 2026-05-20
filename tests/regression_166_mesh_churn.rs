@@ -33,13 +33,15 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    sync::{Mutex, watch},
+    time::timeout,
+};
 
 const STREAMS_PER_DIRECTION: u32 = 120;
 const PAYLOAD_LEN: usize = 48; // 4-byte seq + 4-byte from-index + 40-byte filler
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(90);
-const RECV_IDLE_GRACE: Duration = Duration::from_secs(6);
 
 fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
     if addr.ip().is_unspecified() {
@@ -126,24 +128,33 @@ async fn mesh_churn_preserves_every_acked_stream() {
     // Recv loops — collect every (sender, seq) pair we observe.
     let received: Vec<Arc<Mutex<Vec<(PeerId, u32, u32)>>>> =
         (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    let (recv_shutdown_tx, recv_shutdown_rx) = watch::channel(false);
     let mut recv_tasks = Vec::with_capacity(3);
     for (idx, node) in nodes.iter().enumerate() {
         let node = Arc::clone(node);
         let sink = Arc::clone(&received[idx]);
+        let mut recv_shutdown_rx = recv_shutdown_rx.clone();
         recv_tasks.push(tokio::spawn(async move {
             loop {
-                match timeout(RECV_IDLE_GRACE, node.recv()).await {
-                    Ok(Ok((peer, data))) => {
+                let recv_result = tokio::select! {
+                    result = node.recv() => result,
+                    changed = recv_shutdown_rx.changed() => {
+                        match changed {
+                            Ok(()) if *recv_shutdown_rx.borrow() => break,
+                            Ok(()) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                };
+
+                match recv_result {
+                    Ok((peer, data)) => {
                         if let Some((seq, from_idx)) = decode_payload(&data) {
                             sink.lock().await.push((peer, seq, from_idx));
                         }
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         eprintln!("node idx={idx} recv error: {e}");
-                        break;
-                    }
-                    Err(_) => {
-                        eprintln!("node idx={idx} recv idle grace elapsed");
                         break;
                     }
                 }
@@ -211,12 +222,13 @@ async fn mesh_churn_preserves_every_acked_stream() {
     .await
     .expect("send phase timed out");
 
-    // Let receivers drain before idle grace elapses.
+    // Let receivers drain before requesting shutdown.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     for node in &nodes {
         let _ = timeout(Duration::from_secs(2), Arc::clone(node).shutdown()).await;
     }
+    recv_shutdown_tx.send_replace(true);
     for t in recv_tasks {
         let _ = timeout(Duration::from_secs(15), t).await;
     }
