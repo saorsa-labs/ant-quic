@@ -3176,6 +3176,12 @@ impl P2pEndpoint {
         &self.transport_registry
     }
 
+    /// Get the transport registry stored by the underlying NAT traversal endpoint.
+    #[doc(hidden)]
+    pub fn nat_traversal_transport_registry(&self) -> Option<&Arc<TransportRegistry>> {
+        self.inner.transport_registry()
+    }
+
     /// Get the ML-DSA-65 public key bytes (1952 bytes)
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.public_key

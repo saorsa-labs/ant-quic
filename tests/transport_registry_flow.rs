@@ -186,18 +186,61 @@ async fn test_default_config_empty_registry() {
 /// Note: We verify the wiring by checking that:
 /// 1. Node has access to the registry (via transport_registry())
 /// 2. The registry has our registered provider
-/// 3. The unified_config correctly passes registry to NatTraversalConfig
-///    (verified via to_nat_config() returning transport_registry: Some(...))
+/// 3. The Node-created NatTraversalEndpoint has the exact registered provider
 #[tokio::test]
 async fn test_transport_registry_flows_to_nat_traversal_endpoint() {
-    use ant_quic::unified_config::P2pConfig;
+    use ant_quic::transport::{ProviderError, TransportCapabilities};
 
-    // Create a registry with a provider
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let transport = UdpTransport::bind(addr)
-        .await
-        .expect("Failed to bind UdpTransport");
-    let provider: Arc<dyn TransportProvider> = Arc::new(transport);
+    const PROVIDER_NAME: &str = "phase-1-2-nat-wiring-probe";
+
+    struct NatWiringProbeTransport {
+        name: &'static str,
+        capabilities: TransportCapabilities,
+        local_addr: TransportAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportProvider for NatWiringProbeTransport {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn transport_type(&self) -> TransportType {
+            TransportType::Ble
+        }
+
+        fn capabilities(&self) -> &TransportCapabilities {
+            &self.capabilities
+        }
+
+        fn local_addr(&self) -> Option<TransportAddr> {
+            Some(self.local_addr.clone())
+        }
+
+        async fn send(&self, _data: &[u8], _dest: &TransportAddr) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        fn inbound(&self) -> mpsc::Receiver<InboundDatagram> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+
+        fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    // Create a non-UDP probe provider so it cannot be confused with the internal UDP transport.
+    let provider: Arc<dyn TransportProvider> = Arc::new(NatWiringProbeTransport {
+        name: PROVIDER_NAME,
+        capabilities: TransportCapabilities::ble(),
+        local_addr: TransportAddr::ble([0xA1, 0x7E, 0x51, 0x20, 0x25, 0x01], None),
+    });
 
     // Create NodeConfig with the provider
     let config = NodeConfig::builder()
@@ -209,29 +252,34 @@ async fn test_transport_registry_flows_to_nat_traversal_endpoint() {
         .await
         .expect("Node::with_config should succeed");
 
-    // Verify registry is accessible from Node (Phase 1.1 - already working)
-    // Registry has our external provider + the internal UDP transport from P2pEndpoint
+    // Verify registry is accessible from Node (Phase 1.1 - already working).
     let registry = node.transport_registry();
     assert!(!registry.is_empty(), "Registry should not be empty");
-    assert_eq!(
-        registry.len(),
-        2,
-        "Registry should have 2 providers (internal + external)"
+    assert!(
+        registry
+            .providers()
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &provider)),
+        "Node registry should contain the configured probe provider"
     );
 
-    // Verify P2pConfig's to_nat_config() correctly passes the registry
-    // This is the key Phase 1.2 wiring - P2pConfig must include transport_registry
-    // when converting to NatTraversalConfig for NatTraversalEndpoint creation
-    let p2p_config = P2pConfig::builder()
-        .transport_registry(ant_quic::transport::TransportRegistry::new())
-        .build()
-        .expect("P2pConfig build should succeed");
-    let nat_config = p2p_config.to_nat_config();
-
-    // Verify transport_registry is passed through to NatTraversalConfig
+    let nat_registry = node
+        .inner_endpoint()
+        .nat_traversal_transport_registry()
+        .expect("Node-created NatTraversalEndpoint should store a transport registry");
     assert!(
-        nat_config.transport_registry.is_some(),
-        "P2pConfig::to_nat_config() should include transport_registry"
+        nat_registry
+            .providers()
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &provider)),
+        "Node-created NatTraversalEndpoint registry should contain the configured probe provider"
+    );
+    assert!(
+        nat_registry
+            .providers_by_type(TransportType::Ble)
+            .iter()
+            .any(|registered| registered.name() == PROVIDER_NAME),
+        "Probe provider should be visible by name in the NatTraversalEndpoint registry"
     );
 
     node.shutdown().await;
