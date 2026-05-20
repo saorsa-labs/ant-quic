@@ -187,8 +187,12 @@ pub fn extract_public_key_from_spki(spki: &[u8]) -> Result<MlDsa65PublicKey, Pqc
     let (outer_len, len_bytes) = parse_length(&spki[pos..])?;
     pos += len_bytes;
 
-    // Verify we have enough data
-    if spki.len() < pos + outer_len {
+    let outer_end = pos
+        .checked_add(outer_len)
+        .ok_or(PqcError::InvalidPublicKey)?;
+
+    // DER SubjectPublicKeyInfo must consume the complete input.
+    if spki.len() != outer_end {
         return Err(PqcError::InvalidPublicKey);
     }
 
@@ -200,7 +204,12 @@ pub fn extract_public_key_from_spki(spki: &[u8]) -> Result<MlDsa65PublicKey, Pqc
 
     let (algo_len, len_bytes) = parse_length(&spki[pos..])?;
     pos += len_bytes;
-    let algo_end = pos + algo_len;
+    let algo_end = pos
+        .checked_add(algo_len)
+        .ok_or(PqcError::InvalidPublicKey)?;
+    if algo_end > outer_end {
+        return Err(PqcError::InvalidPublicKey);
+    }
 
     // Parse OID
     if spki.get(pos) != Some(&0x06) {
@@ -216,10 +225,20 @@ pub fn extract_public_key_from_spki(spki: &[u8]) -> Result<MlDsa65PublicKey, Pqc
     }
 
     // Verify ML-DSA-65 OID
-    if spki.get(pos..pos + oid_len) != Some(&ML_DSA_65_OID[..]) {
+    let oid_end = pos.checked_add(oid_len).ok_or(PqcError::InvalidPublicKey)?;
+    if oid_end > algo_end {
         return Err(PqcError::InvalidPublicKey);
     }
-    pos = algo_end;
+
+    if spki.get(pos..oid_end) != Some(&ML_DSA_65_OID[..]) {
+        return Err(PqcError::InvalidPublicKey);
+    }
+    pos = oid_end;
+
+    // ML-DSA AlgorithmIdentifier parameters MUST be absent.
+    if pos != algo_end {
+        return Err(PqcError::InvalidPublicKey);
+    }
 
     // Parse BIT STRING
     if spki.get(pos) != Some(&0x03) {
@@ -229,6 +248,12 @@ pub fn extract_public_key_from_spki(spki: &[u8]) -> Result<MlDsa65PublicKey, Pqc
 
     let (bit_string_len, len_bytes) = parse_length(&spki[pos..])?;
     pos += len_bytes;
+    let bit_string_end = pos
+        .checked_add(bit_string_len)
+        .ok_or(PqcError::InvalidPublicKey)?;
+    if bit_string_len == 0 || bit_string_end != outer_end {
+        return Err(PqcError::InvalidPublicKey);
+    }
 
     // First byte of BIT STRING is unused bits count (must be 0)
     if spki.get(pos) != Some(&0x00) {
@@ -242,9 +267,12 @@ pub fn extract_public_key_from_spki(spki: &[u8]) -> Result<MlDsa65PublicKey, Pqc
         return Err(PqcError::InvalidPublicKey);
     }
 
-    let key_bytes = spki
-        .get(pos..pos + key_len)
-        .ok_or(PqcError::InvalidPublicKey)?;
+    let key_end = pos.checked_add(key_len).ok_or(PqcError::InvalidPublicKey)?;
+    if key_end != bit_string_end {
+        return Err(PqcError::InvalidPublicKey);
+    }
+
+    let key_bytes = spki.get(pos..key_end).ok_or(PqcError::InvalidPublicKey)?;
 
     MlDsa65PublicKey::from_bytes(key_bytes)
 }

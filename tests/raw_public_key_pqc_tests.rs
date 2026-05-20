@@ -7,11 +7,65 @@
 mod pqc_raw_public_key_tests {
     use ant_quic::crypto::pqc::{MlDsaOperations, ml_dsa::MlDsa65};
     use ant_quic::crypto::raw_public_keys::pqc::{
-        PqcRawPublicKeyVerifier, create_subject_public_key_info, derive_peer_id_from_public_key,
-        extract_public_key_from_spki, generate_ml_dsa_keypair, sign_with_ml_dsa,
-        supported_signature_schemes, verify_signature, verify_with_ml_dsa,
+        MlDsaPublicKey, PqcRawPublicKeyVerifier, create_subject_public_key_info,
+        derive_peer_id_from_public_key, extract_public_key_from_spki, generate_ml_dsa_keypair,
+        sign_with_ml_dsa, supported_signature_schemes, verify_signature, verify_with_ml_dsa,
     };
     use rustls::SignatureScheme;
+
+    const FIXED_PUBLIC_KEY_SIZE: usize = 1952;
+    const EXPECTED_ML_DSA_65_SIGNATURE_SCHEME: u16 = 0x0905;
+    const EXPECTED_ML_DSA_65_SPKI_PREFIX: &[u8] = &[
+        0x30, 0x82, 0x07, 0xb2, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+        0x03, 0x12, 0x03, 0x82, 0x07, 0xa1, 0x00,
+    ];
+    const EXPECTED_FIXED_PUBLIC_KEY_PEER_ID: [u8; 32] = [
+        0x62, 0xf7, 0x4e, 0x0a, 0xe9, 0x0d, 0x64, 0xf6, 0xc2, 0xa2, 0xd5, 0x28, 0x24, 0xaa, 0x05,
+        0x67, 0x04, 0x77, 0x3b, 0x36, 0x70, 0x77, 0xd6, 0x90, 0xb3, 0x03, 0x2c, 0x18, 0xb9, 0x32,
+        0xef, 0xce,
+    ];
+
+    fn fixed_public_key_bytes() -> [u8; FIXED_PUBLIC_KEY_SIZE] {
+        std::array::from_fn(|i| ((i * 37 + 11) % 256) as u8)
+    }
+
+    fn fixed_public_key() -> MlDsaPublicKey {
+        let bytes = fixed_public_key_bytes();
+        MlDsaPublicKey::from_bytes(&bytes).expect("fixed ML-DSA-65 public key")
+    }
+
+    fn expected_fixed_spki() -> Vec<u8> {
+        let key_bytes = fixed_public_key_bytes();
+        let mut expected =
+            Vec::with_capacity(EXPECTED_ML_DSA_65_SPKI_PREFIX.len() + key_bytes.len());
+        expected.extend_from_slice(EXPECTED_ML_DSA_65_SPKI_PREFIX);
+        expected.extend_from_slice(&key_bytes);
+        expected
+    }
+
+    #[test]
+    fn test_ml_dsa_raw_public_key_wire_format_known_answer() {
+        let public_key = fixed_public_key();
+
+        let spki = create_subject_public_key_info(&public_key).expect("spki creation");
+        assert_eq!(spki, expected_fixed_spki());
+
+        let recovered_key = extract_public_key_from_spki(&spki).expect("spki extraction");
+        assert_eq!(public_key.as_bytes(), recovered_key.as_bytes());
+
+        let peer_id = derive_peer_id_from_public_key(&public_key);
+        assert_eq!(peer_id.0, EXPECTED_FIXED_PUBLIC_KEY_PEER_ID);
+
+        let mut trailing_spki = spki.clone();
+        trailing_spki.push(0x00);
+        assert!(extract_public_key_from_spki(&trailing_spki).is_err());
+
+        let mut spki_with_null_params = spki;
+        spki_with_null_params[3] = 0xb4;
+        spki_with_null_params[5] = 0x0d;
+        spki_with_null_params.splice(17..17, [0x05, 0x00]);
+        assert!(extract_public_key_from_spki(&spki_with_null_params).is_err());
+    }
 
     #[test]
     fn test_ml_dsa_raw_public_key_lifecycle() {
@@ -97,9 +151,10 @@ mod pqc_raw_public_key_tests {
     fn test_supported_signature_schemes() {
         let schemes = supported_signature_schemes();
 
-        // Should only contain ML-DSA-65 scheme (0x0901 per IANA)
+        // Should only contain ML-DSA-65 scheme (0x0905 per IANA)
         assert_eq!(schemes.len(), 1);
         assert_eq!(schemes[0], SignatureScheme::ML_DSA_65);
+        assert_eq!(u16::from(schemes[0]), EXPECTED_ML_DSA_65_SIGNATURE_SCHEME);
     }
 
     #[test]
