@@ -7,11 +7,82 @@ use ant_quic::crypto::pqc::{
     ml_dsa::MlDsa65,
     ml_kem::MlKem768,
     security_validation::{EntropyQuality, SecurityValidator, Severity, run_security_validation},
-    types::{MlDsaSignature, MlKemCiphertext, MlKemPublicKey},
+    types::{
+        ML_DSA_65_SECRET_KEY_SIZE, ML_KEM_768_SECRET_KEY_SIZE, MlDsaSecretKey, MlDsaSignature,
+        MlKemCiphertext, MlKemPublicKey, MlKemSecretKey,
+    },
 };
-use std::time::Instant;
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    ptr, slice,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    time::Instant,
+};
 
 const MIN_PASSING_SECURITY_SCORE: u8 = 70;
+const NO_OBSERVED_ALLOCATION: usize = usize::MAX;
+
+#[global_allocator]
+static ZEROING_TRACKING_ALLOCATOR: ZeroingTrackingAllocator = ZeroingTrackingAllocator;
+
+static WATCHED_ALLOCATION: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+static WATCHED_ALLOCATION_SIZE: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_NONZERO_BYTES: AtomicUsize = AtomicUsize::new(NO_OBSERVED_ALLOCATION);
+
+struct ZeroingTrackingAllocator;
+
+// SAFETY: This allocator delegates all allocation operations to `System` and
+// only inspects a single watched allocation immediately before forwarding
+// deallocation.
+unsafe impl GlobalAlloc for ZeroingTrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: Delegates to the platform allocator with the layout supplied
+        // by the caller.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let watched = WATCHED_ALLOCATION.load(Ordering::Acquire);
+        let watched_size = WATCHED_ALLOCATION_SIZE.load(Ordering::Acquire);
+
+        if watched == ptr && watched_size == layout.size() {
+            // SAFETY: `ptr` is still a valid allocation for `layout.size()`
+            // bytes until this `dealloc` call forwards it to `System`.
+            let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, layout.size()) };
+            let nonzero_bytes = bytes.iter().filter(|byte| **byte != 0).count();
+            WATCHED_NONZERO_BYTES.store(nonzero_bytes, Ordering::Release);
+            WATCHED_DEALLOCATIONS.fetch_add(1, Ordering::AcqRel);
+            WATCHED_ALLOCATION.store(ptr::null_mut(), Ordering::Release);
+            WATCHED_ALLOCATION_SIZE.store(0, Ordering::Release);
+        }
+
+        // SAFETY: Delegates to the platform allocator with the same pointer and
+        // layout supplied by the caller.
+        unsafe { System.dealloc(ptr, layout) };
+    }
+}
+
+fn watch_allocation(ptr: *const u8, size: usize) {
+    WATCHED_NONZERO_BYTES.store(NO_OBSERVED_ALLOCATION, Ordering::Release);
+    WATCHED_DEALLOCATIONS.store(0, Ordering::Release);
+    WATCHED_ALLOCATION_SIZE.store(size, Ordering::Release);
+    WATCHED_ALLOCATION.store(ptr.cast_mut(), Ordering::Release);
+}
+
+fn assert_watched_allocation_zeroized_on_drop(label: &str) {
+    let observed_deallocations = WATCHED_DEALLOCATIONS.load(Ordering::Acquire);
+    assert_eq!(
+        observed_deallocations, 1,
+        "{label} allocation was not observed during drop"
+    );
+
+    let nonzero_bytes = WATCHED_NONZERO_BYTES.load(Ordering::Acquire);
+    assert_eq!(
+        nonzero_bytes, 0,
+        "{label} left {nonzero_bytes} non-zero byte(s) at deallocation"
+    );
+}
 
 #[test]
 fn test_basic_security_validation() {
@@ -346,22 +417,34 @@ fn test_key_serialization_consistency() {
 }
 
 #[test]
-fn test_memory_zeroing_simulation() {
-    // Simulate checking if sensitive memory is zeroed
-    // In real implementation, this would use memory inspection tools
+fn test_secret_keys_zeroize_on_drop() {
+    let kem_bytes = [0xAA; ML_KEM_768_SECRET_KEY_SIZE];
+    let kem_secret_key = MlKemSecretKey::from_bytes(&kem_bytes)
+        .expect("ML-KEM secret key bytes should have the correct length");
+    assert!(
+        kem_secret_key.as_bytes().iter().any(|byte| *byte != 0),
+        "ML-KEM secret key test fixture must contain non-zero bytes"
+    );
+    watch_allocation(
+        kem_secret_key.as_bytes().as_ptr(),
+        ML_KEM_768_SECRET_KEY_SIZE,
+    );
+    drop(kem_secret_key);
+    assert_watched_allocation_zeroized_on_drop("ML-KEM secret key");
 
-    let sensitive_data = vec![0xAA; 32]; // Simulated key material
-    let _ptr = sensitive_data.as_ptr();
-
-    // Drop the data
-    drop(sensitive_data);
-
-    // In a real test, we would check if the memory at ptr is zeroed
-    // This is a placeholder for the actual implementation
-    // Real implementation would use:
-    // - Custom allocator with tracking
-    // - Memory inspection after drop
-    // - Verification that Drop trait zeroes memory
+    let dsa_bytes = [0xBB; ML_DSA_65_SECRET_KEY_SIZE];
+    let dsa_secret_key = MlDsaSecretKey::from_bytes(&dsa_bytes)
+        .expect("ML-DSA secret key bytes should have the correct length");
+    assert!(
+        dsa_secret_key.as_bytes().iter().any(|byte| *byte != 0),
+        "ML-DSA secret key test fixture must contain non-zero bytes"
+    );
+    watch_allocation(
+        dsa_secret_key.as_bytes().as_ptr(),
+        ML_DSA_65_SECRET_KEY_SIZE,
+    );
+    drop(dsa_secret_key);
+    assert_watched_allocation_zeroized_on_drop("ML-DSA secret key");
 }
 
 #[test]
