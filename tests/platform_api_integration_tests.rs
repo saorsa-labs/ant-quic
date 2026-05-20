@@ -422,6 +422,7 @@ mod macos_tests {
 }
 
 // Cross-platform comparison tests
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 #[test]
 fn test_platform_interface_consistency() {
     #[cfg(target_os = "windows")]
