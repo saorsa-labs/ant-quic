@@ -89,14 +89,6 @@ impl TransportProvider for MockTransportProvider {
         Some(TransportAddr::Udp("127.0.0.1:0".parse().unwrap()))
     }
 
-    fn protocol_engine(&self) -> ant_quic::transport::ProtocolEngine {
-        if self.capabilities.supports_full_quic() {
-            ant_quic::transport::ProtocolEngine::Quic
-        } else {
-            ant_quic::transport::ProtocolEngine::Constrained
-        }
-    }
-
     async fn send(&self, _data: &[u8], _dest: &TransportAddr) -> Result<(), ProviderError> {
         Ok(())
     }
@@ -441,7 +433,7 @@ proptest! {
 
     /// Property: Protocol engine selection matches QUIC capability
     ///
-    /// Protocol engine should be FullQuic if and only if the transport
+    /// Protocol engine should be Quic if and only if the transport
     /// supports full QUIC according to its capabilities.
     #[test]
     fn prop_protocol_engine_matches_quic_capability(transports in arb_transport_list()) {
