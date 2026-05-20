@@ -11,7 +11,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::unified_config::{AutoConnectPolicy, DiscoveryPolicy};
-use ant_quic::{Node, P2pConfig, P2pEndpoint, PeerConnection};
+use ant_quic::{Node, P2pConfig, P2pEndpoint, PeerConnection, PeerId};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -36,6 +37,35 @@ async fn create_localhost_endpoint_with_config(config: P2pConfig) -> P2pEndpoint
     P2pEndpoint::new(config)
         .await
         .expect("P2pEndpoint::new should succeed")
+}
+
+fn peer_id_set(peers: &[PeerConnection]) -> BTreeSet<PeerId> {
+    peers.iter().map(|peer| peer.peer_id).collect()
+}
+
+async fn assert_connected_peer_set(node: &Node, expected: &[PeerId], label: &str) {
+    let expected_ids: BTreeSet<PeerId> = expected.iter().copied().collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let peers = node.connected_peers().await;
+        let actual_ids = peer_id_set(&peers);
+        let matches_expected = peers.len() == expected_ids.len() && actual_ids == expected_ids;
+
+        if matches_expected {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            assert!(
+                matches_expected,
+                "{}: expected peer set {:?}, got {:?} (full peers: {:?})",
+                label, expected_ids, actual_ids, peers
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Test that calling connect_addr() twice to the same address returns the
@@ -156,25 +186,6 @@ async fn test_simultaneous_connect_no_phantom() {
         .expect("B→A should not time out")
         .expect("B→A should succeed");
 
-    // Wait for connection state to stabilize
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // node_a should see exactly 1 connection to node_b
-    let peers_a = node_a.connected_peers().await;
-    assert!(
-        peers_a.len() <= 1,
-        "node_a should have at most 1 peer, got {} (phantom connections!)",
-        peers_a.len()
-    );
-
-    // node_b should see exactly 1 connection to node_a
-    let peers_b = node_b.connected_peers().await;
-    assert!(
-        peers_b.len() <= 1,
-        "node_b should have at most 1 peer, got {} (phantom connections!)",
-        peers_b.len()
-    );
-
     // The connections should reference each other's peer IDs
     assert_eq!(
         conn_a_to_b.peer_id,
@@ -186,6 +197,19 @@ async fn test_simultaneous_connect_no_phantom() {
         node_a.peer_id(),
         "B's connection should point to A's peer ID"
     );
+
+    assert_connected_peer_set(
+        &node_a,
+        &[node_b.peer_id()],
+        "node_a after simultaneous connect",
+    )
+    .await;
+    assert_connected_peer_set(
+        &node_b,
+        &[node_a.peer_id()],
+        "node_b after simultaneous connect",
+    )
+    .await;
 
     // Clean up
     node_a.shutdown().await;
@@ -609,34 +633,30 @@ async fn test_simultaneous_connect_repeated() {
             timeout(Duration::from_secs(10), node_b.connect_addr(addr_a)),
         );
 
-        // At least one should succeed
-        let a_ok = r_a.map(|r| r.is_ok()).unwrap_or(false);
-        let b_ok = r_b.map(|r| r.is_ok()).unwrap_or(false);
-        assert!(
-            a_ok || b_ok,
-            "Iteration {}: at least one connect should succeed (a={}, b={})",
-            iteration,
-            a_ok,
-            b_ok
+        let conn_a_to_b = r_a
+            .expect("A→B should not time out")
+            .expect("A→B should succeed");
+        let conn_b_to_a = r_b
+            .expect("B→A should not time out")
+            .expect("B→A should succeed");
+
+        assert_eq!(
+            conn_a_to_b.peer_id,
+            node_b.peer_id(),
+            "Iteration {}: A's connection should point to B's peer ID",
+            iteration
+        );
+        assert_eq!(
+            conn_b_to_a.peer_id,
+            node_a.peer_id(),
+            "Iteration {}: B's connection should point to A's peer ID",
+            iteration
         );
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // No phantom connections: each node should have at most 1 peer
-        let peers_a = node_a.connected_peers().await;
-        let peers_b = node_b.connected_peers().await;
-        assert!(
-            peers_a.len() <= 1,
-            "Iteration {}: node_a has {} peers (expected <= 1)",
-            iteration,
-            peers_a.len()
-        );
-        assert!(
-            peers_b.len() <= 1,
-            "Iteration {}: node_b has {} peers (expected <= 1)",
-            iteration,
-            peers_b.len()
-        );
+        let label_a = format!("Iteration {iteration}: node_a after simultaneous connect");
+        assert_connected_peer_set(&node_a, &[node_b.peer_id()], &label_a).await;
+        let label_b = format!("Iteration {iteration}: node_b after simultaneous connect");
+        assert_connected_peer_set(&node_b, &[node_a.peer_id()], &label_b).await;
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -813,36 +833,41 @@ async fn test_four_node_mesh_formation() {
                 continue;
             }
             let n = node.clone();
-            connect_handles.push(tokio::spawn(async move {
-                timeout(Duration::from_secs(15), n.connect_addr(addr)).await
-            }));
+            connect_handles.push((
+                i,
+                j,
+                tokio::spawn(async move {
+                    timeout(Duration::from_secs(15), n.connect_addr(addr)).await
+                }),
+            ));
         }
     }
 
     // Wait for all connects to complete
-    for handle in connect_handles {
-        let _ = handle.await;
+    for (from, to, handle) in connect_handles {
+        let conn = handle
+            .await
+            .expect("mesh connect task should not panic")
+            .expect("mesh connect should not time out")
+            .expect("mesh connect should succeed");
+        assert_eq!(
+            conn.peer_id,
+            nodes[to].peer_id(),
+            "connect {from}->{to} should return the destination peer ID"
+        );
     }
 
-    // Let connections stabilize
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let peer_ids: Vec<PeerId> = nodes.iter().map(Node::peer_id).collect();
 
-    // Verify each node sees at most N-1 peers (no phantoms)
+    // Verify each node sees exactly the other N-1 peers (no phantoms or gaps).
     for (i, node) in nodes.iter().enumerate() {
-        let peers = node.connected_peers().await;
-        assert!(
-            peers.len() < N,
-            "Node {} has {} peers (expected < {}, phantom detected!)",
-            i,
-            peers.len(),
-            N
-        );
-        // At least some connections should have formed
-        assert!(
-            !peers.is_empty(),
-            "Node {} has 0 peers (expected at least 1)",
-            i
-        );
+        let expected: Vec<PeerId> = peer_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(j, peer_id)| (i != j).then_some(*peer_id))
+            .collect();
+        let label = format!("Node {i} mesh membership");
+        assert_connected_peer_set(node, &expected, &label).await;
     }
 
     // Shutdown all nodes
