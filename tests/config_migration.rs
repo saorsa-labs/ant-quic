@@ -16,8 +16,42 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::transport::{TransportAddr, TransportType};
-use ant_quic::{NodeConfig, P2pConfig};
-use std::net::SocketAddr;
+use ant_quic::{Node, NodeConfig, P2pConfig, P2pEndpoint};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::time::timeout;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
+fn spawn_accept_loop(node: Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while node.accept().await.is_some() {} })
+}
+
+fn is_udp_bind_denied(error: &impl std::fmt::Display) -> bool {
+    let error = error.to_string();
+    error.contains("Operation not permitted") && error.contains("bind")
+}
+
+fn boxed_error(error: impl std::error::Error + 'static) -> Box<dyn std::error::Error> {
+    Box::new(error)
+}
 
 // ============================================================================
 // P2pConfig Migration Tests
@@ -150,6 +184,113 @@ fn test_p2p_config_known_peers_iterator() {
         );
         assert_eq!(config.known_peers[i].transport_type(), TransportType::Udp);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_runtime_consumes_socket_and_transport_addr_configs() -> TestResult {
+    let _guard = test_guard().await;
+
+    let receiver_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let receiver_config = P2pConfig::builder()
+        .bind_addr(receiver_bind)
+        .build()
+        .expect("Failed to build receiver P2pConfig");
+    let receiver = match P2pEndpoint::new(receiver_config).await {
+        Ok(endpoint) => Arc::new(endpoint),
+        Err(err) if is_udp_bind_denied(&err) => return Ok(()),
+        Err(err) => return Err(boxed_error(err)),
+    };
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender_bind = TransportAddr::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let sender_config = NodeConfig::builder()
+        .bind_addr(sender_bind)
+        .known_peer(TransportAddr::Udp(receiver_addr))
+        .build();
+    let sender = match Node::with_config(sender_config).await {
+        Ok(sender) => sender,
+        Err(err) if is_udp_bind_denied(&err) => {
+            receiver.shutdown().await;
+            accept_receiver.abort();
+            return Ok(());
+        }
+        Err(err) => return Err(boxed_error(err)),
+    };
+    let sender_id = sender.peer_id();
+
+    let connected = timeout(Duration::from_secs(10), sender.connect_known_peers())
+        .await
+        .expect("connect_known_peers timed out")
+        .expect("connect_known_peers failed");
+    assert!(
+        connected > 0,
+        "sender should connect using TransportAddr::Udp known_peer"
+    );
+
+    sender
+        .send(&receiver_id, b"socket-to-transport migration")
+        .await
+        .expect("sender send failed");
+    let (from_sender, payload) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("receiver recv timed out")
+        .expect("receiver recv failed");
+    assert_eq!(from_sender, sender_id);
+    assert_eq!(payload, b"socket-to-transport migration");
+
+    receiver
+        .send(&sender_id, b"transport-to-socket migration")
+        .await
+        .expect("receiver send failed");
+    let (from_receiver, payload) = timeout(Duration::from_secs(5), sender.recv())
+        .await
+        .expect("sender recv timed out")
+        .expect("sender recv failed");
+    assert_eq!(from_receiver, receiver_id);
+    assert_eq!(payload, b"transport-to-socket migration");
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_receiver.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_endpoint_non_udp_bind_addr_uses_default_udp_socket() -> TestResult {
+    let _guard = test_guard().await;
+
+    let ble_bind = TransportAddr::ble([0x10, 0x20, 0x30, 0x40, 0x50, 0x60], None);
+    let config = P2pConfig::builder()
+        .bind_addr(ble_bind.clone())
+        .build()
+        .expect("Failed to build BLE bind config");
+
+    assert_eq!(config.bind_addr, Some(ble_bind));
+    assert_eq!(
+        config.to_nat_config().bind_addr,
+        None,
+        "non-UDP bind_addr has no SocketAddr for the NAT/UDP endpoint"
+    );
+
+    let endpoint = match P2pEndpoint::new(config).await {
+        Ok(endpoint) => endpoint,
+        Err(err) if is_udp_bind_denied(&err) => return Ok(()),
+        Err(err) => return Err(boxed_error(err)),
+    };
+    let local_addr = endpoint.local_addr().expect("endpoint local UDP addr");
+
+    assert_ne!(
+        local_addr.port(),
+        0,
+        "endpoint should bind an ephemeral UDP socket when bind_addr is non-UDP"
+    );
+
+    endpoint.shutdown().await;
+
+    Ok(())
 }
 
 // ============================================================================
