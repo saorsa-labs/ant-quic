@@ -6,15 +6,70 @@
 use std::path::Path;
 
 #[test]
-fn test_matrix_yaml_parsing() {
-    // Test that the YAML format is valid
-    let yaml_content = include_str!("interop/interop-matrix.yaml");
+fn test_matrix_yaml_parsing() -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(serde::Deserialize)]
+    struct InteropMatrix {
+        version: String,
+        implementations: std::collections::BTreeMap<String, Implementation>,
+        test_categories: std::collections::BTreeMap<String, TestCategory>,
+    }
 
-    // Basic validation - just check it's not empty
-    assert!(!yaml_content.is_empty());
-    assert!(yaml_content.contains("version:"));
-    assert!(yaml_content.contains("implementations:"));
-    assert!(yaml_content.contains("test_categories:"));
+    #[derive(serde::Deserialize)]
+    struct Implementation {
+        endpoints: Vec<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TestCategory {
+        tests: Vec<String>,
+        required: bool,
+    }
+
+    let matrix: InteropMatrix = serde_yaml::from_str(include_str!("interop/interop-matrix.yaml"))?;
+
+    assert!(!matrix.version.trim().is_empty(), "version must be set");
+    assert!(
+        !matrix.implementations.is_empty(),
+        "implementations must not be empty"
+    );
+    assert!(
+        !matrix.test_categories.is_empty(),
+        "test_categories must not be empty"
+    );
+
+    for (name, implementation) in &matrix.implementations {
+        assert!(
+            !implementation.endpoints.is_empty(),
+            "implementation {name} must define endpoints"
+        );
+        assert!(
+            implementation
+                .endpoints
+                .iter()
+                .all(|endpoint| !endpoint.trim().is_empty()),
+            "implementation {name} endpoints must be non-empty strings"
+        );
+    }
+
+    for (name, category) in &matrix.test_categories {
+        assert!(
+            !category.tests.is_empty(),
+            "category {name} must define tests"
+        );
+        assert!(
+            category.tests.iter().all(|test| !test.trim().is_empty()),
+            "category {name} tests must be non-empty strings"
+        );
+    }
+    assert!(
+        matrix
+            .test_categories
+            .values()
+            .any(|category| category.required),
+        "at least one test category must be required"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
