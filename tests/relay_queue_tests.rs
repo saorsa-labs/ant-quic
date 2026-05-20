@@ -17,10 +17,10 @@ use ant_quic::{
 };
 
 /// Create a test peer ID
-fn create_test_peer_id(id: u8) -> PeerId {
+fn create_test_peer_id(id: u64) -> PeerId {
     let mut bytes = [0u8; 32];
-    bytes[0] = id;
-    bytes[31] = id; // Add variety to make unique
+    bytes[..8].copy_from_slice(&id.to_le_bytes());
+    bytes[24..].copy_from_slice(&id.to_be_bytes());
     PeerId(bytes)
 }
 
@@ -441,13 +441,14 @@ mod performance_tests {
         // Create many peer IDs and test map operations
         let mut peer_map = HashMap::new();
         for i in 0..10000 {
-            let peer_id = create_test_peer_id(i as u8);
+            let peer_id = create_test_peer_id(i);
             peer_map.insert(peer_id, i);
         }
+        assert_eq!(peer_map.len(), 10000);
 
         // Test lookups
         for i in 0..1000 {
-            let peer_id = create_test_peer_id(i as u8);
+            let peer_id = create_test_peer_id(i);
             let _value = peer_map.get(&peer_id);
         }
 
