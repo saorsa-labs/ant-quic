@@ -6886,6 +6886,26 @@ impl AddressObservationRateLimiter {
     }
 }
 
+/// Exercise the production address discovery burst limiter for integration tests.
+#[doc(hidden)]
+pub fn address_discovery_burst_admissions_for_test(attempts: usize) -> usize {
+    let now = Instant::now();
+    let config = crate::transport_parameters::AddressDiscoveryConfig::SendAndReceive;
+    let mut state = AddressDiscoveryState::new(&config, now);
+    state.observe_all_paths = true;
+
+    (0..attempts)
+        .filter(|attempt| {
+            let octet = ((*attempt % 200) + 1) as u8;
+            let port = 40000u16 + (*attempt % 1000) as u16;
+            let address = SocketAddr::from(([93, 184, 216, octet], port));
+            state
+                .queue_observed_address_frame(*attempt as u64, address)
+                .is_some()
+        })
+        .count()
+}
+
 impl Connection {
     pub(crate) fn supports_ack_receive_v2(&self) -> bool {
         self.peer_params.ack_receive_v2

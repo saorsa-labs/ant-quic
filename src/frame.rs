@@ -1260,6 +1260,40 @@ impl ObservedAddress {
     }
 }
 
+#[doc(hidden)]
+pub fn encode_observed_address_frame(
+    sequence_number: VarInt,
+    address: SocketAddr,
+) -> Result<Vec<u8>, &'static str> {
+    let mut buf = Vec::with_capacity(ObservedAddress::SIZE_BOUND);
+    ObservedAddress {
+        sequence_number,
+        address,
+    }
+    .try_encode(&mut buf)
+    .map_err(|_| "observed address frame encode overflow")?;
+    Ok(buf)
+}
+
+#[doc(hidden)]
+pub fn decode_observed_address_frame(payload: &[u8]) -> Result<(VarInt, SocketAddr), &'static str> {
+    let mut iter =
+        Iter::new(Bytes::copy_from_slice(payload)).map_err(|_| "invalid frame payload")?;
+    let frame = iter
+        .next()
+        .ok_or("missing observed address frame")?
+        .map_err(|_| "invalid observed address frame")?;
+
+    if iter.next().is_some() {
+        return Err("unexpected trailing frame data");
+    }
+
+    match frame {
+        Frame::ObservedAddress(observed) => Ok((observed.sequence_number, observed.address)),
+        _ => Err("frame is not an observed address frame"),
+    }
+}
+
 impl FrameStruct for ObservedAddress {
     const SIZE_BOUND: usize = 4 + 8 + 16 + 2; // frame type (4) + sequence (8) + IPv6 + port
 }
