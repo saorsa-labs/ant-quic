@@ -35,6 +35,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_MESSAGES_PER_CLIENT: usize = 4;
 const SELECT_LOOP_SPIN_DELAY: Duration = Duration::from_millis(1);
 const ACCEPT_CANCELLATIONS_PER_STREAM: usize = 5;
+const STREAM_READ_LIMIT: usize = 4096;
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -72,6 +73,17 @@ fn client_config(chain: &[CertificateDer<'static>]) -> ClientConfig {
     let mut cfg = ClientConfig::with_root_certificates(Arc::new(roots)).expect("client cfg");
     cfg.transport_config(pqc_transport_config());
     cfg
+}
+
+async fn read_stream_bytes(
+    recv: &mut RecvStream,
+    timeout_context: &str,
+    read_context: &str,
+) -> Vec<u8> {
+    timeout(DATAGRAM_TIMEOUT, recv.read_to_end(STREAM_READ_LIMIT))
+        .await
+        .expect(timeout_context)
+        .expect(read_context)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -158,16 +170,17 @@ async fn handle_server_connection(conn: Connection) {
         .await
         .expect("server accept_bi timeout")
         .expect("server accept_bi failed");
-    let mut buf = [0u8; 128];
-    let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-        .await
-        .expect("server stream read timeout")
-        .expect("server stream read failed")
-        .expect("client closed stream prematurely");
-    let msg = std::str::from_utf8(&buf[..len]).expect("valid utf8");
-    assert!(
-        msg.contains(&format!("client-{client_marker}-bi")),
-        "unexpected stream payload: {msg}",
+    let payload = read_stream_bytes(
+        &mut recv,
+        "server stream read timeout",
+        "server stream read failed",
+    )
+    .await;
+    let expected = format!("client-{client_marker}-bi");
+    assert_eq!(
+        payload.as_slice(),
+        expected.as_bytes(),
+        "unexpected stream payload"
     );
 
     let response = format!("server-ack-{client_marker}");
@@ -221,26 +234,26 @@ async fn run_client(
         .expect("client write failed");
     send.finish().expect("client finish stream");
 
-    let mut buf = [0u8; 64];
-    let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-        .await
-        .expect("client read timeout")
-        .expect("client read failed")
-        .expect("server closed stream early");
-    let response = std::str::from_utf8(&buf[..len]).expect("valid utf8");
-    assert_eq!(response, format!("server-ack-{client_marker}"));
+    let response = read_stream_bytes(&mut recv, "client read timeout", "client read failed").await;
+    assert_eq!(
+        response.as_slice(),
+        format!("server-ack-{client_marker}").as_bytes()
+    );
 
     let mut uni = timeout(DATAGRAM_TIMEOUT, conn.accept_uni())
         .await
         .expect("client accept_uni timeout")
         .expect("client accept_uni failed");
-    let len = timeout(DATAGRAM_TIMEOUT, uni.read(&mut buf))
-        .await
-        .expect("client uni read timeout")
-        .expect("client uni read failed")
-        .expect("server uni closed early");
-    let uni_payload = std::str::from_utf8(&buf[..len]).expect("valid utf8");
-    assert_eq!(uni_payload, format!("broadcast-{client_marker}"));
+    let uni_payload = read_stream_bytes(
+        &mut uni,
+        "client uni read timeout",
+        "client uni read failed",
+    )
+    .await;
+    assert_eq!(
+        uni_payload.as_slice(),
+        format!("broadcast-{client_marker}").as_bytes()
+    );
 
     let stats = conn.stats();
     assert_eq!(
@@ -333,18 +346,21 @@ async fn handle_select_loop_connection(conn: Connection) {
             }
             stream = conn.accept_bi() => {
                 let (mut send, mut recv) = stream.expect("select server accept_bi failed");
-                let mut buf = [0u8; 256];
-                let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-                    .await
-                    .expect("select server stream read timeout")
-                    .expect("select server stream read failed")
-                    .expect("select server stream closed");
-                let message = std::str::from_utf8(&buf[..len]).expect("valid UTF-8 stream message");
+                let payload = read_stream_bytes(
+                    &mut recv,
+                    "select server stream read timeout",
+                    "select server stream read failed",
+                )
+                .await;
+                let message = std::str::from_utf8(&payload).expect("valid UTF-8 stream message");
                 let parts: Vec<_> = message.split('-').collect();
-                assert!(
-                    parts.len() >= 4,
+                assert_eq!(
+                    parts.len(),
+                    4,
                     "unexpected stream payload format: {message}"
                 );
+                assert_eq!(parts[0], "client", "unexpected stream payload: {message}");
+                assert_eq!(parts[2], "stream", "unexpected stream payload: {message}");
                 let marker = parts[1].parse::<u8>().expect("stream marker parse");
                 let seq = parts[3].parse::<u8>().expect("stream seq parse");
                 if let Some(existing) = client_marker {
@@ -415,16 +431,15 @@ async fn run_select_loop_client(
             .expect("select client stream write failed");
         send.finish().expect("select client finish stream");
 
-        let mut buf = [0u8; 64];
-        let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-            .await
-            .expect("select client stream read timeout")
-            .expect("select client stream read failed")
-            .expect("select client stream closed early");
-        let response = std::str::from_utf8(&buf[..len]).expect("valid UTF-8 response");
+        let response = read_stream_bytes(
+            &mut recv,
+            "select client stream read timeout",
+            "select client stream read failed",
+        )
+        .await;
         assert_eq!(
-            response,
-            format!("server-ack-{client_marker}-{seq}"),
+            response.as_slice(),
+            format!("server-ack-{client_marker}-{seq}").as_bytes(),
             "select client received mismatched ack"
         );
     }
@@ -469,16 +484,16 @@ async fn handle_cancellable_accept_connection(conn: Connection) {
     for seq in 0..STREAM_MESSAGES_PER_CLIENT {
         let (mut send, mut recv) = accept_with_cancellations(&conn).await;
 
-        let mut buf = [0u8; 128];
-        let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-            .await
-            .expect("cancellation server stream read timeout")
-            .expect("cancellation server stream read failed")
-            .expect("cancellation server stream closed");
-        let message = std::str::from_utf8(&buf[..len]).expect("valid UTF-8 message");
-        assert!(
-            message.contains(&format!("cancel-client-stream-{seq}")),
-            "unexpected cancellation stream payload: {message}"
+        let payload = read_stream_bytes(
+            &mut recv,
+            "cancellation server stream read timeout",
+            "cancellation server stream read failed",
+        )
+        .await;
+        assert_eq!(
+            payload.as_slice(),
+            format!("cancel-client-stream-{seq}").as_bytes(),
+            "unexpected cancellation stream payload"
         );
 
         let response = format!("cancel-server-ack-{seq}");
@@ -536,16 +551,15 @@ async fn run_cancellation_client(
             .expect("cancellation client stream write failed");
         send.finish().expect("cancellation client finish stream");
 
-        let mut buf = [0u8; 64];
-        let len = timeout(DATAGRAM_TIMEOUT, recv.read(&mut buf))
-            .await
-            .expect("cancellation client read timeout")
-            .expect("cancellation client read failed")
-            .expect("cancellation client stream closed");
-        let response = std::str::from_utf8(&buf[..len]).expect("valid UTF-8 cancel response");
+        let response = read_stream_bytes(
+            &mut recv,
+            "cancellation client read timeout",
+            "cancellation client read failed",
+        )
+        .await;
         assert_eq!(
-            response,
-            format!("cancel-server-ack-{seq}"),
+            response.as_slice(),
+            format!("cancel-server-ack-{seq}").as_bytes(),
             "unexpected cancellation ack"
         );
     }
