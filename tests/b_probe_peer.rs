@@ -231,10 +231,67 @@ async fn probes_are_invisible_to_application_pipeline() {
 }
 
 /// `probe_peer` must return `ProbeTimeout` (not `AckTimeout`, not a generic
-/// `Connection` error) when the peer is unreachable within the supplied
-/// deadline.
+/// `Connection` error) when the connection is still live but the remote reader
+/// stops servicing probe streams within the supplied deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_peer_returns_probe_timeout_when_remote_stops_responding() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    let connection = sender
+        .get_quic_connection(&receiver_id)
+        .expect("connection lookup")
+        .expect("live connection");
+    let mut blocked_stream = connection.open_uni().await.expect("open blocking stream");
+    blocked_stream
+        .write_all(b"unfinished application stream")
+        .await
+        .expect("write blocking stream");
+
+    // The receiver's reader is live, but is stuck draining the unfinished
+    // stream above and therefore cannot service the subsequent probe stream.
+    sleep(Duration::from_millis(25)).await;
+
+    let result = sender
+        .probe_peer(&receiver_id, Duration::from_millis(400))
+        .await;
+
+    assert!(
+        matches!(result, Err(EndpointError::ProbeTimeout)),
+        "expected ProbeTimeout while receiver reader was blocked, got {result:?}"
+    );
+
+    blocked_stream.finish().expect("finish blocking stream");
+
+    let (peer_id, payload) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv result");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(payload, b"unfinished application stream");
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_peer_reports_peer_not_found_after_graceful_remote_shutdown() {
     let _guard = test_guard().await;
 
     let receiver = make_node(vec![]).await;
@@ -251,26 +308,28 @@ async fn probe_peer_returns_probe_timeout_when_remote_stops_responding() {
         .expect("initial connect");
     sleep(Duration::from_millis(150)).await;
 
-    // Shut the receiver down so probes go unanswered. The sender's view of
-    // the connection lags this (idle-timeout has not yet fired), so the probe
-    // path must time out cleanly rather than hanging.
     receiver.shutdown().await;
     accept_receiver.abort();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !sender.is_connected(&receiver_id).await {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("sender observed remote shutdown");
 
     let result = sender
         .probe_peer(&receiver_id, Duration::from_millis(400))
         .await;
 
-    match result {
-        Err(EndpointError::ProbeTimeout) => {}
-        // If the sender already observed the close, a ConnectionClosed/PeerNotFound
-        // result is also acceptable — the important assertion is that we do NOT
-        // get the legacy `AckTimeout` variant or a generic `Connection` error
-        // with the old "peer may be dead" string.
-        Err(EndpointError::ConnectionClosed { .. }) => {}
-        Err(EndpointError::PeerNotFound(_)) => {}
-        other => panic!("unexpected probe result: {other:?}"),
-    }
+    assert!(
+        matches!(result, Err(EndpointError::PeerNotFound(peer_id)) if peer_id == receiver_id),
+        "expected PeerNotFound after observed graceful close, got {result:?}"
+    );
 
     sender.shutdown().await;
     accept_sender.abort();
