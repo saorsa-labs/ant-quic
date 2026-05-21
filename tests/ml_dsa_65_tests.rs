@@ -96,7 +96,6 @@ mod ml_dsa_65_tests {
     }
 
     #[test]
-    #[ignore] // TODO: Enable when proper ML-DSA implementation is available
     fn test_ml_dsa_65_verify_wrong_key() {
         // Test that verification fails with wrong public key
         let ml_dsa = MlDsa65::new();
