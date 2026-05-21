@@ -5,6 +5,8 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 //! Integration tests for multi-transport address advertisements
 //!
 //! This test module verifies the ADD_ADDRESS frame extensions for multi-transport support:
