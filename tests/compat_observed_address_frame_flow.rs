@@ -1,26 +1,22 @@
-//! Integration tests for OBSERVED_ADDRESS frame flow
+//! Integration tests for OBSERVED_ADDRESS frame flow.
 //!
-//! These tests verify that OBSERVED_ADDRESS frames are properly
-//! sent and received during connection establishment.
-//!
-//! This crate exercises the low-level `Endpoint::client/server` compatibility API.
-//! Peer-oriented discovery coverage lives in
-//! `tests/p2p_external_address_discovery.rs`.
+//! These tests exercise the low-level `Endpoint::client/server` compatibility
+//! API and assert that real OBSERVED_ADDRESS frames are exchanged by the
+//! production protocol path.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::{
-    ClientConfig, Endpoint, ServerConfig, TransportConfig,
+    ClientConfig, Endpoint, HighLevelConnection, ServerConfig, TransportConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tokio::time::{sleep, timeout};
+use tracing::info;
 
 // Ensure crypto provider is installed for tests
 fn ensure_crypto_provider() {
@@ -28,45 +24,46 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn transport_config_no_pqc() -> Arc<TransportConfig> {
+fn address_discovery_transport_config() -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
     transport_config.enable_pqc(false);
+    transport_config.enable_address_discovery(true);
     Arc::new(transport_config)
 }
 
-/// Mock NAT environment for testing
-#[derive(Clone)]
-struct NatEnvironment {
-    /// Maps local addresses to public addresses
-    mappings: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+async fn accept_one_connection(server: Endpoint) -> (HighLevelConnection, SocketAddr) {
+    timeout(Duration::from_secs(5), async {
+        let incoming = server.accept().await.expect("server endpoint closed");
+        let connection = incoming.await.expect("server failed to accept connection");
+        let observed_remote = connection.remote_address();
+        info!("Server accepted connection from {}", observed_remote);
+        connection.wake_transmit();
+        (connection, observed_remote)
+    })
+    .await
+    .expect("timed out waiting for server connection")
 }
 
-impl NatEnvironment {
-    fn new() -> Self {
-        Self {
-            mappings: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+async fn wait_for_observed_address(connection: &HighLevelConnection) -> SocketAddr {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(address) = connection.observed_address() {
+                return address;
+            }
 
-    /// Simulate NAT mapping
-    fn map_address(&self, local: SocketAddr) -> SocketAddr {
-        let mut mappings = self.mappings.lock().unwrap();
-        if let Some(&public) = mappings.get(&local) {
-            public
-        } else {
-            // Create a new mapping
-            let public = SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(203, 0, 113, rand::random::<u8>())),
-                40000 + rand::random::<u16>() % 20000,
-            );
-            mappings.insert(local, public);
-            info!("NAT: Mapped {} -> {}", local, public);
-            public
+            if let Some(address) = connection.all_observed_addresses().first().copied() {
+                return address;
+            }
+
+            connection.wake_transmit();
+            sleep(Duration::from_millis(10)).await;
         }
-    }
+    })
+    .await
+    .expect("timed out waiting for OBSERVED_ADDRESS frame")
 }
 
-/// Test OBSERVED_ADDRESS frame flow in basic scenario
+/// Test OBSERVED_ADDRESS frame flow in both directions.
 #[tokio::test]
 async fn test_basic_observed_address_flow() {
     ensure_crypto_provider();
@@ -76,145 +73,52 @@ async fn test_basic_observed_address_flow() {
 
     info!("Starting basic OBSERVED_ADDRESS frame flow test");
 
-    // Create endpoints
     let server = create_test_server();
     let server_addr = server.local_addr().unwrap();
+    let server_handle = tokio::spawn(accept_one_connection(server));
 
-    // Track observations
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let obs_clone = observations.clone();
-
-    // Server accepts connections and logs observations
-    let server_handle = tokio::spawn(async move {
-        match tokio::time::timeout(Duration::from_secs(5), server.accept()).await {
-            Ok(Some(incoming)) => {
-                let connection = incoming.await.unwrap();
-                let remote = connection.remote_address();
-                info!("Server accepted connection from {}", remote);
-
-                // In a real implementation, the server would observe the client's
-                // address and potentially send OBSERVED_ADDRESS frames
-
-                // Simulate observation logic
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                // Log that we would send an observation
-                obs_clone
-                    .lock()
-                    .unwrap()
-                    .push(("server->client".to_string(), remote));
-
-                connection
-            }
-            Ok(None) => {
-                panic!("Server accept returned None");
-            }
-            Err(_) => {
-                panic!("Server accept timed out - no connection received");
-            }
-        }
-    });
-
-    // Client connects
     let client = create_test_client();
-    let connection = client
+    let client_connection = client
         .connect(server_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
+    client_connection.wake_transmit();
 
-    info!(
-        "Client connected from {} to {}",
-        connection.local_ip().unwrap(),
-        connection.remote_address()
+    let (server_connection, server_observed_client) = server_handle.await.unwrap();
+    server_connection.wake_transmit();
+
+    let client_observed_address = wait_for_observed_address(&client_connection).await;
+    assert_eq!(
+        client_observed_address, server_observed_client,
+        "client should learn the address observed by the server"
     );
 
-    // Wait for potential observations
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let server_observed_address = wait_for_observed_address(&server_connection).await;
+    assert_eq!(
+        server_observed_address,
+        client_connection.remote_address(),
+        "server should learn the address observed by the client"
+    );
 
-    // Check observations
-    {
-        let obs = observations.lock().unwrap();
-        assert!(!obs.is_empty(), "Should have observations");
-        info!("Observations made: {:?}", *obs);
-    }
+    let client_stats = client_connection.stats();
+    let server_stats = server_connection.stats();
+    assert!(
+        client_stats.frame_rx.observed_address > 0,
+        "client should receive an OBSERVED_ADDRESS frame"
+    );
+    assert!(
+        server_stats.frame_rx.observed_address > 0,
+        "server should receive an OBSERVED_ADDRESS frame"
+    );
 
-    // Clean up connection
-    connection.close(0u32.into(), b"test complete");
+    client_connection.close(0u32.into(), b"test complete");
+    server_connection.close(0u32.into(), b"test complete");
 
-    server_handle.await.unwrap();
-
-    info!("✓ Basic OBSERVED_ADDRESS flow test completed");
+    info!("Basic OBSERVED_ADDRESS flow test completed");
 }
 
-/// Test OBSERVED_ADDRESS frames with NAT simulation
-#[tokio::test]
-async fn test_observed_address_with_nat() {
-    ensure_crypto_provider();
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=debug")
-        .try_init();
-
-    info!("Starting OBSERVED_ADDRESS with NAT test");
-
-    let nat = NatEnvironment::new();
-
-    // Bootstrap server (public IP)
-    let bootstrap = create_test_server();
-    let bootstrap_addr = bootstrap.local_addr().unwrap();
-    info!("Bootstrap server at {}", bootstrap_addr);
-
-    // Client behind NAT
-    let client_local = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 100), 50000));
-    let client_public = nat.map_address(client_local);
-
-    // Bootstrap accepts and observes
-    let bootstrap_handle = tokio::spawn(async move {
-        match tokio::time::timeout(Duration::from_secs(5), bootstrap.accept()).await {
-            Ok(Some(incoming)) => {
-                let connection = incoming.await.unwrap();
-                let observed = connection.remote_address();
-
-                // In NAT scenario, bootstrap sees the public address
-                info!("Bootstrap observed client at: {}", observed);
-
-                // Bootstrap would send OBSERVED_ADDRESS frame with this address
-                // The client would learn its public address
-
-                connection
-            }
-            Ok(None) => {
-                panic!("Bootstrap accept returned None");
-            }
-            Err(_) => {
-                panic!("Bootstrap accept timed out - no connection received");
-            }
-        }
-    });
-
-    // Client connects through NAT
-    let client = create_test_client();
-    let connection = client
-        .connect(bootstrap_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-
-    info!("Client thinks it's at: {}", connection.local_ip().unwrap());
-    info!("Bootstrap sees client at: {}", client_public);
-
-    // In a real scenario, client would receive OBSERVED_ADDRESS
-    // and learn its public address is different from local
-
-    // Clean up connection
-    connection.close(0u32.into(), b"test complete");
-
-    bootstrap_handle.await.unwrap();
-
-    info!("✓ OBSERVED_ADDRESS with NAT test completed");
-}
-
-/// Test multiple observations on different paths
+/// Test that each connection in a batch receives its own OBSERVED_ADDRESS frame.
 #[tokio::test]
 async fn test_multipath_observations() {
     ensure_crypto_provider();
@@ -222,218 +126,59 @@ async fn test_multipath_observations() {
         .with_env_filter("ant_quic=debug")
         .try_init();
 
-    info!("Starting multipath observations test");
+    info!("Starting multiple OBSERVED_ADDRESS frame flow test");
 
     let server = create_test_server();
     let server_addr = server.local_addr().unwrap();
 
-    // Server handles multiple connections
-    let (tx, mut rx) = mpsc::channel::<(usize, SocketAddr)>(10);
-
-    tokio::spawn(async move {
-        let mut conn_id = 0;
-        let start_time = std::time::Instant::now();
-        while conn_id < 3 && start_time.elapsed() < Duration::from_secs(10) {
-            match tokio::time::timeout(Duration::from_secs(2), server.accept()).await {
-                Ok(Some(incoming)) => {
-                    let tx = tx.clone();
-                    let id = conn_id;
-                    conn_id += 1;
-
-                    tokio::spawn(async move {
-                        let connection = incoming.await.unwrap();
-                        let observed = connection.remote_address();
-                        info!("Server connection {}: observed {}", id, observed);
-                        let _ = tx.send((id, observed)).await;
-
-                        // Keep connection alive
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    });
-                }
-                Ok(None) => {
-                    break; // No more connections
-                }
-                Err(_) => {
-                    info!("Server accept timed out, stopping");
-                    break;
-                }
-            }
+    let server_handle = tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        for _ in 0..3 {
+            accepted.push(accept_one_connection(server.clone()).await);
         }
+        accepted
     });
 
-    // Multiple clients connect (simulating different paths)
-    let mut clients = vec![];
-    for i in 0..3 {
+    let mut client_connections = Vec::new();
+    for _ in 0..3 {
         let client = create_test_client();
         let connection = client
             .connect(server_addr, "localhost")
             .unwrap()
             .await
             .unwrap();
-
-        info!("Client {} connected", i);
-        clients.push(connection);
+        connection.wake_transmit();
+        client_connections.push(connection);
     }
 
-    // Collect observations
-    let mut observations = vec![];
-    for _ in 0..3 {
-        if let Some(obs) = rx.recv().await {
-            observations.push(obs);
-        }
+    let server_connections = server_handle.await.unwrap();
+    assert_eq!(server_connections.len(), 3);
+
+    for (client_connection, (server_connection, server_observed_client)) in
+        client_connections.iter().zip(server_connections.iter())
+    {
+        server_connection.wake_transmit();
+
+        let observed_address = wait_for_observed_address(client_connection).await;
+        assert_eq!(
+            observed_address, *server_observed_client,
+            "client should receive the address observed on its own connection"
+        );
+
+        assert!(
+            client_connection.stats().frame_rx.observed_address > 0,
+            "client should receive an OBSERVED_ADDRESS frame"
+        );
     }
 
-    assert_eq!(observations.len(), 3, "Should have 3 observations");
-    info!("All observations: {:?}", observations);
-
-    info!("✓ Multipath observations test completed");
-}
-
-/// Test observation rate limiting behavior
-#[tokio::test]
-async fn test_observation_rate_limiting() {
-    ensure_crypto_provider();
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=debug")
-        .try_init();
-
-    info!("Starting rate limiting test");
-
-    let server = create_test_server();
-    let server_addr = server.local_addr().unwrap();
-
-    // Track observation attempts
-    let attempts = Arc::new(Mutex::new(0));
-    let attempts_clone = attempts.clone();
-
-    // Server with rate limiting simulation
-    let server_handle = tokio::spawn(async move {
-        match tokio::time::timeout(Duration::from_secs(5), server.accept()).await {
-            Ok(Some(incoming)) => {
-                let connection = incoming.await.unwrap();
-
-                // Simulate multiple observation triggers
-                for i in 0..10 {
-                    // Check if we should send (rate limited)
-                    {
-                        let mut count = attempts_clone.lock().unwrap();
-                        *count += 1;
-
-                        // Simulate rate limiting: only first few should succeed
-                        if i < 3 {
-                            info!("Observation {} would be sent", i);
-                        } else {
-                            debug!("Observation {} rate limited", i);
-                        }
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-
-                connection
-            }
-            Ok(None) => {
-                panic!("Rate limiting server accept returned None");
-            }
-            Err(_) => {
-                panic!("Rate limiting server accept timed out - no connection received");
-            }
-        }
-    });
-
-    // Client connects
-    let client = create_test_client();
-    let connection = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-
-    // Wait for rate limiting test
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let total_attempts = *attempts.lock().unwrap();
-    assert_eq!(total_attempts, 10, "Should attempt 10 observations");
-
-    // Clean up connection
-    connection.close(0u32.into(), b"test complete");
-
-    server_handle.await.unwrap();
-
-    info!("✓ Rate limiting test completed");
-}
-
-/// Test address discovery in connection migration scenario
-#[tokio::test]
-async fn test_observation_during_migration() {
-    ensure_crypto_provider();
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("ant_quic=debug")
-        .try_init();
-
-    info!("Starting migration observation test");
-
-    let server = create_test_server();
-    let server_addr = server.local_addr().unwrap();
-
-    // Server monitors for address changes
-    let (tx, mut rx) = mpsc::channel::<String>(10);
-
-    let server_handle = tokio::spawn(async move {
-        match tokio::time::timeout(Duration::from_secs(5), server.accept()).await {
-            Ok(Some(incoming)) => {
-                let connection = incoming.await.unwrap();
-                let initial = connection.remote_address();
-                let _ = tx.send(format!("Initial: {initial}")).await;
-
-                // Monitor for changes
-                for i in 0..5 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let current = connection.remote_address();
-
-                    if current != initial {
-                        let _ = tx
-                            .send(format!("Migration {i}: {initial} -> {current}"))
-                            .await;
-                    }
-                }
-
-                connection
-            }
-            Ok(None) => {
-                panic!("Migration server accept returned None");
-            }
-            Err(_) => {
-                panic!("Migration server accept timed out - no connection received");
-            }
-        }
-    });
-
-    // Client connects
-    let client = create_test_client();
-    let connection = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-
-    // Collect events
-    let mut events = vec![];
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
+    for connection in client_connections {
+        connection.close(0u32.into(), b"test complete");
+    }
+    for (connection, _) in server_connections {
+        connection.close(0u32.into(), b"test complete");
     }
 
-    info!("Migration events: {:?}", events);
-    assert!(!events.is_empty(), "Should have at least initial event");
-
-    // Clean up connection
-    connection.close(0u32.into(), b"test complete");
-
-    server_handle.await.unwrap();
-
-    info!("✓ Migration observation test completed");
+    info!("Multiple OBSERVED_ADDRESS frame flow test completed");
 }
 
 /// Helper to create test server endpoint
@@ -450,7 +195,7 @@ fn create_test_server() -> Endpoint {
 
     let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_config).unwrap()));
-    server_config.transport_config(transport_config_no_pqc());
+    server_config.transport_config(address_discovery_transport_config());
 
     Endpoint::server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap()
 }
@@ -468,7 +213,7 @@ fn create_test_client() -> Endpoint {
 
     let mut client_config =
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
-    client_config.transport_config(transport_config_no_pqc());
+    client_config.transport_config(address_discovery_transport_config());
 
     let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
 
