@@ -32,14 +32,41 @@ use std::{
 use tokio::sync::{Barrier, mpsc};
 use tracing::info;
 
+#[derive(Debug, Default)]
+struct EventCounters {
+    coordination_requested: AtomicUsize,
+    hole_punching_started: AtomicUsize,
+    connection_established: AtomicUsize,
+}
+
+impl EventCounters {
+    fn reset(&self) {
+        self.coordination_requested.store(0, Ordering::SeqCst);
+        self.hole_punching_started.store(0, Ordering::SeqCst);
+        self.connection_established.store(0, Ordering::SeqCst);
+    }
+
+    fn coordination_requested(&self) -> usize {
+        self.coordination_requested.load(Ordering::SeqCst)
+    }
+
+    fn hole_punching_started(&self) -> usize {
+        self.hole_punching_started.load(Ordering::SeqCst)
+    }
+
+    fn connection_established(&self) -> usize {
+        self.connection_established.load(Ordering::SeqCst)
+    }
+}
+
 /// Helper to create a NAT traversal endpoint with event tracking and counting
-async fn create_endpoint_with_event_counter(
+async fn create_endpoint_with_event_counters(
     known_peers: Vec<SocketAddr>,
 ) -> Result<
     (
         Arc<NatTraversalEndpoint>,
         mpsc::UnboundedReceiver<NatTraversalEvent>,
-        Arc<AtomicUsize>, // coordination event counter
+        Arc<EventCounters>,
     ),
     NatTraversalError,
 > {
@@ -49,25 +76,180 @@ async fn create_endpoint_with_event_counter(
         ..NatTraversalConfig::default()
     };
 
-    let coordination_count = Arc::new(AtomicUsize::new(0));
-    let coordination_count_clone = coordination_count.clone();
+    let counters = Arc::new(EventCounters::default());
+    let counters_clone = counters.clone();
 
     let (tx, rx) = mpsc::unbounded_channel();
     let event_callback = Box::new(move |event: NatTraversalEvent| {
-        if matches!(event, NatTraversalEvent::CoordinationRequested { .. }) {
-            coordination_count_clone.fetch_add(1, Ordering::SeqCst);
+        match event {
+            NatTraversalEvent::CoordinationRequested { .. } => {
+                counters_clone
+                    .coordination_requested
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            NatTraversalEvent::HolePunchingStarted { .. } => {
+                counters_clone
+                    .hole_punching_started
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            NatTraversalEvent::ConnectionEstablished { .. } => {
+                counters_clone
+                    .connection_established
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
         }
         let _ = tx.send(event);
     });
 
     let endpoint = Arc::new(NatTraversalEndpoint::new(config, Some(event_callback), None).await?);
-    Ok((endpoint, rx, coordination_count))
+    Ok((endpoint, rx, counters))
 }
 
 /// Helper to generate a random peer ID
 fn generate_random_peer_id() -> PeerId {
     let (public_key, _) = generate_ml_dsa_keypair().expect("Failed to generate keypair");
     derive_peer_id_from_public_key(&public_key)
+}
+
+async fn create_listening_endpoint_pair() -> Result<
+    (
+        Arc<NatTraversalEndpoint>,
+        Arc<NatTraversalEndpoint>,
+        PeerId,
+        SocketAddr,
+        Arc<EventCounters>,
+        Arc<EventCounters>,
+    ),
+    NatTraversalError,
+> {
+    let (endpoint_a, _rx_a, counters_a) = create_endpoint_with_event_counters(vec![]).await?;
+    let (endpoint_b, _rx_b, counters_b) = create_endpoint_with_event_counters(vec![]).await?;
+
+    endpoint_b
+        .start_listening(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await?;
+
+    let b_endpoint = endpoint_b.get_endpoint().ok_or_else(|| {
+        NatTraversalError::ConfigError("endpoint B should have a QUIC endpoint".to_string())
+    })?;
+    let b_addr = b_endpoint.local_addr().map_err(|error| {
+        NatTraversalError::NetworkError(format!("failed to read endpoint B local address: {error}"))
+    })?;
+    let peer_id_b = endpoint_b.local_peer_id();
+
+    Ok((
+        endpoint_a, endpoint_b, peer_id_b, b_addr, counters_a, counters_b,
+    ))
+}
+
+async fn add_existing_connection_to_peer(
+    endpoint: &NatTraversalEndpoint,
+    peer_id: PeerId,
+    remote_addr: SocketAddr,
+) -> Result<(), NatTraversalError> {
+    let connection = endpoint
+        .connect_to_peer(peer_id, "localhost", remote_addr)
+        .await?;
+    endpoint.add_connection(peer_id, connection)?;
+
+    let existing = endpoint.get_connection(&peer_id)?;
+    assert!(
+        existing.is_some(),
+        "Connection should exist after add_connection"
+    );
+
+    Ok(())
+}
+
+async fn drain_endpoint_events(endpoint: &NatTraversalEndpoint) -> Result<(), NatTraversalError> {
+    for _ in 0..5 {
+        let _ = endpoint.poll(std::time::Instant::now())?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+async fn assert_no_redundant_traversal_work(
+    endpoint: &NatTraversalEndpoint,
+    counters: &EventCounters,
+    context: &str,
+) -> Result<(), NatTraversalError> {
+    drain_endpoint_events(endpoint).await?;
+
+    assert_eq!(
+        counters.coordination_requested(),
+        0,
+        "{context}: CoordinationRequested was emitted even though the peer is already connected"
+    );
+    assert_eq!(
+        counters.hole_punching_started(),
+        0,
+        "{context}: HolePunchingStarted was emitted even though the peer is already connected"
+    );
+    assert_eq!(
+        counters.connection_established(),
+        0,
+        "{context}: a redundant connection was established even though the peer is already connected"
+    );
+
+    Ok(())
+}
+
+async fn create_pair_with_registered_connection() -> Result<
+    (
+        Arc<NatTraversalEndpoint>,
+        Arc<NatTraversalEndpoint>,
+        PeerId,
+        SocketAddr,
+        Arc<EventCounters>,
+        Arc<EventCounters>,
+    ),
+    NatTraversalError,
+> {
+    let (endpoint_a, endpoint_b, peer_id_b, b_addr, counters_a, counters_b) =
+        create_listening_endpoint_pair().await?;
+    add_existing_connection_to_peer(endpoint_a.as_ref(), peer_id_b, b_addr).await?;
+    drain_endpoint_events(endpoint_a.as_ref()).await?;
+    drain_endpoint_events(endpoint_b.as_ref()).await?;
+    counters_a.reset();
+    counters_b.reset();
+
+    Ok((
+        endpoint_a, endpoint_b, peer_id_b, b_addr, counters_a, counters_b,
+    ))
+}
+
+async fn create_active_session_with_existing_connection() -> Result<
+    (
+        Arc<NatTraversalEndpoint>,
+        Arc<NatTraversalEndpoint>,
+        PeerId,
+        Arc<EventCounters>,
+    ),
+    NatTraversalError,
+> {
+    let (endpoint_a, endpoint_b, peer_id_b, _b_addr, counters_a, _counters_b) =
+        create_pair_with_registered_connection().await?;
+    let connection = endpoint_a
+        .remove_connection(&peer_id_b)?
+        .ok_or_else(|| NatTraversalError::ConfigError("expected registered connection".into()))?;
+
+    endpoint_a.initiate_nat_traversal(peer_id_b, test_coordinator_addr())?;
+    counters_a.reset();
+    endpoint_a.add_connection(peer_id_b, connection)?;
+
+    let existing = endpoint_a.get_connection(&peer_id_b)?;
+    assert!(
+        existing.is_some(),
+        "Connection should exist before polling active traversal session"
+    );
+
+    Ok((endpoint_a, endpoint_b, peer_id_b, counters_a))
+}
+
+fn test_coordinator_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000)
 }
 
 // ===== Test 1: initiate_nat_traversal() MUST skip when connection exists =====
@@ -82,82 +264,23 @@ fn generate_random_peer_id() -> PeerId {
 async fn test_initiate_nat_traversal_must_skip_when_connection_exists() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Create two endpoints
-    let (endpoint_a, _rx_a, coord_count_a) = create_endpoint_with_event_counter(vec![])
-        .await
-        .expect("Failed to create endpoint A");
-
-    let (endpoint_b, _rx_b, _) = create_endpoint_with_event_counter(vec![])
-        .await
-        .expect("Failed to create endpoint B");
-
-    // Start listening on B
-    let b_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    endpoint_b
-        .start_listening(b_bind)
-        .await
-        .expect("B should listen");
-
-    // Get B's actual listening address from the endpoint
-    let b_endpoint = endpoint_b.get_endpoint().expect("B should have endpoint");
-    let b_addr = b_endpoint.local_addr().expect("B should have local addr");
-
-    // Generate peer ID for B
-    let peer_id_b = endpoint_b.local_peer_id();
-
-    // Establish direct connection from A to B
-    info!("Attempting direct connection from A to B at {}", b_addr);
-    let connect_result = endpoint_a
-        .connect_to_peer(peer_id_b, "localhost", b_addr)
-        .await;
-
-    // Connection should succeed (both endpoints on localhost)
-    if connect_result.is_err() {
-        info!(
-            "Direct connection failed (expected in test env): {:?}",
-            connect_result
-        );
-        // Skip the test if we can't establish connection - the test is still valid
-        let _ = endpoint_a.shutdown().await;
-        let _ = endpoint_b.shutdown().await;
-        return;
-    }
-
-    // Connection succeeded - now add it to A's connection map
-    let connection = connect_result.unwrap();
-    endpoint_a
-        .add_connection(peer_id_b, connection)
-        .expect("Should add connection");
-
-    // Verify connection exists
-    let existing = endpoint_a
-        .get_connection(&peer_id_b)
-        .expect("Should be able to check");
-    assert!(
-        existing.is_some(),
-        "Connection should exist after add_connection"
-    );
-
-    // Reset the coordination counter
-    coord_count_a.store(0, Ordering::SeqCst);
+    let (endpoint_a, endpoint_b, peer_id_b, _b_addr, counters_a, _counters_b) =
+        create_pair_with_registered_connection()
+            .await
+            .expect("Failed to create connected endpoint pair");
 
     // Now call initiate_nat_traversal - WITH the connection already existing
     // This should return immediately without creating a session
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-    let result = endpoint_a.initiate_nat_traversal(peer_id_b, coordinator);
+    let result = endpoint_a.initiate_nat_traversal(peer_id_b, test_coordinator_addr());
     assert!(result.is_ok(), "Should return Ok even when skipping");
 
-    // Allow time for events to be processed
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // After the fix, coordination_count should be 0 (no CoordinationRequested emitted)
-    let count = coord_count_a.load(Ordering::SeqCst);
-    assert_eq!(
-        count, 0,
-        "CoordinationRequested was emitted {} times even though connection exists! \
-         initiate_nat_traversal() should check connections first and return early.",
-        count
-    );
+    assert_no_redundant_traversal_work(
+        endpoint_a.as_ref(),
+        counters_a.as_ref(),
+        "initiate_nat_traversal",
+    )
+    .await
+    .expect("poll should succeed");
 
     // Cleanup
     let _ = endpoint_a.shutdown().await;
@@ -175,52 +298,22 @@ async fn test_initiate_nat_traversal_must_skip_when_connection_exists() {
 async fn test_initiate_hole_punching_must_skip_when_connection_exists() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let hole_punch_count = Arc::new(AtomicUsize::new(0));
-    let hole_punch_count_clone = hole_punch_count.clone();
-
-    let config = NatTraversalConfig {
-        known_peers: vec![],
-        bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-        ..NatTraversalConfig::default()
-    };
-
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let event_callback = Box::new(move |event: NatTraversalEvent| {
-        if matches!(event, NatTraversalEvent::HolePunchingStarted { .. }) {
-            hole_punch_count_clone.fetch_add(1, Ordering::SeqCst);
-        }
-        let _ = tx.send(event);
-    });
-
-    let endpoint = Arc::new(
-        NatTraversalEndpoint::new(config, Some(event_callback), None)
+    let (endpoint_a, endpoint_b, _peer_id_b, counters_a) =
+        create_active_session_with_existing_connection()
             .await
-            .unwrap(),
-    );
+            .expect("Failed to create active session with existing connection");
 
-    let peer_id = generate_random_peer_id();
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    // Start NAT traversal (no connection exists yet)
-    let _ = endpoint.initiate_nat_traversal(peer_id, coordinator);
-
-    // Reset counter before polling
-    hole_punch_count.store(0, Ordering::SeqCst);
-
-    // Poll to advance state machine - this may trigger hole punching
-    for _ in 0..5 {
-        let now = std::time::Instant::now();
-        let _ = endpoint.poll(now);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    info!(
-        "Hole punch events: {} (expected 0 if connection existed)",
-        hole_punch_count.load(Ordering::SeqCst)
-    );
+    assert_no_redundant_traversal_work(
+        endpoint_a.as_ref(),
+        counters_a.as_ref(),
+        "initiate_hole_punching",
+    )
+    .await
+    .expect("poll should succeed");
 
     // Cleanup
-    let _ = endpoint.shutdown().await;
+    let _ = endpoint_a.shutdown().await;
+    let _ = endpoint_b.shutdown().await;
 }
 
 // ===== Test 3: Deferred hole punch loop MUST recheck connections =====
@@ -238,25 +331,18 @@ async fn test_initiate_hole_punching_must_skip_when_connection_exists() {
 async fn test_deferred_hole_punch_must_recheck_connections() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (endpoint, _rx, _) = create_endpoint_with_event_counter(vec![])
+    let (endpoint, endpoint_b, _peer_id_b, counters) =
+        create_active_session_with_existing_connection()
+            .await
+            .expect("Failed to create active session with existing connection");
+
+    assert_no_redundant_traversal_work(endpoint.as_ref(), counters.as_ref(), "deferred_hole_punch")
         .await
-        .expect("Failed to create endpoint");
-
-    let peer_id = generate_random_peer_id();
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    // Start traversal
-    let _ = endpoint.initiate_nat_traversal(peer_id, coordinator);
-
-    // Poll to trigger deferred execution
-    for _ in 0..10 {
-        let now = std::time::Instant::now();
-        let _ = endpoint.poll(now);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        .expect("poll should succeed");
 
     // Cleanup
     let _ = endpoint.shutdown().await;
+    let _ = endpoint_b.shutdown().await;
 }
 
 // ===== Test 4: attempt_connection_to_candidate() MUST check connections =====
@@ -267,25 +353,18 @@ async fn test_deferred_hole_punch_must_recheck_connections() {
 async fn test_candidate_attempt_must_check_existing_connection() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (endpoint, _rx, _) = create_endpoint_with_event_counter(vec![])
+    let (endpoint, endpoint_b, _peer_id_b, counters) =
+        create_active_session_with_existing_connection()
+            .await
+            .expect("Failed to create active session with existing connection");
+
+    assert_no_redundant_traversal_work(endpoint.as_ref(), counters.as_ref(), "candidate_attempt")
         .await
-        .expect("Failed to create endpoint");
-
-    let peer_id = generate_random_peer_id();
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    // Start traversal
-    let _ = endpoint.initiate_nat_traversal(peer_id, coordinator);
-
-    // Poll to advance through phases
-    for _ in 0..5 {
-        let now = std::time::Instant::now();
-        let _ = endpoint.poll(now);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        .expect("poll should succeed");
 
     // Cleanup
     let _ = endpoint.shutdown().await;
+    let _ = endpoint_b.shutdown().await;
 }
 
 // ===== Test 5: Async task spawn MUST check connection first =====
@@ -296,25 +375,18 @@ async fn test_candidate_attempt_must_check_existing_connection() {
 async fn test_async_task_spawn_must_check_connection() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (endpoint, _rx, _) = create_endpoint_with_event_counter(vec![])
+    let (endpoint, endpoint_b, _peer_id_b, counters) =
+        create_active_session_with_existing_connection()
+            .await
+            .expect("Failed to create active session with existing connection");
+
+    assert_no_redundant_traversal_work(endpoint.as_ref(), counters.as_ref(), "async_task_spawn")
         .await
-        .expect("Failed to create endpoint");
-
-    let peer_id = generate_random_peer_id();
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    // Start traversal
-    let _ = endpoint.initiate_nat_traversal(peer_id, coordinator);
-
-    // Poll to trigger candidate connection attempts
-    for _ in 0..5 {
-        let now = std::time::Instant::now();
-        let _ = endpoint.poll(now);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        .expect("poll should succeed");
 
     // Cleanup
     let _ = endpoint.shutdown().await;
+    let _ = endpoint_b.shutdown().await;
 }
 
 // ===== Test 6: Coordinator connection MUST check for existing =====
@@ -325,11 +397,16 @@ async fn test_async_task_spawn_must_check_connection() {
 async fn test_coordinator_connection_must_check_existing() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let coordinator_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    let (endpoint, _rx, _) = create_endpoint_with_event_counter(vec![coordinator_addr])
+    let (
+        endpoint,
+        coordinator_endpoint,
+        _coordinator_peer,
+        coordinator_addr,
+        counters,
+        peer_counters,
+    ) = create_pair_with_registered_connection()
         .await
-        .expect("Failed to create endpoint");
+        .expect("Failed to create endpoint pair with existing coordinator connection");
 
     let peer_id1 = generate_random_peer_id();
     let peer_id2 = generate_random_peer_id();
@@ -343,15 +420,24 @@ async fn test_coordinator_connection_must_check_existing() {
     let result2 = endpoint.initiate_nat_traversal(peer_id2, coordinator_addr);
     assert!(result2.is_ok());
 
-    // Poll to trigger coordinator connections
-    for _ in 0..3 {
-        let now = std::time::Instant::now();
-        let _ = endpoint.poll(now);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        counters.coordination_requested(),
+        2,
+        "Both traversal requests should use the existing coordinator connection"
+    );
+
+    drain_endpoint_events(coordinator_endpoint.as_ref())
+        .await
+        .expect("coordinator events should drain");
+    assert_eq!(
+        peer_counters.connection_established(),
+        0,
+        "Coordinator accepted a redundant connection even though one already existed"
+    );
 
     // Cleanup
     let _ = endpoint.shutdown().await;
+    let _ = coordinator_endpoint.shutdown().await;
 }
 
 // ===== Test 7: Concurrent calls MUST not create duplicate work =====
@@ -362,7 +448,7 @@ async fn test_coordinator_connection_must_check_existing() {
 async fn test_concurrent_initiate_nat_traversal_same_peer() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (endpoint, _rx, coord_count) = create_endpoint_with_event_counter(vec![])
+    let (endpoint, _rx, counters) = create_endpoint_with_event_counters(vec![])
         .await
         .expect("Failed to create endpoint");
 
@@ -401,7 +487,7 @@ async fn test_concurrent_initiate_nat_traversal_same_peer() {
 
     // The existing session check should limit this to 1 coordination event
     // (first call creates session, subsequent calls return early)
-    let count = coord_count.load(Ordering::SeqCst);
+    let count = counters.coordination_requested();
     info!(
         "Coordination events from {} concurrent calls: {}",
         CONCURRENT_CALLS, count
@@ -426,47 +512,25 @@ async fn test_concurrent_initiate_nat_traversal_same_peer() {
 async fn test_full_roundtrip_connection_check() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (endpoint, _rx, coord_count) = create_endpoint_with_event_counter(vec![])
-        .await
-        .expect("Failed to create endpoint");
+    let (endpoint, endpoint_b, peer_id, _b_addr, counters, _counters_b) =
+        create_pair_with_registered_connection()
+            .await
+            .expect("Failed to create connected endpoint pair");
 
-    let peer_id = generate_random_peer_id();
-    let coordinator = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9000);
-
-    // First, verify no connection exists
-    let conn = endpoint.get_connection(&peer_id);
-    assert!(conn.is_ok());
-    assert!(
-        conn.unwrap().is_none(),
-        "Should not have connection initially"
-    );
-
-    // Start first NAT traversal - should proceed normally
-    let result1 = endpoint.initiate_nat_traversal(peer_id, coordinator);
-    assert!(result1.is_ok(), "First traversal should start");
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let first_count = coord_count.load(Ordering::SeqCst);
-    info!("Events from first call: {}", first_count);
-
-    // Second call for same peer - should be skipped (session exists)
-    let result2 = endpoint.initiate_nat_traversal(peer_id, coordinator);
-    assert!(result2.is_ok(), "Second call should return Ok");
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let second_count = coord_count.load(Ordering::SeqCst);
-    info!(
-        "Events after second call: {} (diff: {})",
-        second_count,
-        second_count - first_count
-    );
-
-    // The session check should prevent duplicate events
-    assert_eq!(
-        first_count, second_count,
-        "No new coordination events should be emitted for duplicate session"
-    );
+    // A real localhost connection already exists, so traversal must not
+    // fall back to the duplicate-session behavior this test used to cover.
+    endpoint
+        .initiate_nat_traversal(peer_id, test_coordinator_addr())
+        .expect("traversal call should return Ok when skipping");
+    assert_no_redundant_traversal_work(
+        endpoint.as_ref(),
+        counters.as_ref(),
+        "full_roundtrip_connection_check",
+    )
+    .await
+    .expect("poll should succeed");
 
     // Cleanup
     let _ = endpoint.shutdown().await;
+    let _ = endpoint_b.shutdown().await;
 }

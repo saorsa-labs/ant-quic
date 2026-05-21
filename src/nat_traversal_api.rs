@@ -8506,6 +8506,21 @@ impl NatTraversalEndpoint {
                     .is_some_and(|deadline| now >= deadline),
             };
 
+            if matches!(
+                session.phase,
+                TraversalPhase::Discovery
+                    | TraversalPhase::Coordination
+                    | TraversalPhase::Synchronization
+            ) && self.has_existing_connection(&session.peer_id)
+            {
+                debug!(
+                    "Connection already exists for peer {:?}, skipping pending NAT traversal work",
+                    session.peer_id
+                );
+                Self::set_session_phase(session, now, TraversalPhase::Connected);
+                continue;
+            }
+
             match session.phase {
                 TraversalPhase::Discovery => {
                     if let Some(SessionDeadline {
