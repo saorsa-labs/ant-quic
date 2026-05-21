@@ -13,6 +13,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+const FULL_PEER_ID_HEX_LEN: usize = 64;
+
 /// NAT test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatTestConfig {
@@ -81,7 +83,7 @@ impl NatTestHarness {
         let mut listener_handle = self.start_listener(client2_container).await?;
 
         // Get peer ID from listener
-        let connection_result = match self.get_peer_id_from_logs(&listener_handle).await {
+        let connection_result = match self.get_peer_id_from_logs(&mut listener_handle).await {
             Ok(peer_id) => {
                 // Connect from client1
                 self.connect_to_peer(client1_container, &peer_id).await
@@ -135,7 +137,7 @@ impl NatTestHarness {
             .arg("ant-quic")
             .arg("--listen")
             .arg("0.0.0.0:9000")
-            .arg("--dashboard")
+            .arg("--json")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -149,20 +151,32 @@ impl NatTestHarness {
         Self::spawn_log_reader(stdout, tx.clone());
         Self::spawn_log_reader(stderr, tx);
 
-        // Wait for listener to be ready
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
         Ok(ListenerHandle {
             process: Some(child),
-            _log_rx: rx,
+            log_rx: rx,
         })
     }
 
     /// Extract peer ID from listener logs
-    async fn get_peer_id_from_logs(&self, _handle: &ListenerHandle) -> Result<String> {
-        // In real implementation, parse logs to find peer ID
-        // For now, return a placeholder
-        Ok("test_peer_id".to_string())
+    async fn get_peer_id_from_logs(&self, handle: &mut ListenerHandle) -> Result<String> {
+        let readiness_timeout = self.config.connection_timeout;
+
+        match timeout(readiness_timeout, async {
+            while let Some(line) = handle.log_rx.recv().await {
+                if let Some(peer_id) = Self::parse_peer_id_from_log_line(&line) {
+                    return Ok(peer_id);
+                }
+            }
+
+            anyhow::bail!("Listener exited before emitting peer ID")
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Timed out waiting for listener peer ID after {readiness_timeout:?}"
+            )),
+        }
     }
 
     /// Connect to a peer from a container
@@ -174,10 +188,11 @@ impl NatTestHarness {
             .arg(format!("RUST_LOG={}", self.config.log_level))
             .arg(container)
             .arg("ant-quic")
-            .arg("--connect")
+            .arg("--connect-peer-id")
             .arg(peer_id)
             .arg("--bootstrap")
-            .arg(&self.config.bootstrap_addr);
+            .arg(&self.config.bootstrap_addr)
+            .arg("--json");
 
         let output = Self::run_command_with_timeout(
             command,
@@ -195,18 +210,146 @@ impl NatTestHarness {
         }
 
         // Parse metrics from output
-        Ok(self.parse_connection_metrics(&stdout))
+        Ok(self.parse_connection_metrics(&format!("{stdout}\n{stderr}")))
     }
 
     /// Parse connection metrics from ant-quic output
     fn parse_connection_metrics(&self, output: &str) -> ConnectionMetrics {
-        // Parse real metrics from output
-        // For now, return dummy metrics
-        ConnectionMetrics {
-            hole_punching_used: output.contains("Hole punching successful"),
-            relay_used: output.contains("Using relay"),
-            packets_sent: 100,
-            packets_received: 95,
+        let mut metrics = ConnectionMetrics::default();
+
+        for line in output.lines() {
+            let lower = line.to_ascii_lowercase();
+
+            if lower.contains("hole punching successful") || lower.contains("nat_traversed") {
+                metrics.hole_punching_used = true;
+            }
+            if lower.contains("using relay")
+                || lower.contains("relay connection established")
+                || lower.contains("relayed")
+            {
+                metrics.relay_used = true;
+            }
+
+            if let Some(value) = Self::parse_json_line(line) {
+                Self::update_metrics_from_json(&mut metrics, &value);
+            }
+
+            if let Some(sent) =
+                Self::parse_labeled_u64(line, &["packets sent", "packets_sent", "counters sent"])
+            {
+                metrics.packets_sent = metrics.packets_sent.max(sent);
+            }
+            if let Some(received) = Self::parse_labeled_u64(
+                line,
+                &["packets received", "packets_received", "counters received"],
+            ) {
+                metrics.packets_received = metrics.packets_received.max(received);
+            }
+        }
+
+        metrics
+    }
+
+    fn parse_peer_id_from_log_line(line: &str) -> Option<String> {
+        if let Some(value) = Self::parse_json_line(line)
+            && let Some(peer_id) = value.get("peer_id").and_then(serde_json::Value::as_str)
+        {
+            return Self::normalize_peer_id(peer_id);
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("peer id") && !lower.contains("peer_id") {
+            return None;
+        }
+
+        line.split(|ch: char| !ch.is_ascii_hexdigit())
+            .find_map(Self::normalize_peer_id)
+    }
+
+    fn parse_json_line(line: &str) -> Option<serde_json::Value> {
+        let json_start = line.find('{')?;
+        serde_json::from_str(&line[json_start..]).ok()
+    }
+
+    fn normalize_peer_id(value: &str) -> Option<String> {
+        if value.len() == FULL_PEER_ID_HEX_LEN && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            Some(value.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn update_metrics_from_json(metrics: &mut ConnectionMetrics, value: &serde_json::Value) {
+        if let Some(connection_type) = value
+            .get("connection_type")
+            .and_then(serde_json::Value::as_str)
+        {
+            match connection_type {
+                "nat_traversed" => metrics.hole_punching_used = true,
+                "relayed" => metrics.relay_used = true,
+                _ => {}
+            }
+        }
+
+        if let Some(sent) = Self::json_u64(
+            value,
+            &[
+                "packets_sent",
+                "packetsSent",
+                "counters_sent",
+                "data_chunks_sent",
+                "chunks",
+            ],
+        ) {
+            metrics.packets_sent = metrics.packets_sent.max(sent);
+        }
+        if let Some(received) = Self::json_u64(
+            value,
+            &[
+                "packets_received",
+                "packetsReceived",
+                "counters_received",
+                "data_chunks_verified",
+            ],
+        ) {
+            metrics.packets_received = metrics.packets_received.max(received);
+        }
+    }
+
+    fn json_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_u64))
+    }
+
+    fn parse_labeled_u64(line: &str, labels: &[&str]) -> Option<u64> {
+        let lower = line.to_ascii_lowercase();
+
+        labels.iter().find_map(|label| {
+            lower
+                .find(label)
+                .and_then(|index| Self::first_u64_after(&line[index + label.len()..]))
+        })
+    }
+
+    fn first_u64_after(value: &str) -> Option<u64> {
+        let mut digits = String::new();
+        let mut started = false;
+
+        for ch in value.chars() {
+            if ch.is_ascii_digit() {
+                started = true;
+                digits.push(ch);
+            } else if started && ch == ',' {
+                continue;
+            } else if started {
+                break;
+            }
+        }
+
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
         }
     }
 
@@ -339,7 +482,7 @@ impl NatTestHarness {
 /// Handle for a running listener process
 struct ListenerHandle {
     process: Option<Child>,
-    _log_rx: mpsc::Receiver<String>,
+    log_rx: mpsc::Receiver<String>,
 }
 
 impl ListenerHandle {
@@ -361,7 +504,7 @@ impl Drop for ListenerHandle {
 }
 
 /// Connection metrics
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ConnectionMetrics {
     hole_punching_used: bool,
     relay_used: bool,
@@ -457,7 +600,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel(1);
         let mut handle = ListenerHandle {
             process: Some(child),
-            _log_rx: rx,
+            log_rx: rx,
         };
 
         timeout(Duration::from_secs(1), handle.stop())
@@ -490,6 +633,85 @@ mod tests {
             !marker_path.exists(),
             "timed-out command continued running after timeout"
         );
+    }
+
+    #[test]
+    fn parses_full_peer_id_from_json_identity_line() {
+        let peer_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let line = format!(r#"{{"event":"local_identity","peer_id":"{peer_id}"}}"#);
+
+        let parsed = NatTestHarness::parse_peer_id_from_log_line(&line)
+            .expect("peer ID should parse from JSON identity output");
+
+        assert_eq!(parsed, peer_id);
+    }
+
+    #[test]
+    fn parses_full_peer_id_from_text_log_line() {
+        let peer_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let line = format!("INFO ant_quic: Peer ID (full): {peer_id}");
+
+        let parsed = NatTestHarness::parse_peer_id_from_log_line(&line)
+            .expect("peer ID should parse from text log output");
+
+        assert_eq!(parsed, peer_id);
+    }
+
+    #[test]
+    fn ignores_short_peer_id_log_line() {
+        let line = "INFO ant_quic: Peer ID: abcdef0123456789";
+
+        assert!(NatTestHarness::parse_peer_id_from_log_line(line).is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_id_wait_times_out_without_identity() {
+        let config = NatTestConfig {
+            connection_timeout: Duration::from_millis(10),
+            ..NatTestConfig::default()
+        };
+        let harness = NatTestHarness::new(config);
+        let (_tx, rx) = mpsc::channel(1);
+        let mut handle = ListenerHandle {
+            process: None,
+            log_rx: rx,
+        };
+
+        let error = harness
+            .get_peer_id_from_logs(&mut handle)
+            .await
+            .expect_err("missing peer ID should fail");
+
+        assert!(
+            error.to_string().contains("Timed out waiting"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn parses_connection_metrics_from_json_stats() {
+        let harness = NatTestHarness::new(NatTestConfig::default());
+        let output = r#"
+{"event":"peer_connected","peer_id":"0123456789abcdef","addr":"10.0.0.2:9000","direction":"outbound","connection_type":"nat_traversed"}
+{"type":"final_stats","duration_secs":1.0,"bytes_sent":2048,"bytes_received":1024,"connections_accepted":0,"connections_initiated":1,"nat_traversals":1,"external_addresses":1,"counters_sent":7,"counters_received":5,"echoes_sent":0}
+"#;
+
+        let metrics = harness.parse_connection_metrics(output);
+
+        assert!(metrics.hole_punching_used);
+        assert!(!metrics.relay_used);
+        assert_eq!(metrics.packets_sent, 7);
+        assert_eq!(metrics.packets_received, 5);
+    }
+
+    #[test]
+    fn missing_connection_metrics_stay_zero() {
+        let harness = NatTestHarness::new(NatTestConfig::default());
+
+        let metrics = harness.parse_connection_metrics("Connected to peer without counters");
+
+        assert_eq!(metrics.packets_sent, 0);
+        assert_eq!(metrics.packets_received, 0);
     }
 
     #[test]
