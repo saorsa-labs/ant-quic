@@ -6,57 +6,92 @@
 //! End-to-end tests for event address migration from SocketAddr to TransportAddr.
 //! Validates the entire event pipeline with new address types.
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use ant_quic::transport::TransportAddr;
-use ant_quic::{P2pConfig, P2pEndpoint, P2pEvent, PeerId};
-use std::net::SocketAddr;
+use ant_quic::{NatConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, PqcConfig};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Test that P2pEndpoint emits events with TransportAddr
-#[tokio::test]
-async fn test_event_pipeline_uses_transport_addr() {
-    // Create endpoint
-    let config = P2pConfig::builder()
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn normalize_local_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
+fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
+    P2pConfig::builder()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .known_peers(known_peers)
+        .nat(NatConfig {
+            enable_relay_fallback: false,
+            ..Default::default()
+        })
+        .pqc(PqcConfig::default())
         .fast_timeouts()
         .build()
-        .expect("valid config");
+        .expect("test config")
+}
 
-    let endpoint = match P2pEndpoint::new(config).await {
-        Ok(ep) => ep,
-        Err(_) => {
-            // Skip test if endpoint creation fails (e.g., no network)
-            return;
-        }
-    };
+async fn make_node(known_peers: Vec<SocketAddr>) -> Arc<P2pEndpoint> {
+    Arc::new(
+        P2pEndpoint::new(test_node_config(known_peers))
+            .await
+            .expect("node creation"),
+    )
+}
 
-    // Subscribe to events
-    let mut events = endpoint.subscribe();
+fn spawn_accept_loop(node: Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while node.accept().await.is_some() {} })
+}
 
-    // The subscription channel is set up - verify we can receive events
-    // In a real scenario, connecting to a peer would generate PeerConnected events
-    // For now, verify the channel is working and event types are correct
+/// Test that P2pEndpoint emits events with TransportAddr
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_event_pipeline_uses_transport_addr() {
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
 
-    // Drop endpoint to trigger shutdown (which may emit events)
-    endpoint.shutdown().await;
+    let sender = make_node(vec![receiver_addr]).await;
+    let accept_sender = spawn_accept_loop(sender.clone());
+    let mut events = sender.subscribe();
 
-    // Verify we can receive any events that were emitted
-    // This tests that the event system works with TransportAddr
-    while let Ok(result) = timeout(Duration::from_millis(100), events.recv()).await {
-        if let Ok(event) = result {
-            // All events should be valid P2pEvent variants
-            match event {
-                P2pEvent::PeerConnected { addr, .. } => {
-                    // Verify addr is TransportAddr
-                    let _: TransportAddr = addr;
+    let connection = timeout(CONNECT_TIMEOUT, sender.connect_addr(receiver_addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect receiver");
+    assert_eq!(connection.peer_id, receiver_id);
+
+    let observed_addr = timeout(CONNECT_TIMEOUT, async {
+        loop {
+            match events.recv().await {
+                Ok(P2pEvent::PeerConnected { peer_id, addr, .. }) if peer_id == receiver_id => {
+                    break addr;
                 }
-                P2pEvent::ExternalAddressDiscovered { addr } => {
-                    // Verify addr is TransportAddr
-                    let _: TransportAddr = addr;
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("event channel closed before PeerConnected");
                 }
-                _ => {} // Other events don't have addresses
             }
         }
-    }
+    })
+    .await
+    .expect("timed out waiting for PeerConnected event");
+
+    assert_eq!(observed_addr, TransportAddr::Udp(receiver_addr));
+    assert_eq!(observed_addr.as_socket_addr(), Some(receiver_addr));
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
 }
 
 /// Test PeerConnected event construction with UDP transport
