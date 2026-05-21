@@ -1763,6 +1763,16 @@ impl Connection {
         stats
     }
 
+    /// Whether this connection will transmit RFC-format NAT traversal frames.
+    pub fn nat_traversal_uses_rfc_frame_format(&self) -> bool {
+        self.nat_traversal_frame_config.use_rfc_format
+    }
+
+    /// Whether this connection accepts legacy-format NAT traversal frames.
+    pub fn nat_traversal_accepts_legacy_frame_format(&self) -> bool {
+        self.nat_traversal_frame_config.accept_legacy
+    }
+
     /// Set the bound peer identity for token v2 issuance.
     pub fn set_token_binding_peer_id(&mut self, pid: PeerId) {
         self.peer_id_for_tokens = Some(pid);

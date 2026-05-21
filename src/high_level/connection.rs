@@ -726,6 +726,12 @@ impl Connection {
         conn.inner.send_nat_address_advertisement(address, priority)
     }
 
+    /// Queue a REMOVE_ADDRESS NAT traversal frame via the underlying connection
+    pub fn send_nat_address_removal(&self, sequence: u64) -> Result<(), crate::ConnectionError> {
+        let conn = &mut *self.0.state.lock("send_nat_address_removal");
+        conn.inner.send_nat_address_removal(sequence)
+    }
+
     /// Queue a PUNCH_ME_NOW NAT traversal frame via the underlying connection
     pub fn send_nat_punch_coordination(
         &self,
@@ -751,6 +757,33 @@ impl Connection {
         let conn = &mut *self.0.state.lock("send_nat_punch_via_relay");
         conn.inner
             .send_nat_punch_via_relay(target_peer_id, our_address, round)
+    }
+
+    /// Whether NAT traversal was negotiated for this connection.
+    pub fn nat_traversal_supported(&self) -> bool {
+        self.0
+            .state
+            .lock("nat_traversal_supported")
+            .inner
+            .nat_traversal_supported()
+    }
+
+    /// Whether this connection will transmit RFC-format NAT traversal frames.
+    pub fn nat_traversal_uses_rfc_frame_format(&self) -> bool {
+        self.0
+            .state
+            .lock("nat_traversal_uses_rfc_frame_format")
+            .inner
+            .nat_traversal_uses_rfc_frame_format()
+    }
+
+    /// Whether this connection accepts legacy-format NAT traversal frames.
+    pub fn nat_traversal_accepts_legacy_frame_format(&self) -> bool {
+        self.0
+            .state
+            .lock("nat_traversal_accepts_legacy_frame_format")
+            .inner
+            .nat_traversal_accepts_legacy_frame_format()
     }
 
     /// The side of the connection (client or server)

@@ -5,10 +5,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::{
-    ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt,
+    ClientConfig, Endpoint, HighLevelConnection, ServerConfig, TransportConfig, VarInt,
     crypto::{rustls::QuicClientConfig, rustls::QuicServerConfig},
+    frame::nat_traversal_unified::{AddAddress, PunchMeNow, RemoveAddress},
     transport_parameters::NatTraversalConfig,
 };
+use bytes::{Buf, BytesMut};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -129,6 +131,41 @@ async fn make_pair(
     client_endpoint.set_default_client_config(client_config);
 
     (client_endpoint, server_endpoint)
+}
+
+async fn write_probe(conn: &HighLevelConnection, payload: &'static [u8]) {
+    let mut send = conn.open_uni().await.unwrap();
+    send.write_all(payload).await.unwrap();
+    send.finish().unwrap();
+}
+
+async fn wait_for_nat_frame_exchange(
+    sender: &HighLevelConnection,
+    receiver: &HighLevelConnection,
+    add_address: u64,
+    punch_me_now: u64,
+    remove_address: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sender_stats = sender.stats().frame_tx;
+            let receiver_stats = receiver.stats().frame_rx;
+
+            if sender_stats.add_address >= add_address
+                && sender_stats.punch_me_now >= punch_me_now
+                && sender_stats.remove_address >= remove_address
+                && receiver_stats.add_address >= add_address
+                && receiver_stats.punch_me_now >= punch_me_now
+                && receiver_stats.remove_address >= remove_address
+            {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for NAT traversal frame exchange");
 }
 
 /// Test that a legacy client can connect to an RFC-aware server
@@ -279,18 +316,19 @@ async fn rfc_to_rfc_negotiation() {
     .unwrap();
 
     // Wait for server to accept connection
-    let _server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
+    let server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
         .await
         .unwrap()
         .unwrap();
 
-    // Verify transport parameters indicate RFC support
-    // Note: We'd need to expose transport parameters to properly verify this
-    // For now, just verify the connection works
+    assert!(conn.nat_traversal_supported());
+    assert!(server_conn.nat_traversal_supported());
+    assert!(conn.nat_traversal_uses_rfc_frame_format());
+    assert!(server_conn.nat_traversal_uses_rfc_frame_format());
+    assert!(conn.nat_traversal_accepts_legacy_frame_format());
+    assert!(server_conn.nat_traversal_accepts_legacy_frame_format());
 
-    let mut send = conn.open_uni().await.unwrap();
-    send.write_all(b"RFC negotiation test").await.unwrap();
-    send.finish().unwrap();
+    write_probe(&conn, b"RFC negotiation test").await;
 
     info!("RFC endpoints successfully negotiated format");
 }
@@ -300,7 +338,6 @@ async fn rfc_to_rfc_negotiation() {
 async fn nat_traversal_frame_compatibility() {
     init_logging();
 
-    // This test verifies basic connectivity with NAT traversal enabled
     let mut server_config = server_config();
     let mut transport = TransportConfig::default();
     transport.enable_pqc(false);
@@ -338,18 +375,74 @@ async fn nat_traversal_frame_compatibility() {
     .unwrap();
 
     // Wait for server to accept connection
-    let _server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
+    let server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
         .await
         .unwrap()
         .unwrap();
 
-    // Send data on the connection to verify NAT traversal compatibility
-    let mut send1 = conn1.open_uni().await.unwrap();
-    send1
-        .write_all(b"NAT traversal compatibility test")
-        .await
+    assert!(conn1.nat_traversal_supported());
+    assert!(server_conn.nat_traversal_supported());
+    assert!(conn1.nat_traversal_uses_rfc_frame_format());
+    assert!(server_conn.nat_traversal_uses_rfc_frame_format());
+
+    let candidate: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+    let add_address = AddAddress::new(VarInt::from_u32(9), candidate);
+    let mut rfc_add = BytesMut::new();
+    add_address.encode_rfc(&mut rfc_add);
+    rfc_add.advance(4);
+    let decoded_rfc_add = AddAddress::decode_rfc(&mut rfc_add, false).unwrap();
+    assert_eq!(decoded_rfc_add.sequence, VarInt::from_u32(9));
+    assert_eq!(decoded_rfc_add.address, candidate);
+
+    let mut legacy_add = BytesMut::new();
+    add_address.encode_legacy(&mut legacy_add);
+    legacy_add.advance(4);
+    let decoded_legacy_add = AddAddress::decode_legacy(&mut legacy_add).unwrap();
+    assert_eq!(decoded_legacy_add.sequence, VarInt::from_u32(9));
+    assert_eq!(decoded_legacy_add.address, candidate);
+
+    let punch = PunchMeNow::new(VarInt::from_u32(3), VarInt::from_u32(9), candidate);
+    let mut rfc_punch = BytesMut::new();
+    punch.encode_rfc(&mut rfc_punch);
+    rfc_punch.advance(4);
+    let decoded_rfc_punch = PunchMeNow::decode_rfc(&mut rfc_punch, false).unwrap();
+    assert_eq!(decoded_rfc_punch.round, VarInt::from_u32(3));
+    assert_eq!(
+        decoded_rfc_punch.paired_with_sequence_number,
+        VarInt::from_u32(9)
+    );
+    assert_eq!(decoded_rfc_punch.address, candidate);
+
+    let mut legacy_punch = BytesMut::new();
+    punch.encode_legacy(&mut legacy_punch);
+    legacy_punch.advance(4);
+    let decoded_legacy_punch = PunchMeNow::decode_legacy(&mut legacy_punch).unwrap();
+    assert_eq!(decoded_legacy_punch.round, VarInt::from_u32(3));
+    assert_eq!(
+        decoded_legacy_punch.paired_with_sequence_number,
+        VarInt::from_u32(9)
+    );
+    assert_eq!(decoded_legacy_punch.address, candidate);
+
+    let remove = RemoveAddress::new(VarInt::from_u32(9));
+    let mut remove_buf = BytesMut::new();
+    remove.encode(&mut remove_buf);
+    remove_buf.advance(4);
+    assert_eq!(
+        RemoveAddress::decode(&mut remove_buf).unwrap().sequence,
+        VarInt::from_u32(9)
+    );
+
+    let sequence = conn1
+        .send_nat_address_advertisement(candidate, 65_535)
         .unwrap();
-    send1.finish().unwrap();
+    conn1
+        .send_nat_punch_coordination(sequence, candidate, 1)
+        .unwrap();
+    conn1.send_nat_address_removal(sequence).unwrap();
+
+    write_probe(&conn1, b"NAT traversal compatibility test").await;
+    wait_for_nat_frame_exchange(&conn1, &server_conn, 1, 1, 1).await;
 
     info!("NAT traversal frame compatibility test successful");
 }
@@ -359,8 +452,20 @@ async fn nat_traversal_frame_compatibility() {
 async fn malformed_frame_handling() {
     init_logging();
 
-    // This test verifies that endpoints can handle receiving frames in unexpected formats
-    // without crashing the connection
+    let mut truncated_rfc_add = BytesMut::from(&b"\x01\x7f\x00\x00"[..]);
+    assert!(AddAddress::decode_rfc(&mut truncated_rfc_add, false).is_err());
+
+    let mut invalid_legacy_add = BytesMut::from(&b"\x01\x02\x09\x7f\x00\x00\x01\x12\x34"[..]);
+    assert!(AddAddress::decode_legacy(&mut invalid_legacy_add).is_err());
+
+    let mut truncated_rfc_punch = BytesMut::from(&b"\x01\x02\x7f\x00"[..]);
+    assert!(PunchMeNow::decode_rfc(&mut truncated_rfc_punch, false).is_err());
+
+    let mut truncated_legacy_punch = BytesMut::from(&b"\x01\x02\x04\x7f\x00"[..]);
+    assert!(PunchMeNow::decode_legacy(&mut truncated_legacy_punch).is_err());
+
+    let mut truncated_remove = BytesMut::new();
+    assert!(RemoveAddress::decode(&mut truncated_remove).is_err());
 
     let mut server_config = server_config();
     let mut transport = TransportConfig::default();
@@ -395,18 +500,16 @@ async fn malformed_frame_handling() {
     .unwrap();
 
     // Wait for server to accept connection
-    let _server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
+    let server_conn = tokio::time::timeout(Duration::from_secs(5), server_handle)
         .await
         .unwrap()
         .unwrap();
 
-    // Connection should remain stable even if frames are sent in unexpected formats
-    // (This would be tested more thoroughly with lower-level frame injection)
+    assert!(!conn.nat_traversal_supported());
+    assert!(!server_conn.nat_traversal_supported());
 
     // Verify connection is still alive
-    let mut send = conn.open_uni().await.unwrap();
-    send.write_all(b"connection still alive").await.unwrap();
-    send.finish().unwrap();
+    write_probe(&conn, b"connection still alive").await;
 
     // Wait a bit to ensure no delayed errors
     tokio::time::sleep(Duration::from_millis(100)).await;
