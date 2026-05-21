@@ -40,6 +40,48 @@ fn transport_config_no_pqc() -> Arc<TransportConfig> {
     Arc::new(transport_config)
 }
 
+#[cfg(feature = "network-discovery")]
+fn dual_stack_udp_supported() -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(socket) => socket,
+        Err(e) => {
+            warn!("IPv6 UDP socket creation failed: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = socket.set_only_v6(false) {
+        warn!("Dual-stack UDP sockets are not supported: {e}");
+        return false;
+    }
+
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    if let Err(e) = socket.bind(&addr.into()) {
+        warn!("Dual-stack UDP bind failed: {e}");
+        return false;
+    }
+
+    match socket.only_v6() {
+        Ok(false) => true,
+        Ok(true) => {
+            warn!("Dual-stack UDP socket remained IPv6-only");
+            false
+        }
+        Err(e) => {
+            warn!("Unable to verify dual-stack UDP socket mode: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "network-discovery"))]
+fn dual_stack_udp_supported() -> bool {
+    warn!("Skipping dual-stack test because socket option probing requires network-discovery");
+    false
+}
+
 /// Test IPv4 NAT traversal
 #[tokio::test]
 async fn test_ipv4_nat_traversal() {
@@ -195,8 +237,13 @@ async fn test_dual_stack_nat_traversal() {
     let _ = tracing_subscriber::fmt::try_init();
     info!("Testing dual-stack NAT traversal");
 
-    // Create dual-stack server (bind to all interfaces)
-    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+    if !dual_stack_udp_supported() {
+        info!("Skipping dual-stack test - platform does not support single-socket dual-stack UDP");
+        return;
+    }
+
+    // Create a true dual-stack server through the IPv6 bind path.
+    let server_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 
     let (cert, key) = generate_test_cert();
     let mut server_crypto = rustls::ServerConfig::builder()
@@ -209,7 +256,10 @@ async fn test_dual_stack_nat_traversal() {
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
     server_config.transport_config(transport_config_no_pqc());
 
-    let server = Arc::new(Endpoint::server(server_config, server_addr).unwrap());
+    let server = Arc::new(
+        Endpoint::server(server_config, server_addr)
+            .expect("dual-stack server creation should succeed after capability probe"),
+    );
     let server_port = server.local_addr().unwrap().port();
     info!("Dual-stack server listening on port {}", server_port);
 
@@ -253,7 +303,7 @@ async fn test_dual_stack_nat_traversal() {
         let mut endpoint = Endpoint::client(client_addr).unwrap();
         endpoint.set_default_client_config(client_config);
 
-        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), server_port);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
 
         let conn = endpoint.connect(server_addr, "localhost").unwrap();
         let connection = timeout(Duration::from_secs(5), conn)
@@ -265,11 +315,12 @@ async fn test_dual_stack_nat_traversal() {
             "✓ IPv4 client connected to dual-stack server: {}",
             connection.remote_address()
         );
+        assert!(connection.remote_address().is_ipv4());
     }
 
-    // Test IPv6 client connection (if available)
+    // Test IPv6 client connection on the same listener.
     {
-        let client_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 0);
+        let client_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
 
         let mut client_crypto = rustls::ClientConfig::builder()
             .dangerous()
@@ -281,35 +332,22 @@ async fn test_dual_stack_nat_traversal() {
             ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
         client_config.transport_config(transport_config_no_pqc());
 
-        match Endpoint::client(client_addr) {
-            Ok(mut endpoint) => {
-                endpoint.set_default_client_config(client_config);
+        let mut endpoint = Endpoint::client(client_addr).unwrap();
+        endpoint.set_default_client_config(client_config);
 
-                let server_addr = SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                    server_port,
-                );
+        let server_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), server_port);
 
-                let conn = endpoint.connect(server_addr, "localhost").unwrap();
-                match timeout(Duration::from_secs(5), conn).await {
-                    Ok(Ok(connection)) => {
-                        info!(
-                            "✓ IPv6 client connected to dual-stack server: {}",
-                            connection.remote_address()
-                        );
-                    }
-                    _ => {
-                        warn!("IPv6 connection failed - this is expected on some systems");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "IPv6 client creation failed: {} - this is expected on some systems",
-                    e
-                );
-            }
-        }
+        let conn = endpoint.connect(server_addr, "localhost").unwrap();
+        let connection = timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("IPv6 dual-stack connection timeout")
+            .expect("IPv6 dual-stack connection failed");
+
+        info!(
+            "✓ IPv6 client connected to dual-stack server: {}",
+            connection.remote_address()
+        );
+        assert!(connection.remote_address().is_ipv6());
     }
 }
 
