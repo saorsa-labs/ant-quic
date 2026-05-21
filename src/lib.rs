@@ -540,9 +540,11 @@ impl fmt::Display for StreamId {
 }
 
 impl StreamId {
+    const MAX_INDEX: u64 = VarInt::MAX.into_inner() >> 2;
+
     /// Create a new StreamId if it fits in QUIC's variable-length integer range.
     pub fn try_new(initiator: Side, dir: Dir, index: u64) -> Result<Self, VarIntBoundsExceeded> {
-        if index > (VarInt::MAX.into_inner() >> 2) {
+        if index > Self::MAX_INDEX {
             return Err(VarIntBoundsExceeded);
         }
         let raw = (index << 2) | ((dir as u64) << 1) | initiator as u64;
@@ -606,28 +608,30 @@ mod stream_id_tests {
 
     #[test]
     fn try_new_accepts_largest_valid_stream_index() {
-        let max_index = VarInt::MAX.into_inner() >> 2;
-        let stream_id = StreamId::try_new(Side::Server, Dir::Uni, max_index);
+        let stream_id = StreamId::try_new(Side::Server, Dir::Uni, StreamId::MAX_INDEX);
         assert!(stream_id.is_ok());
     }
 
     #[test]
     fn try_new_rejects_stream_index_outside_varint_range() {
-        let invalid_index = (VarInt::MAX.into_inner() >> 2) + 1;
+        let invalid_index = StreamId::MAX_INDEX + 1;
         let stream_id = StreamId::try_new(Side::Client, Dir::Bi, invalid_index);
         assert!(stream_id.is_err());
     }
 
     #[test]
-    fn try_new_rejects_indexes_that_would_lose_bits_when_shifted() {
-        let stream_id = StreamId::try_new(Side::Client, Dir::Bi, u64::MAX);
+    fn try_new_rejects_index_that_would_alias_after_shift() {
+        let stream_id = StreamId::try_new(Side::Client, Dir::Bi, 1_u64 << 63);
         assert!(stream_id.is_err());
     }
 
     #[test]
     fn valid_stream_id_converts_to_varint() {
-        let stream_id =
-            StreamId::try_new(Side::Client, Dir::Uni, 7).expect("test stream id should be valid");
+        let stream_id = StreamId::try_new(Side::Client, Dir::Uni, 7);
+        assert!(stream_id.is_ok());
+        let Ok(stream_id) = stream_id else {
+            return;
+        };
         let varint = VarInt::from(stream_id);
         assert_eq!(varint.into_inner(), u64::from(stream_id));
     }
