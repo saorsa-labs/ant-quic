@@ -296,23 +296,55 @@ fn compute_sha256(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Generate random test data with verification
-fn generate_test_data(size: u64, chunk_size: usize) -> Vec<VerifiedDataChunk> {
-    let mut chunks = Vec::new();
-    let mut remaining = size;
-    let mut sequence = 0u64;
+#[derive(Debug, Clone)]
+struct TestDataChunks {
+    remaining: u64,
+    chunk_size: usize,
+    sequence: u64,
+}
 
-    while remaining > 0 {
-        let this_chunk = std::cmp::min(remaining, chunk_size as u64) as usize;
+impl TestDataChunks {
+    fn remaining_chunks(&self) -> u64 {
+        data_chunk_count(self.remaining, self.chunk_size)
+    }
+}
+
+impl Iterator for TestDataChunks {
+    type Item = VerifiedDataChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 || self.chunk_size == 0 {
+            return None;
+        }
+
+        let this_chunk = std::cmp::min(self.remaining, self.chunk_size as u64) as usize;
+        let sequence = self.sequence;
         let data: Vec<u8> = (0..this_chunk)
             .map(|i| ((sequence + i as u64) % 256) as u8)
             .collect();
-        chunks.push(VerifiedDataChunk::new(sequence, data));
-        remaining -= this_chunk as u64;
-        sequence += 1;
-    }
 
-    chunks
+        self.remaining -= this_chunk as u64;
+        self.sequence += 1;
+
+        Some(VerifiedDataChunk::new(sequence, data))
+    }
+}
+
+fn data_chunk_count(size: u64, chunk_size: usize) -> u64 {
+    if size == 0 || chunk_size == 0 {
+        0
+    } else {
+        size.div_ceil(chunk_size as u64)
+    }
+}
+
+/// Generate random test data with verification, one chunk at a time.
+fn generate_test_data(size: u64, chunk_size: usize) -> TestDataChunks {
+    TestDataChunks {
+        remaining: size,
+        chunk_size,
+        sequence: 0,
+    }
 }
 
 /// Format bytes in human readable form
@@ -455,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
         info!(
             "Data Generation: {} ({} chunks)",
             format_bytes(args.generate_data),
-            args.generate_data.div_ceil(args.chunk_size as u64)
+            data_chunk_count(args.generate_data, args.chunk_size)
         );
     }
 
@@ -770,14 +802,6 @@ async fn main() -> anyhow::Result<()> {
             // Wait for connections
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            let chunks = generate_test_data(data_size, chunk_size);
-            let total_chunks = chunks.len();
-            info!(
-                "Generated {} chunks ({} total)",
-                total_chunks,
-                format_bytes(data_size)
-            );
-
             let connected_peers: Vec<PeerId> = peers_data.read().await.keys().cloned().collect();
 
             if connected_peers.is_empty() {
@@ -785,13 +809,15 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
+            let chunks = generate_test_data(data_size, chunk_size);
+            let total_chunks = chunks.remaining_chunks();
             info!("Sending data to {} peer(s)...", connected_peers.len());
 
             let send_start = Instant::now();
             let mut chunks_sent = 0u64;
             let mut last_progress = Instant::now();
 
-            for (idx, chunk) in chunks.iter().enumerate() {
+            for (idx, chunk) in chunks.enumerate() {
                 if shutdown_data.is_cancelled() {
                     break;
                 }
@@ -1321,5 +1347,36 @@ mod tests {
 
         assert_eq!(parsed["node_id"].as_str(), Some(node_id));
         assert_eq!(parsed["bytes_sent"].as_u64(), Some(42));
+    }
+
+    #[test]
+    fn generate_test_data_yields_chunks_lazily() {
+        let mut chunks = generate_test_data(10, 4);
+        assert_eq!(chunks.remaining_chunks(), 3);
+
+        let first = chunks.next().expect("first chunk");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.data, vec![0, 1, 2, 3]);
+        assert_eq!(chunks.remaining_chunks(), 2);
+
+        let second = chunks.next().expect("second chunk");
+        assert_eq!(second.sequence, 1);
+        assert_eq!(second.data, vec![1, 2, 3, 4]);
+        assert_eq!(chunks.remaining_chunks(), 1);
+
+        let third = chunks.next().expect("third chunk");
+        assert_eq!(third.sequence, 2);
+        assert_eq!(third.data, vec![2, 3]);
+        assert_eq!(chunks.remaining_chunks(), 0);
+        assert!(chunks.next().is_none());
+    }
+
+    #[test]
+    fn data_chunk_count_handles_empty_and_partial_chunks() {
+        assert_eq!(data_chunk_count(0, 64), 0);
+        assert_eq!(data_chunk_count(1, 64), 1);
+        assert_eq!(data_chunk_count(64, 64), 1);
+        assert_eq!(data_chunk_count(65, 64), 2);
+        assert_eq!(data_chunk_count(65, 0), 0);
     }
 }
