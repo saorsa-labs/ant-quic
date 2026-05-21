@@ -21,13 +21,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ant_quic::bootstrap_cache::{
     BootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
 use ant_quic::masque::{
-    ConnectUdpRequest, MasqueRelayConfig, MasqueRelayServer, RelayManager, RelayManagerConfig,
+    ConnectUdpRequest, ConnectUdpResponse, MasqueRelayConfig, MasqueRelayServer, RelayManager,
+    RelayManagerConfig,
 };
 
 // ============================================================================
@@ -242,6 +244,37 @@ async fn test_no_dual_stack_relay_fails_cross_version() {
 
     // Should fail with clear error
     assert!(response.is_err() || !response.unwrap().is_success());
+}
+
+#[tokio::test]
+async fn test_relay_rejects_unauthenticated_connect_when_auth_required() {
+    let relay_config = MasqueRelayConfig {
+        require_authentication: true,
+        ..dual_stack_relay_config()
+    };
+    let relay = MasqueRelayServer::new_dual_stack(relay_config, ipv4_addr(9301), ipv6_addr(9301));
+
+    let client_addr = ipv4_addr(10011);
+    let target_addr = ipv6_addr(10012);
+
+    let request = ConnectUdpRequest::target(target_addr);
+    let response = relay
+        .handle_unauthenticated_connect_request(&request, client_addr)
+        .await
+        .expect("unauthenticated request should receive rejection response");
+
+    assert_eq!(response.status, ConnectUdpResponse::STATUS_FORBIDDEN);
+    assert!(response.is_error());
+    assert_eq!(
+        relay.stats().auth_failures.load(Ordering::Relaxed),
+        1,
+        "Authentication failure should be recorded"
+    );
+    assert_eq!(
+        relay.session_count().await,
+        0,
+        "Rejected unauthenticated request must not create a session"
+    );
 }
 
 #[tokio::test]

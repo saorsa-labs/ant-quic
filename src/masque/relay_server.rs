@@ -299,6 +299,20 @@ impl MasqueRelayServer {
         self.supports_dual_stack()
     }
 
+    /// Handle a CONNECT-UDP request from a client without relay authentication.
+    pub async fn handle_unauthenticated_connect_request(
+        &self,
+        request: &ConnectUdpRequest,
+        client_addr: SocketAddr,
+    ) -> RelayResult<ConnectUdpResponse> {
+        if self.config.require_authentication {
+            self.stats.record_auth_failure();
+            return Ok(ConnectUdpResponse::forbidden("Authentication required"));
+        }
+
+        self.handle_connect_request(request, client_addr).await
+    }
+
     /// Get the appropriate public address for a target IP version
     ///
     /// Returns the IPv4 address for IPv4 targets, IPv6 for IPv6 targets.
