@@ -68,19 +68,23 @@ async fn symmetric_peer_endpoint_surfaces_external_address_consistently() -> any
     let client_node = P2pEndpoint::new(client_config).await?;
     println!("Dialing peer started at {:?}", client_node.local_addr());
 
+    let mut events = client_node.subscribe();
+
     println!("Dialing peer connecting directly...");
-    let connect_task = {
+    let mut connect_task = {
         let client_node = client_node.clone();
         tokio::spawn(async move { client_node.connect_addr(observer_addr).await })
     };
 
-    let mut events = client_node.subscribe();
     let mut helper_addr: Option<SocketAddr> = None;
     let mut event_addr: Option<TransportAddr> = None;
+    let mut connection = None;
     let timeout = Duration::from_secs(10);
     let start = Instant::now();
 
-    while start.elapsed() < timeout && (helper_addr.is_none() || event_addr.is_none()) {
+    while start.elapsed() < timeout
+        && (connection.is_none() || helper_addr.is_none() || event_addr.is_none())
+    {
         if helper_addr.is_none() {
             helper_addr = client_node.external_addr();
             if let Some(addr) = helper_addr {
@@ -88,52 +92,62 @@ async fn symmetric_peer_endpoint_surfaces_external_address_consistently() -> any
             }
         }
 
-        match tokio::time::timeout(Duration::from_millis(100), events.recv()).await {
-            Ok(Ok(P2pEvent::ExternalAddressDiscovered { addr })) => {
-                println!("Event surfaced external address: {}", addr);
-                event_addr.get_or_insert(addr);
+        tokio::select! {
+            connect_result = &mut connect_task, if connection.is_none() => {
+                connection = Some(
+                    connect_result
+                        .map_err(|err| anyhow::anyhow!("connect_addr task panicked: {err}"))??,
+                );
             }
-            Ok(Ok(P2pEvent::PeerConnected { peer_id, addr, .. })) => {
-                println!("Connected to peer {peer_id:?} at {addr}");
+            event = events.recv() => {
+                match event {
+                    Ok(P2pEvent::ExternalAddressDiscovered { addr }) => {
+                        println!("Event surfaced external address: {}", addr);
+                        event_addr.get_or_insert(addr);
+                    }
+                    Ok(P2pEvent::PeerConnected { peer_id, addr, .. }) => {
+                        println!("Connected to peer {peer_id:?} at {addr}");
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
 
-    let connection = tokio::time::timeout(Duration::from_secs(10), connect_task)
-        .await
-        .expect("connect_addr join timeout")??;
+    let connection = connection.ok_or_else(|| {
+        anyhow::anyhow!("connect_addr did not complete within the external discovery timeout")
+    })?;
     assert_eq!(
         connection.peer_id, observer_id,
         "connect_addr should establish a peer-oriented connection to the observer"
     );
 
-    let discovered_socket = event_addr
-        .as_ref()
-        .and_then(TransportAddr::as_socket_addr)
-        .or(helper_addr);
+    let helper_addr = helper_addr.ok_or_else(|| {
+        anyhow::anyhow!("external_addr helper did not surface an address after connect_addr")
+    })?;
+    let event_addr = event_addr.ok_or_else(|| {
+        anyhow::anyhow!("ExternalAddressDiscovered event was not emitted after connect_addr")
+    })?;
+    let event_socket = event_addr.as_socket_addr().ok_or_else(|| {
+        anyhow::anyhow!("ExternalAddressDiscovered event did not contain a socket address")
+    })?;
 
-    if let Some(addr) = discovered_socket {
-        println!("Verification passed: external address {} discovered.", addr);
-        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert!(
-            client_node.all_external_addrs().contains(&addr),
-            "all_external_addrs should retain the discovered address"
-        );
+    println!(
+        "Verification passed: external address {} discovered.",
+        helper_addr
+    );
+    assert_eq!(helper_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        event_socket, helper_addr,
+        "event address should match external_addr helper"
+    );
 
-        if let Some(helper) = helper_addr {
-            assert_eq!(helper, addr, "external_addr helper should match discovery");
-        }
-        if let Some(event) = &event_addr {
-            assert_eq!(
-                event.as_socket_addr(),
-                Some(addr),
-                "event address should match helper/discovered address"
-            );
-        }
-    } else {
-        println!("No external address discovered on localhost; skipping strict assertion.");
-    }
+    let all_external_addrs = client_node.all_external_addrs();
+    assert!(
+        all_external_addrs.contains(&helper_addr),
+        "all_external_addrs should retain the discovered address {helper_addr}, got {all_external_addrs:?}"
+    );
 
     client_node.shutdown().await;
     observer_node.shutdown().await;
