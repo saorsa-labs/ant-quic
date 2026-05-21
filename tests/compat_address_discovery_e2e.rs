@@ -12,7 +12,8 @@
 mod common;
 
 use ant_quic::{
-    ClientConfig, Endpoint, EndpointConfig, ServerConfig, TransportConfig, VarInt,
+    ClientConfig, Endpoint, EndpointConfig, HighLevelConnection, ServerConfig, TransportConfig,
+    VarInt,
     crypto::{
         pqc::PqcConfig,
         rustls::{QuicClientConfig, QuicServerConfig, configured_provider_with_pqc},
@@ -25,7 +26,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 /// Create a properly configured UDP socket with larger buffers for Windows
@@ -49,8 +50,16 @@ fn create_configured_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSo
 }
 
 fn address_discovery_transport_config() -> Arc<TransportConfig> {
+    transport_config_for_address_discovery(true)
+}
+
+fn transport_config_for_address_discovery(address_discovery_enabled: bool) -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
-    transport_config.enable_address_discovery(true);
+    if address_discovery_enabled {
+        transport_config.enable_address_discovery(true);
+    } else {
+        transport_config.address_discovery_config(None);
+    }
     transport_config.enable_pqc(false);
     Arc::new(transport_config)
 }
@@ -68,6 +77,10 @@ fn generate_test_cert() -> (
 
 /// Create a test server endpoint with properly configured socket buffers
 fn create_server_endpoint() -> Endpoint {
+    create_server_endpoint_with_address_discovery(true)
+}
+
+fn create_server_endpoint_with_address_discovery(address_discovery_enabled: bool) -> Endpoint {
     let (cert, key) = generate_test_cert();
     let provider = configured_provider_with_pqc(Some(&PqcConfig::default()));
 
@@ -81,7 +94,9 @@ fn create_server_endpoint() -> Endpoint {
 
     let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
-    server_config.transport_config(address_discovery_transport_config());
+    server_config.transport_config(transport_config_for_address_discovery(
+        address_discovery_enabled,
+    ));
 
     // Create socket with properly configured buffers
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -126,19 +141,152 @@ fn create_client_endpoint() -> Endpoint {
     Endpoint::new(endpoint_config, None, socket, runtime).unwrap()
 }
 
-/// Test that address discovery is enabled by default
+fn test_client_config(address_discovery_enabled: bool) -> ClientConfig {
+    let provider = configured_provider_with_pqc(Some(&PqcConfig::default()));
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification {}))
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![b"test".to_vec()];
+
+    let mut client_config =
+        ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+    client_config.transport_config(transport_config_for_address_discovery(
+        address_discovery_enabled,
+    ));
+    client_config
+}
+
+type TestConnectionPair = (
+    Endpoint,
+    HighLevelConnection,
+    HighLevelConnection,
+    tokio::task::JoinHandle<HighLevelConnection>,
+    SocketAddr,
+    SocketAddr,
+);
+
+async fn connect_client_server(address_discovery_enabled: bool) -> TestConnectionPair {
+    let server = create_server_endpoint_with_address_discovery(address_discovery_enabled);
+    let server_addr = server.local_addr().unwrap();
+    let (server_conn_tx, server_conn_rx) = oneshot::channel();
+
+    let server_handle = tokio::spawn(async move {
+        info!("Server listening on {}", server_addr);
+
+        let incoming = server.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        info!(
+            "Server accepted connection from {}",
+            connection.remote_address()
+        );
+        let _ = server_conn_tx.send(connection.clone());
+        connection.closed().await;
+        connection
+    });
+
+    let mut client = create_client_endpoint();
+    let client_addr = client.local_addr().unwrap();
+    client.set_default_client_config(test_client_config(address_discovery_enabled));
+
+    info!("Client connecting to {}", server_addr);
+    let client_connection = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    info!("Client connected to {}", client_connection.remote_address());
+
+    let server_connection = server_conn_rx.await.unwrap();
+
+    (
+        client,
+        client_connection,
+        server_connection,
+        server_handle,
+        client_addr,
+        server_addr,
+    )
+}
+
+async fn drive_address_discovery_probe(
+    client_connection: &HighLevelConnection,
+    server_connection: &HighLevelConnection,
+) {
+    client_connection.wake_transmit();
+    server_connection.wake_transmit();
+
+    let mut send = client_connection.open_uni().await.unwrap();
+    send.write_all(b"address-discovery-probe").await.unwrap();
+    send.finish().unwrap();
+}
+
+async fn wait_for_observed_address(
+    connection: &HighLevelConnection,
+    expected: SocketAddr,
+    label: &str,
+) {
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if connection.observed_address() == Some(expected)
+                || connection.all_observed_addresses().contains(&expected)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        observed.is_ok(),
+        "{label} did not observe {expected}; primary={:?}; all={:?}; stats={:?}",
+        connection.observed_address(),
+        connection.all_observed_addresses(),
+        connection.stats()
+    );
+}
+
+async fn assert_observed_addresses_stay_absent(connection: &HighLevelConnection, label: &str) {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        connection.observed_address().is_none(),
+        "{label} unexpectedly recorded primary observed address {:?}",
+        connection.observed_address()
+    );
+    assert!(
+        connection.all_observed_addresses().is_empty(),
+        "{label} unexpectedly recorded observed addresses {:?}",
+        connection.all_observed_addresses()
+    );
+
+    let stats = connection.stats();
+    assert_eq!(
+        stats.frame_rx.observed_address, 0,
+        "{label} received OBSERVED_ADDRESS frames despite disabled address discovery"
+    );
+    assert_eq!(
+        stats.frame_tx.observed_address, 0,
+        "{label} sent OBSERVED_ADDRESS frames despite disabled address discovery"
+    );
+}
+
+/// Test address discovery transport parameter configuration
 #[tokio::test]
-async fn test_address_discovery_enabled_by_default() {
+async fn test_address_discovery_transport_config_advertises_support() {
     common::init_crypto();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("ant_quic=debug")
         .try_init();
 
-    let _server = create_server_endpoint();
-    let _client = create_client_endpoint();
+    let enabled_config = address_discovery_transport_config();
+    let disabled_config = transport_config_for_address_discovery(false);
 
-    // Address discovery is enabled by default in the configuration
-    info!("✓ Address discovery is enabled by default on both endpoints");
+    assert!(enabled_config.get_address_discovery_config().is_some());
+    assert!(disabled_config.get_address_discovery_config().is_none());
 }
 
 /// Test basic client-server address discovery flow
@@ -153,97 +301,64 @@ async fn test_client_server_address_discovery() {
         .with_env_filter("ant_quic=debug")
         .try_init();
 
-    let server = create_server_endpoint();
-    let server_addr = server.local_addr().unwrap();
+    let (_client, client_connection, server_connection, server_handle, client_addr, server_addr) =
+        connect_client_server(true).await;
 
-    // Start server
-    let server_handle = tokio::spawn(async move {
-        info!("Server listening on {}", server_addr);
+    drive_address_discovery_probe(&client_connection, &server_connection).await;
 
-        if let Some(incoming) = server.accept().await {
-            let connection = incoming.await.unwrap();
-            info!(
-                "Server accepted connection from {}",
-                connection.remote_address()
-            );
+    wait_for_observed_address(&client_connection, client_addr, "client").await;
+    wait_for_observed_address(&server_connection, server_addr, "server").await;
 
-            // Keep connection alive for testing
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            // Get stats before closing
-            let stats = connection.stats();
-            info!("Server connection stats: {:?}", stats);
-
-            return connection;
-        }
-        panic!("No incoming connection");
-    });
-
-    // Client connects
-    let mut client = create_client_endpoint();
-
-    // Create client config that skips cert verification for testing
-    let provider = configured_provider_with_pqc(Some(&PqcConfig::default()));
-    let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification {}))
-        .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![b"test".to_vec()];
-
-    let mut client_config =
-        ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
-    client_config.transport_config(address_discovery_transport_config());
-
-    // Set the client config on the endpoint
-    client.set_default_client_config(client_config);
-
-    info!("Client connecting to {}", server_addr);
-    let connection = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-
-    info!("Client connected to {}", connection.remote_address());
-
-    // Give time for potential address observations
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Check connection stats
-    let client_stats = connection.stats();
+    let client_stats = client_connection.stats();
+    let server_stats = server_connection.stats();
     info!("Client connection stats: {:?}", client_stats);
+    info!("Server connection stats: {:?}", server_stats);
 
-    // Verify address discovery is enabled on the connection
-    assert!(connection.stable_id() != 0);
+    assert!(
+        client_stats.frame_rx.observed_address > 0,
+        "client should receive OBSERVED_ADDRESS frames"
+    );
+    assert!(
+        client_stats.frame_tx.observed_address > 0,
+        "client should send OBSERVED_ADDRESS frames"
+    );
+    assert!(
+        server_stats.frame_rx.observed_address > 0,
+        "server should receive OBSERVED_ADDRESS frames"
+    );
+    assert!(
+        server_stats.frame_tx.observed_address > 0,
+        "server should send OBSERVED_ADDRESS frames"
+    );
 
     // Close connections
-    connection.close(VarInt::from_u32(0), b"test done");
-    let server_conn = server_handle.await.unwrap();
-    server_conn.close(VarInt::from_u32(0), b"test done");
+    client_connection.close(VarInt::from_u32(0), b"test done");
+    server_connection.close(VarInt::from_u32(0), b"test done");
+    let _ = server_handle.await.unwrap();
 
     info!("✓ Client-server address discovery flow completed");
 }
 
 /// Test disabling address discovery
 #[tokio::test]
+#[cfg_attr(target_os = "windows", ignore)]
 async fn test_disable_address_discovery() {
     common::init_crypto();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("ant_quic=debug")
         .try_init();
 
-    // Address discovery configuration is set at endpoint creation time
-    // This test verifies the default behavior
-    let _server = create_server_endpoint();
-    let _client = create_client_endpoint();
+    let (_client, client_connection, server_connection, server_handle, _, _) =
+        connect_client_server(false).await;
 
-    // Address discovery is enabled by default in ant-quic
-    info!("Address discovery is enabled by default in ant-quic");
+    drive_address_discovery_probe(&client_connection, &server_connection).await;
 
-    // To disable address discovery, one would need to configure it
-    // at endpoint creation time using a custom EndpointConfig
+    assert_observed_addresses_stay_absent(&client_connection, "client").await;
+    assert_observed_addresses_stay_absent(&server_connection, "server").await;
+
+    client_connection.close(VarInt::from_u32(0), b"test done");
+    server_connection.close(VarInt::from_u32(0), b"test done");
+    let _ = server_handle.await.unwrap();
 
     info!("✓ Address discovery configuration test completed");
 }
