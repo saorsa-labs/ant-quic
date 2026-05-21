@@ -444,17 +444,25 @@ impl NatTestHarness {
         let hole_punching_used = self.results.iter().filter(|r| r.hole_punching_used).count();
         let relay_used = self.results.iter().filter(|r| r.relay_used).count();
 
-        let avg_connection_time = self
-            .results
-            .iter()
-            .filter_map(|r| r.connection_time_ms)
-            .sum::<u64>() as f64
-            / successful as f64;
+        let avg_connection_time = if successful == 0 {
+            0.0
+        } else {
+            self.results
+                .iter()
+                .filter_map(|r| r.connection_time_ms)
+                .sum::<u64>() as f64
+                / successful as f64
+        };
+        let success_rate = if total == 0 {
+            0.0
+        } else {
+            (successful as f64 / total as f64) * 100.0
+        };
 
         TestReport {
             total_tests: total,
             successful_connections: successful,
-            success_rate: (successful as f64 / total as f64) * 100.0,
+            success_rate,
             hole_punching_connections: hole_punching_used,
             relay_connections: relay_used,
             average_connection_time_ms: avg_connection_time,
@@ -584,6 +592,51 @@ mod tests {
         let harness = NatTestHarness::new(config);
 
         assert!(harness.results.is_empty());
+    }
+
+    #[test]
+    fn generate_report_for_empty_harness_uses_finite_zeroes() {
+        let harness = NatTestHarness::new(NatTestConfig::default());
+
+        let report = harness.generate_report();
+
+        assert_eq!(report.total_tests, 0);
+        assert_eq!(report.successful_connections, 0);
+        assert_eq!(report.success_rate, 0.0);
+        assert!(report.success_rate.is_finite());
+        assert_eq!(report.average_connection_time_ms, 0.0);
+        assert!(report.average_connection_time_ms.is_finite());
+        assert!(report.nat_type_matrix.entries.is_empty());
+    }
+
+    #[test]
+    fn generate_report_for_all_failed_results_uses_finite_zero_average() {
+        let mut harness = NatTestHarness::new(NatTestConfig::default());
+        harness.results.push(NatTraversalResult {
+            success: false,
+            connection_time_ms: None,
+            nat_type_client1: "full_cone".to_string(),
+            nat_type_client2: "symmetric".to_string(),
+            hole_punching_used: false,
+            relay_used: false,
+            packets_sent: 0,
+            packets_received: 0,
+            error_message: Some("connection failed".to_string()),
+        });
+
+        let report = harness.generate_report();
+
+        assert_eq!(report.total_tests, 1);
+        assert_eq!(report.successful_connections, 0);
+        assert_eq!(report.success_rate, 0.0);
+        assert!(report.success_rate.is_finite());
+        assert_eq!(report.average_connection_time_ms, 0.0);
+        assert!(report.average_connection_time_ms.is_finite());
+        assert_eq!(report.nat_type_matrix.entries.len(), 1);
+        assert_eq!(report.nat_type_matrix.entries[0].attempts, 1);
+        assert_eq!(report.nat_type_matrix.entries[0].successes, 0);
+        assert_eq!(report.nat_type_matrix.entries[0].success_rate, 0.0);
+        assert!(report.nat_type_matrix.entries[0].success_rate.is_finite());
     }
 
     #[cfg(unix)]
