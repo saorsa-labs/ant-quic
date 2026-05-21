@@ -15,8 +15,24 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use ant_quic::{P2pConfig, P2pEndpoint, PeerId, PqcConfig};
 use rustls::pki_types::CertificateDer;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::timeout;
+
+/// Map an unspecified bind address (`0.0.0.0` / `[::]`) to loopback so it can
+/// be used as a *connect* target. ant-quic rejects connects to unspecified
+/// addresses, but a dual-stack listener bound on loopback is reachable via
+/// `127.0.0.1`.
+fn normalize_connect_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
 
 fn test_p2p_config() -> P2pConfig {
     P2pConfig::builder()
@@ -100,7 +116,10 @@ async fn test_local_p2p_connection_negotiates_pqc_and_ml_dsa_identity() {
     );
     let listener_id = listener.peer_id();
     let listener_key = listener.public_key_bytes().to_vec();
-    let listener_addr = listener.local_addr().expect("listener addr");
+    // `local_addr()` can report the unspecified bind address (e.g. `[::]:port`
+    // on a dual-stack socket); ant-quic correctly refuses to *connect* to an
+    // unspecified address, so normalise it to loopback before dialing.
+    let listener_addr = normalize_connect_addr(listener.local_addr().expect("listener addr"));
     assert_eq!(listener_key.len(), ML_DSA_65_PUBLIC_KEY_SIZE);
 
     let accept_endpoint = Arc::clone(&listener);

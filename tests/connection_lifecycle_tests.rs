@@ -37,8 +37,13 @@ enum ConnectionState {
 /// Test timeout for quick operations
 const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Shutdown timeout to prevent test hangs
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shutdown ceiling to catch genuine cleanup *hangs* (not slowness). It must
+/// exceed the production `SHUTDOWN_DRAIN_TIMEOUT` (5 s) plus margin: when a
+/// failed connect leaves an in-flight attempt, `P2pEndpoint::shutdown()`
+/// legitimately spends up to that drain window winding the attempt down. A 2 s
+/// ceiling flagged that legitimate drain as a failure; 10 s still catches an
+/// unbounded hang while allowing the bounded worst-case drain.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// On dual-stack systems, local_addr() may return [::]:PORT even for IPv4 bind.
 /// Normalize to 127.0.0.1 for use as a known_peer address.

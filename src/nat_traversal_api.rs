@@ -3167,20 +3167,6 @@ impl NatTraversalEndpoint {
             return Ok(()); // Already connected, not an error
         }
 
-        // CRITICAL: Check for existing active session FIRST to prevent race conditions.
-        // Multiple concurrent calls for the same peer would otherwise:
-        // 1. Each create a new session
-        // 2. Each insert into DashMap (replacing previous)
-        // 3. Then fail in start_discovery() with "already in progress"
-        // This race condition can cause resource leaks and potential deadlocks.
-        if self.active_sessions.contains_key(&peer_id) {
-            debug!(
-                "NAT traversal already in progress for peer {:?}, skipping duplicate request",
-                peer_id
-            );
-            return Ok(()); // Already handling this peer, not an error
-        }
-
         info!(
             "Starting NAT traversal to peer {:?} via coordinator {}",
             peer_id, coordinator
@@ -3210,9 +3196,28 @@ impl NatTraversalEndpoint {
             },
         };
 
-        // Store session
-        // DashMap provides lock-free .insert()
-        self.active_sessions.insert(peer_id, session);
+        // CRITICAL: atomically dedup-or-insert the session to prevent a
+        // check-then-insert race. A plain `contains_key()` guard followed by a
+        // separate `insert()` is a TOCTOU gap: multiple concurrent calls for
+        // the same peer can all observe "no session", then each create + insert
+        // a session and proceed into `start_discovery()`, where every call past
+        // the first fails with "already in progress" (the exact race the old
+        // comment claimed to prevent — see the concurrent-initiate regression
+        // test). DashMap's per-key `entry` lock makes the decision atomic: the
+        // first caller takes the Vacant slot and proceeds; all others observe
+        // Occupied and return early as a clean dedup (not an error).
+        match self.active_sessions.entry(peer_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                debug!(
+                    "NAT traversal already in progress for peer {:?}, skipping duplicate request",
+                    peer_id
+                );
+                return Ok(()); // Already handling this peer, not an error
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(session);
+            }
+        }
 
         // Start candidate discovery - parking_lot::RwLock doesn't poison
         let bootstrap_nodes_vec = self.bootstrap_nodes.read().clone();
