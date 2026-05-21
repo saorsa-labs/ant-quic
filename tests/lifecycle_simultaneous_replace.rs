@@ -34,8 +34,8 @@ async fn simultaneous_connect_settles_on_complementary_live_views() {
             tokio::spawn(async move { b.connect_addr(a_addr).await })
         };
 
-        let _ = a_task.await.expect("a join");
-        let _ = b_task.await.expect("b join");
+        a_task.await.expect("a join").expect("a connect");
+        b_task.await.expect("b join").expect("b connect");
 
         wait_until(Duration::from_secs(5), || {
             a.get_quic_connection(&b_id).ok().flatten().is_some()
