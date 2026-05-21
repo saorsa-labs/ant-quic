@@ -49,6 +49,7 @@ fn proof_symmetric_nat_connectivity() {
 ///
 /// NAT traversal must complete within acceptable time limits.
 #[test]
+#[ignore = "Requires measured metrics from a real NAT traversal harness"]
 fn proof_connection_establishment_time_under_2_seconds() {
     // Target: 95th percentile connection time <2s
 
@@ -84,6 +85,7 @@ fn proof_recovery_after_node_failure_under_5_seconds() {
 ///
 /// Once connected, messages must be delivered reliably.
 #[test]
+#[ignore = "Requires measured metrics from a real message delivery harness"]
 fn proof_message_delivery_success_rate_above_99_percent() {
     // Target: >99% message delivery rate
 
@@ -100,6 +102,7 @@ fn proof_message_delivery_success_rate_above_99_percent() {
 ///
 /// Post-quantum cryptography should not add significant latency.
 #[test]
+#[ignore = "Requires measured metrics from a real PQC handshake harness"]
 fn proof_pqc_handshake_overhead_under_50ms() {
     // Target: PQC handshake overhead <50ms compared to classical
 
@@ -118,6 +121,7 @@ fn proof_pqc_handshake_overhead_under_50ms() {
 /// The system must accurately detect NAT types to choose
 /// the right traversal strategy.
 #[test]
+#[ignore = "Requires measured metrics from a real NAT detection harness"]
 fn proof_nat_type_detection_accuracy_above_90_percent() {
     // Target: >90% accuracy in NAT type detection
 
@@ -134,6 +138,7 @@ fn proof_nat_type_detection_accuracy_above_90_percent() {
 ///
 /// A single node must handle many concurrent connections.
 #[test]
+#[ignore = "Requires measured metrics from a real concurrency harness"]
 fn proof_concurrent_connections_above_100() {
     // Target: Support >100 concurrent connections
 
