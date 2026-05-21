@@ -12,12 +12,19 @@
 use ant_quic::{
     Endpoint,
     config::{ClientConfig, ServerConfig},
-    crypto::pqc::{MlDsa65, MlDsaOperations, MlKem768, MlKemOperations, PqcConfigBuilder},
+    crypto::pqc::{
+        MlDsa65, MlDsaOperations, MlKem768, MlKemOperations, NamedGroup, PqcConfigBuilder,
+        SignatureScheme,
+        types::{
+            ML_DSA_65_SECRET_KEY_SIZE, ML_KEM_768_SECRET_KEY_SIZE, MlDsaSecretKey, MlKemSecretKey,
+        },
+    },
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Performance target: PQC overhead should be less than 150% in release builds.
 /// Note: Debug builds are significantly slower; allow a higher ceiling there.
@@ -380,27 +387,26 @@ async fn test_security_compliance() {
 
 #[tokio::test]
 async fn test_memory_safety() {
-    // Test that sensitive keys are properly zeroized
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
-    let ml_kem = MlKem768::new();
-    let (_, sec_key) = ml_kem.generate_keypair().unwrap();
+    assert_zeroize_on_drop::<MlKemSecretKey>();
+    assert_zeroize_on_drop::<MlDsaSecretKey>();
 
-    // Get a pointer to the secret key data
-    let key_bytes = sec_key.as_bytes();
-    let _key_ptr = key_bytes.as_ptr();
-    let key_len = key_bytes.len();
+    let mut kem_key = MlKemSecretKey::from_bytes(&[0xA5; ML_KEM_768_SECRET_KEY_SIZE]).unwrap();
+    assert!(kem_key.as_bytes().iter().any(|&byte| byte != 0));
+    kem_key.zeroize();
+    assert!(
+        kem_key.as_bytes().iter().all(|&byte| byte == 0),
+        "ML-KEM secret key explicit zeroize path must clear key bytes"
+    );
 
-    // Make a copy to verify the original data
-    let key_copy: Vec<u8> = key_bytes.to_vec();
-
-    // Drop the secret key
-    drop(sec_key);
-
-    // In a proper implementation, the memory should be zeroized
-    // This is a safety check that would need actual implementation
-    // For now, we verify the key had proper length
-    assert!(key_len > 0);
-    assert!(!key_copy.is_empty());
+    let mut dsa_key = MlDsaSecretKey::from_bytes(&[0x5A; ML_DSA_65_SECRET_KEY_SIZE]).unwrap();
+    assert!(dsa_key.as_bytes().iter().any(|&byte| byte != 0));
+    dsa_key.zeroize();
+    assert!(
+        dsa_key.as_bytes().iter().all(|&byte| byte == 0),
+        "ML-DSA secret key explicit zeroize path must clear key bytes"
+    );
 }
 
 #[test]
@@ -412,40 +418,58 @@ fn test_feature_flags() {
     println!("All required features enabled");
 }
 
-/// Summary test that ensures all acceptance criteria are met
+/// Release readiness checks backed by concrete assertions.
 #[tokio::test]
 async fn test_release_readiness() {
-    println!("\n=== Pure PQC Release Readiness Check (v0.2) ===\n");
+    let config = PqcConfigBuilder::default()
+        .ml_kem(false)
+        .ml_dsa(false)
+        .build()
+        .expect("PQC config should build with algorithms forced on");
+    assert!(config.ml_kem_enabled, "ML-KEM must remain always enabled");
+    assert!(config.ml_dsa_enabled, "ML-DSA must remain always enabled");
+    config
+        .validate()
+        .expect("default PQC config should validate");
 
-    // 1. Feature completeness
-    println!("All Pure PQC features implemented:");
-    println!("  - ML-KEM-768 (IANA 0x0201) key encapsulation");
-    println!("  - ML-DSA-65 (IANA 0x0901) digital signatures");
-    println!("  - Ed25519 for 32-byte PeerId compact identifier ONLY");
-    println!("  - 100% PQC always enabled (no hybrid modes)");
+    assert_eq!(NamedGroup::PRIMARY, NamedGroup::MlKem768);
+    assert_eq!(NamedGroup::PRIMARY.to_u16(), 0x0201);
+    assert!(NamedGroup::PRIMARY.is_pqc());
+    assert!(NamedGroup::from_u16(0x001D).is_none(), "X25519 rejected");
+    assert!(
+        NamedGroup::from_u16(0x11EC).is_none(),
+        "hybrid X25519MLKEM768 rejected"
+    );
 
-    // 2. Performance targets
-    println!("\nPerformance targets met:");
-    println!("  - PQC overhead < 150%");
-    println!("  - Sub-100ms handshakes possible");
+    assert_eq!(SignatureScheme::PRIMARY, SignatureScheme::MlDsa65);
+    assert_eq!(SignatureScheme::PRIMARY.to_u16(), 0x0905);
+    assert!(SignatureScheme::PRIMARY.is_pqc());
+    assert!(
+        SignatureScheme::from_u16(0x0807).is_none(),
+        "Ed25519 rejected as TLS auth scheme"
+    );
+    assert!(
+        SignatureScheme::from_u16(0x0920).is_none(),
+        "hybrid Ed25519+ML-DSA-65 rejected"
+    );
 
-    // 3. Security compliance
-    println!("\nSecurity requirements satisfied:");
-    println!("  - NIST Level 3 security (192-bit)");
-    println!("  - FIPS 203 (ML-KEM) compliant");
-    println!("  - FIPS 204 (ML-DSA) compliant");
+    let ml_kem = MlKem768::new();
+    let (kem_pub, kem_sec) = ml_kem.generate_keypair().unwrap();
+    assert_eq!(kem_pub.as_bytes().len(), MIN_ML_KEM_KEY_SIZE);
+    assert_eq!(kem_sec.as_bytes().len(), ML_KEM_768_SECRET_KEY_SIZE);
+    let (ciphertext, shared_secret1) = ml_kem.encapsulate(&kem_pub).unwrap();
+    let shared_secret2 = ml_kem.decapsulate(&kem_sec, &ciphertext).unwrap();
+    assert_eq!(shared_secret1.as_bytes(), shared_secret2.as_bytes());
 
-    // 4. Platform support
-    println!("\nCross-platform support verified:");
-    println!("  - Current platform: {}", std::env::consts::OS);
-    println!("  - Architecture: {}", std::env::consts::ARCH);
-
-    // 5. v0.2 pure PQC architecture
-    println!("\nv0.2 Pure PQC Architecture:");
-    println!("  - Pure PQC only (no hybrid or classical algorithms)");
-    println!("  - No fallback to classical crypto");
-    println!("  - Symmetric P2P nodes (no roles)");
-    println!("  - Greenfield network - no legacy compatibility");
-
-    println!("\n=== Release v0.2 Ready for Deployment ===\n");
+    let ml_dsa = MlDsa65::new();
+    let (dsa_pub, dsa_sec) = ml_dsa.generate_keypair().unwrap();
+    assert_eq!(dsa_pub.as_bytes().len(), MIN_ML_DSA_KEY_SIZE);
+    assert_eq!(dsa_sec.as_bytes().len(), ML_DSA_65_SECRET_KEY_SIZE);
+    let signature = ml_dsa.sign(&dsa_sec, b"release-readiness").unwrap();
+    assert!(
+        ml_dsa
+            .verify(&dsa_pub, b"release-readiness", &signature)
+            .unwrap(),
+        "ML-DSA signature should verify"
+    );
 }
