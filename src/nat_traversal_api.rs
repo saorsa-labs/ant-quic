@@ -188,6 +188,101 @@ impl TransportCandidate {
     }
 }
 
+/// Select the best supported transport candidate from a candidate list.
+///
+/// This is the pure selection core used by [`NatTraversalEndpoint`]. Callers
+/// provide transport support as a predicate so tests and higher-level APIs can
+/// exercise the same ordering without constructing a network endpoint.
+pub fn select_best_supported_transport_candidate(
+    candidates: &[TransportCandidate],
+    supports_transport: impl Fn(TransportType) -> bool,
+) -> Option<&TransportCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let supported: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| supports_transport(candidate.transport_type()))
+        .collect();
+
+    if supported.is_empty() {
+        tracing::debug!("No supported transport candidates available");
+        return None;
+    }
+
+    let (quic_capable, constrained): (Vec<_>, Vec<_>) = supported
+        .into_iter()
+        .partition(|candidate| candidate.supports_full_quic().unwrap_or(false));
+
+    if !quic_capable.is_empty() {
+        return quic_capable
+            .into_iter()
+            .max_by_key(|candidate| candidate.priority);
+    }
+
+    constrained
+        .into_iter()
+        .max_by_key(|candidate| candidate.priority)
+}
+
+/// Calculate a transport candidate score for ordering.
+///
+/// Higher scores are preferred. The score combines explicit candidate priority,
+/// transport preference, full-QUIC support, and latency/bandwidth capability
+/// tiers.
+pub fn transport_candidate_score(candidate: &TransportCandidate) -> u32 {
+    let mut score: u32 = 0;
+
+    score += candidate.priority;
+
+    let transport_bonus = match candidate.transport_type() {
+        TransportType::Udp => 10000,
+        TransportType::Yggdrasil => 9000,
+        TransportType::I2p => 8000,
+        TransportType::Ble => 7000,
+        TransportType::Serial => 5000,
+        TransportType::LoRa => 3000,
+        TransportType::Ax25 => 2000,
+    };
+    score += transport_bonus;
+
+    if candidate.supports_full_quic().unwrap_or(false) {
+        score += 50000;
+    }
+
+    if let Some(caps) = candidate.capabilities {
+        let latency_bonus = match caps.latency_tier() {
+            3 => 30000,
+            2 => 20000,
+            1 => 10000,
+            0 => 0,
+            _ => 0,
+        };
+        score += latency_bonus;
+
+        let bandwidth_bonus = match caps.bandwidth_tier() {
+            3 => 20000,
+            2 => 15000,
+            1 => 10000,
+            0 => 5000,
+            _ => 0,
+        };
+        score += bandwidth_bonus;
+    }
+
+    score
+}
+
+/// Sort transport candidates by descending transport score.
+pub fn sort_transport_candidates_by_score(candidates: &mut [TransportCandidate]) {
+    candidates.sort_by(|a, b| {
+        let score_a = transport_candidate_score(a);
+        let score_b = transport_candidate_score(b);
+        score_b.cmp(&score_a)
+    });
+}
+
 use tracing::{debug, error, info, trace, warn};
 
 use blake3::Hasher as Blake3Hasher;
@@ -7436,33 +7531,9 @@ impl NatTraversalEndpoint {
         &self,
         candidates: &'a [TransportCandidate],
     ) -> Option<&'a TransportCandidate> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // Filter to supported transports
-        let supported: Vec<_> = candidates
-            .iter()
-            .filter(|c| self.supports_transport(c.transport_type()))
-            .collect();
-
-        if supported.is_empty() {
-            debug!("No supported transport candidates available");
-            return None;
-        }
-
-        // Separate into QUIC-capable and constrained candidates
-        let (quic_capable, constrained): (Vec<_>, Vec<_>) = supported
-            .into_iter()
-            .partition(|c| c.supports_full_quic().unwrap_or(false));
-
-        // Prefer QUIC-capable transports, sorted by priority
-        if !quic_capable.is_empty() {
-            return quic_capable.into_iter().max_by_key(|c| c.priority);
-        }
-
-        // Fall back to constrained transports, sorted by priority
-        constrained.into_iter().max_by_key(|c| c.priority)
+        select_best_supported_transport_candidate(candidates, |transport_type| {
+            self.supports_transport(transport_type)
+        })
     }
 
     /// Filter candidates by transport type
@@ -7504,60 +7575,12 @@ impl NatTraversalEndpoint {
     /// - Latency tier (lower latency = higher score)
     /// - User-specified priority
     pub fn calculate_transport_score(&self, candidate: &TransportCandidate) -> u32 {
-        let mut score: u32 = 0;
-
-        // Base score from priority (0-65535 range)
-        score += candidate.priority;
-
-        // Transport type bonus (0-10000)
-        let transport_bonus = match candidate.transport_type() {
-            TransportType::Udp => 10000,
-            TransportType::Yggdrasil => 9000,
-            TransportType::I2p => 8000,
-            TransportType::Ble => 7000,
-            TransportType::Serial => 5000,
-            TransportType::LoRa => 3000,
-            TransportType::Ax25 => 2000,
-        };
-        score += transport_bonus;
-
-        // QUIC capability bonus (0-50000)
-        if candidate.supports_full_quic().unwrap_or(false) {
-            score += 50000;
-        }
-
-        // Latency tier bonus (0-30000)
-        if let Some(caps) = candidate.capabilities {
-            let latency_bonus = match caps.latency_tier() {
-                3 => 30000, // <100ms
-                2 => 20000, // 100-500ms
-                1 => 10000, // 500ms-2s
-                0 => 0,     // >2s
-                _ => 0,
-            };
-            score += latency_bonus;
-
-            // Bandwidth tier bonus (0-20000)
-            let bandwidth_bonus = match caps.bandwidth_tier() {
-                3 => 20000, // High
-                2 => 15000, // Medium
-                1 => 10000, // Low
-                0 => 5000,  // VeryLow
-                _ => 0,
-            };
-            score += bandwidth_bonus;
-        }
-
-        score
+        transport_candidate_score(candidate)
     }
 
     /// Sort candidates by transport score (best first)
     pub fn sort_candidates_by_score(&self, candidates: &mut [TransportCandidate]) {
-        candidates.sort_by(|a, b| {
-            let score_a = self.calculate_transport_score(a);
-            let score_b = self.calculate_transport_score(b);
-            score_b.cmp(&score_a) // Descending order (highest first)
-        });
+        sort_transport_candidates_by_score(candidates);
     }
 
     // ============ Transport Candidate Storage ============
