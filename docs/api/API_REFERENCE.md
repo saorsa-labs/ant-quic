@@ -515,6 +515,6 @@ The following types were **removed** in v0.13.0:
 
 ## Support
 
-- GitHub Issues: https://github.com/dirvine/ant-quic/issues
+- GitHub Issues: https://github.com/saorsa-labs/ant-quic/issues
 - Documentation: https://docs.rs/ant-quic
-- Examples: https://github.com/dirvine/ant-quic/tree/main/examples
+- Examples: https://github.com/saorsa-labs/ant-quic/tree/main/examples

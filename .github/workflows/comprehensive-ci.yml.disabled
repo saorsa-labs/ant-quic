@@ -232,7 +232,7 @@ jobs:
         # Deploy
         ssh $DO_USER@$DO_HOST << 'ENDSSH'
           set -e
-          cd ~/ant-quic || git clone https://github.com/dirvine/ant-quic ~/ant-quic
+          cd ~/ant-quic || git clone https://github.com/saorsa-labs/ant-quic ~/ant-quic
           cd ~/ant-quic
           git fetch origin
           git checkout ${{ github.sha }}

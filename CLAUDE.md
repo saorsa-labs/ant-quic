@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **NEVER** create PRs to quinn-rs/quinn
 - **NEVER** push to any quinn-rs repositories
 - **NEVER** add quinn-rs/quinn as an upstream remote
-- This repository: github.com/dirvine/ant-quic (standalone project)
+- This repository: github.com/saorsa-labs/ant-quic (standalone project)
 - Although GitHub shows it as a fork (legacy), we DO NOT contribute back to Quinn
 
 ## Project Overview

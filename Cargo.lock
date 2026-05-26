@@ -196,7 +196,6 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
- "libc",
  "log",
  "memchr",
  "mio",

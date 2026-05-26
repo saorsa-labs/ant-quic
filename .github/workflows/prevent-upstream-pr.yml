@@ -9,7 +9,7 @@ on:
 jobs:
   check-pr-target:
     runs-on: ubuntu-latest
-    if: github.repository == 'dirvine/ant-quic' || github.repository == 'saorsa-labs/ant-quic'
+    if: github.repository == 'saorsa-labs/ant-quic'
     steps:
       - name: Check PR Target
         run: |

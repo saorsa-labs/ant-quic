@@ -127,7 +127,7 @@ sudo ip netns exec nat_ns sysctl -w net.ipv4.ip_forward=1
 
 ```bash
 # Clone the repository
-git clone https://github.com/dirvine/ant-quic.git
+git clone https://github.com/saorsa-labs/ant-quic.git
 cd ant-quic/docker
 
 # Build Docker images

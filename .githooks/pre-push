@@ -15,7 +15,7 @@ if [[ "$url" == *"quinn-rs/quinn"* ]] || [[ "$url" == *"github.com/quinn-rs"* ]]
     echo "If you're trying to contribute to ant-quic, use:"
     echo "  git push origin <branch-name>"
     echo ""
-    echo "Repository: github.com/dirvine/ant-quic"
+    echo "Repository: github.com/saorsa-labs/ant-quic"
     exit 1
 fi
 

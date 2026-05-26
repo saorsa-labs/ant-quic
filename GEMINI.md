@@ -10,7 +10,7 @@ Repository guidelines for Google Gemini when working with ant-quic.
 
 - Do NOT open PRs to `quinn-rs/quinn`
 - Do NOT add `quinn-rs/quinn` as an upstream remote
-- Contribute only to `github.com/dirvine/ant-quic`
+- Contribute only to `github.com/saorsa-labs/ant-quic`
 - Although GitHub shows it as a fork (legacy), we do NOT contribute back to Quinn
 
 ## Project Overview

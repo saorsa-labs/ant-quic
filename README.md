@@ -7,8 +7,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
 
-[![CI Status](https://github.com/dirvine/ant-quic/actions/workflows/ci.yml/badge.svg)](https://github.com/dirvine/ant-quic/actions/workflows/ci.yml)
-[![Security Audit](https://github.com/dirvine/ant-quic/actions/workflows/security.yml/badge.svg)](https://github.com/dirvine/ant-quic/actions/workflows/security.yml)
+[![CI Status](https://github.com/saorsa-labs/ant-quic/actions/workflows/ci.yml/badge.svg)](https://github.com/saorsa-labs/ant-quic/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/saorsa-labs/ant-quic/actions/workflows/security.yml/badge.svg)](https://github.com/saorsa-labs/ant-quic/actions/workflows/security.yml)
 
 ## Key Features
 
@@ -240,7 +240,7 @@ cargo add ant-quic
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/dirvine/ant-quic/releases):
+Download from [GitHub Releases](https://github.com/saorsa-labs/ant-quic/releases):
 - Linux: `ant-quic-linux-x86_64`, `ant-quic-linux-aarch64`
 - Windows: `ant-quic-windows-x86_64.exe`
 - macOS: `ant-quic-macos-x86_64`, `ant-quic-macos-aarch64`
@@ -248,7 +248,7 @@ Download from [GitHub Releases](https://github.com/dirvine/ant-quic/releases):
 ### From Source
 
 ```bash
-git clone https://github.com/dirvine/ant-quic
+git clone https://github.com/saorsa-labs/ant-quic
 cd ant-quic
 cargo build --release
 ```
@@ -460,7 +460,7 @@ Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 # Development setup
-git clone https://github.com/dirvine/ant-quic
+git clone https://github.com/saorsa-labs/ant-quic
 cd ant-quic
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings

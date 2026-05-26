@@ -23,7 +23,7 @@ Repository guidelines for AI coding assistants working with ant-quic.
 
 - Do NOT open PRs to `quinn-rs/quinn`
 - Do NOT add `quinn-rs/quinn` as an upstream remote
-- Contribute only to `github.com/dirvine/ant-quic`
+- Contribute only to `github.com/saorsa-labs/ant-quic`
 - Keep API patterns consistent locally
 
 ## Project Overview

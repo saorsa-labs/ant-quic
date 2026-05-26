@@ -6,19 +6,19 @@
 
 - ❌ **DO NOT** create PRs to quinn-rs/quinn
 - ❌ **DO NOT** reference "upstream" Quinn repository
-- ✅ **DO** create PRs to github.com/dirvine/ant-quic
+- ✅ **DO** create PRs to github.com/saorsa-labs/ant-quic
 - ✅ **DO** treat this as a standalone project
 
 Although GitHub may show this as a fork (legacy reason), ant-quic has diverged completely and is maintained independently.
 
 ## How to Contribute
 
-1. Fork the repository from https://github.com/dirvine/ant-quic
+1. Fork the repository from https://github.com/saorsa-labs/ant-quic
 2. Create a feature branch: `git checkout -b feature/your-feature`
 3. Make your changes and ensure tests pass: `cargo test`
 4. Run formatting and linting: `cargo fmt && cargo clippy`
 5. Push to YOUR fork: `git push origin feature/your-feature`
-6. Create a PR to `dirvine/ant-quic:master` (NOT to quinn-rs/quinn!)
+6. Create a PR to `saorsa-labs/ant-quic:master` (NOT to quinn-rs/quinn!)
 
 ## Development Setup
 
@@ -45,4 +45,4 @@ cargo test
 
 ## Questions?
 
-Open an issue at https://github.com/dirvine/ant-quic/issues
+Open an issue at https://github.com/saorsa-labs/ant-quic/issues
