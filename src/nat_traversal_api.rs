@@ -4776,6 +4776,19 @@ impl NatTraversalEndpoint {
         transport_config.max_concurrent_uni_streams(
             crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
         );
+        // X0X memory bound: cap the connection-level receive window. The
+        // TransportConfig default is VarInt::MAX (unbounded), so under
+        // CPU-bound reads a peer could fill per-stream reassembly buffers up to
+        // `max_concurrent_uni_streams * stream_receive_window` with no
+        // connection-level ceiling — driving RSS to multiple GB on busy nodes.
+        // 16 MiB bounds per-connection buffered-but-unread receive data via
+        // QUIC flow control (the sender stops once a connection has that much
+        // unread). A loopback soak at 8 MiB cut RSS max 2.4 GB → 0.66 GB and
+        // CPU ~38%; 16 MiB keeps the memory bound well under 1 GB/conn-pool
+        // while leaving more send headroom so per-peer flow-control back-
+        // pressure (republish_per_peer_timeout) stays low. Applies to every
+        // ant-quic P2P node built through this config.
+        transport_config.receive_window(crate::VarInt::from_u32(16 * 1024 * 1024));
 
         // QUIC keep-alive is a transport-level concern. Do not couple it to NAT
         // traversal retry cadence; use the transport default unless/until we add
