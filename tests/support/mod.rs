@@ -170,7 +170,7 @@ where
         }
         sleep(Duration::from_millis(20)).await;
     }
-    panic!("condition not met within {timeout:?}");
+    assert!(check(), "condition not met within {timeout:?}");
 }
 
 pub fn lifecycle_generations_for_peer(peer_id: PeerId) -> Vec<u64> {

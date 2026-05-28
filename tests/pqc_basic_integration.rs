@@ -55,10 +55,9 @@ fn assert_ml_dsa_peer_identity(
         "rustls peer identity should be certificate/SPKI bytes"
     );
 
-    let certs = match identity.downcast::<Vec<CertificateDer<'static>>>() {
-        Ok(certs) => certs,
-        Err(_) => panic!("peer identity type checked above"),
-    };
+    let certs_result = identity.downcast::<Vec<CertificateDer<'static>>>();
+    assert!(certs_result.is_ok(), "peer identity type checked above");
+    let certs = certs_result.unwrap_or_default();
     let spki = certs
         .first()
         .expect("peer identity should contain an ML-DSA-65 SPKI");
