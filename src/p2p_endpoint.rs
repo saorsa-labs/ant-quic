@@ -54,7 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
@@ -803,6 +803,15 @@ pub struct P2pEndpoint {
 
     /// Circuit-breaker for coordinator peers (tracks failures by address).
     pub(crate) coordinator_health: Arc<crate::coordinator_health::CoordinatorHealth>,
+
+    /// Test-only fault injection counter. When non-zero, the next N
+    /// successfully-admitted ACK-v2 requests have their response stream
+    /// finished empty (the sender reads `len=0`) instead of receiving the ACK
+    /// envelope — reproducing a mid-exchange response-stream drop. The payload
+    /// is still admitted and the outcome cached in the dedupe window, so a
+    /// duplicate-safe retry replays the cached `Accepted`. Always `0` in
+    /// production. See [`Self::inject_ack_response_drops_for_testing`].
+    ack_response_drop_injection: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -1086,6 +1095,7 @@ enum AckOutcome {
     SenderAccepted,
     SenderRejected,
     SenderInvalidResponse,
+    SenderResponseIncomplete,
     SenderAckTimeout,
     SenderConnectionClosed,
     SenderRetryAttempted,
@@ -1307,6 +1317,12 @@ pub struct AckOutcomeCounters {
     pub sender_rejected: u64,
     /// Sender received an invalid ACK response envelope.
     pub sender_invalid_response: u64,
+    /// Sender's first attempt observed the ACK response stream close empty
+    /// (`len=0`) before an acknowledgement arrived — a transient mid-exchange
+    /// connection drop that triggers the duplicate-safe retry. Retry-attempt
+    /// occurrences are folded into `sender_retry_failed`, mirroring how
+    /// retry-attempt timeouts are counted.
+    pub sender_response_incomplete: u64,
     /// Sender timed out waiting for an ACK response.
     pub sender_ack_timeout: u64,
     /// Sender observed the response side close before an ACK response arrived.
@@ -1339,6 +1355,7 @@ impl AckOutcomeCounters {
             AckOutcome::SenderAccepted => self.sender_accepted += 1,
             AckOutcome::SenderRejected => self.sender_rejected += 1,
             AckOutcome::SenderInvalidResponse => self.sender_invalid_response += 1,
+            AckOutcome::SenderResponseIncomplete => self.sender_response_incomplete += 1,
             AckOutcome::SenderAckTimeout => self.sender_ack_timeout += 1,
             AckOutcome::SenderConnectionClosed => self.sender_connection_closed += 1,
             AckOutcome::SenderRetryAttempted => self.sender_retry_attempted += 1,
@@ -1389,8 +1406,9 @@ pub struct AckDiagnosticsSnapshot {
 ///   success, retry success, or any non-timeout terminal error (Rejected,
 ///   ConnectionClosed, invalid response — peer answered, just not OK).
 /// - `RetryAckTimeout` — the only outcome that signals half-dead: both the
-///   initial send AND its X0X-0060 duplicate-safe retry timed out with no
-///   response from the remote.
+///   initial send AND its X0X-0060 duplicate-safe retry produced no valid
+///   acknowledgement from the remote, either because they timed out or
+///   because the response stream closed empty (`AckResponseIncomplete`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckLivenessSignal {
     Success,
@@ -1416,12 +1434,13 @@ enum AckAttemptKind {
     /// not count first-attempt timeouts (X0X-0060's duplicate-safe retry
     /// gets a second chance before we conclude half-dead).
     FirstAttempt,
-    /// Caller is making the X0X-0060 duplicate-safe retry. Timeouts here
-    /// are the half-dead signal — record `SenderRetryFailed` AND
-    /// increment the liveness counter synchronously. If the increment
-    /// crosses `LIVENESS_FAILURE_THRESHOLD`, spawn a detached task to
-    /// invoke `trigger_liveness_close` (the async cleanup path) so that
-    /// the close fires even when the outer caller cancels our future.
+    /// Caller is making the X0X-0060 duplicate-safe retry. A timeout OR an
+    /// empty response stream (`AckResponseIncomplete`) here is the half-dead
+    /// signal — record `SenderRetryFailed` AND increment the liveness counter
+    /// synchronously via [`P2pEndpoint::record_ack_retry_failure_sync`]. If
+    /// the increment crosses `LIVENESS_FAILURE_THRESHOLD`, spawn a detached
+    /// task to invoke `trigger_liveness_close` (the async cleanup path) so
+    /// that the close fires even when the outer caller cancels our future.
     Retry,
 }
 
@@ -2137,6 +2156,18 @@ pub enum EndpointError {
     /// Timed out waiting for the remote receive pipeline ACK.
     #[error("Timed out waiting for remote receive acknowledgement")]
     AckTimeout,
+
+    /// The ACK-v2 response stream closed before a valid acknowledgement
+    /// envelope arrived — the peer reset or finished the bidi response
+    /// mid-exchange, so the sender read zero bytes (`len=0`). This is a
+    /// transient connection-drop signal, not a protocol violation: because
+    /// ACK-v2 carries a receiver-side request-id idempotency window, a
+    /// reissue with the same request id is duplicate-safe (the receiver
+    /// replays the cached outcome rather than redelivering the payload).
+    /// `send_with_receive_ack` treats a single occurrence like
+    /// [`AckTimeout`](Self::AckTimeout) and retries once before surfacing it.
+    #[error("ACK-v2 response stream closed before acknowledgement arrived")]
+    AckResponseIncomplete,
 
     /// Timed out waiting for a peer liveness probe response.
     #[error("Timed out waiting for peer liveness probe response")]
@@ -2996,6 +3027,7 @@ impl P2pEndpoint {
             peer_event_channels,
             peer_event_generations,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
+            ack_response_drop_injection: Arc::new(AtomicUsize::new(0)),
         };
 
         let (ack_bidi_tx, mut ack_bidi_rx) = mpsc::unbounded_channel();
@@ -3011,6 +3043,7 @@ impl P2pEndpoint {
             let event_tx = endpoint.event_tx.clone();
             let shutdown = endpoint.shutdown.clone();
             let max_read_bytes = endpoint.config.max_message_size;
+            let ack_response_drop_injection = Arc::clone(&endpoint.ack_response_drop_injection);
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -3042,6 +3075,7 @@ impl P2pEndpoint {
                                 prefix,
                                 accepted_at,
                                 max_read_bytes,
+                                &ack_response_drop_injection,
                             )
                             .await
                             {
@@ -3191,6 +3225,21 @@ impl P2pEndpoint {
     #[doc(hidden)]
     pub fn inject_constrained_event_for_testing(&self, event: ConstrainedEventWithAddr) -> bool {
         self.inner.constrained_event_tx().send(event).is_ok()
+    }
+
+    /// Test-only: queue `count` ACK-v2 response drops on this (receiver)
+    /// endpoint. The next `count` successfully-admitted ACK-v2 requests have
+    /// their response stream finished empty — the sender reads `len=0`, a
+    /// mid-exchange response-stream drop — instead of receiving the ACK
+    /// envelope. The payload is still admitted exactly once and the `Accepted`
+    /// outcome is cached in the receiver-side request-id idempotency window, so
+    /// a duplicate-safe retry replays the cached outcome rather than
+    /// redelivering. Used to reproduce the empty-response duplicate-safe-retry
+    /// path; the counter is always `0` in production.
+    #[doc(hidden)]
+    pub fn inject_ack_response_drops_for_testing(&self, count: usize) {
+        self.ack_response_drop_injection
+            .store(count, Ordering::SeqCst);
     }
 
     /// Get the ML-DSA-65 public key bytes (1952 bytes)
@@ -5668,6 +5717,20 @@ impl P2pEndpoint {
         }
     }
 
+    /// Test-only fault hook: atomically consume one queued ACK-v2 response
+    /// drop. Returns `true` (and decrements the counter) when a drop is
+    /// pending, `false` otherwise. The `load` fast-path keeps the production
+    /// case (counter always 0) to a single relaxed read on the hot accept
+    /// path. See [`Self::inject_ack_response_drops_for_testing`].
+    fn take_ack_response_drop(counter: &AtomicUsize) -> bool {
+        if counter.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
     async fn send_ack_bidi_response(
         ack_diagnostics: &AckDiagnostics,
         peer_id: PeerId,
@@ -5760,6 +5823,7 @@ impl P2pEndpoint {
         prefix: Vec<u8>,
         accepted_at: Instant,
         max_read_bytes: usize,
+        ack_response_drop_injection: &AtomicUsize,
     ) -> bool {
         ack_diagnostics.record_stage(
             peer_id,
@@ -5822,6 +5886,17 @@ impl P2pEndpoint {
                     conn_stable_id,
                     AckOutcome::ReceiverDuplicateReplayed,
                 );
+                if Self::take_ack_response_drop(ack_response_drop_injection) {
+                    // TEST-ONLY (no-op in production): drop the *replayed* ACK
+                    // response too, so a persistently-faulty peer fails the
+                    // duplicate-safe retry as well — exercising the bounded
+                    // retry + liveness-close path. (The first-attempt drop on
+                    // the fresh-accept path below caches the outcome; this drop
+                    // simulates the retry's replayed response also vanishing.)
+                    let mut send = send;
+                    let _ = send.finish();
+                    return true;
+                }
                 Self::send_ack_bidi_response(
                     ack_diagnostics,
                     peer_id,
@@ -5902,6 +5977,18 @@ impl P2pEndpoint {
                     payload,
                     AckControlOutcome::Accepted,
                 );
+                if Self::take_ack_response_drop(ack_response_drop_injection) {
+                    // TEST-ONLY (no-op in production: counter is always 0):
+                    // simulate a peer that finishes the ACK-v2 response stream
+                    // empty mid-exchange. The payload was already admitted and
+                    // the `Accepted` outcome cached above, so the sender's
+                    // duplicate-safe retry will replay the cached ACK. Finish
+                    // with no bytes so the sender reads `len=0` (a clean FIN),
+                    // exercising the empty-response retry path.
+                    let mut send = send;
+                    let _ = send.finish();
+                    return true;
+                }
                 Self::send_ack_bidi_response(
                     ack_diagnostics,
                     peer_id,
@@ -6498,12 +6585,22 @@ impl P2pEndpoint {
                 AckAttemptKind::FirstAttempt,
             )
             .await;
-        if !matches!(first, Err(EndpointError::AckTimeout)) {
+        if !matches!(
+            first,
+            Err(EndpointError::AckTimeout) | Err(EndpointError::AckResponseIncomplete)
+        ) {
             // X0X-0062: first-attempt success OR a non-timeout terminal error
             // both prove the remote responded — reset the liveness tracker.
             // Reviewer P1.1: this path previously bypassed the tracker, so
             // first-attempt successes between retry failures did not reset
             // the counter.
+            //
+            // Empty-response retry gap: an `AckResponseIncomplete` first
+            // attempt is NOT terminal — the peer reset/finished the response
+            // stream mid-exchange (`len=0`). Because ACK-v2 dedupes on the
+            // request id, reissuing the same id is duplicate-safe, so we fall
+            // through to the duplicate-safe retry below exactly as we do for a
+            // timeout rather than surfacing a hard `Connection` error.
             self.record_ack_liveness_signal(*peer_id, AckLivenessSignal::Success)
                 .await;
             return first;
@@ -6547,6 +6644,20 @@ impl P2pEndpoint {
                 // arm ends up running).
                 Err(EndpointError::AckTimeout)
             }
+            Err(EndpointError::AckResponseIncomplete) => {
+                // Empty-response retry gap: the retry attempt ALSO drained the
+                // response stream empty (`len=0`). Like the AckTimeout arm
+                // above, the `SenderRetryFailed` diagnostic and the
+                // liveness-counter increment (+ threshold force-close) were
+                // already recorded synchronously inside
+                // `send_ack_exchange_once` via `record_ack_retry_failure_sync`
+                // — so we do NOT re-record here. The bounded retry is now
+                // exhausted (one first attempt + one retry), so we surface the
+                // transient drop as an error rather than looping: a genuinely
+                // dead peer keeps producing this outcome and is force-closed
+                // by the liveness path once the threshold is crossed.
+                Err(EndpointError::AckResponseIncomplete)
+            }
             Err(error) => {
                 // X0X-0062 P1.2: the remote responded on retry with a
                 // non-timeout terminal outcome (Rejected, ConnectionClosed,
@@ -6578,6 +6689,37 @@ impl P2pEndpoint {
             .unwrap_or_default();
         self.ack_diagnostics
             .record_outcome(peer_id, stable_id, outcome);
+    }
+
+    /// X0X-0062: record a retry-attempt "no valid acknowledgement" failure
+    /// **synchronously**: bump `SenderRetryFailed`, increment the per-(peer,
+    /// stable_id) liveness counter, and — if the increment crosses
+    /// `LIVENESS_FAILURE_THRESHOLD` — spawn the detached force-close.
+    ///
+    /// Shared by the ACK-timeout retry arm and the empty-response
+    /// (`AckResponseIncomplete`) retry arm of `send_ack_exchange_once`. Both
+    /// are half-dead signals — the remote produced no valid acknowledgement on
+    /// the duplicate-safe retry — and both must do this bookkeeping before any
+    /// `.await` the outer caller could cancel across (the original
+    /// outer-match-arm approach lost the recording under caller cancellation;
+    /// see [`AckAttemptKind`]).
+    fn record_ack_retry_failure_sync(&self, peer_id: PeerId, stable_id: usize) {
+        self.ack_diagnostics
+            .record_outcome(peer_id, stable_id, AckOutcome::SenderRetryFailed);
+        // Sync counter increment — survives caller cancellation.
+        if self.ack_liveness.record_failure(peer_id, stable_id) {
+            // Threshold crossed. Spawn a detached task to do the async close
+            // so it doesn't get cancelled along with us. The task captures
+            // clones of the shared state via P2pEndpoint::clone (all Arc).
+            let endpoint = self.clone();
+            tokio::spawn(async move {
+                if let Some(connection) = endpoint.inner.get_connection(&peer_id).ok().flatten() {
+                    endpoint
+                        .trigger_liveness_close(peer_id, stable_id, &connection)
+                        .await;
+                }
+            });
+        }
     }
 
     /// X0X-0062: feed an `send_with_receive_ack` outcome (across the full
@@ -6825,7 +6967,37 @@ impl P2pEndpoint {
                     );
                     Err(EndpointError::ConnectionClosed { reason })
                 }
+                None if response.is_empty() => {
+                    // Empty-response retry gap: the peer accepted the ACK-v2
+                    // bidi stream but reset/finished the response side before
+                    // writing an acknowledgement envelope, so we read zero
+                    // bytes (`len=0`). This is a transient mid-exchange
+                    // connection drop, not a protocol violation — and because
+                    // the receiver dedupes on the request id, reissuing the
+                    // same id is duplicate-safe. Mirror the timeout path's
+                    // attempt-kind split so the half-dead liveness signal still
+                    // fires on the retry attempt (record_ack_retry_failure_sync
+                    // also records `SenderRetryFailed`, folding retry-attempt
+                    // empties into the same counter as retry timeouts).
+                    match attempt_kind {
+                        AckAttemptKind::FirstAttempt => {
+                            self.ack_diagnostics.record_outcome(
+                                *peer_id,
+                                stable_id,
+                                AckOutcome::SenderResponseIncomplete,
+                            );
+                        }
+                        AckAttemptKind::Retry => {
+                            self.record_ack_retry_failure_sync(*peer_id, stable_id);
+                        }
+                    }
+                    Err(EndpointError::AckResponseIncomplete)
+                }
                 None => {
+                    // Non-empty but undecodable: the peer wrote bytes that are
+                    // not a valid ACK envelope. This is a genuine protocol
+                    // violation, not a transient drop — keep it a hard error
+                    // (retrying would not help and would mask the bug).
                     self.ack_diagnostics.record_outcome(
                         *peer_id,
                         stable_id,
@@ -6857,30 +7029,7 @@ impl P2pEndpoint {
                         );
                     }
                     AckAttemptKind::Retry => {
-                        self.ack_diagnostics.record_outcome(
-                            *peer_id,
-                            stable_id,
-                            AckOutcome::SenderRetryFailed,
-                        );
-                        // Sync counter increment — survives caller cancellation.
-                        if self.ack_liveness.record_failure(*peer_id, stable_id) {
-                            // Threshold crossed. Spawn a detached task to do
-                            // the async close so it doesn't get cancelled
-                            // along with us. The task captures clones of the
-                            // shared state via P2pEndpoint::clone (all Arc).
-                            let endpoint = self.clone();
-                            let peer = *peer_id;
-                            let stable = stable_id;
-                            tokio::spawn(async move {
-                                if let Some(connection) =
-                                    endpoint.inner.get_connection(&peer).ok().flatten()
-                                {
-                                    endpoint
-                                        .trigger_liveness_close(peer, stable, &connection)
-                                        .await;
-                                }
-                            });
-                        }
+                        self.record_ack_retry_failure_sync(*peer_id, stable_id);
                     }
                 }
                 Err(EndpointError::AckTimeout)
@@ -8215,6 +8364,7 @@ impl P2pEndpoint {
         let inner = Arc::clone(&self.inner);
         let reader_exit_tx = self.reader_exit_tx.clone();
         let max_read_bytes = self.config.max_message_size;
+        let ack_response_drop_injection = Arc::clone(&self.ack_response_drop_injection);
         let conn_stable_id = connection.stable_id();
         let lifecycle_snapshot = self
             .inner
@@ -8314,6 +8464,7 @@ impl P2pEndpoint {
                                 prefix,
                                 accepted_at,
                                 max_read_bytes,
+                                &ack_response_drop_injection,
                             )
                             .await
                             {
@@ -9079,6 +9230,7 @@ impl Clone for P2pEndpoint {
             peer_event_channels: Arc::clone(&self.peer_event_channels),
             peer_event_generations: Arc::clone(&self.peer_event_generations),
             coordinator_health: Arc::clone(&self.coordinator_health),
+            ack_response_drop_injection: Arc::clone(&self.ack_response_drop_injection),
         }
     }
 }

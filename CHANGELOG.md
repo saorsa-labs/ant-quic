@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.25] - 2026-05-29
+
+ACK-v2 empty-response duplicate-safe retry. Fixes an intermittent
+direct-message failure that surfaced as
+`invalid ACK-v2 response envelope: len=0` when a peer reset or
+finished the ACK-v2 bidi response stream mid-exchange (a transient
+connection drop), before writing the acknowledgement envelope. The
+sender previously treated the zero-length response as a hard
+`Connection` error and never retried it, even though the receiver-side
+request-id idempotency window makes a reissue safe.
+
+### Added
+- `EndpointError::AckResponseIncomplete` — distinguishes the transient
+  `len=0` mid-exchange response-stream drop from a genuine (non-empty)
+  invalid-envelope protocol violation.
+- `AckOutcomeCounters::sender_response_incomplete` diagnostic counter.
+
+### Fixed
+- `send_with_receive_ack[_with_request_id]` now retries the empty-response
+  case once with the same request id (duplicate-safe via the receiver's
+  ACK-v2 dedupe window), exactly like the existing `AckTimeout` retry,
+  instead of surfacing a hard error on a single transient drop. The retry
+  stays bounded and a persistently-failing peer is still force-closed by
+  the X0X-0062 liveness path. Non-empty invalid responses remain a hard
+  `Connection` error (unchanged).
+
 ## [0.27.22] - 2026-05-12
 
 X0X-0075 Part B — qlog-style transport telemetry for live peer

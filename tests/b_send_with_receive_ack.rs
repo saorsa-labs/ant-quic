@@ -13,6 +13,12 @@ use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard, te
 use tokio::sync::Barrier;
 use tokio::time::{sleep, timeout};
 
+/// Mirrors the private `LIVENESS_FAILURE_THRESHOLD` in `p2p_endpoint.rs`: the
+/// number of consecutive ACK-v2 retry failures that force-close a half-dead
+/// connection. Kept in sync manually because the production constant is not
+/// part of the public surface.
+const LIVENESS_FAILURE_THRESHOLD_TEST: u32 = 5;
+
 fn ack_bucket(
     diagnostics: &AckDiagnosticsSnapshot,
     peer_id: PeerId,
@@ -281,6 +287,195 @@ async fn send_with_receive_ack_with_request_id_dedupes_duplicate_sends() {
         "duplicate request_id must not trigger a second recv() delivery, got {no_redelivery:?}"
     );
 
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}
+
+/// Empty-response duplicate-safe retry (transient mid-exchange drop).
+///
+/// Reproduces the intermittent production failure
+/// `invalid ACK-v2 response envelope: len=0`: the receiver accepts the
+/// ACK-v2 bidi request, admits the payload, and caches the `Accepted`
+/// outcome, but the response stream is reset/finished empty before the ACK
+/// envelope reaches the sender (the sender reads `len=0`).
+///
+/// WHY this matters (Rule 9): a single transient connection drop on the ACK
+/// response side must NOT fail the DM. Because ACK-v2 dedupes on the request
+/// id, the duplicate-safe retry replays the cached `Accepted` and the send
+/// succeeds — without redelivering the payload. Before the fix, the sender's
+/// retry gate only retried `AckTimeout`, so the empty response surfaced as a
+/// hard `EndpointError::Connection("invalid ACK-v2 response envelope: len=0")`
+/// and x0x mapped it to a hard `ConnectionFailed`. This test fails on the
+/// pre-fix code (the send returns that error) and passes after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_with_receive_ack_retries_transient_empty_response_via_dedupe() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    // Drop exactly ONE ACK-v2 response: the first attempt's response vanishes
+    // (sender reads len=0), the duplicate-safe retry's replayed response gets
+    // through.
+    receiver.inject_ack_response_drops_for_testing(1);
+
+    let start = Instant::now();
+    sender
+        .send_with_receive_ack(
+            &receiver_id,
+            b"transient empty-response payload",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("send must succeed via the duplicate-safe retry after a transient empty response");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the empty response must trigger an immediate retry, not wait for the ACK timeout"
+    );
+
+    // The payload must be delivered to recv() EXACTLY ONCE: the first attempt
+    // admitted it; the retry was replayed from the dedupe cache and must not
+    // redeliver.
+    let (peer_id, payload) = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv result");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(payload, b"transient empty-response payload");
+
+    let no_redelivery = timeout(Duration::from_millis(500), receiver.recv()).await;
+    assert!(
+        no_redelivery.is_err(),
+        "the retried (deduped) request must not trigger a second recv() delivery, got {no_redelivery:?}"
+    );
+
+    // Diagnostics encode the retry path: a first-attempt empty response, a
+    // retry attempt, and a retry that succeeded.
+    let sender_diagnostics = sender.ack_diagnostics();
+    let sender_bucket = ack_bucket(&sender_diagnostics, receiver_id);
+    assert!(
+        sender_bucket.outcomes.sender_response_incomplete >= 1,
+        "first attempt must record an empty-response outcome, got {:?}",
+        sender_bucket.outcomes
+    );
+    assert!(
+        sender_bucket.outcomes.sender_retry_attempted >= 1,
+        "the empty response must trigger a duplicate-safe retry, got {:?}",
+        sender_bucket.outcomes
+    );
+    assert!(
+        sender_bucket.outcomes.sender_retry_accepted >= 1,
+        "the retry must be accepted via the receiver's dedupe replay, got {:?}",
+        sender_bucket.outcomes
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    accept_sender.abort();
+    accept_receiver.abort();
+}
+
+/// Persistent empty responses still surface an error and force-close the
+/// half-dead connection — the bounded retry does not loop forever.
+///
+/// WHY this matters (Rule 9): the empty-response retry must be bounded. A
+/// peer that keeps dropping the ACK response (first attempt AND the replayed
+/// retry) must (a) surface `EndpointError::AckResponseIncomplete` rather than
+/// spinning, and (b) be detected as half-dead by the X0X-0062 liveness path,
+/// which force-closes the connection after `LIVENESS_FAILURE_THRESHOLD` (5)
+/// consecutive retry failures. This guards against turning the new retry into
+/// an infinite loop or a way to mask a genuinely dead peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_with_receive_ack_surfaces_persistent_empty_response_and_closes_half_dead() {
+    let _guard = test_guard().await;
+
+    let receiver = make_node(vec![]).await;
+    let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
+    let receiver_id = receiver.peer_id();
+    let accept_receiver = spawn_accept_loop(receiver.clone());
+
+    let sender = make_node(vec![receiver_addr]).await;
+    let accept_sender = spawn_accept_loop(sender.clone());
+
+    sender
+        .connect_addr(receiver_addr)
+        .await
+        .expect("initial connect");
+    sleep(Duration::from_millis(150)).await;
+
+    // Drain the receiver so admitted payloads never backpressure (each first
+    // attempt admits the payload before its response is dropped).
+    let drain_receiver = receiver.clone();
+    let drain = tokio::spawn(async move { while drain_receiver.recv().await.is_ok() {} });
+
+    // Drop EVERY ACK-v2 response from here on: both the first attempt and the
+    // replayed retry fail, so every send exhausts its bounded retry.
+    receiver.inject_ack_response_drops_for_testing(usize::MAX);
+
+    // First send must surface the transient-drop error after the bounded retry
+    // (one first attempt + one retry), not loop forever.
+    let start = Instant::now();
+    let err = sender
+        .send_with_receive_ack(
+            &receiver_id,
+            b"persistent empty-response payload",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("persistent empty responses must surface an error after the bounded retry");
+    assert!(
+        matches!(err, EndpointError::AckResponseIncomplete),
+        "expected AckResponseIncomplete after exhausting the bounded retry, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the bounded retry must return promptly (no infinite loop / no full timeout wait)"
+    );
+
+    // Keep sending until the half-dead liveness path force-closes the
+    // connection. Each call contributes one retry failure;
+    // LIVENESS_FAILURE_THRESHOLD (5) consecutive failures trip the close.
+    for _ in 0..LIVENESS_FAILURE_THRESHOLD_TEST {
+        let _ = sender
+            .send_with_receive_ack(
+                &receiver_id,
+                b"persistent empty-response payload",
+                Duration::from_secs(5),
+            )
+            .await;
+    }
+
+    // The force-close runs in a detached task; poll until the sender drops the
+    // connection.
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            if !sender.is_connected(&receiver_id).await {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the half-dead connection must be force-closed after {LIVENESS_FAILURE_THRESHOLD_TEST} consecutive retry failures"
+    );
+
+    drain.abort();
     sender.shutdown().await;
     receiver.shutdown().await;
     accept_sender.abort();
