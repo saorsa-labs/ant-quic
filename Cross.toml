@@ -36,6 +36,11 @@ pre-build = [
 [target.aarch64-unknown-linux-gnu.env]
 passthrough = [
     "PKG_CONFIG_ALLOW_CROSS=1",
+    # Give the emulated test binary a writable cache dir. Without this the
+    # container has no writable TMPDIR/HOME, so default_cache_dir() falls back
+    # to a read-only path and BootstrapCache::open() fails with EACCES,
+    # panicking every endpoint-constructing test (see bootstrap_cache::config).
+    "TMPDIR=/tmp",
 ]
 
 # ARM64 MUSL static builds
