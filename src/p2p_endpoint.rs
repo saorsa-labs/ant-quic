@@ -2102,6 +2102,9 @@ fn endpoint_error_from_read_to_end_error(
         crate::high_level::ReadToEndError::TooLong => {
             EndpointError::Connection("ACK-v2 response too long".to_string())
         }
+        crate::high_level::ReadToEndError::MissingData => {
+            EndpointError::Connection("stream ended with undelivered data ranges".to_string())
+        }
     }
 }
 
