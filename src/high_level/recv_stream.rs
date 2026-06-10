@@ -781,17 +781,23 @@ mod tests {
         assert!(assemble_unordered_chunks(&mut chunks, 0, 10_706).is_none());
     }
 
+    /// Overlaps are benign duplicate delivery (e.g. across the
+    /// ordered->unordered transition) — the overlapping prefix is skipped
+    /// and assembly succeeds with each byte appearing exactly once. Only
+    /// gaps (missing data) are fatal.
     #[test]
-    fn assemble_rejects_overlapping_chunks() {
+    fn assemble_tolerates_overlapping_chunks() {
         let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
         let mut chunks = chunks_of(&payload, &[(0, 2048), (1024, 4096)]);
-        assert!(assemble_unordered_chunks(&mut chunks, 0, 4096).is_none());
+        let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("overlap is benign");
+        assert_eq!(buffer, payload);
     }
 
     #[test]
-    fn assemble_rejects_duplicate_chunk() {
+    fn assemble_tolerates_duplicate_chunk() {
         let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
         let mut chunks = chunks_of(&payload, &[(0, 2048), (0, 2048), (2048, 4096)]);
-        assert!(assemble_unordered_chunks(&mut chunks, 0, 4096).is_none());
+        let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("duplicate is benign");
+        assert_eq!(buffer, payload);
     }
 }
