@@ -655,6 +655,156 @@ mod test {
         assert_eq!(x.read(3, false), None);
     }
 
+    /// Models the `read_to_end` contract end to end at the assembler layer.
+    ///
+    /// `ReadToEnd` performs unordered reads and, once the connection layer signals
+    /// end-of-stream (`Chunks::next` gate: `bytes_read == final_size`), assembles the
+    /// chunks by offset into a zero-initialized buffer. Any range the assembler counted
+    /// as read but never yielded ships to the application as zeros inside `Ok` — a
+    /// silent data-integrity failure (observed in the wild as 2×1448-byte zero gaps).
+    ///
+    /// This test replays randomized but deterministic frame schedules — duplicates,
+    /// coalesced/resegmented retransmissions, arbitrary overlaps, reordering, and reads
+    /// interleaved at random points (including the ordered→unordered transition at the
+    /// first read) — and asserts the contract: every byte is yielded exactly once with
+    /// correct content, and the end-of-stream gate never fires while data is missing.
+    #[test]
+    fn read_to_end_contract_random_schedules() {
+        use rand::{Rng, SeedableRng};
+
+        const PACKET: usize = 1448;
+        for seed in 0..4096u64 {
+            let mut rng = rand_pcg::Pcg64Mcg::seed_from_u64(seed);
+            let n: usize = rng.gen_range(2 * PACKET..12 * PACKET);
+            let payload: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+
+            enum Ev {
+                Insert { offset: usize, len: usize },
+                Read,
+                Defrag,
+            }
+
+            // Base segmentation at packet-sized boundaries, each frame delivered once
+            let mut inserts: Vec<(usize, usize)> = Vec::new();
+            let mut off = 0;
+            while off < n {
+                let end = (off + PACKET).min(n);
+                inserts.push((off, end - off));
+                off = end;
+            }
+            // Retransmission variants: duplicates, coalesced 2-packet frames,
+            // subranges, and arbitrarily misaligned overlaps
+            let base = inserts.clone();
+            for &(s, l) in &base {
+                if rng.gen_bool(0.6) {
+                    match rng.gen_range(0..4u32) {
+                        0 => inserts.push((s, l)),
+                        1 => {
+                            let end = (s + 2 * PACKET).min(n);
+                            inserts.push((s, end - s));
+                        }
+                        2 => {
+                            let ds = rng.gen_range(0..l);
+                            let dl = rng.gen_range(1..=l - ds);
+                            inserts.push((s + ds, dl));
+                        }
+                        _ => {
+                            let rs = rng.gen_range(s.saturating_sub(PACKET)..(s + l).min(n - 1));
+                            let rl = rng.gen_range(1..=(n - rs).min(2 * PACKET));
+                            inserts.push((rs, rl));
+                        }
+                    }
+                }
+            }
+            // Shuffle delivery order (Fisher-Yates)
+            for i in (1..inserts.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                inserts.swap(i, j);
+            }
+            let mut events: Vec<Ev> = Vec::new();
+            for (offset, len) in inserts {
+                events.push(Ev::Insert { offset, len });
+                if rng.gen_bool(0.35) {
+                    events.push(Ev::Read);
+                }
+                if rng.gen_bool(0.05) {
+                    events.push(Ev::Defrag);
+                }
+            }
+            events.push(Ev::Read);
+
+            let mut x = Assembler::new();
+            // (offset, len) of every chunk yielded to the "application"
+            let mut yielded: Vec<(u64, u64)> = Vec::new();
+
+            let verify = |yielded: &mut Vec<(u64, u64)>, gate_fired: bool, seed: u64| {
+                yielded.sort_unstable();
+                let mut pos = 0u64;
+                let mut covered = 0u64;
+                for &(s, l) in yielded.iter() {
+                    assert!(
+                        s >= pos,
+                        "seed {seed}: range [{s}, {}) overlaps previously yielded data \
+                         (double-yield inflates bytes_read)",
+                        s + l
+                    );
+                    pos = s + l;
+                    covered += l;
+                }
+                if gate_fired {
+                    assert_eq!(
+                        covered, n as u64,
+                        "seed {seed}: end-of-stream gate fired with unyielded ranges — \
+                         read_to_end would return zero-filled gaps"
+                    );
+                }
+            };
+
+            for ev in events {
+                match ev {
+                    Ev::Insert { offset, len } => {
+                        let bytes = Bytes::copy_from_slice(&payload[offset..offset + len]);
+                        let alloc = if rng.gen_bool(0.3) {
+                            len + rng.gen_range(0..200)
+                        } else {
+                            len
+                        };
+                        x.insert(offset as u64, bytes, alloc);
+                    }
+                    Ev::Defrag => x.defragment(),
+                    Ev::Read => {
+                        x.ensure_ordering(false).unwrap();
+                        while let Some(chunk) = x.read(usize::MAX, false) {
+                            let s = chunk.offset as usize;
+                            let e = s + chunk.bytes.len();
+                            assert!(
+                                e <= n,
+                                "seed {seed}: chunk [{s}, {e}) exceeds stream size {n}"
+                            );
+                            assert_eq!(
+                                &chunk.bytes[..],
+                                &payload[s..e],
+                                "seed {seed}: chunk content at [{s}, {e}) does not match payload"
+                            );
+                            yielded.push((chunk.offset, chunk.bytes.len() as u64));
+                        }
+                        // This is the end-of-stream gate from `Chunks::next`
+                        let gate_fired = x.bytes_read() == n as u64;
+                        verify(&mut yielded, gate_fired, seed);
+                    }
+                }
+            }
+
+            // All frames were delivered: the stream must complete with full coverage
+            assert_eq!(
+                x.bytes_read(),
+                n as u64,
+                "seed {seed}: stream stalled — all data inserted but end-of-stream gate never fired"
+            );
+            verify(&mut yielded, true, seed);
+        }
+    }
+
     fn next_unordered(x: &mut Assembler) -> Chunk {
         x.read(usize::MAX, false).unwrap()
     }

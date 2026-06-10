@@ -259,10 +259,16 @@ impl RecvStream {
     /// all data read. Uses unordered reads to be more efficient than using `AsyncRead` would
     /// allow. `size_limit` should be set to limit worst-case memory use.
     ///
-    /// If unordered reads have already been made, the resulting buffer may have gaps containing
-    /// arbitrary data.
+    /// The returned buffer is guaranteed to be contiguous stream data: if any range between the
+    /// first and last byte this call observed was consumed elsewhere and never delivered (for
+    /// example by an earlier `read_to_end` future that was dropped mid-read, or by prior
+    /// unordered reads), this fails with [`ReadToEndError::MissingData`] instead of silently
+    /// filling the holes.
     ///
-    /// This operation is *not* cancel-safe.
+    /// This operation is *not* cancel-safe: dropping the returned future after it has consumed
+    /// stream data discards that data irrecoverably. A subsequent `read_to_end` returns the
+    /// remaining contiguous data, or fails with [`ReadToEndError::MissingData`] if the discard
+    /// left a hole in what it observes.
     ///
     /// `ReadToEndError::TooLong`: Error returned when size limit is exceeded
     pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
@@ -467,16 +473,50 @@ impl Future for ReadToEnd<'_> {
                         // Never received anything
                         return Poll::Ready(Ok(Vec::new()));
                     }
-                    let start = self.start;
-                    let mut buffer = vec![0; (self.end - start) as usize];
-                    for (data, offset) in self.read.drain(..) {
-                        let offset = (offset - start) as usize;
-                        buffer[offset..offset + data.len()].copy_from_slice(&data);
-                    }
-                    return Poll::Ready(Ok(buffer));
+                    let (start, end) = (self.start, self.end);
+                    return match assemble_unordered_chunks(&mut self.read, start, end) {
+                        Some(buffer) => Poll::Ready(Ok(buffer)),
+                        // End-of-stream was signaled but ranges in [start, end)
+                        // were consumed elsewhere (e.g. by a dropped earlier
+                        // read) and can never be re-read. Fail loud rather
+                        // than fabricate zero-filled bytes.
+                        None => Poll::Ready(Err(ReadToEndError::MissingData)),
+                    };
                 }
             }
         }
+    }
+}
+
+/// Assemble unordered chunks into a contiguous buffer
+///
+/// Returns `None` unless the chunks tile `[start, end)` exactly — each byte
+/// present once, with no gaps and no overlaps. A `None` means part of the
+/// stream was consumed but never delivered to this reader; zero-filling the
+/// holes (the previous behavior) would silently corrupt the result.
+fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) -> Option<Vec<u8>> {
+    chunks.sort_unstable_by_key(|&(_, offset)| offset);
+    let mut buffer = Vec::with_capacity((end - start) as usize);
+    for (data, offset) in chunks.iter() {
+        let expected = start + buffer.len() as u64;
+        if *offset > expected {
+            // Gap: a range in [start, end) was consumed but never delivered
+            // to this reader. Zero-filling it (the previous behavior) would
+            // silently corrupt the result.
+            return None;
+        }
+        // Benign overlap (duplicate delivery, e.g. across the
+        // ordered->unordered transition): skip the already-assembled prefix.
+        let skip = (expected - *offset) as usize;
+        if skip < data.len() {
+            buffer.extend_from_slice(&data[skip..]);
+        }
+    }
+    // `end` is the maximum chunk end, so full coverage always lands on it
+    if start + buffer.len() as u64 == end {
+        Some(buffer)
+    } else {
+        None
     }
 }
 
@@ -489,6 +529,15 @@ pub enum ReadToEndError {
     /// The stream is larger than the user-supplied limit
     #[error("stream too long")]
     TooLong,
+    /// The stream ended, but ranges of it were consumed and never delivered to this call
+    ///
+    /// Returning a buffer would require fabricating the missing bytes (previously they were
+    /// silently zero-filled — a data-integrity hazard for consumers without payload checksums).
+    /// This happens after an earlier `read_to_end` future on this stream was dropped mid-read
+    /// (`read_to_end` is not cancel-safe), or when prior unordered reads left a hole between
+    /// the chunks this call observed.
+    #[error("stream ended with undelivered data ranges")]
+    MissingData,
 }
 
 impl tokio::io::AsyncRead for RecvStream {
@@ -689,5 +738,66 @@ impl Future for ReadChunks<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.stream.poll_read_chunks(cx, this.bufs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunks_of(payload: &[u8], ranges: &[(usize, usize)]) -> Vec<(Bytes, u64)> {
+        ranges
+            .iter()
+            .map(|&(start, end)| (Bytes::copy_from_slice(&payload[start..end]), start as u64))
+            .collect()
+    }
+
+    #[test]
+    fn assemble_accepts_exact_tiling_in_any_order() {
+        let payload: Vec<u8> = (0..10_706).map(|i| (i % 250 + 1) as u8).collect();
+        let mut chunks = chunks_of(&payload, &[(4344, 10_706), (0, 1448), (1448, 4344)]);
+        let buffer =
+            assemble_unordered_chunks(&mut chunks, 0, 10_706).expect("exact tiling must assemble");
+        assert_eq!(buffer, payload);
+    }
+
+    #[test]
+    fn assemble_accepts_nonzero_start() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
+        let mut chunks = chunks_of(&payload, &[(2048, 4096), (1024, 2048)]);
+        let buffer = assemble_unordered_chunks(&mut chunks, 1024, 4096)
+            .expect("suffix tiling must assemble");
+        assert_eq!(buffer, &payload[1024..]);
+    }
+
+    /// The captured corruption geometry: a 10,706-byte message whose range
+    /// [1085, 3981) (2×1448 bytes) was consumed by a dropped reader. The old
+    /// code shipped this as `Ok` with the hole zero-filled; it must now be
+    /// rejected.
+    #[test]
+    fn assemble_rejects_captured_zero_gap_geometry() {
+        let payload: Vec<u8> = (0..10_706).map(|i| (i % 250 + 1) as u8).collect();
+        let mut chunks = chunks_of(&payload, &[(0, 1085), (3981, 10_706)]);
+        assert!(assemble_unordered_chunks(&mut chunks, 0, 10_706).is_none());
+    }
+
+    /// Overlaps are benign duplicate delivery (e.g. across the
+    /// ordered->unordered transition) — the overlapping prefix is skipped
+    /// and assembly succeeds with each byte appearing exactly once. Only
+    /// gaps (missing data) are fatal.
+    #[test]
+    fn assemble_tolerates_overlapping_chunks() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
+        let mut chunks = chunks_of(&payload, &[(0, 2048), (1024, 4096)]);
+        let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("overlap is benign");
+        assert_eq!(buffer, payload);
+    }
+
+    #[test]
+    fn assemble_tolerates_duplicate_chunk() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
+        let mut chunks = chunks_of(&payload, &[(0, 2048), (0, 2048), (2048, 4096)]);
+        let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("duplicate is benign");
+        assert_eq!(buffer, payload);
     }
 }
