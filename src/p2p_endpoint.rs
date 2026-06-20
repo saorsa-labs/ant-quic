@@ -2834,7 +2834,7 @@ impl P2pEndpoint {
         )
         .await
         {
-            Ok((transport, dual_socket)) => {
+            Ok((_transport, dual_socket)) => {
                 let (v4_addr, v6_addr) = dual_socket.local_addrs();
                 info!(
                     "Bound dual-socket: IPv4={}, IPv6={} (true dual-stack, separate sockets)",
@@ -2850,10 +2850,12 @@ impl P2pEndpoint {
                     EndpointError::Config(format!("Failed to get local address: {e}"))
                 })?;
 
-                // Create transport registry
+                // Create transport registry. Do not register the QUIC UDP socket
+                // itself: the high-level endpoint owns that socket directly, and
+                // retaining a registry clone would keep a fixed bind port alive
+                // after `shutdown()` in long-lived embedding processes.
                 let mut transport_registry = config.transport_registry.clone();
                 crate::transport::register_best_effort_transports(&mut transport_registry).await;
-                transport_registry.register(Arc::new(transport));
 
                 nat_config.transport_registry = Some(Arc::new(transport_registry));
                 nat_config.bind_addr = Some(actual_bind_addr);
@@ -2894,7 +2896,7 @@ impl P2pEndpoint {
                     .and_then(|addr| addr.as_socket_addr())
                     .unwrap_or(dual_stack_default);
 
-                let (transport, quinn_socket) =
+                let (_transport, quinn_socket) =
                     match crate::transport::UdpTransport::bind_for_quinn(bind_addr).await {
                         Ok(result) => result,
                         Err(e2) if bind_addr == dual_stack_default => {
@@ -2928,9 +2930,12 @@ impl P2pEndpoint {
                     }
                 );
 
+                // Do not register the QUIC UDP socket itself: the high-level
+                // endpoint owns that socket directly, and retaining a registry
+                // clone would keep a fixed bind port alive after `shutdown()` in
+                // long-lived embedding processes.
                 let mut transport_registry = config.transport_registry.clone();
                 crate::transport::register_best_effort_transports(&mut transport_registry).await;
-                transport_registry.register(Arc::new(transport));
 
                 nat_config.transport_registry = Some(Arc::new(transport_registry));
                 nat_config.bind_addr = Some(actual_bind_addr);
@@ -10757,24 +10762,24 @@ mod tests {
     async fn test_p2p_endpoint_stores_transport_registry() {
         use crate::transport::TransportType;
 
-        // Build config with default transport providers
-        // Phase 5.3: P2pEndpoint::new() always adds a shared UDP transport
+        // Build config with default transport providers. The QUIC UDP socket is
+        // owned by the high-level endpoint, not retained as a registry provider,
+        // so shutdown can release fixed bind ports.
         let config = P2pConfig::builder().build().expect("valid config");
 
         // Create endpoint
         let result = P2pEndpoint::new(config).await;
 
-        // Verify registry is accessible and contains the auto-added UDP provider
+        // Verify registry is accessible but does not retain the QUIC UDP socket.
         if let Ok(endpoint) = result {
             let registry = endpoint.transport_registry();
-            // Phase 5.3: Registry now always has at least 1 UDP provider (socket sharing)
-            assert!(
-                !registry.is_empty(),
-                "Registry should have at least 1 provider"
-            );
-
             let udp_providers = registry.providers_by_type(TransportType::Udp);
-            assert_eq!(udp_providers.len(), 1, "Should have 1 UDP provider");
+            assert_eq!(
+                udp_providers.len(),
+                0,
+                "QUIC UDP socket should not be retained by the transport registry"
+            );
+            endpoint.shutdown().await;
         }
         // Note: endpoint creation may fail in test environment without network
     }
@@ -10787,20 +10792,82 @@ mod tests {
         // Create endpoint
         let result = P2pEndpoint::new(config).await;
 
-        // Phase 5.3: Default registry now includes a shared UDP transport
-        // This is required for socket sharing with Quinn
+        // The default registry may be empty: the QUIC UDP socket is owned by
+        // the high-level endpoint so explicit shutdown can release it.
         if let Ok(endpoint) = result {
             let registry = endpoint.transport_registry();
             assert!(
-                !registry.is_empty(),
-                "Default registry should have UDP for socket sharing"
+                !registry.has_quic_capable_transport(),
+                "Default registry should not retain the QUIC UDP socket"
             );
-            assert!(
-                registry.has_quic_capable_transport(),
-                "Default registry should have QUIC-capable transport"
-            );
+            endpoint.shutdown().await;
         }
         // Note: endpoint creation may fail in test environment without network
+    }
+
+    fn allocate_loopback_port() -> SocketAddr {
+        let probe = std::net::UdpSocket::bind(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
+            .expect("allocate probe port");
+        let requested_addr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+        requested_addr
+    }
+
+    async fn fixed_port_endpoint(requested_addr: SocketAddr) -> P2pEndpoint {
+        let config = P2pConfig::builder()
+            .bind_addr(requested_addr)
+            .port_mapping_enabled(false)
+            .build()
+            .expect("valid config");
+
+        P2pEndpoint::new(config).await.expect("endpoint starts")
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_udp_socket_for_same_process_rebind() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let local_addr = endpoint.local_addr().expect("endpoint local addr");
+
+        endpoint.shutdown().await;
+
+        let rebound = std::net::UdpSocket::bind(local_addr);
+        assert!(
+            rebound.is_ok(),
+            "shutdown should release {local_addr} for immediate same-process rebind while endpoint handle remains alive: {rebound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_multiple_fixed_udp_sockets_and_is_idempotent() {
+        let first = fixed_port_endpoint(allocate_loopback_port()).await;
+        let second = fixed_port_endpoint(allocate_loopback_port()).await;
+        let first_addr = first.local_addr().expect("first endpoint local addr");
+        let second_addr = second.local_addr().expect("second endpoint local addr");
+
+        assert!(
+            std::net::UdpSocket::bind(first_addr).is_err(),
+            "first fixed port should be held during steady state"
+        );
+        assert!(
+            std::net::UdpSocket::bind(second_addr).is_err(),
+            "second fixed port should be held during steady state"
+        );
+
+        first.shutdown().await;
+        first.shutdown().await;
+        second.shutdown().await;
+        second.shutdown().await;
+
+        let first_rebound = std::net::UdpSocket::bind(first_addr);
+        let second_rebound = std::net::UdpSocket::bind(second_addr);
+        assert!(
+            first_rebound.is_ok(),
+            "first fixed port should be immediately rebindable after idempotent shutdown: {first_rebound:?}"
+        );
+        assert!(
+            second_rebound.is_ok(),
+            "second fixed port should be immediately rebindable after idempotent shutdown: {second_rebound:?}"
+        );
     }
 
     #[tokio::test]

@@ -7824,6 +7824,11 @@ impl NatTraversalEndpoint {
             {
                 info!("wait_idle timed out during shutdown, proceeding");
             }
+
+            #[cfg(not(wasm_browser))]
+            if let Err(error) = endpoint.release_socket_for_shutdown() {
+                warn!(%error, "failed to release endpoint UDP socket during shutdown");
+            }
         }
 
         // Wait for transport listener tasks to complete
