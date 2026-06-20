@@ -436,6 +436,61 @@ impl Endpoint {
             .local_addr()
     }
 
+    /// Replace the endpoint's UDP socket with an ephemeral loopback socket.
+    ///
+    /// This is used during explicit shutdown to synchronously release the
+    /// externally visible bind port while the `Endpoint` handle itself may stay
+    /// alive in an embedding process. Unlike `rebind_abstract`, this deliberately
+    /// clears `prev_socket` so the old socket is dropped immediately rather than
+    /// retained until migration traffic arrives on the replacement socket.
+    #[cfg(not(wasm_browser))]
+    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<()> {
+        let (old_addr, runtime) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
+            if state.socket_released_for_shutdown {
+                return Ok(());
+            }
+            (state.socket.local_addr()?, state.runtime.clone())
+        };
+
+        let replacement_addr = if old_addr.is_ipv6() {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0))
+        } else {
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))
+        };
+
+        let replacement = std::net::UdpSocket::bind(replacement_addr).or_else(|first_error| {
+            if old_addr.is_ipv6() {
+                let fallback_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+                std::net::UdpSocket::bind(fallback_addr)
+            } else {
+                Err(first_error)
+            }
+        })?;
+        replacement.set_nonblocking(true)?;
+        let replacement = runtime.wrap_udp_socket(replacement)?;
+        let replacement_addr = replacement.local_addr()?;
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
+        if state.socket_released_for_shutdown {
+            return Ok(());
+        }
+        state.prev_socket = None;
+        state.socket = replacement;
+        state.ipv6 = replacement_addr.is_ipv6();
+        state.socket_released_for_shutdown = true;
+
+        Ok(())
+    }
+
     /// Get the number of connections that are currently open
     pub fn open_connections(&self) -> usize {
         self.inner
@@ -681,6 +736,7 @@ pub(crate) struct State {
     stats: EndpointStats,
     /// Channel for forwarding peer address updates to the upper layer.
     peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
+    socket_released_for_shutdown: bool,
 }
 
 #[derive(Debug)]
@@ -934,6 +990,7 @@ impl EndpointRef {
                 runtime,
                 stats: EndpointStats::default(),
                 peer_address_update_tx: None,
+                socket_released_for_shutdown: false,
             }),
         }))
     }

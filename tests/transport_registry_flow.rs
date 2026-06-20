@@ -74,19 +74,20 @@ async fn test_transport_registry_flows_from_node_config_to_p2p_endpoint() {
         !registry.is_empty(),
         "Registry should not be empty after wiring"
     );
-    // The registry contains our externally-registered provider PLUS the internal
-    // UDP transport created by P2pEndpoint for Quinn socket sharing.
+    // The registry contains externally-registered providers only. The QUIC UDP
+    // socket is owned by the high-level endpoint and is deliberately not exposed
+    // as a registry provider, so explicit shutdown can release fixed bind ports.
     assert_eq!(
         registry.len(),
-        2,
-        "Registry should have 2 providers (internal + external)"
+        1,
+        "Registry should have 1 external provider"
     );
 
     let udp_providers = registry.providers_by_type(TransportType::Udp);
     assert_eq!(
         udp_providers.len(),
-        2,
-        "Should have 2 UDP providers (internal + external)"
+        1,
+        "Should have 1 external UDP provider"
     );
 
     // Cleanup
@@ -126,12 +127,13 @@ async fn test_multiple_transport_providers_flow() {
         .await
         .expect("Node::with_config should succeed");
 
-    // Verify both providers are in the registry (+ the internal UDP transport = 3 total)
+    // Verify both externally configured providers are in the registry. The
+    // endpoint-owned QUIC UDP socket is intentionally not retained here.
     let registry = node.transport_registry();
     assert_eq!(
         registry.len(),
-        3,
-        "Registry should have 3 providers (internal + 2 external)"
+        2,
+        "Registry should have 2 external providers"
     );
 
     node.shutdown().await;
