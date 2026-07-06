@@ -203,6 +203,31 @@ pub(crate) const APP_BIDI_STREAM_MAGIC: &[u8; 8] = b"ANQAppB1";
 /// same connection.
 const APP_BIDI_CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum time the reader task will wait for the 8-byte bidi stream prefix.
+///
+/// DoS guard: an authenticated peer could open a bidirectional stream and then
+/// never write the prefix, stalling the reader task (and with it that
+/// connection's `recv`, ACK-v2 handling, and shutdown cancel-check). The prefix
+/// is always the opener's first write, so a healthy peer delivers it within a
+/// round trip; this bound frees the reader if it never arrives, resetting the
+/// half-opened stream so the opener observes backpressure. Generous enough to
+/// absorb slow or congested links. Shortened under `cfg(test)` so the guard is
+/// exercisable without slowing the suite.
+const BIDI_PREFIX_READ_TIMEOUT: Duration = if cfg!(test) {
+    // Under test (and CI) the runtime can be starved by many concurrent test
+    // processes, so allow more grace than the unit value would suggest while
+    // still keeping the DoS-regression test fast.
+    Duration::from_millis(2000)
+} else {
+    Duration::from_secs(10)
+};
+
+// The reader reads exactly `ACK_BIDI_REQUEST_MAGIC.len()` bytes as the bidi
+// prefix and then compares it against `APP_BIDI_STREAM_MAGIC`. The two magics
+// MUST be the same length or the app comparison would read the wrong byte
+// window. This compile-time assertion keeps that invariant locked.
+const _: () = assert!(APP_BIDI_STREAM_MAGIC.len() == ACK_BIDI_REQUEST_MAGIC.len());
+
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
 /// Free-slot fraction (of capacity) at or below which a data-channel
@@ -7500,12 +7525,15 @@ impl P2pEndpoint {
         ),
         EndpointError,
     > {
-        if self.shutdown.is_cancelled() {
-            return Err(EndpointError::ShuttingDown);
-        }
-
         let mut rx = self.app_bi_rx.lock().await;
+        // Biased select: `rx.recv()` is polled first and resolves instantly
+        // when a handle is already queued, so already-buffered app streams are
+        // drained before the shutdown signal wins. Only when the queue is
+        // empty does shutdown fire — matching the documented "drains the
+        // queue" contract. When the last sender is dropped, `rx.recv()` returns
+        // `None` (also `ShuttingDown`).
         tokio::select! {
+            biased;
             item = rx.recv() => match item {
                 Some(stream) => Ok(stream),
                 None => Err(EndpointError::ShuttingDown),
@@ -8608,15 +8636,35 @@ impl P2pEndpoint {
                 };
 
                 let mut recv_stream = match incoming {
-                    IncomingStream::AckBidi { send, mut recv } => {
+                    IncomingStream::AckBidi { mut send, mut recv } => {
                         let accepted_at = Instant::now();
                         let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
-                        if let Err(e) = recv.read_exact(&mut prefix).await {
-                            debug!(
-                                "Reader task for peer {:?} (conn stable_id={}): bidi prefix read error: {}",
-                                peer_id, conn_stable_id, e
-                            );
-                            continue;
+                        match timeout(BIDI_PREFIX_READ_TIMEOUT, recv.read_exact(&mut prefix)).await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                debug!(
+                                    "Reader task for peer {:?} (conn stable_id={}): bidi prefix read error: {}",
+                                    peer_id, conn_stable_id, e
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                // DoS guard (BIDI_PREFIX_READ_TIMEOUT): the peer
+                                // opened a bidirectional stream but never sent
+                                // the 8-byte prefix. Reset it so the opener
+                                // observes backpressure and move on — without
+                                // this the reader task would block forever,
+                                // freezing this connection's recv / ACK-v2 /
+                                // shutdown handling.
+                                let _ = send.reset(crate::VarInt::from_u32(0));
+                                debug!(
+                                    "Reader task for peer {:?} (conn stable_id={}): \
+                                     bidi prefix read timed out after {:?}; resetting stream",
+                                    peer_id, conn_stable_id, BIDI_PREFIX_READ_TIMEOUT
+                                );
+                                continue;
+                            }
                         }
 
                         if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
@@ -12497,5 +12545,73 @@ mod tests {
         // Verify transport address is preserved
         assert_eq!(conn.remote_addr, TransportAddr::Udp(socket_addr));
         assert!(conn.authenticated);
+    }
+
+    /// DoS guard for `BIDI_PREFIX_READ_TIMEOUT`: a bidi stream opened with a
+    /// partial prefix must not freeze the reader task. After the prefix-read
+    /// timeout the reader resets the half-opened stream and continues, so a
+    /// subsequent application stream is still delivered to `accept_bi`.
+    #[tokio::test]
+    async fn reader_recovers_from_prefix_starvation() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        // Open a bidi stream on a's connection and write only 4 of the 8
+        // prefix bytes, then hold the stream open. b's reader task reads the 4
+        // bytes and blocks on `read_exact(8)` for the remaining 4 — without the
+        // timeout guard this would freeze the reader (and the connection's
+        // recv / ACK-v2 / shutdown handling) forever.
+        let conn = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection")
+            .expect("a is connected to b");
+        let (mut starved_send, _starved_recv) = conn.open_bi().await.expect("raw open_bi");
+        starved_send
+            .write_all(&[0u8; 4])
+            .await
+            .expect("partial prefix write");
+
+        // Wait beyond the prefix-read timeout so the reader resets the starved
+        // stream and re-enters its accept loop.
+        tokio::time::sleep(BIDI_PREFIX_READ_TIMEOUT + Duration::from_millis(400)).await;
+
+        // The reader must have recovered: a real application stream (full
+        // `ANQAppB1` prefix) is delivered to `accept_bi`. If the reader were
+        // still frozen on the starved stream, this would time out.
+        let (mut send_a, _recv_a) = a.open_bi(&b_id).await.expect("open_bi after starvation");
+        let accepted = tokio::time::timeout(Duration::from_secs(5), b.accept_bi()).await;
+        assert!(
+            accepted.is_ok(),
+            "accept_bi did not yield the post-starvation app stream — reader froze"
+        );
+        send_a.finish().ok();
+        drop(starved_send);
+
+        a.shutdown().await;
+        b.shutdown().await;
     }
 }

@@ -35,6 +35,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+mod support;
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -86,6 +88,7 @@ async fn connected_pair() -> (Node, Node, ant_quic::PeerId, ant_quic::PeerId) {
 /// half-close. Exercises QUIC-native flow control (no intermediate buffer).
 #[tokio::test]
 async fn app_bidi_echo_loopback() {
+    let _g = support::test_guard().await;
     let (a, b, a_id, b_id) = connected_pair().await;
 
     let (mut send_a, mut recv_a) = a.open_bi(&b_id).await.expect("a.open_bi");
@@ -133,6 +136,7 @@ async fn app_bidi_echo_loopback() {
 /// the app stream.
 #[tokio::test]
 async fn app_bidi_concurrent_with_message_traffic() {
+    let _g = support::test_guard().await;
     let (a, b, a_id, b_id) = connected_pair().await;
 
     const MSG_COUNT: u32 = 32;
@@ -210,6 +214,7 @@ async fn app_bidi_concurrent_with_message_traffic() {
 /// app streams and nothing more.
 #[tokio::test]
 async fn accept_bi_never_yields_internal_stream() {
+    let _g = support::test_guard().await;
     let (a, b, a_id, b_id) = connected_pair().await;
 
     // Internal traffic category 1: ACK-v2 bidi streams (`ANQAckB3`).
@@ -277,6 +282,7 @@ async fn accept_bi_never_yields_internal_stream() {
 /// Minimal Node-level echo locking the documented public signature.
 #[tokio::test]
 async fn node_open_bi_accept_bi_smoke() {
+    let _g = support::test_guard().await;
     let (a, b, a_id, b_id) = connected_pair().await;
 
     let (mut send_a, mut recv_a) = a.open_bi(&b_id).await.expect("Node::open_bi");
