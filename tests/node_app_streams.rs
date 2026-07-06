@@ -40,8 +40,8 @@ mod support;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ant_quic::Node;
-use tokio::time::timeout;
+use ant_quic::{EndpointError, Node, NodeError};
+use tokio::time::{sleep, timeout};
 
 /// Coerce a node's bound local address to a reachable loopback socket addr.
 /// `Node::local_addr()` may report an unspecified IPv6 `[::]:port` (dual-stack
@@ -307,4 +307,114 @@ async fn node_open_bi_accept_bi_smoke() {
     let copied = b_echo.await.expect("node echo join");
     assert_eq!(copied, payload.len() as u64);
     assert_eq!(&echoed[..], payload, "node echo integrity");
+}
+
+/// Regression: `accept_bi` drains the internal queue before returning
+/// `ShuttingDown`.
+///
+/// When a remote peer opens bidi streams and the local endpoint is subsequently
+/// shut down with handles still buffered in `app_bi_tx`, `accept_bi` must yield
+/// every queued handle before the shutdown arm fires. The `biased;` keyword in
+/// `P2pEndpoint::accept_bi`'s `tokio::select!` enforces this ordering by always
+/// polling the queue arm first.
+///
+/// # Regression guard
+///
+/// Removing `biased;` makes the select choose randomly between the queue-drain
+/// arm and the shutdown arm whenever both are simultaneously ready (i.e. the
+/// queue is non-empty AND shutdown is cancelled). With `DRAIN_STREAMS = 8`
+/// handles queued, all 8 calls returning `Ok` before `ShuttingDown` requires
+/// the queue arm to win 8 consecutive coin-flips — probability ≈ (1/2)^8 =
+/// 0.4%. In other words, a `biased;` regression causes this test to fail on
+/// ~99.6% of CI runs.
+///
+/// # Synchronisation note
+///
+/// The test keeps the local `(SendStream, RecvStream)` pairs alive until after
+/// all assertions. `SendStream::drop()` schedules an implicit `finish()`, which
+/// is correct but creates a tiny window where the FIN could race with `b`'s
+/// reader task reading the 8-byte magic prefix. Keeping the streams live until
+/// after the drain eliminates this race without changing correctness.
+///
+/// A single "primer" stream is opened and confirmed via `b.accept_bi()` before
+/// the DRAIN_STREAMS batch. This rules out a startup race where `b.accept()`
+/// has not yet run (so no reader task exists), and provides a concrete proof
+/// that the QUIC + reader-task path is live before the drain batch is added
+/// to the queue.
+#[tokio::test]
+async fn accept_bi_drains_queue_before_shutting_down() {
+    let _g = support::test_guard().await;
+    let (a, b, _a_id, b_id) = connected_pair().await;
+
+    // `shutdown()` takes ownership of `self`, so clone before calling it.
+    // The clone shares the same Arc-wrapped inner endpoint, meaning the
+    // cancelled CancellationToken is visible on `b_drainer` after shutdown.
+    let b_drainer = b.clone();
+
+    // Number of app-stream handles to queue. See doc comment for the regression
+    // guard math.
+    const DRAIN_STREAMS: usize = 8;
+
+    // All streams (primer + test batch) are kept alive until after the drain
+    // assertions. This prevents `SendStream::drop()` from scheduling an
+    // implicit `finish()` before `b`'s reader task has had a chance to read
+    // the 8-byte stream magic.
+    let mut a_streams: Vec<_> = Vec::with_capacity(DRAIN_STREAMS + 1);
+
+    // Primer: open one stream and block until `b.accept_bi()` returns it.
+    // This is a hard synchronisation point: if it returns, then both
+    // `b.accept()` has run (reader task spawned) and the QUIC path from `a`
+    // to `b`'s `app_bi_tx` channel is confirmed live. Any subsequent stream
+    // opened by `a` will follow the same path.
+    a_streams.push(a.open_bi(&b_id).await.expect("primer open_bi"));
+    timeout(Duration::from_secs(5), b.accept_bi())
+        .await
+        .expect("primer timed out — b.accept() may not have run")
+        .expect("primer accept_bi error");
+
+    // With the reader task confirmed active, open DRAIN_STREAMS more streams.
+    // Each `open_bi` call writes the 8-byte magic prefix via `write_all` and
+    // returns synchronously once the bytes are in Quinn's send buffer. The
+    // reader task processes each stream independently (accept_bi + read_exact
+    // + try_send) in its own loop iterations.
+    for _ in 0..DRAIN_STREAMS {
+        a_streams.push(a.open_bi(&b_id).await.expect("open_bi"));
+    }
+
+    // Give `b`'s reader task time to forward all DRAIN_STREAMS handles into
+    // `app_bi_tx`. The primer confirmed the reader task is active; on loopback
+    // the forwarding is O(µs). 100 ms is a very conservative bound even under
+    // concurrent test load.
+    sleep(Duration::from_millis(100)).await;
+
+    // Trigger shutdown. This cancels the CancellationToken shared by `b` and
+    // `b_drainer`. Now, for the first DRAIN_STREAMS calls to `accept_bi`, both
+    // the queue arm and the shutdown arm of the internal select are
+    // simultaneously ready.
+    b.shutdown().await;
+
+    // All DRAIN_STREAMS handles must come back as `Ok` before `ShuttingDown`.
+    // With `biased;`, the queue arm is always polled first, so the drain is
+    // deterministic and immediate. Without `biased;`, each call is a coin-flip
+    // and this loop fails on ~99.6% of runs.
+    for i in 0..DRAIN_STREAMS {
+        match b_drainer.accept_bi().await {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "accept_bi[{i}] returned {e:?} before the queue was drained; \
+                 regression: `biased;` may be missing from the internal select"
+            ),
+        }
+    }
+
+    // With the queue empty and shutdown cancelled, the shutdown arm must fire
+    // on the very next call. (`rx.recv()` is not ready when the queue is empty,
+    // so `biased;` order makes no difference here — the shutdown arm wins.)
+    match b_drainer.accept_bi().await {
+        Err(NodeError::Endpoint(EndpointError::ShuttingDown)) => {}
+        other => panic!("expected ShuttingDown after full drain, got {other:?}"),
+    }
+
+    // Drop here so streams stay alive through all assertions above.
+    drop(a_streams);
 }
