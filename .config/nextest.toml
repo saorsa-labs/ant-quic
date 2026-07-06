@@ -1,0 +1,18 @@
+# nextest configuration for the ant-quic workspace.
+#
+# node_app_streams tests are serialised because they use `b.shutdown()`, which
+# sends QUIC Connection Close frames to every active connection. When these
+# tests run concurrently they can accidentally accumulate cross-test mDNS
+# connections that are then torn down by the shutdown, interfering with
+# neighbouring tests.
+#
+# This matches the original intent of `test_guard()` in tests/support/mod.rs,
+# which is a static tokio::Mutex that serialises within a single process but
+# has no effect across nextest's default process-per-test model.
+
+[test-groups]
+node-app-streams = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary_id(ant-quic::node_app_streams)"
+test-group = "node-app-streams"
