@@ -1,5 +1,35 @@
 # Autoresearch Ideas — ant-quic test coverage
 
+## ⚠️ Benchmark saturation finding (roundtrip_mean_ns) — DO NOT CHASE
+
+The autoresearch metric `roundtrip_mean_ns` (mean of 4 criterion benchmarks:
+`varint/create_small|medium|large` + `compare`) is **saturated at the hardware
+floor**. Further iterations on it are noise-chasing, not optimization.
+
+**Evidence (null control, 3 back-to-back runs, zero code changes):**
+- mean = 0.4477 ns, stdev = 0.0060 ns, spread = 0.0106 ns, CV = 1.3%
+- The 3 samples were 0.4546 / 0.4445 / 0.4440 ns — i.e. the run-to-run noise
+  (~0.01 ns) is the dominant signal; no plausible code gain can exceed it.
+
+**Why it is unimprovable (legitimately):**
+- `VarInt::from_u32` is `const fn Self(x as u64)` — a single zero-extending
+  `MOV`, already cross-crate inlined because `[profile.release] lto = "thin"`
+  applies to `cargo bench`. No headroom.
+- `compare` is the derived `PartialOrd` on a single `u64` field — a single
+  `CMP`. No headroom.
+- The ~0.45 ns is essentially `black_box` + loop overhead + 1–2 real cycles.
+
+**Implication for history:** runs 1–45 added `#[cfg(test)]` unit tests, which
+are compiled out of the release-mode benchmark, so their metric swings
+(0.44–0.67 ns) were pure measurement noise, not real gains.
+
+**Do NOT:** remove `black_box`, constant-fold the benchmark inputs, edit the
+benchmark harness, or special-case benchmark values. Any of those would be
+cheating/overfitting. If this autoresearch is resumed, switch the metric to
+something with real headroom (e.g. packet encode/decode throughput, NAT
+punch success rate, or memory-bound receive-window throughput) rather than
+the VarInt constructor.
+
 ## Status: 10 iterations, ~376 tests added, all self-contained modules covered
 
 ## Remaining untested top-level modules (low testability)
