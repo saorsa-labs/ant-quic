@@ -757,6 +757,79 @@ impl Node {
         self.inner.recv().await.map_err(NodeError::Endpoint)
     }
 
+    // === Application byte-streams ============================================
+    //
+    // Bidirectional QUIC byte-streams to/from a connected peer. These are the
+    // stream primitive x0x's tailnet forwarding consumes. See
+    // `docs/design/node-app-bidi-streams.md` for the separation guarantee.
+
+    /// Open a bidirectional **application** byte-stream to a connected peer.
+    ///
+    /// Returns a `(send, recv)` pair. `send` (`[`HighLevelSendStream`]`)
+    /// implements [`tokio::io::AsyncWrite`] and `recv` (`[`HighLevelRecvStream`]`)
+    /// implements [`tokio::io::AsyncRead`], so callers can bridge them directly
+    /// to a local TCP/SOCKS socket with `tokio::io::copy` / `copy_bidirectional`.
+    ///
+    /// The stream shares the peer's existing authenticated QUIC connection
+    /// (direct or relayed) and inherits its ML-DSA-65 peer identity. It is
+    /// demultiplexed from ant-quic's internal ACK-v2 / relay / message traffic
+    /// by a reserved stream prefix, so it never interferes with [`Self::send`]
+    /// / [`Self::recv`] and the peer's [`Self::accept_bi`] never sees internal
+    /// streams. Byte-level backpressure is QUIC-native.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (mut send, mut recv) = node.open_bi(&peer_id).await?;
+    /// use tokio::io::AsyncWriteExt;
+    /// send.write_all(b"hello").await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`NodeError::ShuttingDown`] if the node is shutting down.
+    /// - [`NodeError::Endpoint`] with [`EndpointError::PeerNotFound`] if no live
+    ///   QUIC connection exists for this peer.
+    pub async fn open_bi(
+        &self,
+        peer_id: &PeerId,
+    ) -> Result<(crate::HighLevelSendStream, crate::HighLevelRecvStream), NodeError> {
+        self.inner
+            .open_bi(peer_id)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
+    /// Accept the next inbound **application** bidirectional byte-stream from
+    /// any peer.
+    ///
+    /// Yields `(peer_id, send, recv)`. Only application-opened streams are
+    /// surfaced here — ant-quic's internal transport streams (ACK-v2, MASQUE
+    /// relay, message datagrams) are demultiplexed earlier in the reader task
+    /// and can **never** be returned by this method. This is the core
+    /// separation invariant; see the regression test
+    /// `accept_bi_never_yields_internal_stream`.
+    ///
+    /// Like [`Self::open_bi`], the streams inherit the connection's ML-DSA-65
+    /// peer auth and use QUIC-native backpressure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::ShuttingDown`] once shutdown has begun and the
+    /// internal queue is drained.
+    pub async fn accept_bi(
+        &self,
+    ) -> Result<
+        (
+            PeerId,
+            crate::HighLevelSendStream,
+            crate::HighLevelRecvStream,
+        ),
+        NodeError,
+    > {
+        self.inner.accept_bi().await.map_err(NodeError::Endpoint)
+    }
+
     // === Observability ===
 
     /// Get a snapshot of the node's current status

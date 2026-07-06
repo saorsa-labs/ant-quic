@@ -170,6 +170,39 @@ const ACK_REQUEST_DEDUPE_TTL: Duration = Duration::from_secs(120);
 /// Bound receiver-side ACK request dedupe memory in long-lived daemons.
 const ACK_REQUEST_DEDUPE_MAX_ENTRIES: usize = 8192;
 
+// ============================================================================
+// Application bidirectional byte-streams (`Node::open_bi` / `accept_bi`).
+//
+// The reader task already owns `accept_bi()`/`accept_uni()` for every QUIC
+// connection and demultiplexes inbound bidi streams by an 8-byte magic prefix
+// written as the stream's first bytes (see `spawn_reader_task`). Application
+// streams carry a distinct prefix so they are forwarded to the `app_bi` channel
+// instead of being handled as ACK-v2 / relay / control traffic. See
+// `docs/design/node-app-bidi-streams.md` for the full separation argument.
+// ============================================================================
+
+/// 8-byte magic prefix written as the first bytes of every **application**
+/// bidirectional stream.
+///
+/// Distinct from the internal `ACK_BIDI_REQUEST_MAGIC` (`ANQAckB3`) and from
+/// the MASQUE relay framing (which begins with a 4-byte big-endian length, not
+/// a magic). The reader checks this prefix *after* the ACK-v2 magic and
+/// *before* the relay handler, so application streams can never be mistaken
+/// for either internal category.
+pub(crate) const APP_BIDI_STREAM_MAGIC: &[u8; 8] = b"ANQAppB1";
+
+/// Capacity of the bounded channel used to hand inbound application stream
+/// **handles** (not bytes) from the reader task to `accept_bi`.
+///
+/// Only stream handles traverse this channel; byte-level backpressure remains
+/// QUIC-native because `accept_bi` returns the raw `RecvStream`/`SendStream`.
+/// The queue depth is additionally bounded by the peer's
+/// `max_concurrent_bidi_streams`, so this is a defensive ceiling: when full,
+/// the reader resets the surplus inbound stream (the opener observes a reset)
+/// rather than blocking and stalling ACK-v2 / relay / `recv()` traffic on the
+/// same connection.
+const APP_BIDI_CHANNEL_CAPACITY: usize = 256;
+
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
 /// Free-slot fraction (of capacity) at or below which a data-channel
@@ -748,6 +781,28 @@ pub struct P2pEndpoint {
 
     /// Saturation diagnostics for `data_tx` (X0X-0039).
     data_tx_diagnostics: Arc<DataChannelDiagnostics>,
+
+    /// Sender side of the channel that hands inbound **application**
+    /// bidirectional stream handles from each reader task to
+    /// [`P2pEndpoint::accept_bi`]. Carries stream *handles*, not bytes — byte
+    /// backpressure stays QUIC-native.
+    app_bi_tx: mpsc::Sender<(
+        PeerId,
+        crate::high_level::SendStream,
+        crate::high_level::RecvStream,
+    )>,
+
+    /// Receiver side of the application bi-stream channel, drained by
+    /// [`P2pEndpoint::accept_bi`].
+    app_bi_rx: Arc<
+        tokio::sync::Mutex<
+            mpsc::Receiver<(
+                PeerId,
+                crate::high_level::SendStream,
+                crate::high_level::RecvStream,
+            )>,
+        >,
+    >,
 
     /// Sender used by reader tasks to report deterministic exit events.
     reader_exit_tx: mpsc::UnboundedSender<ReaderExitEvent>,
@@ -2980,6 +3035,8 @@ impl P2pEndpoint {
         let data_tx_capacity = config.data_channel_capacity;
         let (data_tx, data_rx) = mpsc::channel(data_tx_capacity);
         let data_tx_diagnostics = Arc::new(DataChannelDiagnostics::default());
+        // Bounded channel for inbound *application* bi-stream handles (not bytes).
+        let (app_bi_tx, app_bi_rx) = mpsc::channel(APP_BIDI_CHANNEL_CAPACITY);
         let (reader_exit_tx, reader_exit_rx) = mpsc::unbounded_channel();
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
@@ -3020,6 +3077,8 @@ impl P2pEndpoint {
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             data_tx_capacity,
             data_tx_diagnostics,
+            app_bi_tx,
+            app_bi_rx: Arc::new(tokio::sync::Mutex::new(app_bi_rx)),
             reader_exit_tx,
             reader_exit_rx: Arc::new(tokio::sync::Mutex::new(reader_exit_rx)),
             reader_handles,
@@ -7351,6 +7410,110 @@ impl P2pEndpoint {
         }
     }
 
+    // === Application byte-streams ============================================
+    //
+    // See `docs/design/node-app-bidi-streams.md`. Application bi-streams share
+    // the same QUIC connection as ACK-v2 / relay / message traffic but carry a
+    // distinct 8-byte magic prefix (`APP_BIDI_STREAM_MAGIC`) so the reader task
+    // routes them here instead of to the internal handlers.
+
+    /// Open a bidirectional **application** byte-stream to a connected peer.
+    ///
+    /// Returns a `(send, recv)` pair whose types implement `tokio::io::AsyncWrite`
+    /// and `tokio::io::AsyncRead` respectively, so callers can wire them directly
+    /// into `tokio::io` copy/bridge utilities. Byte-level backpressure is
+    /// QUIC-native: there is no intermediate buffer.
+    ///
+    /// The stream is tagged with an 8-byte magic prefix consumed by the remote
+    /// reader task, which forwards it to the peer's [`P2pEndpoint::accept_bi`].
+    /// The tag is invisible to both applications — the returned streams carry
+    /// pure application bytes from offset 0.
+    ///
+    /// Works identically over direct and MASQUE-relayed connections.
+    ///
+    /// # Errors
+    ///
+    /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
+    /// - [`EndpointError::PeerNotFound`] if no live QUIC connection exists for
+    ///   this peer (e.g. the peer is only reachable over a constrained transport
+    ///   such as BLE/LoRa, which cannot carry QUIC byte-streams).
+    /// - [`EndpointError::ConnectionClosed`] if the connection is closing.
+    pub async fn open_bi(
+        &self,
+        peer_id: &PeerId,
+    ) -> Result<(crate::high_level::SendStream, crate::high_level::RecvStream), EndpointError> {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+
+        let (mut send_stream, recv_stream) = connection
+            .open_bi()
+            .await
+            .map_err(endpoint_error_from_connection_error)?;
+
+        // Tag the stream so the peer's reader task routes it to the application
+        // channel. The peer consumes these 8 bytes and forwards the positioned
+        // streams; the local RecvStream is unaffected.
+        send_stream
+            .write_all(APP_BIDI_STREAM_MAGIC)
+            .await
+            .map_err(endpoint_error_from_write_error)?;
+
+        Ok((send_stream, recv_stream))
+    }
+
+    /// Accept the next inbound **application** bidirectional byte-stream from
+    /// any connected peer.
+    ///
+    /// Yields `(peer_id, send, recv)`. Only streams opened by a remote peer via
+    /// its equivalent of [`P2pEndpoint::open_bi`] (or any opener that writes the
+    /// `APP_BIDI_STREAM_MAGIC` prefix) are surfaced here. Internal ACK-v2,
+    /// MASQUE relay, and message-transport streams are demultiplexed earlier in
+    /// the reader task and can **never** appear in this queue.
+    ///
+    /// Byte-level backpressure is QUIC-native. Stream *handles* (not bytes)
+    /// traverse a bounded internal channel; if the application does not drain
+    /// `accept_bi` fast enough, surplus inbound streams are reset and the opener
+    /// may retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::ShuttingDown`] once the endpoint has begun
+    /// shutting down and the internal queue is drained.
+    pub async fn accept_bi(
+        &self,
+    ) -> Result<
+        (
+            PeerId,
+            crate::high_level::SendStream,
+            crate::high_level::RecvStream,
+        ),
+        EndpointError,
+    > {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+
+        let mut rx = self.app_bi_rx.lock().await;
+        tokio::select! {
+            item = rx.recv() => match item {
+                Some(stream) => Ok(stream),
+                None => Err(EndpointError::ShuttingDown),
+            },
+            _ = self.shutdown.cancelled() => Err(EndpointError::ShuttingDown),
+        }
+    }
+
     // === Events ===
 
     /// Subscribe to endpoint events.
@@ -8373,6 +8536,7 @@ impl P2pEndpoint {
         let reader_exit_tx = self.reader_exit_tx.clone();
         let max_read_bytes = self.config.max_message_size;
         let ack_response_drop_injection = Arc::clone(&self.ack_response_drop_injection);
+        let app_bi_tx = self.app_bi_tx.clone();
         let conn_stable_id = connection.stable_id();
         let lifecycle_snapshot = self
             .inner
@@ -8481,6 +8645,44 @@ impl P2pEndpoint {
                                     peer_id
                                 );
                                 break;
+                            }
+                            continue;
+                        }
+
+                        // Application bidirectional byte-stream (`Node::open_bi`
+                        // / `accept_bi`). Checked BEFORE the relay handler: the
+                        // relay handler reads the prefix's first 4 bytes as a
+                        // big-endian length and consumes the stream whenever a
+                        // relay server is present, so an app magic must be
+                        // recognized here first. The 8-byte magic has already
+                        // been drained into `prefix`, so the forwarded
+                        // `RecvStream` starts cleanly at application byte 0.
+                        if prefix.as_slice() == &APP_BIDI_STREAM_MAGIC[..] {
+                            match app_bi_tx.try_send((peer_id, send, recv)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Endpoint is shutting down; stop draining.
+                                    break;
+                                }
+                                Err(mpsc::error::TrySendError::Full((_, mut surplus_send, _))) => {
+                                    // Defensive ceiling: the app consumer is
+                                    // not calling `accept_bi` fast enough. Reset
+                                    // the surplus inbound stream so the opener
+                                    // observes backpressure and may retry,
+                                    // rather than blocking this reader task and
+                                    // stalling ACK-v2 / relay / `recv()` traffic
+                                    // on the same connection. In practice the
+                                    // queue depth is bounded by the peer's
+                                    // `max_concurrent_bidi_streams`, so this path
+                                    // is not hit in steady state.
+                                    let _ = surplus_send.reset(crate::VarInt::from_u32(0));
+                                    debug!(
+                                        peer_id = ?peer_id,
+                                        conn_stable_id,
+                                        "application bi-stream channel full; \
+                                         resetting inbound app stream"
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -9223,6 +9425,8 @@ impl Clone for P2pEndpoint {
             data_rx: Arc::clone(&self.data_rx),
             data_tx_capacity: self.data_tx_capacity,
             data_tx_diagnostics: Arc::clone(&self.data_tx_diagnostics),
+            app_bi_tx: self.app_bi_tx.clone(),
+            app_bi_rx: Arc::clone(&self.app_bi_rx),
             reader_exit_tx: self.reader_exit_tx.clone(),
             reader_exit_rx: Arc::clone(&self.reader_exit_rx),
             reader_handles: Arc::clone(&self.reader_handles),

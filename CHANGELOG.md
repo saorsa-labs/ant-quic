@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Node::open_bi(peer) -> Result<(HighLevelSendStream, HighLevelRecvStream)>`
+  and `Node::accept_bi() -> Result<(PeerId, HighLevelSendStream,
+  HighLevelRecvStream)>` — application bidirectional QUIC byte-streams on the
+  primary `Node` API, with the corresponding `P2pEndpoint::open_bi` /
+  `P2pEndpoint::accept_bi`. Streams implement `tokio::io::AsyncWrite` /
+  `AsyncRead` so consumers (e.g. x0x tailnet forwarding) can bridge them
+  directly to local TCP/SOCKS sockets. Application streams are demultiplexed
+  from internal ACK-v2 / MASQUE-relay / message traffic by a reserved 8-byte
+  prefix (`ANQAppB1`) checked in the reader task after the ACK magic and before
+  the relay handler, guaranteeing `accept_bi` never surfaces an internal stream.
+  Works identically over direct and MASQUE-relayed connections; PQC identity is
+  inherited from the connection. See `docs/design/node-app-bidi-streams.md`.
+
 ## [0.27.25] - 2026-05-29
 
 ACK-v2 empty-response duplicate-safe retry. Fixes an intermittent

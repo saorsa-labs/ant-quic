@@ -50,6 +50,11 @@ This layer provides developer-friendly APIs wrapping the low-level protocol.
   - Primary API for symmetric P2P networking
   - Event-driven architecture
   - Address discovery and peer management
+  - Message API (`send`/`recv`) **and** application bidirectional byte-streams
+    (`open_bi`/`accept_bi`), surfaced on `Node`. App streams are demultiplexed
+    from internal ACK-v2 / relay / message traffic by a reserved stream prefix
+    in the per-connection reader task; see
+    [`docs/design/node-app-bidi-streams.md`](../design/node-app-bidi-streams.md).
 
 - **`src/unified_config.rs`** - Configuration types (v0.13.0+)
   - `P2pConfig` - Main configuration builder
