@@ -467,13 +467,19 @@ impl CertificateNegotiationManager {
     /// Clean up completed negotiations older than the specified duration
     pub fn cleanup_old_sessions(&self, max_age: Duration) {
         let mut sessions = self.sessions.write();
-        let cutoff = Instant::now() - max_age;
+        let now = Instant::now();
 
         sessions.retain(|id, state| {
             let should_retain = match state {
-                NegotiationState::Completed { completed_at, .. } => *completed_at > cutoff,
-                NegotiationState::Failed { failed_at, .. } => *failed_at > cutoff,
-                NegotiationState::TimedOut { timeout_at, .. } => *timeout_at > cutoff,
+                NegotiationState::Completed { completed_at, .. } => {
+                    now.saturating_duration_since(*completed_at) < max_age
+                }
+                NegotiationState::Failed { failed_at, .. } => {
+                    now.saturating_duration_since(*failed_at) < max_age
+                }
+                NegotiationState::TimedOut { timeout_at, .. } => {
+                    now.saturating_duration_since(*timeout_at) < max_age
+                }
                 _ => true, // Keep pending and waiting sessions
             };
 

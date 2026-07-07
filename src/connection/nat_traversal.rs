@@ -774,9 +774,8 @@ impl SecurityValidationState {
 
     /// Clean up old rate tracking entries
     fn cleanup_rate_tracker(&mut self, now: Instant) {
-        let cutoff = now - self.rate_window;
         while let Some(&front_time) = self.candidate_rate_tracker.front() {
-            if front_time < cutoff {
+            if now.saturating_duration_since(front_time) > self.rate_window {
                 self.candidate_rate_tracker.pop_front();
             } else {
                 break;
@@ -785,9 +784,8 @@ impl SecurityValidationState {
     }
     /// Clean up old coordination tracking entries
     fn cleanup_coordination_tracker(&mut self, now: Instant) {
-        let cutoff = now - self.rate_window;
         while let Some(front_request) = self.coordination_requests.front() {
-            if front_request.timestamp < cutoff {
+            if now.saturating_duration_since(front_request.timestamp) > self.rate_window {
                 self.coordination_requests.pop_front();
             } else {
                 break;
@@ -1811,9 +1809,6 @@ impl NetworkConditionMonitor {
 
     /// Clean up old samples and statistics
     fn cleanup(&mut self, now: Instant) {
-        // Remove old RTT samples (keep only recent ones)
-        let _cutoff_time = now - Duration::from_secs(60);
-
         // Reset statistics if they're too old
         if let Some(last_update) = self.timeout_stats.last_update {
             if now.duration_since(last_update) > Duration::from_secs(300) {

@@ -2211,8 +2211,6 @@ impl Connection {
         let rtt = self.path.rtt.conservative();
         let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
 
-        // Packets sent before this time are deemed lost.
-        let lost_send_time = now.checked_sub(loss_delay).unwrap();
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
@@ -2235,7 +2233,11 @@ impl Connection {
                 persistent_congestion_start = None;
             }
 
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
+            // Panic-free loss threshold: avoids the `now - loss_delay` underflow that fires when
+            // the process starts within `loss_delay` of boot (Windows QPC epoch = boot).
+            // quinn #2436; x0x #190.
+            if now.saturating_duration_since(info.time_sent) >= loss_delay
+                || largest_acked_packet >= packet + packet_threshold
             {
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
