@@ -628,4 +628,64 @@ mod tests {
         let stats = manager.get_stats();
         assert_eq!(stats.timed_out, 1);
     }
+    /// Regression for saorsa-labs/x0x#190: `Instant - Duration` panics at low uptime.
+    ///
+    /// `Instant`'s epoch is *boot* on Windows (QPC) and near process-start on
+    /// other platforms, so `Instant::now() - max_age` underflows — panicking
+    /// with "overflow when subtracting duration from instant" — whenever
+    /// `max_age` exceeds the process uptime. A daemon auto-started shortly
+    /// after boot therefore panicked on every cleanup pass whose window was
+    /// longer than its uptime.
+    ///
+    /// `cleanup_old_sessions` now evaluates `now.saturating_duration_since(t)
+    /// < max_age`, which is panic-free and answers "nothing is stale" when
+    /// `max_age > uptime` — the correct result, since nothing can be older than
+    /// a window longer than the process has existed. This test feeds a 100-year
+    /// window (guaranteed larger than any host uptime); the old `Instant::now()
+    /// - max_age` subtraction would have panicked here.
+    #[test]
+    fn cleanup_old_sessions_survives_window_longer_than_uptime() {
+        let manager = CertificateNegotiationManager::default();
+        let now = Instant::now();
+        {
+            let mut sessions = manager.sessions.write();
+            sessions.insert(
+                NegotiationId::new(),
+                NegotiationState::Completed {
+                    result: NegotiationResult::new(
+                        CertificateType::RawPublicKey,
+                        CertificateType::X509,
+                    ),
+                    completed_at: now,
+                },
+            );
+            sessions.insert(
+                NegotiationId::new(),
+                NegotiationState::Failed {
+                    error: "synthetic".to_string(),
+                    failed_at: now,
+                },
+            );
+            sessions.insert(
+                NegotiationId::new(),
+                NegotiationState::TimedOut { timeout_at: now },
+            );
+        }
+        assert_eq!(manager.sessions.read().len(), 3);
+
+        // A window longer than any conceivable uptime. Under the old code this
+        // formed `Instant::now() - max_age` and panicked; the saturating
+        // rewrite correctly concludes nothing is stale.
+        let impossible_age = Duration::from_secs(86_400 * 365 * 100);
+        manager.cleanup_old_sessions(impossible_age);
+        assert_eq!(
+            manager.sessions.read().len(),
+            3,
+            "nothing evicted when max_age exceeds process uptime"
+        );
+
+        // Correctness preserved: a zero-age window evicts every terminal session.
+        manager.cleanup_old_sessions(Duration::ZERO);
+        assert_eq!(manager.sessions.read().len(), 0);
+    }
 }
