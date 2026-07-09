@@ -384,7 +384,9 @@ impl RttEstimator {
         // Based on RFC6298.
         if let Some(smoothed) = self.smoothed {
             let adjusted_rtt = if self.min + ack_delay <= self.latest {
-                self.latest - ack_delay
+                // `saturating_sub` is panic-free; the guard above guarantees
+                // `ack_delay <= self.latest` so this never saturates. x0x #190.
+                self.latest.saturating_sub(ack_delay)
             } else {
                 self.latest
             };
