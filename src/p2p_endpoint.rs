@@ -8846,7 +8846,15 @@ impl P2pEndpoint {
                     continue;
                 }
 
-                let payload = data;
+                // Defensive reallocation: ensure the delivered bytes are in a
+                // fully independent allocation that cannot alias any internal
+                // QUIC reassembly buffer. Under concurrent multi-stream load,
+                // the Vec<u8> from read_to_end is assembled from Bytes slices
+                // that reference decrypted packet allocations. These allocations
+                // can be recycled by the QUIC stack before the consumer copies
+                // the data, causing aliasing corruption at the recv boundary.
+                // See: FINDING-recv-boundary-aliasing.md
+                let payload = data.clone();
                 let payload_len = payload.len();
 
                 let now = Instant::now();
