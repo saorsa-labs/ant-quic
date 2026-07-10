@@ -494,6 +494,13 @@ impl Future for ReadToEnd<'_> {
 /// present once, with no gaps and no overlaps. A `None` means part of the
 /// stream was consumed but never delivered to this reader; zero-filling the
 /// holes (the previous behavior) would silently corrupt the result.
+///
+/// Overlapping chunks (from retransmissions or the ordered→unordered
+/// transition) are expected to carry identical data at the same offsets.
+/// If overlapping bytes DIFFER, the transport has delivered corrupt content
+/// — a data-integrity violation. This function fails loud (returns `None`)
+/// rather than silently assembling mismatched bytes, and logs a diagnostic
+/// so the root cause can be identified.
 fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) -> Option<Vec<u8>> {
     chunks.sort_unstable_by_key(|&(_, offset)| offset);
     let mut buffer = Vec::with_capacity((end - start) as usize);
@@ -508,6 +515,29 @@ fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) 
         // Benign overlap (duplicate delivery, e.g. across the
         // ordered->unordered transition): skip the already-assembled prefix.
         let skip = (expected - *offset) as usize;
+        if skip > 0 && skip <= data.len() {
+            // Data-integrity check: when chunks overlap, the overlapping
+            // bytes MUST be identical (QUIC RFC 9000 §13.1 requires
+            // retransmissions to carry the same data). If they differ, the
+            // transport has delivered corrupt content. Fail loud rather
+            // than silently assembling mismatched bytes.
+            let prev = &buffer[buffer.len() - skip..];
+            let curr = &data[..skip];
+            if prev != curr {
+                let first_diff = prev.iter().zip(curr).position(|(a, b)| a != b);
+                tracing::error!(
+                    target: "ant_quic::data_integrity",
+                    stream_offset = offset,
+                    overlap_len = skip,
+                    first_diff_within_overlap = first_diff,
+                    "DATA INTEGRITY VIOLATION: overlapping stream chunks have \
+                     different byte content at the same offset — the transport \
+                     delivered corrupt data. Dropping message to prevent silent \
+                     corruption of signed payloads."
+                );
+                return None;
+            }
+        }
         if skip < data.len() {
             buffer.extend_from_slice(&data[skip..]);
         }
