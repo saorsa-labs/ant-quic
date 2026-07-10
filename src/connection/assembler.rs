@@ -811,44 +811,47 @@ mod test {
         }
     }
 
-    /// Repro for the recv-boundary-aliasing corruption (FINDING-recv-boundary-aliasing.md).
+    /// Regression test for recv-boundary-aliasing corruption
+    /// (FINDING-recv-boundary-aliasing.md).
     ///
-    /// Without the fix (copy-to-owned at insert time), the assembler stores
-    /// Bytes references into the packet allocation. If that allocation is
-    /// recycled by the QUIC stack between insert and read, the read returns
-    /// stale/overwritten data (torn read).
-    ///
-    /// This test simulates the recycling by modifying the allocation through
-    /// a raw pointer after insert. With the fix, the assembler has its own
-    /// copy and the modification is invisible.
+    /// Verifies that insert() copies data to a fully-owned allocation,
+    /// independent of the input Bytes's backing storage. Without this copy,
+    /// the assembler would store a Bytes reference to a decrypted packet
+    /// allocation that the QUIC stack can recycle under concurrent
+    /// multi-stream load, producing torn reads during out-of-order assembly.
     #[test]
     fn insert_copies_to_owned_storage_preventing_aliasing() {
         let mut x = Assembler::new();
 
-        // Create data in a known allocation
-        let data_vec = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let ptr = data_vec.as_ptr() as *mut u8;
-        let data = Bytes::from(data_vec);
+        // Use a payload large enough to force heap allocation (avoids
+        // Bytes inline-storage optimization that could alias addresses).
+        let original: Vec<u8> = (0..256).map(|i| (i % 250 + 1) as u8).collect();
+        let input = Bytes::copy_from_slice(&original);
+        let input_ptr = input.as_ptr();
 
-        // Insert into assembler
-        x.insert(0, data, 16);
+        // Insert into assembler — with the fix, this copies to a NEW allocation.
+        x.insert(0, input.clone(), 256);
 
-        // Simulate packet allocation recycling: overwrite through raw pointer.
-        // In production, this happens when the QUIC stack processes a new packet
-        // and the allocator reuses the freed packet buffer.
-        unsafe {
-            for i in 0..16 {
-                std::ptr::write_volatile(ptr.add(i), 200 + i as u8);
-            }
-        }
+        // The input Bytes must still be valid and unchanged.
+        assert_eq!(&input[..], &original[..]);
 
-        // Read from assembler — must return ORIGINAL data, not modified.
-        // Without the insert-time copy, this would return [200, 201, ...].
-        let chunk = x.read(16, true).expect("data must be readable");
+        // Read from assembler — data must match the original exactly.
+        let chunk = x.read(256, true).expect("data must be readable");
         assert_eq!(
             &chunk.bytes[..],
-            &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            "Assembler must store owned copy, not reference to recyclable packet allocation"
+            &original[..],
+            "Assembler data must match original"
+        );
+
+        // The assembler's stored data must be at a DIFFERENT memory address
+        // than the input. This proves insert() made an independent copy,
+        // not a reference to the input's allocation. Without the fix,
+        // this assertion would fail (same pointer = alias, not copy).
+        assert_ne!(
+            chunk.bytes.as_ptr(),
+            input_ptr,
+            "Assembler must store data at a different address than the input \
+             (owned copy, not alias to recyclable packet allocation)"
         );
     }
 
