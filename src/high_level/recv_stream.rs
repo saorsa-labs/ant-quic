@@ -446,9 +446,18 @@ impl<T> From<(Option<T>, Option<crate::ReadError>)> for ReadStatus<T> {
 }
 
 /// Future produced by `RecvStream::read_to_end()`.
+///
+/// CRITICAL: Chunks are copied into owned `Vec<u8>` immediately on arrival,
+/// NOT stored as `Bytes` references. This is because `Bytes` slices alias
+/// decrypted packet allocations that the QUIC stack recycles under concurrent
+/// multi-stream load. Holding `Bytes` references across `.await` points
+/// (between `poll_read_chunk` calls) creates a window where another reader
+/// task can trigger packet processing that overwrites the aliased allocation,
+/// producing a torn read. Copying to `Vec<u8>` on arrival closes this window.
+/// See: FINDING-recv-boundary-aliasing.md
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
-    read: Vec<(Bytes, u64)>,
+    read: Vec<(Vec<u8>, u64)>,
     start: u64,
     end: u64,
     size_limit: usize,
@@ -466,7 +475,11 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
                     self.end = self.end.max(end);
-                    self.read.push((chunk.bytes, chunk.offset));
+                    // Copy bytes into an owned Vec<u8> IMMEDIATELY, dropping
+                    // the Bytes reference before the next poll cycle. This
+                    // prevents aliasing corruption from recycled packet
+                    // allocations under concurrent multi-stream load.
+                    self.read.push((chunk.bytes.to_vec(), chunk.offset));
                 }
                 None => {
                     if self.end == 0 {
@@ -501,7 +514,11 @@ impl Future for ReadToEnd<'_> {
 /// — a data-integrity violation. This function fails loud (returns `None`)
 /// rather than silently assembling mismatched bytes, and logs a diagnostic
 /// so the root cause can be identified.
-fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) -> Option<Vec<u8>> {
+fn assemble_unordered_chunks(
+    chunks: &mut [(Vec<u8>, u64)],
+    start: u64,
+    end: u64,
+) -> Option<Vec<u8>> {
     chunks.sort_unstable_by_key(|&(_, offset)| offset);
     let mut buffer = Vec::with_capacity((end - start) as usize);
     for (data, offset) in chunks.iter() {
@@ -775,10 +792,10 @@ impl Future for ReadChunks<'_> {
 mod tests {
     use super::*;
 
-    fn chunks_of(payload: &[u8], ranges: &[(usize, usize)]) -> Vec<(Bytes, u64)> {
+    fn chunks_of(payload: &[u8], ranges: &[(usize, usize)]) -> Vec<(Vec<u8>, u64)> {
         ranges
             .iter()
-            .map(|&(start, end)| (Bytes::copy_from_slice(&payload[start..end]), start as u64))
+            .map(|&(start, end)| (payload[start..end].to_vec(), start as u64))
             .collect()
     }
 
