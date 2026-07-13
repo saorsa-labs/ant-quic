@@ -3361,7 +3361,7 @@ impl P2pEndpoint {
         // multiple times to the same target (e.g. during reconnect loops).
         {
             let peers = self.connected_peers.read().await;
-            for (_, existing) in peers.iter() {
+            for existing in peers.values() {
                 if existing.remote_addr == TransportAddr::Udp(addr) {
                     // Verify the underlying QUIC connection is still alive
                     if let Some(peer_id) = peers

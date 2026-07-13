@@ -876,13 +876,10 @@ impl CandidateDiscoveryManager {
                     continue;
                 }
 
-                let bound_candidate = self.config.bound_address.and_then(|addr| {
-                    if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
-                        Some(addr)
-                    } else {
-                        None
-                    }
-                });
+                let bound_candidate = self
+                    .config
+                    .bound_address
+                    .filter(|addr| self.is_valid_local_address(addr) || addr.ip().is_loopback());
 
                 if let Some(bound_addr) = bound_candidate {
                     if let Some(session) = self.active_sessions.get_mut(&peer_id) {
@@ -1075,12 +1072,8 @@ impl CandidateDiscoveryManager {
                         peer_id
                     );
 
-                    let bound_candidate = self.config.bound_address.and_then(|addr| {
-                        if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
-                            Some(addr)
-                        } else {
-                            None
-                        }
+                    let bound_candidate = self.config.bound_address.filter(|addr| {
+                        self.is_valid_local_address(addr) || addr.ip().is_loopback()
                     });
 
                     if let Some(session) = self.active_sessions.get_mut(&peer_id) {
