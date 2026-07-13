@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Works identically over direct and MASQUE-relayed connections; PQC identity is
   inherited from the connection. See `docs/design/node-app-bidi-streams.md`.
 
+## [0.27.31] - 2026-07-13
+
+### Fixed
+- NAT-traversal sessions that failed terminally were never removed from
+  `active_sessions` and kept holding their `Connection` handle — megabytes of
+  per-connection state (streams tables sized by the configured
+  concurrent-stream limits) retained per failed dial to an unreachable peer
+  (#210, #211). Terminal failures now mark the session `Closed`, drop the
+  connection handle, and clear candidates/attempt records; establishment
+  timeouts release the handle immediately instead of one cache-TTL later.
+
+### Maintenance
+- Fixed six new stable-clippy lints (`manual_filter`, `for_kv_map`,
+  `unneeded_wildcard_pattern`) that were failing CI for every PR (#212).
+
 ## [0.27.25] - 2026-05-29
 
 ACK-v2 empty-response duplicate-safe retry. Fixes an intermittent
