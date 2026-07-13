@@ -2967,7 +2967,7 @@ impl BleTransport {
         let mut disconnecting = 0;
         let mut oldest_activity = None;
 
-        for (_id, conn) in connections.iter() {
+        for conn in connections.values() {
             let conn = conn.read().await;
             match conn.state().await {
                 BleConnectionState::Connected => active += 1,
