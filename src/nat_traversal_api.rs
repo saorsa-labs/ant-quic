@@ -3513,6 +3513,13 @@ impl NatTraversalEndpoint {
                             if let Some(mut session) = sessions.get_mut(&peer_id) {
                                 session.session_state.state = ConnectionState::Closed;
                                 session.session_state.last_transition = std::time::Instant::now();
+                                // Release the connection handle now, not at
+                                // session removal one cache-TTL later — a
+                                // timed-out establishment attempt otherwise
+                                // pins megabytes of per-connection state for
+                                // the whole Closed grace window (#210).
+                                session.session_state.connection = None;
+                                session.session_state.active_attempts.clear();
                                 tracing::warn!("Connection to {:?} timed out", peer_id);
                             }
                         }
@@ -9205,6 +9212,19 @@ impl NatTraversalEndpoint {
                 session.retry_at = None;
                 session.next_deadline = None;
                 session.phase = TraversalPhase::Failed;
+                // Terminal failure must also release everything the session
+                // pins and hand it to the session reaper. A Failed session
+                // that stays `Connecting`/`Idle` is never matched by the
+                // reaper's `Closed` arm, so it sits in `active_sessions`
+                // forever holding its `Connection` handle — megabytes of
+                // per-connection state (streams tables sized by the
+                // configured concurrent-stream limits) retained per failed
+                // dial to an unreachable peer (#210).
+                session.session_state.state = ConnectionState::Closed;
+                session.session_state.last_transition = now;
+                session.session_state.connection = None;
+                session.session_state.active_attempts.clear();
+                session.candidates.clear();
                 self.emit_event(
                     events,
                     NatTraversalEvent::TraversalTerminated {
@@ -11971,7 +11991,12 @@ mod tests {
             started_at: now,
             phase_started_at: now,
             phase: TraversalPhase::Synchronization,
-            candidates: Vec::new(),
+            candidates: vec![CandidateAddress {
+                address: "192.0.2.7:4433".parse().unwrap(),
+                priority: 100,
+                source: CandidateSource::Local,
+                state: CandidateState::New,
+            }],
             last_progress_at: now,
             next_deadline: Some(SessionDeadline {
                 kind: TraversalDeadlineKind::RetryBackoff,
@@ -11983,7 +12008,7 @@ mod tests {
                 state: ConnectionState::Connecting,
                 last_transition: now,
                 connection: None,
-                active_attempts: Vec::new(),
+                active_attempts: vec![("192.0.2.7:4433".parse().unwrap(), now)],
                 metrics: ConnectionMetrics::default(),
             },
         };
@@ -12009,6 +12034,26 @@ mod tests {
             "terminal failures clear next_deadline"
         );
         assert!(matches!(session.phase, TraversalPhase::Failed));
+        // #210: a terminal failure must hand the session to the reaper and
+        // release everything it pins. If the state is not `Closed` the reaper
+        // never removes the entry, and a retained `connection` handle keeps
+        // megabytes of per-connection state alive per failed dial.
+        assert!(
+            matches!(session.session_state.state, ConnectionState::Closed),
+            "terminal failure must mark the session Closed for the reaper"
+        );
+        assert!(
+            session.session_state.connection.is_none(),
+            "terminal failure must release the held connection handle"
+        );
+        assert!(
+            session.session_state.active_attempts.is_empty(),
+            "terminal failure must clear in-flight attempt records"
+        );
+        assert!(
+            session.candidates.is_empty(),
+            "terminal failure must clear discovered candidates"
+        );
         assert!(matches!(
             events.as_slice(),
             [
