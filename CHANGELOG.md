@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.32] - 2026-07-14
+
+### Security
+- **Reassembly-buffer memory exhaustion (GHSA-4w2j-m93h-cj5j, CVSS 7.5,
+  CWE-770).** A peer sending stream fragments with many gaps while withholding
+  the early part of the stream could grow the receiver's out-of-order
+  reassembly buffer without bound. `Assembler::insert` now yields a
+  `TooManyChunks` error once more than 1024 chunks remain buffered after a
+  defragmentation pass; both call sites (crypto-stream and stream-data) convert
+  this to a connection-fatal `TransportError::INTERNAL_ERROR`, tearing the
+  connection down instead of buffering indefinitely. Ports the quinn project's
+  fix `fed0321a` / PR #2694. (#214)
+
+### Changed
+- Remote stream state is now allocated lazily. `StreamsState::new` previously
+  eagerly inserted a send/recv map entry for every remote stream the advertised
+  `MAX_STREAMS` permits — up to ~1.58 MB of hashbrown allocation per
+  connection at a 50,000-stream advertisement, paid up front on every
+  connection whether or not it ever opened a stream. Maps now start empty and
+  streams are materialized on first reference via `ensure_remote()`, bounded by
+  the advertised limit (RFC 9000 §21.8). This removes the unconditional
+  per-connection cost that dominated failed-dial memory retention. Ports the
+  quinn project's PR #2601. (#210)
+
 ### Added
 - `Node::open_bi(peer) -> Result<(HighLevelSendStream, HighLevelRecvStream)>`
   and `Node::accept_bi() -> Result<(PeerId, HighLevelSendStream,
