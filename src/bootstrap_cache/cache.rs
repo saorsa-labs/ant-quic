@@ -66,7 +66,8 @@ pub struct CacheStats {
 pub struct BootstrapCache {
     config: BootstrapCacheConfig,
     data: Arc<RwLock<CacheData>>,
-    persistence: CachePersistence,
+    /// `None` when the cache is in-memory only (`config.persist == false`).
+    persistence: Option<CachePersistence>,
     event_tx: broadcast::Sender<CacheEvent>,
     last_save: Arc<RwLock<Instant>>,
     last_cleanup: Arc<RwLock<Instant>>,
@@ -77,13 +78,29 @@ impl BootstrapCache {
     /// Open or create a bootstrap cache.
     ///
     /// Loads existing cache data from disk if available, otherwise starts fresh.
+    /// With `config.persist == false` the cache is in-memory only: nothing is
+    /// loaded, nothing is ever written, and no cache directory is created.
     pub async fn open(config: BootstrapCacheConfig) -> std::io::Result<Self> {
-        let persistence = CachePersistence::new(&config.cache_dir, config.enable_file_locking)?;
-        let data = persistence.load()?;
+        let persistence = if config.persist {
+            Some(CachePersistence::new(
+                &config.cache_dir,
+                config.enable_file_locking,
+            )?)
+        } else {
+            None
+        };
+        let data = match &persistence {
+            Some(p) => p.load()?,
+            None => CacheData::new(super::persistence::generate_instance_id()),
+        };
         let (event_tx, _) = broadcast::channel(256);
         let now = Instant::now();
 
-        info!("Opened bootstrap cache with {} peers", data.peers.len());
+        info!(
+            "Opened bootstrap cache with {} peers (persist: {})",
+            data.peers.len(),
+            config.persist
+        );
 
         Ok(Self {
             config,
@@ -392,8 +409,11 @@ impl BootstrapCache {
         self.data.write().await.peers.remove(&peer_id.0)
     }
 
-    /// Save cache to disk.
+    /// Save cache to disk. No-op for in-memory caches (`persist: false`).
     pub async fn save(&self) -> std::io::Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
         let mut data = self.data.write().await;
 
         if data.peers.len() < self.config.min_peers_to_save {
@@ -405,7 +425,7 @@ impl BootstrapCache {
             return Ok(());
         }
 
-        self.persistence.save(&mut data)?;
+        persistence.save(&mut data)?;
 
         drop(data);
         *self.last_save.write().await = Instant::now();
@@ -499,11 +519,15 @@ impl BootstrapCache {
     /// Start background maintenance tasks.
     ///
     /// Spawns a task that periodically:
-    /// - Saves the cache to disk
+    /// - Saves the cache to disk (no-op for in-memory caches)
     /// - Cleans up stale peers
     /// - Recalculates quality scores
     ///
     /// Returns a handle that can be used to cancel the task.
+    ///
+    /// Note: [`crate::p2p_endpoint::P2pEndpoint`] starts maintenance
+    /// automatically for its own cache — embedders sharing the endpoint's
+    /// cache (via [`crate::Node::bootstrap_cache`]) must not call this again.
     pub fn start_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let cache = self;
 
@@ -583,6 +607,35 @@ mod tests {
             .build();
 
         BootstrapCache::open(config).await.unwrap()
+    }
+
+    /// `persist: false` must make the cache purely in-memory: opening in a
+    /// directory that does not exist succeeds, and adding peers + saving
+    /// never creates the directory, cache file, or lock file. This is what
+    /// lets multiple node instances on one host opt out of the shared
+    /// default cache dir without cross-instance pollution.
+    #[tokio::test]
+    async fn in_memory_cache_never_touches_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("does-not-exist");
+        let config = BootstrapCacheConfig::builder()
+            .cache_dir(&cache_dir)
+            .min_peers_to_save(1)
+            .persist(false)
+            .build();
+
+        let cache = BootstrapCache::open(config).await.unwrap();
+        cache
+            .add_seed(PeerId([7u8; 32]), vec!["127.0.0.1:9000".parse().unwrap()])
+            .await;
+        cache.save().await.unwrap();
+
+        assert!(
+            !cache_dir.exists(),
+            "in-memory cache must not create its cache directory"
+        );
+        // Runtime behaviour is unchanged: the peer is still selectable.
+        assert_eq!(cache.peer_count().await, 1);
     }
 
     #[tokio::test]

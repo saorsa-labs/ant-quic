@@ -171,6 +171,10 @@ fn node_config_to_p2p_config(config: NodeConfig) -> Result<P2pConfig, NodeError>
         p2p_config.nat.port_mapping.enabled = enabled;
     }
 
+    if let Some(cache_config) = config.bootstrap_cache {
+        p2p_config.bootstrap_cache = cache_config;
+    }
+
     Ok(p2p_config)
 }
 
@@ -513,6 +517,19 @@ impl Node {
     /// Get access to the underlying P2pEndpoint for advanced operations.
     pub fn inner_endpoint(&self) -> &Arc<P2pEndpoint> {
         &self.inner
+    }
+
+    /// The node's bootstrap peer cache.
+    ///
+    /// This is the single cache instance the endpoint uses for
+    /// quality-scored reconnection, coordinator selection and bootstrap
+    /// tokens (configured via [`NodeConfig::bootstrap_cache`]). Embedders
+    /// should enrich and
+    /// query this shared instance rather than opening a second cache on
+    /// the same directory. The endpoint runs cache maintenance itself —
+    /// do not call `start_maintenance` on this handle.
+    pub fn bootstrap_cache(&self) -> Arc<crate::BootstrapCache> {
+        Arc::clone(&self.inner.bootstrap_cache)
     }
 
     /// Get the transport registry for this node

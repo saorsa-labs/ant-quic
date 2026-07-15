@@ -545,7 +545,7 @@ impl Drop for EncryptedCachePersistence {
     }
 }
 
-fn generate_instance_id() -> String {
+pub(super) fn generate_instance_id() -> String {
     format!(
         "{}_{:x}",
         std::process::id(),

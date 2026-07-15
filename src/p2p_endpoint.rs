@@ -747,6 +747,11 @@ pub struct P2pEndpoint {
     /// Bootstrap cache for peer persistence
     pub bootstrap_cache: Arc<BootstrapCache>,
 
+    /// Background maintenance task for `bootstrap_cache` (periodic save,
+    /// stale cleanup, quality recalculation). Shared across endpoint clones;
+    /// aborted on shutdown.
+    bootstrap_cache_maintenance: Arc<tokio::task::JoinHandle<()>>,
+
     /// Advanced externally supplied peer hints keyed by authenticated peer ID.
     ///
     /// This is intentionally separate from the persisted bootstrap cache so
@@ -2881,13 +2886,28 @@ impl P2pEndpoint {
         // Create NAT traversal endpoint with the same identity key used for auth
         // This ensures P2pEndpoint and NatTraversalEndpoint use the same keypair
         let mut nat_config = config.to_nat_config_with_key(public_key.clone(), secret_key);
-        let bootstrap_cache = Arc::new(
-            BootstrapCache::open(config.bootstrap_cache.clone())
-                .await
-                .map_err(|e| {
+        let bootstrap_cache = match BootstrapCache::open(config.bootstrap_cache.clone()).await {
+            Ok(cache) => Arc::new(cache),
+            Err(e) => {
+                // Degrade to an in-memory cache rather than failing endpoint
+                // creation: the cache is an optimization, not a correctness
+                // requirement, and a corrupt file or unwritable directory
+                // must not keep the node offline.
+                warn!(
+                    "Failed to open bootstrap cache at {:?} ({e}); continuing with an in-memory cache",
+                    config.bootstrap_cache.cache_dir
+                );
+                let mut memory_config = config.bootstrap_cache.clone();
+                memory_config.persist = false;
+                Arc::new(BootstrapCache::open(memory_config).await.map_err(|e| {
                     EndpointError::Config(format!("Failed to open bootstrap cache: {}", e))
-                })?,
-        );
+                })?)
+            }
+        };
+        // The endpoint owns cache maintenance so every embedder gets periodic
+        // saves and stale-entry cleanup without extra wiring.
+        let bootstrap_cache_maintenance =
+            Arc::new(Arc::clone(&bootstrap_cache).start_maintenance());
 
         // Create token store
         let token_store = Arc::new(BootstrapTokenStore::new(bootstrap_cache.clone()).await);
@@ -3088,6 +3108,7 @@ impl P2pEndpoint {
             shutdown: CancellationToken::new(),
             pending_data: Arc::new(RwLock::new(BoundedPendingBuffer::default())),
             bootstrap_cache,
+            bootstrap_cache_maintenance,
             peer_hint_records: Arc::new(RwLock::new(HashMap::new())),
             transport_registry,
             router: Arc::new(RwLock::new(router)),
@@ -8013,6 +8034,13 @@ impl P2pEndpoint {
         info!("Shutting down P2P endpoint");
         self.shutdown.cancel();
 
+        // Stop cache maintenance and flush learned peers so they survive
+        // restart without waiting for the next periodic save tick.
+        self.bootstrap_cache_maintenance.abort();
+        if let Err(e) = self.bootstrap_cache.save().await {
+            warn!("Failed to save bootstrap cache on shutdown: {e}");
+        }
+
         // Abort all background reader tasks.
         let handles = {
             let mut handles = self.reader_handles.write().await;
@@ -9459,6 +9487,7 @@ impl Clone for P2pEndpoint {
             shutdown: self.shutdown.clone(),
             pending_data: Arc::clone(&self.pending_data),
             bootstrap_cache: Arc::clone(&self.bootstrap_cache),
+            bootstrap_cache_maintenance: Arc::clone(&self.bootstrap_cache_maintenance),
             peer_hint_records: Arc::clone(&self.peer_hint_records),
             transport_registry: Arc::clone(&self.transport_registry),
             router: Arc::clone(&self.router),

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.33] - 2026-07-15
+
+### Added
+- `BootstrapCacheConfig::persist` (default `true`): `persist(false)` gives a purely in-memory cache — nothing loaded, nothing written, no cache directory or lock file created.
+- `NodeConfig::bootstrap_cache` + builder method: plumb a per-instance `BootstrapCacheConfig` through the high-level `Node` API into the endpoint (previously only reachable via low-level `P2pConfig`, so every `Node` embedder silently got the host-shared default cache dir).
+- `Node::bootstrap_cache()` accessor: expose the endpoint's single shared `Arc<BootstrapCache>` so embedders enrich/query one instance instead of opening a second cache on the same directory.
+
+### Fixed
+- `P2pEndpoint` now starts bootstrap-cache maintenance itself (periodic save, stale cleanup, quality recalculation) — previously no ant-quic code path ever called `start_maintenance`, so the endpoint's cache never persisted or cleaned up unless the embedder wired it manually.
+- `P2pEndpoint::shutdown` aborts the maintenance task and flushes the cache so learned peers survive restart without waiting for the next save tick.
+- Endpoint creation no longer hard-fails when the bootstrap cache cannot be opened (corrupt file, unwritable dir): it degrades to an in-memory cache with a warning.
+
 ## [0.27.32] - 2026-07-14
 
 ### Security
