@@ -44,6 +44,14 @@ pub struct BootstrapCacheConfig {
     /// Enable file locking for multi-process safety
     pub enable_file_locking: bool,
 
+    /// Persist the cache to disk (default: true).
+    ///
+    /// When `false` the cache is purely in-memory: nothing is loaded on
+    /// open, nothing is written on save, and no cache directory or lock
+    /// file is created. Runtime behaviour (quality scoring, peer
+    /// selection, maintenance) is unchanged.
+    pub persist: bool,
+
     /// Quality score weights
     pub weights: QualityWeights,
 }
@@ -74,6 +82,7 @@ impl Default for BootstrapCacheConfig {
             cleanup_interval: Duration::from_secs(6 * 3600), // 6 hours
             min_peers_to_save: 10,
             enable_file_locking: true,
+            persist: true,
             weights: QualityWeights::default(),
         }
     }
@@ -164,6 +173,12 @@ impl BootstrapCacheConfigBuilder {
         self
     }
 
+    /// Enable or disable disk persistence (see [`BootstrapCacheConfig::persist`])
+    pub fn persist(mut self, persist: bool) -> Self {
+        self.config.persist = persist;
+        self
+    }
+
     /// Set quality weights
     pub fn weights(mut self, weights: QualityWeights) -> Self {
         self.config.weights = weights;
@@ -238,6 +253,7 @@ mod tests {
         assert_eq!(config.cleanup_interval, Duration::from_secs(6 * 3600));
         assert_eq!(config.min_peers_to_save, 10);
         assert!(config.enable_file_locking);
+        assert!(config.persist);
         assert!(
             config.cache_dir.ends_with("ant-quic-cache") || config.cache_dir.ends_with("ant-quic")
         );

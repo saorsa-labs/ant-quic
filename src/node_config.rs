@@ -35,6 +35,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::bootstrap_cache::BootstrapCacheConfig;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::host_identity::HostIdentity;
 use crate::transport::{TransportAddr, TransportProvider, TransportRegistry};
@@ -107,6 +108,18 @@ pub struct NodeConfig {
     /// discovery + port-mapping task is skipped. When `None`, the ant-quic
     /// default applies (currently enabled).
     pub port_mapping_enabled: Option<bool>,
+
+    /// Bootstrap peer cache configuration for the node's endpoint.
+    ///
+    /// The endpoint always owns exactly one [`BootstrapCacheConfig`]-backed
+    /// cache used for quality-scored reconnection, coordinator selection and
+    /// bootstrap tokens. When `None`, the ant-quic default applies — a
+    /// **host-shared** directory (`$TMPDIR/ant-quic-cache` or the platform
+    /// cache dir). Embedders running multiple nodes per host (or wanting
+    /// per-instance persistence) should set an explicit per-instance
+    /// `cache_dir`, or `persist(false)` for an in-memory-only cache.
+    /// Access the resulting shared cache via [`crate::Node::bootstrap_cache`].
+    pub bootstrap_cache: Option<BootstrapCacheConfig>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -167,6 +180,7 @@ pub struct NodeConfigBuilder {
     max_concurrent_uni_streams: Option<u32>,
     max_message_size: Option<usize>,
     port_mapping_enabled: Option<bool>,
+    bootstrap_cache: Option<BootstrapCacheConfig>,
 }
 
 impl NodeConfigBuilder {
@@ -371,6 +385,13 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Configure the endpoint's bootstrap peer cache (see
+    /// [`NodeConfig::bootstrap_cache`])
+    pub fn bootstrap_cache(mut self, config: BootstrapCacheConfig) -> Self {
+        self.bootstrap_cache = Some(config);
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> NodeConfig {
         NodeConfig {
@@ -382,6 +403,7 @@ impl NodeConfigBuilder {
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
             max_message_size: self.max_message_size,
             port_mapping_enabled: self.port_mapping_enabled,
+            bootstrap_cache: self.bootstrap_cache,
         }
     }
 }
@@ -422,6 +444,28 @@ mod tests {
         assert!(config.keypair.is_none());
         assert!(config.transport_providers.is_empty());
         assert!(config.max_message_size.is_none());
+    }
+
+    /// The endpoint always opens exactly one bootstrap cache from
+    /// `NodeConfig::bootstrap_cache`; without this plumbing embedders were
+    /// forced to open a *second* cache instance (host-shared default dir)
+    /// that diverged from the endpoint's own.
+    #[test]
+    fn builder_plumbs_bootstrap_cache_config() {
+        let cache_config = BootstrapCacheConfig::builder()
+            .cache_dir("/tmp/per-instance-peers")
+            .persist(false)
+            .build();
+        let config = NodeConfig::builder().bootstrap_cache(cache_config).build();
+
+        let plumbed = config.bootstrap_cache.expect("bootstrap cache config set");
+        assert_eq!(
+            plumbed.cache_dir,
+            std::path::PathBuf::from("/tmp/per-instance-peers")
+        );
+        assert!(!plumbed.persist);
+        // Default stays None so existing embedders keep ant-quic's default.
+        assert!(NodeConfig::default().bootstrap_cache.is_none());
     }
 
     #[test]
