@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.34] - 2026-07-18
+
+### Fixed
+
+- **Transient ICMP-derived recv errors no longer terminate the endpoint
+  driver** (saorsa-labs/x0x#262). On Linux, one unreachable peer surfaces
+  as a pending socket error on the next `recvmsg` of the *shared* endpoint
+  socket; `poll_socket` treated every error except `ConnectionReset` as
+  fatal, killing the sole driver task — `driver_lost` then failed every
+  future `connect()` and the socket was never polled again, while the host
+  process stayed alive (observed 14+ hours on a production bootstrap).
+  The transient family (host/net unreachable, refused, not-connected,
+  addr-not-available, timed-out + raw errnos 49/51/65/101/113) now drops
+  the datagram and keeps polling; genuinely fatal socket states still
+  terminate.
+- Driver termination is now `error!`-logged unconditionally (previously
+  `debug!` for the "expected background" class — invisible in production),
+  and `EndpointDriver::drop` warns when `driver_lost` is set without an
+  intentional close.
+
 ## [0.27.33] - 2026-07-15
 
 ### Added
