@@ -45,7 +45,23 @@ use super::{
 };
 use crate::{EndpointConfig, VarInt};
 
-fn is_expected_background_io_error(error: &io::Error) -> bool {
+/// Transient per-datagram socket errors that must NOT terminate the endpoint
+/// driver (x0x issue #262).
+///
+/// On Linux, an unconnected UDP socket surfaces asynchronous ICMP errors
+/// (host/net unreachable, port unreachable) as a pending socket error on the
+/// next `recvmsg` — i.e. one unreachable *peer* manifests as a recv error on
+/// the *shared* socket. Terminating the driver on such an error kills all
+/// QUIC I/O for the process: `driver_lost` makes every future `connect()`
+/// fail synchronously and nothing polls the socket again, while the host
+/// process stays alive. A production bootstrap node sat in exactly that
+/// wedged state for 14+ hours. These errors are scoped to a single datagram
+/// exchange: drop it and keep polling.
+///
+/// Raw errnos cover platform gaps in `io::ErrorKind` mapping: 49
+/// (EADDRNOTAVAIL, macOS), 51/65 (ENETUNREACH/EHOSTUNREACH, macOS),
+/// 101/113 (ENETUNREACH/EHOSTUNREACH, Linux).
+fn is_transient_socket_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::AddrNotAvailable
@@ -252,11 +268,16 @@ impl Endpoint {
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
-                    if is_expected_background_io_error(&e) {
-                        debug!("background I/O path ended: {}", e);
-                    } else {
-                        tracing::error!("I/O error: {}", e);
-                    }
+                    // A driver exit is never routine: it permanently ends all
+                    // QUIC I/O on this endpoint (`driver_lost` fails every
+                    // future connect and nothing polls the socket again).
+                    // Transient per-datagram errors are handled inside
+                    // poll_socket; anything that reaches here is fatal and
+                    // must be loud (x0x issue #262 hid for 14h at debug!).
+                    tracing::error!(
+                        "endpoint driver terminated: {} — transport is dead on this endpoint",
+                        e
+                    );
                 }
             }
             .instrument(Span::current()),
@@ -625,6 +646,16 @@ impl Future for EndpointDriver {
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
         if let Ok(mut endpoint) = self.0.state.lock() {
+            // Loud by design (x0x issue #262): once `driver_lost` is set,
+            // every future connect() fails and the socket is never polled
+            // again — operators need that in logs, not just the effect.
+            // An intentional close() (close reason recorded) stays quiet.
+            if endpoint.recv_state.connections.close.is_none() {
+                tracing::warn!(
+                    "endpoint driver dropped without close — driver_lost set; \
+                     no further QUIC I/O on this endpoint"
+                );
+            }
             endpoint.driver_lost = true;
             self.0.shared.incoming.notify_waiters();
             // Drop all outgoing channels, signaling the termination of the endpoint to the associated
@@ -1143,8 +1174,13 @@ impl RecvState {
                     });
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
-                // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                // attacker; likewise every ICMP-derived transient error a
+                // single unreachable peer can pin on the shared socket —
+                // terminating the driver here silently kills ALL transport
+                // for the process (x0x issue #262). Drop the datagram and
+                // keep polling.
+                Poll::Ready(Err(ref e)) if is_transient_socket_error(e) => {
+                    debug!("ignoring transient socket recv error: {}", e);
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
@@ -1178,4 +1214,56 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(test)]
+mod driver_error_tests {
+    use super::is_transient_socket_error;
+    use std::io;
+
+    /// WHY (x0x issue #262): on Linux, one unreachable peer surfaces as an
+    /// ICMP-derived recv error on the SHARED endpoint socket. If any of
+    /// these terminate the driver, the whole process loses QUIC I/O
+    /// silently — a prod bootstrap sat wedged like that for 14+ hours.
+    #[test]
+    fn icmp_derived_errors_are_transient() {
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                is_transient_socket_error(&io::Error::new(kind, "test")),
+                "{kind:?} must not kill the endpoint driver"
+            );
+        }
+        // Raw errnos with platform-dependent ErrorKind mapping.
+        for errno in [49, 51, 65, 101, 113] {
+            assert!(
+                is_transient_socket_error(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not kill the endpoint driver"
+            );
+        }
+    }
+
+    /// Genuinely fatal socket states must still terminate the driver: a
+    /// dead file descriptor or permission loss is not per-datagram.
+    #[test]
+    fn fatal_errors_still_terminate() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                !is_transient_socket_error(&io::Error::new(kind, "test")),
+                "{kind:?} must remain driver-fatal"
+            );
+        }
+    }
 }
