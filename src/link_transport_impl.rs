@@ -42,7 +42,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::sync::{RwLock as TokioRwLock, broadcast};
+use tokio::sync::{RwLock as TokioRwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::high_level::{
@@ -423,6 +423,67 @@ struct LinkTransportState {
     capabilities: HashMap<PeerId, Capabilities>,
     /// Event broadcaster for LinkEvents.
     event_tx: broadcast::Sender<LinkEvent>,
+    /// Per-protocol accept queues fed by the accept dispatcher.
+    accept_slots: HashMap<ProtocolId, AcceptSlot>,
+    /// Whether the accept dispatcher task has been started.
+    accept_dispatcher_started: bool,
+}
+
+/// Bound on each per-protocol accept queue. Incoming connections beyond the
+/// bound are dropped (with a warning) rather than stalling demux for every
+/// protocol behind one slow acceptor.
+const ACCEPT_QUEUE_BOUND: usize = 64;
+
+/// Queue state for one protocol's accept lane.
+struct AcceptSlot {
+    /// Dispatcher side of the lane.
+    tx: mpsc::Sender<LinkResult<P2pLinkConn>>,
+    /// Held here until `accept()` for this protocol is first called.
+    rx: Option<mpsc::Receiver<LinkResult<P2pLinkConn>>>,
+}
+
+impl AcceptSlot {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel(ACCEPT_QUEUE_BOUND);
+        Self { tx, rx: Some(rx) }
+    }
+}
+
+/// Determine the application protocol a connection negotiated, from the QUIC
+/// handshake's ALPN result.
+///
+/// The ant-quic wire format does not yet carry [`ProtocolId`]: no dial path
+/// offers it via ALPN and no server config advertises it, so today every
+/// connection maps to [`ProtocolId::DEFAULT`]. Reading the negotiated ALPN
+/// here makes the demux correct the moment protocol-aware dialing lands,
+/// with no further accept-side changes.
+fn negotiated_protocol(conn: &HighLevelConnection) -> ProtocolId {
+    let Some(data) = conn.handshake_data() else {
+        return ProtocolId::DEFAULT;
+    };
+    let Some(handshake) = data.downcast_ref::<crate::crypto::rustls::HandshakeData>() else {
+        return ProtocolId::DEFAULT;
+    };
+    alpn_to_protocol_id(handshake.protocol.as_deref())
+}
+
+/// Map a negotiated ALPN value to a [`ProtocolId`].
+///
+/// Protocol-aware peers offer the 16 raw [`ProtocolId`] bytes as their ALPN;
+/// a UTF-8 string form is also accepted for hand-rolled clients. Anything
+/// else falls back to [`ProtocolId::DEFAULT`].
+fn alpn_to_protocol_id(alpn: Option<&[u8]>) -> ProtocolId {
+    match alpn {
+        Some(bytes) if bytes.len() == 16 => {
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(bytes);
+            ProtocolId::new(raw)
+        }
+        Some(bytes) => std::str::from_utf8(bytes)
+            .map(ProtocolId::from)
+            .unwrap_or(ProtocolId::DEFAULT),
+        None => ProtocolId::DEFAULT,
+    }
 }
 
 impl Default for LinkTransportState {
@@ -432,6 +493,8 @@ impl Default for LinkTransportState {
             protocols: vec![ProtocolId::DEFAULT],
             capabilities: HashMap::new(),
             event_tx,
+            accept_slots: HashMap::new(),
+            accept_dispatcher_started: false,
         }
     }
 }
@@ -585,6 +648,82 @@ impl P2pLinkTransport {
         }
     }
 
+    /// Single consumer of `P2pEndpoint::accept()` that routes each incoming
+    /// connection to the accept queue for its negotiated protocol.
+    ///
+    /// One dispatcher per transport replaces the previous scheme where every
+    /// `accept()` call competed for the same endpoint accept queue, so
+    /// concurrent acceptors could steal each other's connections at random.
+    async fn accept_dispatcher(endpoint: Arc<P2pEndpoint>, state: Arc<RwLock<LinkTransportState>>) {
+        while let Some(peer_conn) = endpoint.accept().await {
+            let (proto, item) = match endpoint
+                .get_quic_connection(&peer_conn.peer_id)
+                .ok()
+                .flatten()
+            {
+                Some(conn) => {
+                    // Extract SocketAddr from TransportAddr for LinkConn trait compatibility
+                    let socket_addr = peer_conn
+                        .remote_addr
+                        .as_socket_addr()
+                        .unwrap_or_else(|| conn.remote_address());
+                    let proto = negotiated_protocol(&conn);
+                    (
+                        proto,
+                        Ok(P2pLinkConn::new(conn, peer_conn.peer_id, socket_addr)),
+                    )
+                }
+                None => {
+                    // Protocol is unknowable without the connection; report on
+                    // the default lane, which is where undifferentiated
+                    // traffic is routed.
+                    (
+                        ProtocolId::DEFAULT,
+                        Err(LinkError::ConnectionFailed(
+                            "Connection not found".to_string(),
+                        )),
+                    )
+                }
+            };
+
+            let Ok(mut guard) = state.write() else {
+                error!("accept dispatcher: transport state lock poisoned; stopping demux");
+                return;
+            };
+            let slot = guard
+                .accept_slots
+                .entry(proto)
+                .or_insert_with(AcceptSlot::new);
+            match slot.tx.try_send(item) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        protocol = ?proto,
+                        "accept queue full; dropping incoming connection (acceptor stalled?)"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(item)) => {
+                    // The acceptor was dropped without a successor. Rebuild
+                    // the lane so this connection is still queued for the
+                    // next accept() call rather than lost.
+                    *slot = AcceptSlot::new();
+                    if slot.tx.try_send(item).is_err() {
+                        warn!(
+                            protocol = ?proto,
+                            "failed to requeue incoming connection on rebuilt accept lane"
+                        );
+                    }
+                }
+            }
+            drop(guard);
+        }
+
+        // Endpoint is shutting down: close every lane so accept streams end.
+        if let Ok(mut guard) = state.write() {
+            guard.accept_slots.clear();
+        }
+    }
+
     /// Get the underlying P2pEndpoint.
     pub fn endpoint(&self) -> &P2pEndpoint {
         &self.endpoint
@@ -633,46 +772,73 @@ impl LinkTransport for P2pLinkTransport {
             })
     }
 
-    fn accept(&self, _proto: ProtocolId) -> Incoming<Self::Conn> {
-        // TODO: Implement protocol-based accept filtering
-        // For now, accept all incoming connections
-        let endpoint = self.endpoint.clone();
-
-        Box::pin(futures_util::stream::unfold(
-            endpoint,
-            |endpoint| async move {
-                // Wait for an incoming connection
-                if let Some(peer_conn) = endpoint.accept().await {
-                    // Get the underlying QUIC connection
-                    if let Some(conn) = endpoint
-                        .get_quic_connection(&peer_conn.peer_id)
-                        .ok()
-                        .flatten()
-                    {
-                        // Extract SocketAddr from TransportAddr for LinkConn trait compatibility
-                        let socket_addr = peer_conn
-                            .remote_addr
-                            .as_socket_addr()
-                            .unwrap_or_else(|| conn.remote_address());
-                        let link_conn = P2pLinkConn::new(conn, peer_conn.peer_id, socket_addr);
-                        Some((Ok(link_conn), endpoint))
-                    } else {
-                        // Connection not found, try again
-                        Some((
-                            Err(LinkError::ConnectionFailed(
-                                "Connection not found".to_string(),
-                            )),
-                            endpoint,
-                        ))
+    /// Accept incoming connections for a specific protocol.
+    ///
+    /// Connections are routed by the protocol negotiated during the QUIC
+    /// handshake (ALPN). The ant-quic wire format does not yet carry
+    /// [`ProtocolId`] — neither the dial path nor the server TLS config
+    /// transmits it — so until protocol-aware dialing lands, **every
+    /// connection is routed to [`ProtocolId::DEFAULT`]** and acceptors for
+    /// other protocols yield nothing. This is the honest subset of
+    /// protocol-based accept filtering: the demux and per-protocol queues
+    /// are real, but the wire cannot yet distinguish protocols (issue #224).
+    ///
+    /// A single dispatcher feeds all accept lanes, so concurrent acceptors
+    /// can no longer steal each other's connections from the shared endpoint
+    /// queue. Calling `accept()` again for a protocol that already has an
+    /// acceptor supersedes it: the old acceptor's stream ends and queued
+    /// connections are delivered to the new one.
+    fn accept(&self, proto: ProtocolId) -> Incoming<Self::Conn> {
+        let rx = {
+            let rx_and_dispatcher = self.state.write().map(|mut state| {
+                let slot = state
+                    .accept_slots
+                    .entry(proto)
+                    .or_insert_with(AcceptSlot::new);
+                let rx = match slot.rx.take() {
+                    Some(rx) => rx,
+                    None => {
+                        // An earlier acceptor for this protocol owns the
+                        // previous receiver; supersede it with a fresh lane.
+                        let (tx, rx) = mpsc::channel(ACCEPT_QUEUE_BOUND);
+                        slot.tx = tx;
+                        rx
                     }
-                } else {
-                    // Endpoint is shutting down
-                    None
+                };
+                if !state.accept_dispatcher_started {
+                    state.accept_dispatcher_started = true;
+                    let endpoint = self.endpoint.clone();
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        Self::accept_dispatcher(endpoint, state).await;
+                    });
                 }
-            },
-        ))
+                rx
+            });
+            match rx_and_dispatcher {
+                Ok(rx) => rx,
+                Err(_) => {
+                    return Box::pin(futures_util::stream::once(async {
+                        Err(LinkError::ConnectionFailed(
+                            "transport state lock poisoned".to_string(),
+                        ))
+                    }));
+                }
+            }
+        };
+
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
     }
 
+    /// Dial a peer by PeerId.
+    ///
+    /// Note: the protocol argument is currently **advisory only** — it is not
+    /// transmitted on the wire (issue #224), so the remote side routes the
+    /// connection to its [`ProtocolId::DEFAULT`] acceptor regardless of what
+    /// is passed here. See [`LinkTransport::accept`] for the corresponding
+    /// accept-side contract.
     fn dial(&self, peer: PeerId, _proto: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>> {
         Box::pin(async move {
             // Look up peer address from capabilities
@@ -708,6 +874,14 @@ impl LinkTransport for P2pLinkTransport {
         })
     }
 
+    /// Dial a peer by direct address.
+    ///
+    /// The protocol argument is advisory only for now (not transmitted on
+    /// the wire — see [`Self::dial`]). Address-only dials never enter the
+    /// hole-punch stage (coordination requires an authentic target PeerId)
+    /// and every fallback stage is bounded by the endpoint's connection
+    /// establishment budget, so unreachable addresses fail with a precise
+    /// strategy error rather than hanging (issue #224).
     fn dial_addr(
         &self,
         addr: SocketAddr,
@@ -1421,6 +1595,28 @@ mod tests {
         let stats = ConnectionStats::default();
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.bytes_received, 0);
+    }
+
+    #[test]
+    fn test_alpn_to_protocol_id() {
+        // No ALPN negotiated -> default bucket.
+        assert_eq!(alpn_to_protocol_id(None), ProtocolId::DEFAULT);
+
+        // Raw 16-byte form round-trips exactly.
+        let proto = ProtocolId::from("saorsa-dht/1.0.0");
+        assert_eq!(alpn_to_protocol_id(Some(proto.as_bytes())), proto);
+
+        // UTF-8 string form maps like ProtocolId::from.
+        assert_eq!(
+            alpn_to_protocol_id(Some(b"my-app/1.0")),
+            ProtocolId::from("my-app/1.0")
+        );
+
+        // Non-UTF-8, non-16-byte values fall back to default.
+        assert_eq!(
+            alpn_to_protocol_id(Some(&[0xff, 0xfe, 0xfd])),
+            ProtocolId::DEFAULT
+        );
     }
 
     #[test]
