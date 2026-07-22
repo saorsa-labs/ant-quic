@@ -108,7 +108,7 @@ dirs = "5.0"
 keyring = "3"
 
 # Crypto dependencies (required for PQC)
-rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "aws-lc-rs"] } # floor is 0.23.40: MLKEM1024 via rustls::crypto::aws_lc_rs::kx_group (issue #223)
 aws-lc-rs = { version = "1.16", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"] }
 rustls-platform-verifier = { version = "0.6", optional = true }
 # PQC crypto - required in v0.12.0+
