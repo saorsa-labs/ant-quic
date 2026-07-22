@@ -4976,6 +4976,23 @@ impl P2pEndpoint {
                 ConnectionStage::HolePunching {
                     coordinator, round, ..
                 } => {
+                    // Address-only dials carry no authentic target identity:
+                    // the peer id derived from the socket address is a
+                    // placeholder the target endpoint never claims, so
+                    // coordination can never converge. Entering the stage
+                    // anyway burns the whole connection-establishment budget
+                    // waiting for coordination state that cannot arrive,
+                    // which is the indefinite-looking dial hang reported in
+                    // issue #224. Skip straight to relay with a precise
+                    // reason naming the missing prerequisite.
+                    let Some(target_peer_id) = peer_id else {
+                        strategy.transition_to_relay(
+                            "address-only dial: hole-punch requires the target's PeerId \
+                             (use connect_peer) and cannot coordinate by address alone",
+                        );
+                        continue;
+                    };
+
                     let target = target_ipv4
                         .or(target_ipv6)
                         .ok_or(EndpointError::NoAddress)?;
@@ -4985,17 +5002,20 @@ impl P2pEndpoint {
                         target, coordinator, round
                     );
 
-                    // Use our existing NAT traversal infrastructure
-                    // If peer_id provided, use it. Otherwise derive from address.
-                    let target_peer_id =
-                        peer_id.unwrap_or_else(|| peer_id_from_socket_addr(target));
+                    // Bound the await by the stage's own budget as well as the
+                    // overall establishment deadline. Previously only the
+                    // overall deadline applied, so one hole-punch round could
+                    // consume the entire connection budget even though the
+                    // strategy advertised a smaller holepunch_timeout.
+                    let stage_deadline = overall_deadline
+                        .min(tokio::time::Instant::now() + strategy.holepunch_timeout());
 
                     match self
                         .start_hole_punch_session(coordinator, target_peer_id)
                         .await
                     {
                         Ok(()) => match self
-                            .await_hole_punch_outcome(target, target_peer_id, overall_deadline)
+                            .await_hole_punch_outcome(target, target_peer_id, stage_deadline)
                             .await
                         {
                             Ok(conn) => {
@@ -5062,8 +5082,22 @@ impl P2pEndpoint {
 
                     info!("Trying relay connection to {} via {}", target, relay_addr);
 
+                    // The relay stage must respect the overall establishment
+                    // deadline too: previously it could add a full
+                    // relay_timeout on top of an already-exhausted budget
+                    // (issue #224).
+                    let remaining =
+                        overall_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        strategy.transition_to_next_relay(
+                            "overall connection establishment budget exhausted",
+                        );
+                        continue;
+                    }
+                    let relay_budget = strategy.relay_timeout().min(remaining);
+
                     match timeout(
-                        strategy.relay_timeout(),
+                        relay_budget,
                         self.try_relay_connection(target, relay_addr, peer_id),
                     )
                     .await
