@@ -217,6 +217,13 @@ pub struct Connection {
     permit_idle_reset: bool,
     /// Negotiated idle timeout
     idle_timeout: Option<Duration>,
+    /// Instant of the most recent ACK that advanced the largest acknowledged
+    /// packet for a space in which we held unacked, ack-eliciting data. Gates
+    /// idle-timer resets so a peer that keeps authenticating packets but never
+    /// acknowledges our outstanding data cannot pin the connection forever
+    /// (zombie-connection defense; deliberate deviation from RFC 9000 §10.1 —
+    /// see x0x#278).
+    ack_progress_at: Instant,
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
@@ -373,6 +380,7 @@ impl Connection {
                 None | Some(VarInt(0)) => None,
                 Some(dur) => Some(Duration::from_millis(dur.0)),
             },
+            ack_progress_at: now,
             timers: TimerTable::default(),
             authentication_failures: 0,
             error: None,
@@ -2001,6 +2009,12 @@ impl Connection {
                 false
             }
         };
+        if new_largest && self.path.in_flight.ack_eliciting > 0 {
+            // ACK progress in a space where we hold unacked, ack-eliciting data.
+            // Record it so idle-timer resets stay gated on real peer progress and
+            // a non-acking zombie cannot keep the connection alive (x0x#278).
+            self.ack_progress_at = now;
+        }
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
@@ -2447,7 +2461,21 @@ impl Connection {
     ) {
         self.total_authed_packets += 1;
         self.reset_keep_alive(now);
-        self.reset_idle_timeout(now, space_id);
+        // Gate the idle-timer reset on ACK progress to defeat zombie peers that
+        // keep authenticating packets (retransmits/keepalives/junk) but never
+        // acknowledge our outstanding data. Previously every authenticated
+        // packet reset the idle timer, pinning the connection — and its
+        // ~9.5 MiB send window — forever (x0x#278 measured ~18-20 zombies ×
+        // 9.5 MiB ≈ 172 MB, 200 MB/h RSS growth → OOM in 12-24h).
+        //
+        // When we hold no ack-eliciting data we reset unconditionally (healthy
+        // keepalive, RFC 9000 §10.1 compatible). When we DO hold such data we
+        // only reset while the peer is making ACK progress within the idle
+        // window; otherwise we let `Timer::Idle` reap the connection. This is a
+        // deliberate hardening deviation from RFC 9000 §10.1.
+        if self.no_unacked_data() || self.ack_progress_recent(now) {
+            self.reset_idle_timeout(now, space_id);
+        }
         self.permit_idle_reset = true;
         self.receiving_ecn |= ecn.is_some();
         if let Some(x) = ecn {
@@ -2493,6 +2521,22 @@ impl Connection {
         }
         let dt = cmp::max(timeout, 3 * self.pto(space));
         self.timers.set(Timer::Idle, now + dt);
+    }
+    /// Whether we currently hold no ack-eliciting data awaiting acknowledgement.
+    fn no_unacked_data(&self) -> bool {
+        self.path.in_flight.ack_eliciting == 0
+    }
+
+    /// Whether the peer has made ACK progress (advanced the largest acknowledged
+    /// packet of a space carrying our unacked data) within the current idle
+    /// window. Keeps a genuinely responsive peer alive while letting a
+    /// non-acking zombie time out (x0x#278).
+    fn ack_progress_recent(&self, now: Instant) -> bool {
+        let timeout = match self.idle_timeout {
+            None => return true,
+            Some(d) => d,
+        };
+        now.saturating_duration_since(self.ack_progress_at) < timeout
     }
 
     fn reset_keep_alive(&mut self, now: Instant) {

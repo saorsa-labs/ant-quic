@@ -65,7 +65,7 @@ impl Connecting {
         handle: ConnectionHandle,
         conn: crate::Connection,
         endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        conn_events: mpsc::Receiver<ConnectionEvent>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
@@ -1263,7 +1263,7 @@ impl ConnectionRef {
         handle: ConnectionHandle,
         conn: crate::Connection,
         endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        conn_events: mpsc::Receiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
         socket: Arc<dyn AsyncUdpSocket>,
@@ -1362,7 +1362,7 @@ pub(crate) struct State {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+    conn_events: mpsc::Receiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
@@ -1793,6 +1793,81 @@ mod tests {
         .await
         .expect("weak handle released after strong handles dropped");
 
+        server_task.await.expect("server task");
+    }
+    /// The hard live-connection cap refuses connections beyond the limit via the
+    /// existing refuse path, so a peer flood cannot exhaust a fleet/bootstrap
+    /// node's memory (x0x#278).
+    #[tokio::test]
+    async fn live_connection_cap_refuses_beyond_limit() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, key) = gen_self_signed_cert();
+        let server_config =
+            ServerConfig::with_single_cert(chain.clone(), key).expect("server config");
+        let server =
+            Endpoint::server(server_config, ([127, 0, 0, 1], 0).into()).expect("server endpoint");
+        // Allow only two live connections on this endpoint.
+        server.set_max_connections(2);
+        let server_addr = server.local_addr().expect("server local addr");
+
+        // Server accepts and holds exactly two connections, saturating the cap.
+        let server_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let incoming = timeout(Duration::from_secs(10), server.accept())
+                    .await
+                    .expect("server accept wait")
+                    .expect("incoming connection");
+                let conn = timeout(Duration::from_secs(10), incoming)
+                    .await
+                    .expect("server handshake wait")
+                    .expect("server handshake");
+                held.push(conn);
+            }
+            // Keep the two connections alive until the client tears down.
+            timeout(Duration::from_secs(20), async {
+                for conn in held {
+                    let _ = conn.closed().await;
+                }
+            })
+            .await
+            .ok();
+        });
+
+        let mut client = Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client endpoint");
+        client.set_default_client_config(client_config(&chain));
+
+        // Two connections complete; their handshakes succeeding guarantees the
+        // server has accepted (inserted) them, so the live cap is saturated.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let conn = timeout(
+                Duration::from_secs(10),
+                client
+                    .connect(server_addr, "localhost")
+                    .expect("dial under cap"),
+            )
+            .await
+            .expect("connect wait under cap")
+            .expect("connect under cap");
+            held.push(conn);
+        }
+
+        // A third connection is past the saturated cap and must be refused: it
+        // must never establish, whether the refusal surfaces as an immediate
+        // error or a timeout (x0x#278).
+        let third = client
+            .connect(server_addr, "localhost")
+            .expect("dial past cap");
+        let outcome = timeout(Duration::from_secs(8), third).await;
+        assert!(
+            !matches!(outcome, Ok(Ok(_))),
+            "connection past the live cap must be refused, not established"
+        );
+
+        // Tear down so the server task can complete.
+        drop(held);
+        drop(client);
         server_task.await.expect("server task");
     }
 }
