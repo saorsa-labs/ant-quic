@@ -345,6 +345,10 @@ pub struct Endpoint {
     /// Pending peer address updates from ADD_ADDRESS frames.
     /// Each entry is (peer_connection_addr, new_advertised_addr).
     pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
+    /// Slab capacity recorded the last time the connection index was compacted,
+    /// used to amortise `shrink_to_fit` so a mass reap releases index memory
+    /// without per-removal churn (x0x#278).
+    index_compacted_at_capacity: usize,
 }
 
 impl Endpoint {
@@ -384,6 +388,7 @@ impl Endpoint {
             address_change_callback: None,
             pending_relay_events: Vec::new(),
             pending_peer_address_updates: Vec::new(),
+            index_compacted_at_capacity: 0,
         }
     }
 
@@ -767,6 +772,8 @@ impl Endpoint {
                     // the illegal call.
                     error!(id = ch.0, "unknown connection drained");
                 }
+                // Amortised index compaction after a reap (x0x#278).
+                self.maybe_shrink_index();
             }
         }
         None
@@ -1653,6 +1660,27 @@ impl Endpoint {
         self.connections.len()
     }
 
+    /// Amortised compaction of the connection-index maps. Invoked after a
+    /// connection is reaped (Drained): only when the live connection count has
+    /// fallen to a quarter of the slab's allocated capacity — and only once per
+    /// capacity epoch (tracked by `index_compacted_at_capacity`) — do we
+    /// `shrink_to_fit` the maps. A mass reap therefore releases index memory,
+    /// but we never compact on every single removal (x0x#278).
+    fn maybe_shrink_index(&mut self) {
+        let live = self.connections.len();
+        let cap = self.connections.capacity();
+        // `live * 4 > cap` keeps us above the quarter threshold; the capacity
+        // watermark ensures we compact at most once until the slab grows again.
+        if cap == 0 || live * 4 > cap || cap == self.index_compacted_at_capacity {
+            return;
+        }
+        self.index.connection_ids.shrink_to_fit();
+        self.index.connection_ids_initial.shrink_to_fit();
+        self.index.connection_reset_tokens.shrink_to_fit();
+        self.peer_connections.shrink_to_fit();
+        self.index_compacted_at_capacity = cap;
+    }
+
     /// Counter for the number of bytes currently used
     /// in the buffers for Initial and 0-RTT messages for pending incoming connections
     pub fn incoming_buffer_bytes(&self) -> u64 {
@@ -2136,6 +2164,14 @@ impl ResetTokenTable {
         let token = ResetToken::from(<[u8; RESET_TOKEN_SIZE]>::try_from(token).ok()?);
         self.0.get(&remote)?.get(&token)
     }
+
+    /// Compact both levels of the table after a mass reap (x0x#278).
+    fn shrink_to_fit(&mut self) {
+        self.0.shrink_to_fit();
+        for inner in self.0.values_mut() {
+            inner.shrink_to_fit();
+        }
+    }
 }
 
 /// Identifies a connection by the combination of remote and local addresses
@@ -2152,6 +2188,8 @@ struct FourTuple {
 #[cfg(test)]
 mod tests {
     use super::is_cid_space_exhausted;
+    use super::{ConnectionHandle, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable};
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
     fn cid_space_check_ignores_zero_and_large_lengths() {
@@ -2174,5 +2212,36 @@ mod tests {
         assert!(!is_cid_space_exhausted(4, total_space - quarter_space));
         assert!(is_cid_space_exhausted(4, total_space - quarter_space + 1));
         assert!(is_cid_space_exhausted(4, total_space - 1));
+    }
+
+    /// `ResetTokenTable::shrink_to_fit` (used by the amortised reap compaction)
+    /// releases both levels of the table after a mass removal (x0x#278).
+    #[test]
+    fn reset_token_table_shrink_releases_capacity() {
+        let mut table = ResetTokenTable::default();
+        let addrs: Vec<SocketAddr> = (0..200u16)
+            .map(|i| SocketAddr::from((Ipv4Addr::new(10, 0, 0, (i % 200) as u8), 1000 + i)))
+            .collect();
+        for (i, addr) in addrs.iter().enumerate() {
+            let token = ResetToken::from([(i + 1) as u8; RESET_TOKEN_SIZE]);
+            table.insert(*addr, token, ConnectionHandle(i));
+        }
+        let cap_before = table.0.capacity();
+        assert!(
+            cap_before >= 200,
+            "table should have allocated capacity for the entries"
+        );
+
+        for (i, addr) in addrs.iter().enumerate() {
+            let token = ResetToken::from([(i + 1) as u8; RESET_TOKEN_SIZE]);
+            table.remove(*addr, token);
+        }
+        table.shrink_to_fit();
+        let cap_after = table.0.capacity();
+        assert!(
+            cap_after < cap_before,
+            "shrink_to_fit must release capacity after a mass removal: {cap_after} >= {cap_before}"
+        );
+        assert!(table.0.is_empty());
     }
 }
