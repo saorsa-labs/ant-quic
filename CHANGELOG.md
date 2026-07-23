@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.35] - 2026-07-23
+
+### Fixed
+
+- Reap zombie connections (x0x#278): connections whose peer keeps
+  transmitting authenticated packets but never acknowledges outstanding
+  data previously never reached `Drained`, pinning ~9.5 MiB of send window,
+  an unbounded recv-event channel, and endpoint index entries per zombie —
+  measured at ~200 MB/h RSS growth on x0x's 4 GB fleet nodes (OOM in
+  12-24h). The idle-timer reset in `on_packet_authenticated` is now gated
+  on ACK progress while ack-eliciting data is outstanding (deliberate
+  RFC 9000 §10.1 hardening deviation).
+- The per-connection recv-event channel is now bounded (256 events) with
+  drop-on-full backpressure; 1024 consecutive overflows force-close the
+  connection (→ `Drained` → reaped) so a permanently stuck consumer cannot
+  pin memory.
+- Hard live-connection cap (default 4096, `set_max_connections`) on the
+  incoming path, plus amortised `shrink_to_fit` on the connection-index
+  maps after reaps so mass reaps release index memory.
+
 ## [0.27.34] - 2026-07-18
 
 ### Fixed
