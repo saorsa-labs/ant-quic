@@ -171,6 +171,22 @@ fn node_config_to_p2p_config(config: NodeConfig) -> Result<P2pConfig, NodeError>
         p2p_config.nat.port_mapping.enabled = enabled;
     }
 
+    // Issue #206: pipe NodeConfig's mDNS plane-isolation knobs into the
+    // underlying P2pConfig discovery policy so embedders using the simple
+    // Node API can keep co-located daemons on different logical planes
+    // (e.g. prod + testnet) from discovering and auto-connecting to each
+    // other via the default `ant-quic` mDNS service.
+    if let Some(enabled) = config.mdns_enabled {
+        let mut mdns = p2p_config.discovery.mdns.unwrap_or_default();
+        mdns.enabled = enabled;
+        p2p_config.discovery.mdns = Some(mdns);
+    }
+    if let Some(namespace) = config.mdns_namespace {
+        let mut mdns = p2p_config.discovery.mdns.unwrap_or_default();
+        mdns.namespace = Some(namespace);
+        p2p_config.discovery.mdns = Some(mdns);
+    }
+
     if let Some(cache_config) = config.bootstrap_cache {
         p2p_config.bootstrap_cache = cache_config;
     }
@@ -1147,6 +1163,36 @@ mod tests {
         let config = NodeConfig::builder().max_message_size(0).build();
         let err = node_config_to_p2p_config(config).unwrap_err();
         assert!(err.to_string().contains("max_message_size"));
+    }
+
+    /// Issue #206: NodeConfig's mDNS knobs must reach the P2pConfig
+    /// discovery policy, otherwise `Node` embedders have no way to
+    /// isolate co-located planes that share the default `ant-quic`
+    /// mDNS service (namespace filter only fires once one is set).
+    #[test]
+    fn test_node_config_mdns_namespace_propagates_to_p2p_config() {
+        let config = NodeConfig::builder().mdns_namespace("testnet").build();
+        let p2p_config = node_config_to_p2p_config(config).unwrap();
+        let mdns = p2p_config.discovery.mdns.expect("mDNS config should exist");
+        assert_eq!(mdns.namespace.as_deref(), Some("testnet"));
+        // Untouched knobs keep the ant-quic defaults.
+        assert!(mdns.enabled);
+    }
+
+    #[test]
+    fn test_node_config_mdns_enabled_propagates_to_p2p_config() {
+        let config = NodeConfig::builder().mdns_enabled(false).build();
+        let p2p_config = node_config_to_p2p_config(config).unwrap();
+        let mdns = p2p_config.discovery.mdns.expect("mDNS config should exist");
+        assert!(!mdns.enabled);
+    }
+
+    #[test]
+    fn test_node_config_default_keeps_default_mdns_policy() {
+        let p2p_config = node_config_to_p2p_config(NodeConfig::default()).unwrap();
+        let mdns = p2p_config.discovery.mdns.expect("mDNS config should exist");
+        assert!(mdns.enabled);
+        assert_eq!(mdns.namespace, None);
     }
 
     #[tokio::test]

@@ -109,6 +109,26 @@ pub struct NodeConfig {
     /// default applies (currently enabled).
     pub port_mapping_enabled: Option<bool>,
 
+    /// Enable or disable first-party mDNS discovery for this node.
+    ///
+    /// When `Some(false)`, mDNS browsing and advertising are disabled so
+    /// co-located daemons on the same LAN cannot discover and auto-connect
+    /// to this node via mDNS. When `None`, the ant-quic default applies
+    /// (currently enabled with auto-connect).
+    pub mdns_enabled: Option<bool>,
+
+    /// mDNS namespace isolating this node from other logical planes.
+    ///
+    /// When set, the namespace is advertised in the mDNS TXT record and
+    /// discovered services advertising a different (or no) namespace are
+    /// rejected as dial candidates. Callers running multiple logical
+    /// planes on one host (e.g. prod + testnet daemons) MUST set a
+    /// distinct namespace per plane, otherwise the daemons discover each
+    /// other via the shared `ant-quic` service and auto-connect, bridging
+    /// gossip across planes. When `None`, the ant-quic default applies
+    /// (no namespace; every `ant-quic` service on the LAN is eligible).
+    pub mdns_namespace: Option<String>,
+
     /// Bootstrap peer cache configuration for the node's endpoint.
     ///
     /// The endpoint always owns exactly one [`BootstrapCacheConfig`]-backed
@@ -180,6 +200,8 @@ pub struct NodeConfigBuilder {
     max_concurrent_uni_streams: Option<u32>,
     max_message_size: Option<usize>,
     port_mapping_enabled: Option<bool>,
+    mdns_enabled: Option<bool>,
+    mdns_namespace: Option<String>,
     bootstrap_cache: Option<BootstrapCacheConfig>,
 }
 
@@ -385,6 +407,22 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Enable or disable first-party mDNS discovery (see
+    /// [`NodeConfig::mdns_enabled`]). Use `false` to keep co-located
+    /// daemons on other planes from discovering this node via mDNS.
+    pub fn mdns_enabled(mut self, enabled: bool) -> Self {
+        self.mdns_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the mDNS namespace isolating this node's logical plane (see
+    /// [`NodeConfig::mdns_namespace`]). Callers running multiple planes on
+    /// one host MUST set a distinct namespace per plane.
+    pub fn mdns_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.mdns_namespace = Some(namespace.into());
+        self
+    }
+
     /// Configure the endpoint's bootstrap peer cache (see
     /// [`NodeConfig::bootstrap_cache`])
     pub fn bootstrap_cache(mut self, config: BootstrapCacheConfig) -> Self {
@@ -403,6 +441,8 @@ impl NodeConfigBuilder {
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
             max_message_size: self.max_message_size,
             port_mapping_enabled: self.port_mapping_enabled,
+            mdns_enabled: self.mdns_enabled,
+            mdns_namespace: self.mdns_namespace,
             bootstrap_cache: self.bootstrap_cache,
         }
     }
@@ -466,6 +506,24 @@ mod tests {
         assert!(!plumbed.persist);
         // Default stays None so existing embedders keep ant-quic's default.
         assert!(NodeConfig::default().bootstrap_cache.is_none());
+    }
+
+    /// Issue #206: NodeConfig must expose mDNS plane-isolation knobs so
+    /// co-located daemons on different logical planes do not discover and
+    /// auto-connect to each other via the default `ant-quic` service.
+    #[test]
+    fn builder_plumbs_mdns_plane_isolation_config() {
+        let config = NodeConfig::builder()
+            .mdns_enabled(false)
+            .mdns_namespace("testnet")
+            .build();
+        assert_eq!(config.mdns_enabled, Some(false));
+        assert_eq!(config.mdns_namespace.as_deref(), Some("testnet"));
+
+        // Defaults stay None so existing embedders keep ant-quic's default.
+        let default = NodeConfig::default();
+        assert!(default.mdns_enabled.is_none());
+        assert!(default.mdns_namespace.is_none());
     }
 
     #[test]
