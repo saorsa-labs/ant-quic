@@ -1228,4 +1228,417 @@ mod tests {
         let requests = server.received_requests().await;
         assert_eq!(requests.len(), 3);
     }
+
+    /// Discoverer that skips SSDP and hands out the real `IgdGatewayClient`
+    /// pointed at a `mock-igd` HTTP control endpoint, so the full lifecycle
+    /// runs over actual SOAP/HTTP without needing multicast.
+    struct MockIgdDiscoverer {
+        gateway: IgdGatewayClient,
+    }
+
+    #[async_trait]
+    impl GatewayDiscoverer for MockIgdDiscoverer {
+        async fn discover(&self) -> Result<Box<dyn GatewayControl>, PortMappingError> {
+            Ok(Box::new(self.gateway.clone()))
+        }
+    }
+
+    /// Issue #190: exercise the full additive-mapping lifecycle against a
+    /// mock IGD over real HTTP/SOAP — establish, lease renewal with the
+    /// configured lease values, and `DeletePortMapping` cleanup on shutdown.
+    #[tokio::test]
+    async fn test_mock_igd_lifecycle_establishes_renews_and_cleans_up() {
+        let server = MockIgdServer::start().await.expect("mock IGD server");
+        server
+            .mock(
+                Action::GetExternalIPAddress,
+                Responder::success()
+                    .with_external_ip("198.51.100.7".parse::<IpAddr>().expect("valid external IP")),
+            )
+            .await;
+        server
+            .mock(
+                Action::add_port_mapping().with_protocol(Protocol::UDP),
+                Responder::success(),
+            )
+            .await;
+        server
+            .mock(
+                Action::delete_port_mapping().with_protocol(Protocol::UDP),
+                Responder::success(),
+            )
+            .await;
+
+        let discoverer = MockIgdDiscoverer {
+            gateway: mock_gateway(&server),
+        };
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig {
+                lease_duration_secs: 2,
+                ..PortMappingConfig::default()
+            },
+            31020,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let established = wait_for_events(&events, 1).await;
+        assert!(established.iter().any(|event| matches!(
+            event,
+            PortMappingEvent::Established { snapshot }
+                if snapshot.external_addr == Some("198.51.100.7:31020".parse().expect("valid mapped addr"))
+        )));
+
+        // Lease of 2s renews after 1s; wait for the renewal event.
+        let renewed = wait_for_events(&events, 2).await;
+        assert!(renewed.iter().any(|event| matches!(
+            event,
+            PortMappingEvent::Renewed { snapshot }
+                if snapshot.external_addr == Some("198.51.100.7:31020".parse().expect("valid mapped addr"))
+        )));
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+
+        let requests = server.received_requests().await;
+        let add_requests: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match &request.body {
+                mock_igd::matcher::SoapRequestBody::AddPortMapping(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            add_requests.len() >= 2,
+            "expected initial AddPortMapping plus at least one renewal, got {:?}",
+            add_requests
+        );
+        for request in &add_requests {
+            assert_eq!(request.external_port, 31020);
+            assert_eq!(request.internal_port, 31020);
+            assert_eq!(request.protocol.to_uppercase(), "UDP");
+            assert_eq!(request.lease_duration, 2);
+            assert_eq!(request.description, PORT_MAPPING_DESCRIPTION);
+        }
+
+        let delete_requests: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match &request.body {
+                mock_igd::matcher::SoapRequestBody::DeletePortMapping(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delete_requests.len(),
+            1,
+            "shutdown must issue exactly one DeletePortMapping, got {:?}",
+            delete_requests
+        );
+        assert_eq!(delete_requests[0].external_port, 31020);
+    }
+
+    /// Issue #190: a mock IGD that rejects the requested external port must
+    /// drive the client onto a random external port, and the chosen port
+    /// must be reported back through the established snapshot.
+    #[tokio::test]
+    async fn test_mock_igd_port_conflict_retries_with_random_external_port() {
+        let server = MockIgdServer::start().await.expect("mock IGD server");
+        server
+            .mock(
+                Action::GetExternalIPAddress,
+                Responder::success()
+                    .with_external_ip("198.51.100.8".parse::<IpAddr>().expect("valid external IP")),
+            )
+            .await;
+        // The requested same-port mapping is rejected with the IGD conflict
+        // error; any other (random) external port succeeds.
+        server
+            .mock_with_priority(
+                Action::add_port_mapping()
+                    .with_external_port(31021)
+                    .with_protocol(Protocol::UDP),
+                Responder::error(718, "ConflictInMappingEntry"),
+                10,
+            )
+            .await;
+        server
+            .mock(
+                Action::add_port_mapping().with_protocol(Protocol::UDP),
+                Responder::success(),
+            )
+            .await;
+        server
+            .mock(
+                Action::delete_port_mapping().with_protocol(Protocol::UDP),
+                Responder::success(),
+            )
+            .await;
+
+        let discoverer = MockIgdDiscoverer {
+            gateway: mock_gateway(&server),
+        };
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig::default(),
+            31021,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let events = wait_for_events(&events, 1).await;
+        let mapped_addr = events
+            .iter()
+            .find_map(|event| match event {
+                PortMappingEvent::Established { snapshot } => snapshot.external_addr,
+                _ => None,
+            })
+            .expect("mapping should be established via the random-port fallback");
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+
+        assert_eq!(
+            mapped_addr.ip(),
+            "198.51.100.8".parse::<IpAddr>().expect("valid external IP")
+        );
+        assert_ne!(
+            mapped_addr.port(),
+            31021,
+            "conflicted same-port mapping must not be reported as established"
+        );
+
+        let requests = server.received_requests().await;
+        let add_requests: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match &request.body {
+                mock_igd::matcher::SoapRequestBody::AddPortMapping(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            add_requests.len() >= 2,
+            "expected rejected same-port request plus random-port retry, got {:?}",
+            add_requests
+        );
+        assert_eq!(add_requests[0].external_port, 31021);
+        assert_eq!(add_requests[1].external_port, mapped_addr.port());
+        assert!(
+            (32_768..=65_535).contains(&mapped_addr.port()),
+            "fallback external port should come from the IGD random-port range, got {}",
+            mapped_addr.port()
+        );
+
+        let delete_requests: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match &request.body {
+                mock_igd::matcher::SoapRequestBody::DeletePortMapping(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delete_requests.len(), 1);
+        assert_eq!(delete_requests[0].external_port, mapped_addr.port());
+    }
+
+    /// Discoverer that records how often discovery runs, so tests can prove
+    /// the lifecycle sticks to a selected gateway (no flapping) and only
+    /// re-discovers after the active mapping fails.
+    struct CountingDiscoverer {
+        gateway: Arc<TestGateway>,
+        discover_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl GatewayDiscoverer for CountingDiscoverer {
+        async fn discover(&self) -> Result<Box<dyn GatewayControl>, PortMappingError> {
+            self.discover_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(TestGatewayHandle {
+                inner: Arc::clone(&self.gateway),
+            }))
+        }
+    }
+
+    /// Issue #190 (multi-IGD determinism at the lifecycle layer): once a
+    /// gateway is selected and the mapping is healthy, renewals must not
+    /// re-run discovery — the client sticks to its chosen gateway.
+    #[tokio::test]
+    async fn test_healthy_mapping_does_not_rediscover_gateway() {
+        let gateway = Arc::new(TestGateway::new(
+            "127.0.0.1:1900".parse().expect("valid gateway"),
+            "203.0.113.50".parse().expect("valid external IP"),
+        ));
+        gateway
+            .add_port_results
+            .lock()
+            .expect("lock add_port_results")
+            .extend([Ok(()), Ok(()), Ok(())]);
+
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let discoverer = CountingDiscoverer {
+            gateway,
+            discover_calls: Arc::clone(&discover_calls),
+        };
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig {
+                lease_duration_secs: 2,
+                ..PortMappingConfig::default()
+            },
+            31022,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        // Established plus two renewals (lease 2s → renewal every 1s).
+        let events = wait_for_events(&events, 3).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PortMappingEvent::Established { .. },
+                PortMappingEvent::Renewed { .. },
+                PortMappingEvent::Renewed { .. }
+            ]
+        ));
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "healthy mapping must not flap back through gateway discovery"
+        );
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+    }
+
+    /// Issue #190: when a renewal fails the lifecycle must drop the stale
+    /// mapping, clean it up on the gateway, and re-discover to re-establish.
+    #[tokio::test]
+    async fn test_renewal_failure_drops_mapping_and_rediscovers() {
+        let gateway = Arc::new(TestGateway::new(
+            "127.0.0.1:1900".parse().expect("valid gateway"),
+            "203.0.113.51".parse().expect("valid external IP"),
+        ));
+        // establish Ok → renewal Err → re-establish Ok
+        gateway
+            .add_port_results
+            .lock()
+            .expect("lock add_port_results")
+            .extend([Ok(()), Err("renewal lost".to_string()), Ok(())]);
+
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let discoverer = CountingDiscoverer {
+            gateway: Arc::clone(&gateway),
+            discover_calls: Arc::clone(&discover_calls),
+        };
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            discoverer,
+            PortMappingConfig {
+                lease_duration_secs: 2,
+                ..PortMappingConfig::default()
+            },
+            31023,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let events = wait_for_events(&events, 4).await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    PortMappingEvent::Established { .. },
+                    PortMappingEvent::Failed { .. },
+                    PortMappingEvent::Removed { .. },
+                    PortMappingEvent::Established { .. }
+                ]
+            ),
+            "renewal failure should drop, clean up, and re-establish the mapping; got {:?}",
+            events
+        );
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            2,
+            "failed mapping must be re-established through a fresh discovery"
+        );
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+
+        let removed_ports = gateway
+            .remove_port_calls
+            .lock()
+            .expect("lock remove_port_calls")
+            .clone();
+        assert_eq!(
+            removed_ports,
+            vec![31023, 31023],
+            "stale mapping must be deleted after renewal failure and again on shutdown"
+        );
+    }
+
+    /// Live smoke test for `just heavy-upnp` (requires `ANT_QUIC_LIVE_UPNP=1`
+    /// and a real IGD on the LAN): discovery → mapping → cleanup on shutdown.
+    #[tokio::test]
+    #[ignore = "requires a real IGD/UPnP gateway on the LAN; run via `just heavy-upnp`"]
+    async fn test_upnp_live_igd_mapping_lifecycle() {
+        // Hold a real UDP port so the mapping targets a plausible listener.
+        let socket =
+            std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind UDP socket");
+        let internal_port = socket.local_addr().expect("socket local addr").port();
+
+        let shutdown = CancellationToken::new();
+        let (events, on_update) = collect_events();
+
+        let task = tokio::spawn(run_port_mapping_lifecycle(
+            IgdGatewayDiscoverer,
+            PortMappingConfig::default(),
+            internal_port,
+            shutdown.clone(),
+            on_update,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let established_addr = loop {
+            let current = events.lock().expect("lock events").clone();
+            if let Some(addr) = current.iter().find_map(|event| match event {
+                PortMappingEvent::Established { snapshot } => snapshot.external_addr,
+                _ => None,
+            }) {
+                break addr;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no IGD established a mapping within 30s — is there a UPnP gateway on this LAN? events: {:?}",
+                current
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            !established_addr.ip().is_unspecified(),
+            "live IGD must report a concrete external address, got {established_addr}"
+        );
+
+        shutdown.cancel();
+        task.await.expect("port-mapping task should exit cleanly");
+
+        let final_events = events.lock().expect("lock events").clone();
+        assert!(
+            final_events
+                .iter()
+                .any(|event| matches!(event, PortMappingEvent::Removed { .. })),
+            "graceful shutdown must remove the live mapping; got {:?}",
+            final_events
+        );
+    }
 }

@@ -7,7 +7,7 @@ This plan tracks the repo-wide push to make ant-quic's discovery, traversal, mes
 - `tests/`: broad integration suite with NAT traversal, PQC, compatibility, lifecycle, constrained transport, and P2P delivery tests.
 - `benches/`: Criterion coverage for NAT traversal, connection management, candidate discovery, address discovery, relay queue, PQC pool, and QUIC benchmarks.
 - `src/mdns.rs`: production mDNS discovery with deterministic directory/state logic that should be tested without live multicast.
-- `src/port_mapping.rs`: UPnP/IGD port mapping with `GatewayDiscoverer` and `GatewayControl` seams suitable for mocked tests.
+- `src/port_mapping.rs`: UPnP/IGD port mapping with `GatewayDiscoverer` and `GatewayControl` seams suitable for mocked tests. Mocked coverage includes the full lifecycle over real SOAP/HTTP against `mock-igd` (establish, lease renewal values, port-conflict random-port fallback, `DeletePortMapping` cleanup), gateway stickiness (no re-discovery while healthy), and re-discovery after renewal failure. PR CI runs these via the `UPnP/IGD port mapping tests (mock IGD)` step of the NAT Tests job. `just heavy-upnp` runs a live ignored smoke test (`test_upnp_live_igd_mapping_lifecycle`) against a real LAN IGD.
 - Existing coverage workflow focuses on library coverage; integration coverage should be reported separately before being used as a hard gate.
 
 ## Test Tiers

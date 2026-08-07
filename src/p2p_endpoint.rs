@@ -11199,6 +11199,51 @@ mod tests {
         }
     }
 
+    /// Issue #190: endpoint-level no-mapping startup and capability
+    /// reflection. Port mapping stays enabled in config, but a loopback-only
+    /// bind makes UPnP pointless, so the endpoint must skip the mapping task
+    /// entirely: startup is clean, capabilities report no external mapping,
+    /// and no port-mapping lifecycle events are emitted.
+    #[tokio::test]
+    async fn test_port_mapping_enabled_loopback_bind_skips_mapping_task() {
+        let config = P2pConfig::builder()
+            .bind_addr(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                0,
+            ))
+            .build()
+            .expect("valid config");
+        assert!(config.nat.port_mapping.enabled);
+
+        let endpoint = P2pEndpoint::new(config)
+            .await
+            .expect("endpoint should start cleanly without a usable IGD path");
+        let mut events = endpoint.subscribe();
+
+        // No mapping task was spawned, so this can never produce events;
+        // the brief wait just lets any unexpected task surface them.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(!endpoint.port_mapping_active());
+        assert_eq!(endpoint.port_mapping_addr(), None);
+
+        let collected = collect_broadcast_events(&mut events);
+        assert!(
+            !collected.iter().any(|event| matches!(
+                event,
+                P2pEvent::PortMappingEstablished { .. }
+                    | P2pEvent::PortMappingRenewed { .. }
+                    | P2pEvent::PortMappingAddressChanged { .. }
+                    | P2pEvent::PortMappingFailed { .. }
+                    | P2pEvent::PortMappingRemoved { .. }
+            )),
+            "loopback-only endpoint must not emit port-mapping events, got {:?}",
+            collected
+        );
+
+        endpoint.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_port_mapping_candidate_propagates_to_external_addresses() {
         let config = P2pConfig::builder()
