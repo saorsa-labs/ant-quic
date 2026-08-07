@@ -7832,9 +7832,19 @@ impl NatTraversalEndpoint {
                 info!("wait_idle timed out during shutdown, proceeding");
             }
 
+            // Drop lifecycle-tracked connection handles. Each TrackedConnection
+            // holds a `Connection` clone, which keeps the endpoint's UDP socket
+            // Arc — and its OS file descriptor — alive until process exit
+            // (issue #199). Connections are already closed above; the lifecycle
+            // map is only pruned on new registrations, never on shutdown.
+            self.connection_lifecycle.write().clear();
+
             #[cfg(not(wasm_browser))]
-            if let Err(error) = endpoint.release_socket_for_shutdown() {
-                warn!(%error, "failed to release endpoint UDP socket during shutdown");
+            match endpoint.release_socket_for_shutdown() {
+                Ok(released) => Self::await_socket_fd_release(released).await,
+                Err(error) => {
+                    warn!(%error, "failed to release endpoint UDP socket during shutdown");
+                }
             }
         }
 
@@ -7865,6 +7875,48 @@ impl NatTraversalEndpoint {
 
         info!("NAT traversal endpoint shutdown completed");
         Ok(())
+    }
+
+    /// Wait until every socket extracted by `release_socket_for_shutdown` has
+    /// dropped its last strong reference, closing the underlying OS file
+    /// descriptor before shutdown returns (issue #199).
+    ///
+    /// The endpoint swaps in an ephemeral replacement synchronously, but live
+    /// connection driver tasks keep `Arc` clones of the original socket (and
+    /// senders built from it) alive until they finish draining — briefly after
+    /// `wait_idle` completes. Awaiting the reference drain makes an immediate
+    /// same-fixed-port rebind succeed in a tight stop/start loop. Bounded so a
+    /// leaked socket clone can only delay, never hang, shutdown.
+    #[cfg(not(wasm_browser))]
+    async fn await_socket_fd_release(
+        released: Vec<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>>,
+    ) {
+        /// How often to poll for lingering socket references during shutdown.
+        const SOCKET_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+        /// Bounded wait for connection driver tasks to release the fixed-port
+        /// socket; a leaked clone delays rebind but must not hang shutdown.
+        const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        if released.is_empty() {
+            return;
+        }
+        let watchers: Vec<_> = released.iter().map(Arc::downgrade).collect();
+        drop(released);
+
+        let wait = async {
+            loop {
+                if watchers.iter().all(|weak| weak.upgrade().is_none()) {
+                    return;
+                }
+                sleep(SOCKET_RELEASE_POLL_INTERVAL).await;
+            }
+        };
+        if timeout(SOCKET_RELEASE_TIMEOUT, wait).await.is_err() {
+            warn!(
+                "timed out waiting for UDP socket references to drop; \
+                 fixed port may remain briefly unavailable for rebind"
+            );
+        }
     }
 
     /// Discover address candidates for a peer
