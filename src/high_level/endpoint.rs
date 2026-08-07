@@ -772,6 +772,20 @@ fn spawn_supervised_driver(rc: EndpointRef, runtime: Arc<dyn Runtime>) {
                 }
                 sleep_for(&*task_runtime, backoff).await;
                 backoff = (backoff * 2).min(DRIVER_RESPAWN_MAX_BACKOFF);
+                // An intentional close or shutdown can land during the
+                // backoff sleep; respawning past it would resurrect a
+                // deliberately released socket.
+                let closed_during_backoff = match rc.state.lock() {
+                    Ok(state) => {
+                        state.recv_state.connections.close.is_some()
+                            || state.socket_released_for_shutdown
+                    }
+                    Err(_) => true,
+                };
+                if closed_during_backoff {
+                    debug!("endpoint driver not respawned: endpoint closed during backoff");
+                    return;
+                }
                 #[cfg(not(wasm_browser))]
                 rebind_for_respawn(&rc, &*task_runtime);
             }
@@ -1935,6 +1949,39 @@ mod driver_supervisor_tests {
         assert!(
             state.recv_state.connections.senders.is_empty(),
             "terminal teardown must drop connection channels"
+        );
+    }
+
+    /// WHY (issue #220 vs #199): `shutdown()` can fire while the supervisor is
+    /// sleeping out its respawn backoff. Without a post-sleep re-check the
+    /// supervisor would rebind and spawn a fresh driver on a socket that
+    /// shutdown had just released, leaving a zombie driver behind.
+    #[tokio::test]
+    async fn shutdown_during_backoff_prevents_respawn() {
+        let socket = Arc::new(ControllableSocket {
+            addr: unbindable_addr(),
+            fail_with: Mutex::new(Some(io::ErrorKind::PermissionDenied)),
+            recv_calls: AtomicUsize::new(0),
+        });
+        let (rc, inner, runtime) = test_endpoint_ref(socket.clone());
+        let _user_handle = rc.clone();
+        spawn_supervised_driver(rc, runtime);
+
+        // The first driver dies fatally and the supervisor enters its
+        // backoff sleep...
+        assert!(
+            wait_until(|| recv_calls(&socket) >= 1, Duration::from_secs(5)).await,
+            "driver must poll the socket once"
+        );
+        // ...then shutdown lands mid-backoff (the release path sets this
+        // flag before swapping the socket out).
+        inner.state.lock().unwrap().socket_released_for_shutdown = true;
+
+        tokio::time::sleep(DRIVER_RESPAWN_INITIAL_BACKOFF * 5).await;
+        assert_eq!(
+            recv_calls(&socket),
+            1,
+            "supervisor must not respawn a driver after shutdown released the socket"
         );
     }
 
