@@ -476,8 +476,14 @@ impl Endpoint {
     /// alive in an embedding process. Unlike `rebind_abstract`, this deliberately
     /// clears `prev_socket` so the old socket is dropped immediately rather than
     /// retained until migration traffic arrives on the replacement socket.
+    ///
+    /// The replaced socket(s) are returned so the caller can wait out any
+    /// remaining `Arc` clones (held by live connection driver tasks and the
+    /// senders built from the socket) before reporting shutdown complete —
+    /// the OS file descriptor stays open until the last clone drops (issue
+    /// #199). Returns an empty `Vec` when the socket was already released.
     #[cfg(not(wasm_browser))]
-    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<()> {
+    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<Vec<Arc<dyn AsyncUdpSocket>>> {
         let (old_addr, runtime) = {
             let state = self
                 .inner
@@ -485,7 +491,7 @@ impl Endpoint {
                 .lock()
                 .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
             if state.socket_released_for_shutdown {
-                return Ok(());
+                return Ok(Vec::new());
             }
             (state.socket.local_addr()?, state.runtime.clone())
         };
@@ -514,14 +520,17 @@ impl Endpoint {
             .lock()
             .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
         if state.socket_released_for_shutdown {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        state.prev_socket = None;
-        state.socket = replacement;
+        let mut released = Vec::with_capacity(2);
+        released.push(mem::replace(&mut state.socket, replacement));
+        if let Some(prev_socket) = state.prev_socket.take() {
+            released.push(prev_socket);
+        }
         state.ipv6 = replacement_addr.is_ipv6();
         state.socket_released_for_shutdown = true;
 
-        Ok(())
+        Ok(released)
     }
 
     /// Get the number of connections that are currently open

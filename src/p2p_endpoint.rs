@@ -11186,6 +11186,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_releases_udp_socket_for_tight_loop_same_port_rebind() {
+        // Issue #199: a zero-gap stop->start loop on the same fixed UDP port
+        // must not hit EADDRINUSE once shutdown() has returned.
+        let addr = allocate_loopback_port();
+        for iteration in 0..3 {
+            let endpoint = fixed_port_endpoint(addr).await;
+            // The endpoint may upgrade the requested v4 bind to a dual-stack
+            // socket, so probe the address it actually holds.
+            let held_addr = endpoint.local_addr().expect("endpoint local addr");
+
+            endpoint.shutdown().await;
+
+            let rebound = std::net::UdpSocket::bind(held_addr);
+            assert!(
+                rebound.is_ok(),
+                "iteration {iteration}: shutdown should release {held_addr} for immediate \
+                 zero-gap same-port rebind: {rebound:?}"
+            );
+            drop(rebound);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_udp_socket_for_tight_loop_rebind_with_live_connection() {
+        // Issue #199 with the x0x pattern: a live connection leaves Arc clones of
+        // the fixed-port socket in lifecycle tracking and driver tasks.
+        // shutdown() must wait out those references, not just swap the
+        // endpoint-state socket, before an immediate same-port rebind can pass.
+        let listener = fixed_port_endpoint(allocate_loopback_port()).await;
+        let listener_addr = localhost_addr(listener.local_addr().expect("listener addr"));
+
+        let addr = allocate_loopback_port();
+        for iteration in 0..3 {
+            let endpoint = fixed_port_endpoint(addr).await;
+            let held_addr = endpoint.local_addr().expect("endpoint local addr");
+
+            let accept_handle = tokio::spawn({
+                let listener = listener.clone();
+                async move { listener.accept().await }
+            });
+
+            let connection = tokio::time::timeout(
+                Duration::from_secs(10),
+                endpoint.connect_addr(listener_addr),
+            )
+            .await
+            .expect("connect should not time out")
+            .expect("connect should succeed");
+            drop(connection);
+
+            endpoint.shutdown().await;
+
+            let rebound = std::net::UdpSocket::bind(held_addr);
+            assert!(
+                rebound.is_ok(),
+                "iteration {iteration}: shutdown should release {held_addr} for immediate \
+                 zero-gap same-port rebind despite the live connection: {rebound:?}"
+            );
+            drop(rebound);
+            let _accepted = accept_handle.await;
+        }
+
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_port_mapping_disabled_mode_starts_cleanly() {
         let config = P2pConfig::builder()
             .port_mapping_enabled(false)
