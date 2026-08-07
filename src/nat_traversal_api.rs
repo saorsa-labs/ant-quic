@@ -9520,7 +9520,10 @@ impl NatTraversalEndpoint {
             return true;
         }
 
-        warn!("Peer {:?} is not synchronized", session.peer_id);
+        // Not an error worth WARN: this fires on every session poll until the
+        // peer syncs (or times out, which is reported separately), producing
+        // activity-proportional noise that drowns real signals (issue #221).
+        debug!("Peer {:?} is not synchronized", session.peer_id);
         false
     }
 

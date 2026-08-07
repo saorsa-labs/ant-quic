@@ -4854,6 +4854,20 @@ impl Connection {
                 // Silently ignore duplicates (peer may resend)
                 Ok(())
             }
+            Err(
+                e @ (NatTraversalError::ResourceLimitExceeded
+                | NatTraversalError::RateLimitExceeded
+                | NatTraversalError::InvalidAddress
+                | NatTraversalError::SecurityValidationFailed),
+            ) => {
+                // Expected rejections under normal peer churn (rate limits,
+                // suspicious/invalid advertiser addresses). The specifics are
+                // already logged inside add_remote_candidate; emitting WARN
+                // per rejected ADD_ADDRESS frame is activity-proportional
+                // noise on healthy nodes (issue #221).
+                debug!("Rejected remote candidate {}: {}", normalized_addr, e);
+                Ok(())
+            }
             Err(e) => {
                 warn!("Failed to add remote candidate: {}", e);
                 Ok(()) // Don't terminate connection for non-critical errors

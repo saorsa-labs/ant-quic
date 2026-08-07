@@ -711,6 +711,19 @@ fn peer_id_from_socket_addr(addr: SocketAddr) -> PeerId {
     PeerId(id)
 }
 
+/// Returns true when `peer_id` matches the synthetic placeholder layout
+/// produced by [`peer_id_from_socket_addr`] (8 bytes of address hash + 2 bytes
+/// of port, followed by 22 zero bytes).
+///
+/// Synthetic ids are ephemeral, address-derived placeholders — not durable
+/// ML-DSA-65 identities. They must never be persisted to the bootstrap cache,
+/// key NAT traversal sessions, or be targeted by hole punching (issue #221).
+/// A genuine SHA-256-derived PeerId accidentally matching this layout would
+/// need 22 trailing zero bytes (~2^-176), so the check is safe in practice.
+fn is_synthetic_peer_id(peer_id: &PeerId) -> bool {
+    peer_id.0[10..].iter().all(|byte| *byte == 0)
+}
+
 /// P2P endpoint - the primary API for ant-quic
 ///
 /// This struct provides the main interface for P2P communication with
@@ -3559,6 +3572,16 @@ impl P2pEndpoint {
         }
 
         for peer in self.bootstrap_cache.all_peers().await {
+            // Phantom entries persisted by older builds (or before the
+            // synthetic-id guards landed) must not re-enter dialing or
+            // coordination (issue #221).
+            if is_synthetic_peer_id(&peer.peer_id) {
+                debug!(
+                    "skipping cached peer with synthetic placeholder id {:?}",
+                    peer.peer_id
+                );
+                continue;
+            }
             snapshot.add_cached_peer(&peer);
         }
 
@@ -4285,6 +4308,17 @@ impl P2pEndpoint {
         addrs: Vec<SocketAddr>,
         capabilities: Option<PeerCapabilities>,
     ) {
+        // Synthetic placeholder ids are not durable identities; accepting
+        // hints for them would leak phantom peers into the persisted
+        // bootstrap cache (issue #221).
+        if is_synthetic_peer_id(&peer_id) {
+            debug!(
+                "ignoring peer hints for synthetic placeholder peer id {:?}",
+                peer_id
+            );
+            return;
+        }
+
         {
             let mut hints = self.peer_hint_records.write().await;
             hints
@@ -4983,9 +5017,13 @@ impl P2pEndpoint {
                     // anyway burns the whole connection-establishment budget
                     // waiting for coordination state that cannot arrive,
                     // which is the indefinite-looking dial hang reported in
-                    // issue #224. Skip straight to relay with a precise
+                    // issue #224. Synthetic placeholder ids that leak in from
+                    // stale hints or cache entries fail the same way
+                    // (issue #221). Skip straight to relay with a precise
                     // reason naming the missing prerequisite.
-                    let Some(target_peer_id) = peer_id else {
+                    let Some(target_peer_id) =
+                        peer_id.filter(|peer_id| !is_synthetic_peer_id(peer_id))
+                    else {
                         strategy.transition_to_relay(
                             "address-only dial: hole-punch requires the target's PeerId \
                              (use connect_peer) and cannot coordinate by address alone",
@@ -5203,8 +5241,13 @@ impl P2pEndpoint {
 
         // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
         self.inner.register_connection_peer_id(addr, peer_id);
-        self.inner
-            .record_bootstrap_direct_connection(peer_id, &addr, Some(connection.rtt()));
+        // Synthetic placeholder ids are not durable identities: recording them
+        // would pollute `successful_candidates` and promote an address-only
+        // peer into the bootstrap/coordinator set (issue #221).
+        if !is_synthetic_peer_id(&peer_id) {
+            self.inner
+                .record_bootstrap_direct_connection(peer_id, &addr, Some(connection.rtt()));
+        }
 
         // Clone the connection for the reader task BEFORE handler consumes it.
         // Do NOT re-fetch via get_connection() — see simultaneous-connect fix.
@@ -5758,6 +5801,18 @@ impl P2pEndpoint {
         peer_conn: &PeerConnection,
     ) {
         if !peer_conn.traversal_method.is_direct() {
+            return;
+        }
+
+        // Synthetic placeholder ids are not durable identities; persisting
+        // them would leak phantom peers into the bootstrap cache, where they
+        // would later be dialed as hole-punch targets that can never
+        // authenticate (issue #221).
+        if is_synthetic_peer_id(&peer_conn.peer_id) {
+            debug!(
+                "skipping bootstrap-cache persistence for synthetic peer id {:?}",
+                peer_conn.peer_id
+            );
             return;
         }
 
@@ -8984,21 +9039,33 @@ impl P2pEndpoint {
             .map(|(peer_id, _)| *peer_id);
 
         if let Some(peer_id) = peer_id {
-            peer_hint_records
-                .write()
-                .await
-                .entry(peer_id)
-                .or_default()
-                .merge(vec![advertised_addr], None);
+            if is_synthetic_peer_id(&peer_id) {
+                // The address matched a connection tracked under a synthetic
+                // placeholder id; do not persist hints or cache entries that
+                // could later be dialed as phantom hole-punch targets
+                // (issue #221).
+                debug!(
+                    peer_addr = %peer_addr,
+                    advertised_addr = %advertised_addr,
+                    "peer address update matched a synthetic placeholder peer id; skipping persistence"
+                );
+            } else {
+                peer_hint_records
+                    .write()
+                    .await
+                    .entry(peer_id)
+                    .or_default()
+                    .merge(vec![advertised_addr], None);
 
-            let mut cached_peer = bootstrap_cache
-                .get_peer(&peer_id)
-                .await
-                .unwrap_or_else(|| CachedPeer::new(peer_id, Vec::new(), PeerSource::Merge));
-            cached_peer
-                .capabilities
-                .record_external_address(advertised_addr);
-            bootstrap_cache.upsert(cached_peer).await;
+                let mut cached_peer = bootstrap_cache
+                    .get_peer(&peer_id)
+                    .await
+                    .unwrap_or_else(|| CachedPeer::new(peer_id, Vec::new(), PeerSource::Merge));
+                cached_peer
+                    .capabilities
+                    .record_external_address(advertised_addr);
+                bootstrap_cache.upsert(cached_peer).await;
+            }
         } else {
             debug!(
                 peer_addr = %peer_addr,
@@ -11737,6 +11804,150 @@ mod tests {
                 advertised_addr: observed_advertised_addr,
             } if *observed_peer_addr == peer_addr && *observed_advertised_addr == advertised_addr
         )));
+
+        endpoint.shutdown().await;
+    }
+
+    #[test]
+    fn test_is_synthetic_peer_id_detection() {
+        let synthetic = peer_id_from_socket_addr("192.0.2.1:1234".parse().expect("valid addr"));
+        assert!(is_synthetic_peer_id(&synthetic));
+
+        // A real ML-DSA-65-derived PeerId (SHA-256 over the public key)
+        // essentially never carries 22 trailing zero bytes.
+        assert!(!is_synthetic_peer_id(&PeerId([0x34; 32])));
+
+        // Layout sanity: hash in bytes 0..8, port in bytes 8..10.
+        assert_eq!(&synthetic.0[8..10], &1234u16.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_persist_direct_reachability_if_applicable_skips_synthetic_peer_id() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let remote_addr: SocketAddr = "198.51.100.35:5483".parse().expect("valid addr");
+        let peer_id = peer_id_from_socket_addr(remote_addr);
+        let peer_conn = PeerConnection {
+            peer_id,
+            remote_addr: TransportAddr::Udp(remote_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        P2pEndpoint::persist_direct_peer_reachability_if_applicable(
+            endpoint.bootstrap_cache.as_ref(),
+            &peer_conn,
+        )
+        .await;
+
+        assert!(
+            endpoint.bootstrap_cache.get_peer(&peer_id).await.is_none(),
+            "synthetic placeholder ids must never reach bootstrap-cache persistence"
+        );
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_address_update_skips_synthetic_peer_id() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let peer_addr: SocketAddr = "127.0.0.1:45001".parse().expect("valid addr");
+        let advertised_addr: SocketAddr = "198.51.100.45:5483".parse().expect("valid addr");
+        let peer_id = peer_id_from_socket_addr(peer_addr);
+        let mut events = endpoint.subscribe();
+
+        endpoint
+            .register_connected_peer(PeerConnection {
+                peer_id,
+                remote_addr: TransportAddr::Udp(peer_addr),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Server,
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            })
+            .await;
+
+        P2pEndpoint::apply_peer_address_update(
+            endpoint.connected_peers.as_ref(),
+            endpoint.bootstrap_cache.as_ref(),
+            endpoint.peer_hint_records.as_ref(),
+            &endpoint.event_tx,
+            peer_addr,
+            advertised_addr,
+        )
+        .await;
+
+        assert!(
+            endpoint.hinted_addrs_for_peer(peer_id).await.is_empty(),
+            "synthetic placeholder ids must not accumulate peer hints"
+        );
+        assert!(
+            endpoint.bootstrap_cache.get_peer(&peer_id).await.is_none(),
+            "synthetic placeholder ids must never reach bootstrap-cache persistence"
+        );
+        // The address-update event is still emitted; only persistence is skipped.
+        let observed_events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(observed_events.iter().any(|event| matches!(
+            event,
+            P2pEvent::PeerAddressUpdated {
+                peer_addr: observed_peer_addr,
+                advertised_addr: observed_advertised_addr,
+            } if *observed_peer_addr == peer_addr && *observed_advertised_addr == advertised_addr
+        )));
+
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_upsert_peer_hints_ignores_synthetic_peer_id() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        let hinted_addr: SocketAddr = "127.0.0.1:9001".parse().expect("valid addr");
+        let peer_id = peer_id_from_socket_addr(hinted_addr);
+
+        endpoint
+            .upsert_peer_hints(peer_id, vec![hinted_addr], None)
+            .await;
+
+        assert!(endpoint.hinted_addrs_for_peer(peer_id).await.is_empty());
+        assert!(endpoint.bootstrap_cache.get_peer(&peer_id).await.is_none());
 
         endpoint.shutdown().await;
     }
