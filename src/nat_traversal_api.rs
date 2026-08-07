@@ -330,6 +330,20 @@ use crate::config::validation::{ConfigValidator, ValidationResult};
 
 use crate::crypto::{pqc::PqcConfig, raw_public_keys::RawPublicKeyConfigBuilder};
 
+/// Hard cap on concurrent NAT traversal sessions tracked in `active_sessions`
+/// (audit #215). Sessions are only created by local outbound calls
+/// (`initiate_nat_traversal`), so this is not remote-drivable, but without a
+/// bound a caller looping over a large peer set could grow the map — and its
+/// per-session candidates, timers, and connection attempts — without limit.
+const MAX_ACTIVE_TRAVERSAL_SESSIONS: usize = 100;
+
+/// Hard cap on incoming connections queued in `pending_accepts` awaiting
+/// `accept_connection()` (audit #215). Entries are only produced after a
+/// completed, authenticated handshake and are tiny (`PendingAccept` is 40
+/// bytes), but an application that never drains the queue would otherwise let
+/// it grow with every inbound connection.
+const MAX_PENDING_ACCEPTS: usize = 1024;
+
 #[derive(Debug, Clone, Copy)]
 struct PendingAccept {
     peer_id: PeerId,
@@ -886,6 +900,9 @@ impl TraversalFailureReason {
                     Self::NetworkError(message.clone())
                 }
             }
+            NatTraversalError::TooManySessions => {
+                Self::NetworkError("session budget exhausted".to_string())
+            }
         }
     }
 
@@ -914,6 +931,9 @@ impl TraversalFailureReason {
                 Some(Self::ProtocolViolation(message.clone()))
             }
             NatTraversalError::NetworkError(message) => Some(Self::NetworkError(message.clone())),
+            NatTraversalError::TooManySessions => {
+                Some(Self::NetworkError("session budget exhausted".to_string()))
+            }
         }
     }
 }
@@ -1516,6 +1536,8 @@ pub enum NatTraversalError {
     TraversalFailed(String),
     /// Peer not connected
     PeerNotConnected,
+    /// Too many concurrent NAT traversal sessions (session budget exhausted)
+    TooManySessions,
 }
 
 impl Default for NatTraversalConfig {
@@ -2784,10 +2806,13 @@ impl NatTraversalEndpoint {
                                     }
                                 };
 
-                                pending_accepts.lock().push_back(PendingAccept {
-                                    peer_id,
-                                    generation,
-                                });
+                                Self::push_pending_accept(
+                                    &pending_accepts,
+                                    PendingAccept {
+                                        peer_id,
+                                        generation,
+                                    },
+                                );
                                 if let Some(ref tx) = relay_event_tx {
                                     if let Err(e) =
                                         tx.send(NatTraversalEvent::ConnectionEstablished {
@@ -3206,6 +3231,21 @@ impl NatTraversalEndpoint {
         // test). DashMap's per-key `entry` lock makes the decision atomic: the
         // first caller takes the Vacant slot and proceeds; all others observe
         // Occupied and return early as a clean dedup (not an error).
+        //
+        // Session budget (audit #215): reject *new* peers once the map is full.
+        // Checked before `entry()` so a full map fails cheaply without taking a
+        // shard write lock; an already-tracked peer still dedups cleanly below.
+        // Concurrent callers can overshoot the cap by a small amount — harmless
+        // for a resource guard.
+        if self.active_sessions.len() >= MAX_ACTIVE_TRAVERSAL_SESSIONS
+            && !self.active_sessions.contains_key(&peer_id)
+        {
+            warn!(
+                "NAT traversal session limit ({MAX_ACTIVE_TRAVERSAL_SESSIONS}) reached; rejecting new session for peer {:?}",
+                peer_id
+            );
+            return Err(NatTraversalError::TooManySessions);
+        }
         match self.active_sessions.entry(peer_id) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 debug!(
@@ -5332,10 +5372,13 @@ impl NatTraversalEndpoint {
                                     }
                                 };
 
-                                pending_accepts.lock().push_back(PendingAccept {
-                                    peer_id,
-                                    generation,
-                                });
+                                Self::push_pending_accept(
+                                    &pending_accepts,
+                                    PendingAccept {
+                                        peer_id,
+                                        generation,
+                                    },
+                                );
                                 incoming_notify.notify_one();
                                 traversal_event_notify.notify_waiters();
 
@@ -6427,7 +6470,34 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Accept incoming connections on the endpoint
+    /// Push an entry onto the bounded pending-accept queue (audit #215).
+    /// Entries are only produced after a completed, authenticated handshake,
+    /// but an application that never calls `accept_connection()` would
+    /// otherwise let the queue grow with every inbound connection. When the
+    /// queue is full the oldest entry is evicted (the evicted connection
+    /// remains live in `connections`, it is just no longer delivered via
+    /// `accept_connection()`); stale entries are skipped at drain time anyway.
+    fn push_pending_accept(
+        pending_accepts: &ParkingMutex<std::collections::VecDeque<PendingAccept>>,
+        pending: PendingAccept,
+    ) {
+        let mut queue = pending_accepts.lock();
+        if queue.len() >= MAX_PENDING_ACCEPTS
+            && let Some(evicted) = queue.pop_front()
+        {
+            warn!(
+                "pending accept queue full ({MAX_PENDING_ACCEPTS}); dropping oldest entry for peer {:?}",
+                evicted.peer_id
+            );
+        }
+        queue.push_back(pending);
+    }
+
+    /// Accept incoming connections on the endpoint.
+    ///
+    /// The pending-accept queue is bounded (`MAX_PENDING_ACCEPTS`); if the
+    /// application does not drain it, the oldest queued connections are
+    /// evicted and will not be returned here.
     pub async fn accept_connection(&self) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         debug!("Waiting for incoming connection via accept queue...");
         loop {
@@ -10244,6 +10314,7 @@ impl fmt::Display for NatTraversalError {
             Self::ConnectionFailed(msg) => write!(f, "connection failed: {msg}"),
             Self::TraversalFailed(msg) => write!(f, "traversal failed: {msg}"),
             Self::PeerNotConnected => write!(f, "peer not connected"),
+            Self::TooManySessions => write!(f, "too many concurrent NAT traversal sessions"),
         }
     }
 }
@@ -12619,5 +12690,112 @@ mod tests {
             handles.is_empty(),
             "Handles should remain empty after shutdown"
         );
+    }
+
+    /// Audit #215: the pending-accept queue must be bounded; when full, the
+    /// oldest entry is evicted so an application that never drains the queue
+    /// cannot exhaust memory.
+    #[test]
+    fn test_push_pending_accept_evicts_oldest_when_full() {
+        let queue = ParkingMutex::new(std::collections::VecDeque::new());
+
+        for i in 0..=MAX_PENDING_ACCEPTS {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            NatTraversalEndpoint::push_pending_accept(
+                &queue,
+                PendingAccept {
+                    peer_id: PeerId(id),
+                    generation: i as u64,
+                },
+            );
+        }
+
+        let queue = queue.lock();
+        assert_eq!(queue.len(), MAX_PENDING_ACCEPTS);
+        assert_eq!(
+            queue.front().map(|p| p.generation),
+            Some(1),
+            "oldest entry (generation 0) must have been evicted"
+        );
+        assert_eq!(
+            queue.back().map(|p| p.generation),
+            Some(MAX_PENDING_ACCEPTS as u64),
+            "newest entry must still be queued"
+        );
+    }
+
+    /// Audit #215: `active_sessions` must be bounded; initiating traversal to
+    /// a *new* peer once the budget is exhausted is rejected, while an
+    /// already-tracked peer still dedups cleanly.
+    #[tokio::test]
+    async fn test_initiate_nat_traversal_enforces_session_budget() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        let now = std::time::Instant::now();
+        let make_session = |peer_id: PeerId| NatTraversalSession {
+            peer_id,
+            coordinator: "127.0.0.1:9000".parse().unwrap(),
+            attempt: 1,
+            started_at: now,
+            phase_started_at: now,
+            phase: TraversalPhase::Discovery,
+            candidates: Vec::new(),
+            last_progress_at: now,
+            next_deadline: None,
+            retry_at: None,
+            last_failure: None,
+            session_state: SessionState {
+                state: ConnectionState::Connecting,
+                last_transition: now,
+                connection: None,
+                active_attempts: Vec::new(),
+                metrics: ConnectionMetrics::default(),
+            },
+        };
+
+        // Fill the session budget with already-tracked peers.
+        let tracked_peer = PeerId([0xAA; 32]);
+        endpoint
+            .active_sessions
+            .insert(tracked_peer, make_session(tracked_peer));
+        for i in 1..MAX_ACTIVE_TRAVERSAL_SESSIONS {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let peer_id = PeerId(id);
+            endpoint
+                .active_sessions
+                .insert(peer_id, make_session(peer_id));
+        }
+        assert_eq!(
+            endpoint.active_sessions.len(),
+            MAX_ACTIVE_TRAVERSAL_SESSIONS
+        );
+
+        let coordinator: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // A new peer must be rejected once the budget is exhausted.
+        let new_peer = PeerId([0xBB; 32]);
+        let result = endpoint.initiate_nat_traversal(new_peer, coordinator);
+        assert!(
+            matches!(result, Err(NatTraversalError::TooManySessions)),
+            "expected TooManySessions, got {result:?}"
+        );
+        assert!(!endpoint.active_sessions.contains_key(&new_peer));
+
+        // An already-tracked peer still dedups as Ok (not an error).
+        let result = endpoint.initiate_nat_traversal(tracked_peer, coordinator);
+        assert!(
+            result.is_ok(),
+            "duplicate initiate for tracked peer must dedup cleanly, got {result:?}"
+        );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
     }
 }
