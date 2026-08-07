@@ -10,6 +10,9 @@ jobs:
   check-pr-target:
     runs-on: ubuntu-latest
     if: github.repository == 'saorsa-labs/ant-quic'
+    permissions:
+      issues: write
+      pull-requests: write
     steps:
       - name: Check PR Target
         run: |
@@ -37,9 +40,16 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '⚠️ **Reminder**: ant-quic is an independent project, not a fork of Quinn. We do not contribute changes back to quinn-rs/quinn.'
-            })
+            // The reminder is best-effort: pull_request events from forks get a
+            // read-only token no matter what permissions are declared, and the
+            // reminder must not fail the check when it cannot be posted.
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '⚠️ **Reminder**: ant-quic is an independent project, not a fork of Quinn. We do not contribute changes back to quinn-rs/quinn.'
+              })
+            } catch (error) {
+              core.warning(`Could not post reminder comment: ${error.message}`)
+            }
