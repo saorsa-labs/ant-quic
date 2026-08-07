@@ -692,6 +692,50 @@ mod tests {
     }
 
     #[test]
+    fn test_peer_is_removed_when_update_loses_all_routable_addresses() {
+        let local_peer_id = PeerId([0xb1; 32]);
+        let mut directory = base_directory(local_peer_id);
+        let remote_peer_id = PeerId([0xb2; 32]);
+
+        let first = directory.apply_resolved(resolved_service(
+            "peer-flap._ant-quic._udp.local.",
+            9000,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 64))],
+            &[
+                ("peer_id", &hex::encode(remote_peer_id.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+        assert!(matches!(
+            first.as_slice(),
+            [
+                MdnsRuntimeEvent::PeerDiscovered(_),
+                MdnsRuntimeEvent::PeerEligible(_)
+            ]
+        ));
+        assert_eq!(directory.snapshot(true, false).discovered_peers.len(), 1);
+
+        let events = directory.apply_resolved(resolved_service(
+            "peer-flap._ant-quic._udp.local.",
+            9000,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            &[
+                ("peer_id", &hex::encode(remote_peer_id.0)),
+                ("namespace", "workspace-a"),
+            ],
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                MdnsRuntimeEvent::PeerRemoved(_),
+                MdnsRuntimeEvent::PeerIneligible { reason, .. }
+            ] if reason == "no routable addresses"
+        ));
+        assert!(directory.snapshot(true, false).discovered_peers.is_empty());
+    }
+
+    #[test]
     fn test_remove_drops_peer_record() {
         let local_peer_id = PeerId([0xaa; 32]);
         let mut directory = base_directory(local_peer_id);
@@ -809,85 +853,296 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires host mDNS responder/browser support on a real local interface"]
-    async fn test_mdns_runtime_discovers_advertised_peer_on_local_network()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let service = format!("ant-quic-test-{}", std::process::id());
-        let namespace = format!("workspace-{}", std::process::id());
-        let browser_peer = PeerId([0xd0; 32]);
-        let advertised_peer = PeerId([0xd1; 32]);
-        let advertised_port = 31_555;
+    const LIVE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+    const LIVE_NEGATIVE_TIMEOUT: Duration = Duration::from_secs(5);
+    const LIVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-        let browser_shutdown = CancellationToken::new();
-        let advertiser_shutdown = CancellationToken::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    /// Unique per-process service/namespace pair so concurrently running live
+    /// tests on the same LAN do not cross-discover each other.
+    fn live_scope(tag: &str) -> (String, String) {
+        let pid = std::process::id();
+        (format!("aq-{tag}-{pid}"), format!("workspace-{tag}-{pid}"))
+    }
 
-        let browser_config = MdnsConfig {
+    fn live_config(service: &str, namespace: Option<&str>, mode: MdnsMode) -> MdnsConfig {
+        MdnsConfig {
             enabled: true,
-            service: Some(service.clone()),
-            namespace: Some(namespace.clone()),
-            mode: MdnsMode::BrowseOnly,
+            service: Some(service.to_string()),
+            namespace: namespace.map(str::to_string),
+            mode,
             auto_connect: AutoConnectPolicy::Disabled,
             metadata: BTreeMap::new(),
-        };
-        let advertiser_config = MdnsConfig {
-            enabled: true,
-            service: Some(service),
-            namespace: Some(namespace),
-            mode: MdnsMode::AdvertiseOnly,
-            auto_connect: AutoConnectPolicy::Disabled,
-            metadata: BTreeMap::new(),
-        };
+        }
+    }
 
-        let browser_task = tokio::spawn(run_mdns_runtime(
-            browser_config,
-            browser_peer,
-            0,
-            browser_shutdown.clone(),
+    type LiveEvents = tokio::sync::mpsc::UnboundedReceiver<MdnsRuntimeEvent>;
+
+    fn spawn_live_runtime(
+        config: MdnsConfig,
+        peer_id: PeerId,
+        port: u16,
+    ) -> (
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), String>>,
+        LiveEvents,
+    ) {
+        let shutdown = CancellationToken::new();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_mdns_runtime(
+            config,
+            peer_id,
+            port,
+            shutdown.clone(),
             move |event| {
                 let _ = events_tx.send(event);
             },
         ));
+        (shutdown, task, events_rx)
+    }
 
-        let advertiser_task = tokio::spawn(run_mdns_runtime(
-            advertiser_config,
-            advertised_peer,
-            advertised_port,
-            advertiser_shutdown.clone(),
-            |_| {},
-        ));
-
-        let discovered = tokio::time::timeout(Duration::from_secs(15), async {
-            while let Some(event) = events_rx.recv().await {
-                match event {
-                    MdnsRuntimeEvent::PeerDiscovered(peer)
-                    | MdnsRuntimeEvent::PeerUpdated(peer)
-                    | MdnsRuntimeEvent::PeerEligible(peer)
-                        if peer.claimed_peer_id == Some(advertised_peer)
-                            && peer
-                                .addresses
-                                .iter()
-                                .any(|addr| addr.port() == advertised_port) =>
-                    {
-                        return true;
-                    }
-                    _ => {}
+    async fn wait_for_live_event(
+        events: &mut LiveEvents,
+        timeout: Duration,
+        mut matches: impl FnMut(&MdnsRuntimeEvent) -> bool,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            while let Some(event) = events.recv().await {
+                if matches(&event) {
+                    return true;
                 }
             }
             false
         })
         .await
-        .unwrap_or(false);
+        .unwrap_or(false)
+    }
 
-        browser_shutdown.cancel();
-        advertiser_shutdown.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), browser_task).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), advertiser_task).await;
+    async fn shutdown_live_runtime(
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        shutdown.cancel();
+        let _ = tokio::time::timeout(LIVE_SHUTDOWN_TIMEOUT, task).await;
+    }
+
+    fn is_eligible_event_for(event: &MdnsRuntimeEvent, peer_id: PeerId) -> bool {
+        matches!(
+            event,
+            MdnsRuntimeEvent::PeerDiscovered(peer)
+            | MdnsRuntimeEvent::PeerUpdated(peer)
+            | MdnsRuntimeEvent::PeerEligible(peer)
+                if peer.claimed_peer_id == Some(peer_id)
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires host mDNS responder/browser support on a real local interface"]
+    async fn test_mdns_runtime_discovers_advertised_peer_on_local_network()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (service, namespace) = live_scope("dsc");
+        let browser_peer = PeerId([0xd0; 32]);
+        let advertised_peer = PeerId([0xd1; 32]);
+        let advertised_port = 31_555;
+
+        let (browser_shutdown, browser_task, mut browser_events) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::BrowseOnly),
+            browser_peer,
+            0,
+        );
+        let (advertiser_shutdown, advertiser_task, _advertiser_events) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::AdvertiseOnly),
+            advertised_peer,
+            advertised_port,
+        );
+
+        let discovered = wait_for_live_event(
+            &mut browser_events,
+            LIVE_DISCOVERY_TIMEOUT,
+            |event| match event {
+                MdnsRuntimeEvent::PeerDiscovered(peer)
+                | MdnsRuntimeEvent::PeerUpdated(peer)
+                | MdnsRuntimeEvent::PeerEligible(peer) => {
+                    peer.claimed_peer_id == Some(advertised_peer)
+                        && peer
+                            .addresses
+                            .iter()
+                            .any(|addr| addr.port() == advertised_port)
+                }
+                _ => false,
+            },
+        )
+        .await;
+
+        shutdown_live_runtime(browser_shutdown, browser_task).await;
+        shutdown_live_runtime(advertiser_shutdown, advertiser_task).await;
 
         assert!(
             discovered,
             "browser did not discover advertised mDNS peer on the local network"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires host mDNS responder/browser support on a real local interface"]
+    async fn test_mdns_runtime_bidirectional_loopback_discovery()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (service, namespace) = live_scope("bidir");
+        let peer_a = PeerId([0xe0; 32]);
+        let peer_b = PeerId([0xe1; 32]);
+
+        let (shutdown_a, task_a, mut events_a) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::Both),
+            peer_a,
+            31_556,
+        );
+        let (shutdown_b, task_b, mut events_b) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::Both),
+            peer_b,
+            31_557,
+        );
+
+        let (a_saw_b, b_saw_a) = tokio::join!(
+            wait_for_live_event(&mut events_a, LIVE_DISCOVERY_TIMEOUT, |event| {
+                is_eligible_event_for(event, peer_b)
+            }),
+            wait_for_live_event(&mut events_b, LIVE_DISCOVERY_TIMEOUT, |event| {
+                is_eligible_event_for(event, peer_a)
+            }),
+        );
+
+        shutdown_live_runtime(shutdown_a, task_a).await;
+        shutdown_live_runtime(shutdown_b, task_b).await;
+
+        assert!(a_saw_b, "node A did not discover node B via mDNS loopback");
+        assert!(b_saw_a, "node B did not discover node A via mDNS loopback");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires host mDNS responder/browser support on a real local interface"]
+    async fn test_mdns_runtime_service_name_isolation()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pid = std::process::id();
+        let service_a = format!("aq-iso-a-{pid}");
+        let service_b = format!("aq-iso-b-{pid}");
+        let browser_peer = PeerId([0xe2; 32]);
+        let same_service_peer = PeerId([0xe3; 32]);
+        let other_service_peer = PeerId([0xe4; 32]);
+
+        let (browser_shutdown, browser_task, mut browser_events) = spawn_live_runtime(
+            live_config(&service_a, None, MdnsMode::BrowseOnly),
+            browser_peer,
+            0,
+        );
+        let (same_shutdown, same_task, _same_events) = spawn_live_runtime(
+            live_config(&service_a, None, MdnsMode::AdvertiseOnly),
+            same_service_peer,
+            31_558,
+        );
+        let (other_shutdown, other_task, _other_events) = spawn_live_runtime(
+            live_config(&service_b, None, MdnsMode::AdvertiseOnly),
+            other_service_peer,
+            31_559,
+        );
+
+        // Positive control: the browser must find the advertiser that shares
+        // its service name, otherwise the environment cannot run this test.
+        let found_same =
+            wait_for_live_event(&mut browser_events, LIVE_DISCOVERY_TIMEOUT, |event| {
+                is_eligible_event_for(event, same_service_peer)
+            })
+            .await;
+        // Negative window: no event may reference the other-service advertiser.
+        let found_other =
+            wait_for_live_event(&mut browser_events, LIVE_NEGATIVE_TIMEOUT, |event| {
+                is_eligible_event_for(event, other_service_peer)
+            })
+            .await;
+
+        shutdown_live_runtime(browser_shutdown, browser_task).await;
+        shutdown_live_runtime(same_shutdown, same_task).await;
+        shutdown_live_runtime(other_shutdown, other_task).await;
+
+        assert!(
+            found_same,
+            "browser did not discover the advertiser sharing its service name"
+        );
+        assert!(
+            !found_other,
+            "browser discovered a peer advertising a different service name"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires host mDNS responder/browser support on a real local interface"]
+    async fn test_mdns_runtime_namespace_mismatch_is_not_eligible()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (service, namespace) = live_scope("ns");
+        let other_namespace = format!("{namespace}-other");
+        let browser_peer = PeerId([0xe5; 32]);
+        let matching_peer = PeerId([0xe6; 32]);
+        let mismatched_peer = PeerId([0xe7; 32]);
+
+        let (browser_shutdown, browser_task, mut browser_events) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::BrowseOnly),
+            browser_peer,
+            0,
+        );
+        let (matching_shutdown, matching_task, _matching_events) = spawn_live_runtime(
+            live_config(&service, Some(&namespace), MdnsMode::AdvertiseOnly),
+            matching_peer,
+            31_560,
+        );
+        let (mismatched_shutdown, mismatched_task, _mismatched_events) = spawn_live_runtime(
+            live_config(&service, Some(&other_namespace), MdnsMode::AdvertiseOnly),
+            mismatched_peer,
+            31_561,
+        );
+
+        let mut saw_matching_eligible = false;
+        let mut saw_mismatch_ineligible = false;
+        let mut saw_mismatch_eligible = false;
+        let _ = tokio::time::timeout(LIVE_DISCOVERY_TIMEOUT, async {
+            while let Some(event) = browser_events.recv().await {
+                match &event {
+                    MdnsRuntimeEvent::PeerIneligible { peer, reason }
+                        if peer.claimed_peer_id == Some(mismatched_peer) =>
+                    {
+                        assert_eq!(reason, "namespace mismatch");
+                        saw_mismatch_ineligible = true;
+                    }
+                    event if is_eligible_event_for(event, matching_peer) => {
+                        saw_matching_eligible = true;
+                    }
+                    event if is_eligible_event_for(event, mismatched_peer) => {
+                        saw_mismatch_eligible = true;
+                    }
+                    _ => {}
+                }
+                if saw_matching_eligible && saw_mismatch_ineligible {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        shutdown_live_runtime(browser_shutdown, browser_task).await;
+        shutdown_live_runtime(matching_shutdown, matching_task).await;
+        shutdown_live_runtime(mismatched_shutdown, mismatched_task).await;
+
+        assert!(
+            saw_matching_eligible,
+            "browser did not discover the advertiser with a matching namespace"
+        );
+        assert!(
+            saw_mismatch_ineligible,
+            "browser did not report the namespace-mismatched advertiser as ineligible"
+        );
+        assert!(
+            !saw_mismatch_eligible,
+            "namespace-mismatched advertiser was surfaced as an eligible peer"
         );
         Ok(())
     }
