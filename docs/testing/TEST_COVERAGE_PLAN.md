@@ -106,6 +106,12 @@ Use explicit environment guards:
 - `ANT_QUIC_LIVE_UPNP=1`
 - `ANT_QUIC_LIVE_PUBLIC_ENDPOINTS=1`
 
+Live mDNS coverage (`src/mdns.rs`, run via `just heavy-mdns`) currently includes
+loopback responder/browser discovery, bidirectional loopback discovery,
+service-name isolation, and namespace-mismatch rejection. Still open: multi-interface
+behavior, IPv4/IPv6 runtime parity, multicast-loss tolerance, and a feature-gated
+mock multicast backend for exercising the discovery state machine in PR CI.
+
 ## Coverage Reporting
 
 Keep the current fast library coverage report. Add a separate integration coverage report first as warning-only:
