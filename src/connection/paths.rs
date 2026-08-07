@@ -219,7 +219,19 @@ impl PathData {
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        self.in_flight.bytes -= space.sent(pn, packet);
+        // `PacketSpace::sent` returns the byte count of any forgotten non-ack-eliciting tail
+        // packet evicted from the space to bound memory. Those bytes may have been sent on a
+        // *different* path (before a migration), so they were never counted in this path's
+        // `in_flight.bytes`. Subtracting them raw would underflow; use `saturating_sub` so a
+        // cross-path eviction produces a bounded accounting error (counter clamps at 0) rather
+        // than wrapping to ~2^64 and stalling congestion control permanently in release builds.
+        let forgotten_bytes = space.sent(pn, packet);
+        debug_assert!(
+            self.in_flight.bytes >= forgotten_bytes,
+            "InFlight::bytes underflow in PathData::sent: forgotten non-ack-eliciting tail \
+             bytes may belong to a previous path"
+        );
+        self.in_flight.bytes = self.in_flight.bytes.saturating_sub(forgotten_bytes);
     }
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
@@ -499,8 +511,21 @@ impl InFlight {
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
     fn remove(&mut self, packet: &SentPacket) {
-        self.bytes -= u64::from(packet.size);
-        self.ack_eliciting -= u64::from(packet.ack_eliciting);
+        debug_assert!(
+            self.bytes >= u64::from(packet.size),
+            "InFlight::bytes underflow: removing packet never counted or already removed"
+        );
+        debug_assert!(
+            self.ack_eliciting >= u64::from(packet.ack_eliciting),
+            "InFlight::ack_eliciting underflow: removing packet never counted or already removed"
+        );
+        // `saturating_sub` bounds the accounting error to zero instead of wrapping to ~2^64 in
+        // release builds (where the debug_asserts above are elided). A root cause fix for the
+        // double-remove that triggers these is tracked separately (x0x #230).
+        self.bytes = self.bytes.saturating_sub(u64::from(packet.size));
+        self.ack_eliciting = self
+            .ack_eliciting
+            .saturating_sub(u64::from(packet.ack_eliciting));
     }
 }
 
@@ -992,5 +1017,99 @@ mod tests {
         // Rate should be preserved, tokens should be reset
         assert_eq!(path.observation_rate_limiter.rate, 15.0);
         assert_eq!(path.observation_rate_limiter.tokens, 15.0); // Full tokens after reset
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    /// Construct a minimal `SentPacket` for testing `InFlight` counters.
+    ///
+    /// `SentPacket` is private to the `connection` module; constructing it here is
+    /// acceptable because this test module is also inside that module tree.
+    fn make_packet(size: u16, ack_eliciting: bool) -> SentPacket {
+        SentPacket {
+            time_sent: Instant::now(),
+            size,
+            ack_eliciting,
+            largest_acked: None,
+            retransmits: Default::default(),
+            stream_frames: Default::default(),
+        }
+    }
+
+    /// A single insert followed by a single remove must bring both counters back to zero.
+    #[test]
+    fn in_flight_insert_remove_balances() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        assert_eq!(in_flight.bytes, 1200);
+        assert_eq!(in_flight.ack_eliciting, 1);
+
+        in_flight.remove(&packet);
+        assert_eq!(
+            in_flight.bytes, 0,
+            "bytes must return to zero after balanced remove"
+        );
+        assert_eq!(
+            in_flight.ack_eliciting, 0,
+            "ack_eliciting must return to zero after balanced remove"
+        );
+    }
+
+    /// A non-ack-eliciting packet (e.g. pure PADDING) counts bytes but not ack_eliciting.
+    #[test]
+    fn in_flight_non_ack_eliciting_packet() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(64, false);
+
+        in_flight.insert(&packet);
+        assert_eq!(in_flight.bytes, 64);
+        assert_eq!(in_flight.ack_eliciting, 0);
+
+        in_flight.remove(&packet);
+        assert_eq!(in_flight.bytes, 0);
+        assert_eq!(in_flight.ack_eliciting, 0);
+    }
+
+    /// In debug builds a double-remove must trip the `debug_assert!` with a message
+    /// containing "underflow", making the bug immediately visible rather than silently
+    /// wrapping to ~2^64.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "underflow")]
+    fn in_flight_double_remove_panics_in_debug() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        in_flight.remove(&packet); // first remove — OK
+        in_flight.remove(&packet); // double-remove — must panic
+    }
+
+    /// In release builds (no debug assertions) a double-remove must clamp both counters
+    /// at 0 via `saturating_sub` instead of wrapping to ~2^64 and freezing congestion
+    /// control. This is the fix for x0x #230.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn in_flight_double_remove_saturates_in_release() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        in_flight.remove(&packet); // first remove — OK
+        in_flight.remove(&packet); // double-remove — must clamp, not wrap
+
+        assert_eq!(
+            in_flight.bytes, 0,
+            "bytes must saturate at 0 on double-remove, not wrap to ~2^64"
+        );
+        assert_eq!(
+            in_flight.ack_eliciting, 0,
+            "ack_eliciting must saturate at 0 on double-remove, not wrap"
+        );
     }
 }
