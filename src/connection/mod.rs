@@ -1699,7 +1699,7 @@ impl Connection {
                         // The path we're abandoning owns in-flight packets whose accounting is
                         // dropped along with it. Restart the restored path's window so those
                         // packets can never be debited from it when they are later acked or
-                        // declared lost (x0x #230).
+                        // declared lost (issue #230).
                         self.path = prev;
                         self.path.restart_in_flight();
                     }
