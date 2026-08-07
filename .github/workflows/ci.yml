@@ -151,6 +151,11 @@ jobs:
       - name: Connection establishment tests
         run: cargo test --lib connection_establishment -- --test-threads=2
 
+      # Issue #190: proves additive UPnP/IGD port-mapping behaviour against
+      # a mock IGD (mock-igd) without needing a real router.
+      - name: UPnP/IGD port mapping tests (mock IGD)
+        run: cargo test --lib port_mapping -- --test-threads=2
+
   # MSRV verification
   msrv:
     name: MSRV (1.88.0)
