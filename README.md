@@ -253,6 +253,24 @@ cd ant-quic
 cargo build --release
 ```
 
+### Optional BLE Transport
+
+Bluetooth Low Energy support is an **opt-in** Cargo feature, off by default on
+all platforms (see [ADR-010](docs/adr/ADR-010-ble-transport-opt-in.md)):
+
+```bash
+cargo build --release --features ble
+```
+
+When compiled in, BLE registers best-effort at endpoint startup — if it cannot
+initialize, the endpoint logs and continues with UDP only. Platform notes:
+
+- **Linux**: BlueZ via btleplug; works for plain binaries.
+- **macOS**: Core Bluetooth via btleplug; plain CLI/test binaries are refused
+  at runtime. BLE only activates when running from an app bundle whose
+  `Info.plist` declares `NSBluetoothAlwaysUsageDescription`.
+- **Windows**: WinRT via btleplug.
+
 ## Binary Usage
 
 ```bash

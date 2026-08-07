@@ -162,6 +162,40 @@ fn no_orphaned_gitlinks_without_gitmodules_mapping() -> Result<(), String> {
 }
 
 #[test]
+fn default_features_exclude_ble() -> Result<(), String> {
+    // Issue #177: BLE stays opt-in (never a default feature) until macOS
+    // app-bundle packaging for Core Bluetooth is solved. See
+    // docs/adr/ADR-010-ble-transport-opt-in.md.
+    let manifest = fs::read_to_string(repo_file("Cargo.toml"))
+        .map_err(|error| format!("failed to read Cargo.toml: {error}"))?;
+
+    let mut in_features_section = false;
+    let mut default_features: Option<String> = None;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[features]" {
+            in_features_section = true;
+            continue;
+        }
+        if in_features_section && trimmed.starts_with('[') {
+            break;
+        }
+        if in_features_section && trimmed.starts_with("default = ") {
+            default_features = Some(trimmed.to_string());
+            break;
+        }
+    }
+
+    let default_features =
+        default_features.ok_or_else(|| "default features not found in Cargo.toml".to_string())?;
+    assert!(
+        !default_features.contains("\"ble\""),
+        "ble must remain an opt-in feature until macOS runtime packaging is solved (issue #177); default features are: {default_features}"
+    );
+    Ok(())
+}
+
+#[test]
 fn git_worktree_check_skips_plain_directory() -> Result<(), String> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

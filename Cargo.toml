@@ -68,9 +68,11 @@ __qlog = ["dep:qlog"]
 # Zero-cost tracing system
 trace = []
 
-# BLE transport support (Linux and macOS)
+# BLE transport support (Linux, macOS, Windows) — opt-in on all platforms
+# until macOS app-bundle packaging is solved (issue #177,
+# docs/adr/ADR-010-ble-transport-opt-in.md).
 # Enables Bluetooth Low Energy transport for short-range P2P
-# - Linux: Uses BlueZ via bluer crate
+# - Linux: Uses BlueZ via btleplug crate
 # - macOS: Uses Core Bluetooth via btleplug crate; plain CLI/test binaries
 #   require an app bundle that declares `NSBluetoothAlwaysUsageDescription`
 ble = ["dep:btleplug"]
