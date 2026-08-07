@@ -28,11 +28,11 @@ use super::{
     runtime::{AsyncUdpSocket, Runtime},
     udp_transmit,
 };
-use crate::Instant;
 use crate::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointEvent,
     ServerConfig,
 };
+use crate::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
@@ -77,6 +77,30 @@ fn is_transient_socket_error(error: &io::Error) -> bool {
             | io::ErrorKind::TimedOut
     ) || matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
 }
+
+/// `EndpointRef`s held by driver infrastructure rather than user-visible
+/// handles (issue #220).
+///
+/// `ref_count` tracks `EndpointRef::clone()` calls, so it is always one less
+/// than the number of live refs (the root ref from `EndpointRef::new` is
+/// never counted). The supervisor task holds one counted clone for the
+/// endpoint's whole lifetime, so when the user drops their last handle
+/// `ref_count` falls to `DRIVER_INFRA_REFS` — the supervisor's ref plus the
+/// driver's own. That is the driver's cue to shut down (see
+/// `EndpointDriver::poll` and `EndpointRef::drop`).
+const DRIVER_INFRA_REFS: usize = 1;
+
+/// Initial delay before respawning a fatally terminated endpoint driver
+/// (issue #220). Doubles on each consecutive quick failure, capped at
+/// [`DRIVER_RESPAWN_MAX_BACKOFF`]; a driver that stayed up for at least
+/// [`DRIVER_RESPAWN_HEALTHY_RUN`] resets the backoff to this value.
+const DRIVER_RESPAWN_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+/// Upper bound on the driver respawn backoff (issue #220), so a permanently
+/// broken socket is retried slowly instead of hot-looping.
+const DRIVER_RESPAWN_MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a driver must stay up for its death to count as a fresh failure
+/// rather than a crash loop (issue #220).
+const DRIVER_RESPAWN_HEALTHY_RUN: Duration = Duration::from_secs(30);
 
 /// A QUIC endpoint.
 ///
@@ -268,24 +292,7 @@ impl Endpoint {
             addr.is_ipv6(),
             runtime.clone(),
         );
-        let driver = EndpointDriver(rc.clone());
-        runtime.spawn(Box::pin(
-            async {
-                if let Err(e) = driver.await {
-                    // A driver exit is never routine: it permanently ends all
-                    // QUIC I/O on this endpoint (`driver_lost` fails every
-                    // future connect and nothing polls the socket again).
-                    // Transient per-datagram errors are handled inside
-                    // poll_socket; anything that reaches here is fatal and
-                    // must be loud (x0x issue #262 hid for 14h at debug!).
-                    tracing::error!(
-                        "endpoint driver terminated: {} — transport is dead on this endpoint",
-                        e
-                    );
-                }
-            }
-            .instrument(Span::current()),
-        ));
+        spawn_supervised_driver(rc.clone(), runtime.clone());
         Ok(Self {
             inner: rc,
             default_client_config: None,
@@ -548,6 +555,10 @@ impl Endpoint {
                 return;
             }
         };
+        // Record the close so new connection attempts are rejected, `accept`
+        // drains, and the driver supervisor treats a driver exit as
+        // intentional rather than respawning it (issue #220).
+        endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
         endpoint
             .recv_state
             .connections
@@ -612,7 +623,11 @@ pub struct EndpointStats {
 /// running this task is necessary to keep the endpoint's connections running.
 ///
 /// `EndpointDriver` futures terminate when all clones of the `Endpoint` have been dropped, or when
-/// an I/O error occurs.
+/// an I/O error occurs. A fatal exit is not terminal for the endpoint: the
+/// supervisor that spawned the driver (see [`spawn_supervised_driver`])
+/// observes the exit, rebinds the socket, and respawns the driver (issue
+/// #220), so a fatal-class socket error no longer permanently ends QUIC I/O
+/// for a live process.
 #[must_use = "endpoint drivers must be spawned for I/O to occur"]
 #[derive(Debug)]
 pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
@@ -640,7 +655,7 @@ impl Future for EndpointDriver {
             self.0.shared.incoming.notify_waiters();
         }
 
-        if endpoint.ref_count == 0 && endpoint.recv_state.connections.is_empty() {
+        if endpoint.ref_count == DRIVER_INFRA_REFS && endpoint.recv_state.connections.is_empty() {
             Poll::Ready(Ok(()))
         } else {
             drop(endpoint);
@@ -658,25 +673,191 @@ impl Future for EndpointDriver {
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
         if let Ok(mut endpoint) = self.0.state.lock() {
-            // Loud by design (x0x issue #262): once `driver_lost` is set,
-            // every future connect() fails and the socket is never polled
-            // again — operators need that in logs, not just the effect.
-            // An intentional close() (close reason recorded) stays quiet.
-            if endpoint.recv_state.connections.close.is_none() {
-                tracing::warn!(
-                    "endpoint driver dropped without close — driver_lost set; \
-                     no further QUIC I/O on this endpoint"
-                );
+            // The stored waker belongs to this dead driver; a respawned
+            // driver must register a fresh one (issue #220).
+            endpoint.driver = None;
+            if endpoint.recv_state.connections.close.is_some() {
+                // Intentional close: terminal teardown, and quiet by design
+                // (x0x issue #262) — nothing will respawn this driver.
+                endpoint.driver_lost = true;
+                // Drop all outgoing channels, signaling the termination of the endpoint to the associated
+                // connections.
+                endpoint.recv_state.connections.senders.clear();
+            } else {
+                // Supervised (issue #220): the supervisor observes this exit
+                // and respawns the driver. Connections and `driver_lost`
+                // stay untouched so live connections ride out the respawn
+                // instead of being torn down. The supervisor logs the fatal
+                // error itself; keep this at debug to avoid double-logging
+                // on every respawn cycle.
+                debug!("endpoint driver exited without close; supervisor will respawn it");
             }
-            endpoint.driver_lost = true;
             self.0.shared.incoming.notify_waiters();
-            // Drop all outgoing channels, signaling the termination of the endpoint to the associated
-            // connections.
-            endpoint.recv_state.connections.senders.clear();
         } else {
             error!("Failed to lock endpoint state in drop - mutex poisoned");
         }
     }
+}
+
+/// Spawn the endpoint driver under a supervisor that respawns it after a
+/// fatal exit (issue #220).
+///
+/// A fatal driver exit used to be terminal for the process's QUIC I/O:
+/// `driver_lost` failed every future `connect()` and the socket was never
+/// polled again, with recovery only via process restart (x0x issue #262 hid
+/// that wedge for 14h at debug level). The supervisor instead logs the fatal
+/// error, waits out an exponential backoff, rebinds the socket on a
+/// best-effort basis, and spawns a fresh driver. Live connections survive:
+/// the dead driver's `Drop` leaves their channels in place and the rebind
+/// migrates them onto the new socket, exactly like [`Endpoint::rebind`].
+///
+/// The loop ends when the driver exits cleanly (every `Endpoint` handle and
+/// connection is gone) or when the endpoint was closed intentionally — a
+/// close must never resurrect I/O.
+///
+/// `rc` is the one infrastructure-held [`EndpointRef`] accounted for by
+/// [`DRIVER_INFRA_REFS`]; the supervisor holds it for the endpoint's whole
+/// lifetime so `ref_count` only ever reflects user-visible handles.
+fn spawn_supervised_driver(rc: EndpointRef, runtime: Arc<dyn Runtime>) {
+    let task_runtime = runtime.clone();
+    runtime.spawn(Box::pin(
+        async move {
+            let mut backoff = DRIVER_RESPAWN_INITIAL_BACKOFF;
+            loop {
+                let started = task_runtime.now();
+                let result = EndpointDriver(rc.clone()).await;
+                let Err(error) = result else {
+                    // Clean exit: no live handles or connections remain, so
+                    // there is nothing left to drive.
+                    return;
+                };
+                let closed = match rc.state.lock() {
+                    // An explicit shutdown releases the socket without
+                    // recording a close reason; both are deliberate, so
+                    // neither may be resurrected by a respawn.
+                    Ok(state) => {
+                        state.recv_state.connections.close.is_some()
+                            || state.socket_released_for_shutdown
+                    }
+                    Err(_) => {
+                        error!(
+                            "endpoint driver terminated ({error}) and the state mutex is poisoned; \
+                             not respawning"
+                        );
+                        return;
+                    }
+                };
+                if closed {
+                    debug!("endpoint driver terminated after intentional close: {error}");
+                    return;
+                }
+                // Anything reaching here is fatal and must stay loud (x0x
+                // issue #262): unlike the pre-supervisor behavior the
+                // transport recovers, but operators still need the failures
+                // in their logs.
+                error!("endpoint driver terminated: {error} — respawning in {backoff:?}");
+                if task_runtime.now() >= started + DRIVER_RESPAWN_HEALTHY_RUN {
+                    // The driver had a healthy run; treat this as a fresh
+                    // failure rather than a crash loop.
+                    backoff = DRIVER_RESPAWN_INITIAL_BACKOFF;
+                }
+                sleep_for(&*task_runtime, backoff).await;
+                backoff = (backoff * 2).min(DRIVER_RESPAWN_MAX_BACKOFF);
+                #[cfg(not(wasm_browser))]
+                rebind_for_respawn(&rc, &*task_runtime);
+            }
+        }
+        .instrument(Span::current()),
+    ));
+}
+
+/// Runtime-agnostic sleep used for the driver respawn backoff.
+async fn sleep_for(runtime: &dyn Runtime, duration: Duration) {
+    let mut timer = runtime.new_timer(runtime.now() + duration);
+    std::future::poll_fn(|cx| timer.as_mut().poll(cx)).await;
+}
+
+/// Best-effort socket replacement before a driver respawn (issue #220).
+///
+/// A fatal driver exit usually means the socket itself is broken (e.g. its
+/// fd was closed from under us), so bind a fresh socket on the same local
+/// address and swap it in, migrating live connections via the same
+/// `ConnectionEvent::Rebind` broadcast as [`Endpoint::rebind_abstract`]. If
+/// the old socket still owns the address the bind fails and we keep it — the
+/// respawned driver either recovers on it or fails again under backoff.
+#[cfg(not(wasm_browser))]
+fn rebind_for_respawn(rc: &EndpointRef, runtime: &dyn Runtime) {
+    let old_addr = match rc.state.lock() {
+        Ok(state) => match state.socket.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("driver respawn: old socket address unreadable ({e}); keeping old socket");
+                return;
+            }
+        },
+        Err(_) => {
+            error!("endpoint state mutex poisoned; cannot rebind for driver respawn");
+            return;
+        }
+    };
+    let socket = match bind_replacement_socket(old_addr)
+        .and_then(|socket| runtime.wrap_udp_socket(socket))
+    {
+        Ok(socket) => socket,
+        Err(e) => {
+            debug!("driver respawn: rebind to {old_addr} failed ({e}); keeping old socket");
+            return;
+        }
+    };
+    let mut state = match rc.state.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            error!("endpoint state mutex poisoned; cannot rebind for driver respawn");
+            return;
+        }
+    };
+    state.prev_socket = Some(mem::replace(&mut state.socket, socket));
+    state.ipv6 = old_addr.is_ipv6();
+    let socket = state.socket.clone();
+    state
+        .recv_state
+        .connections
+        .broadcast_control(move || ConnectionEvent::Rebind(socket.clone()));
+    tracing::info!("endpoint driver respawn rebound socket on {old_addr}");
+}
+
+/// Bind a fresh UDP socket on `addr` to replace a broken one, mirroring
+/// [`Endpoint::server`]: dual-stack where possible, platform buffer sizes.
+#[cfg(all(not(wasm_browser), feature = "network-discovery"))]
+fn bind_replacement_socket(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        if let Err(e) = socket.set_only_v6(false) {
+            debug!(%e, "unable to make replacement socket dual-stack");
+        }
+    }
+    socket.set_nonblocking(true)?;
+
+    use crate::config::buffer_defaults;
+    let buffer_size = buffer_defaults::PLATFORM_DEFAULT;
+    if let Err(e) = socket.set_send_buffer_size(buffer_size) {
+        debug!(%e, "unable to set send buffer size on replacement socket");
+    }
+    if let Err(e) = socket.set_recv_buffer_size(buffer_size) {
+        debug!(%e, "unable to set recv buffer size on replacement socket");
+    }
+
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// Bind a fresh UDP socket on `addr` to replace a broken one (fallback
+/// without the `network-discovery` feature).
+#[cfg(all(not(wasm_browser), not(feature = "network-discovery")))]
+fn bind_replacement_socket(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
 }
 
 #[derive(Debug)]
@@ -773,6 +954,7 @@ pub(crate) struct State {
     ipv6: bool,
     events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
     /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
+    /// and the supervisor's infrastructure ref (see `DRIVER_INFRA_REFS`)
     ref_count: usize,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
@@ -1133,9 +1315,11 @@ impl Drop for EndpointRef {
         if let Ok(mut endpoint) = self.0.state.lock() {
             if let Some(x) = endpoint.ref_count.checked_sub(1) {
                 endpoint.ref_count = x;
-                if x == 0 {
-                    // If the driver is about to be on its own, ensure it can shut down if the last
-                    // connection is gone.
+                if x == DRIVER_INFRA_REFS {
+                    // Only infrastructure refs remain (the supervisor's and
+                    // the driver's own, see DRIVER_INFRA_REFS): wake the
+                    // driver so it can shut down once the last connection is
+                    // gone.
                     if let Some(task) = endpoint.driver.take() {
                         task.wake();
                     }
@@ -1512,5 +1696,292 @@ mod recv_event_backpressure_tests {
             "a successful send after draining must reset the overflow counter"
         );
         assert!(cs.senders.contains_key(&handle));
+    }
+}
+
+#[cfg(test)]
+mod driver_supervisor_tests {
+    use super::*;
+    use crate::high_level::runtime::UdpSender;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A socket whose recv path can be failed on demand, to force the
+    /// endpoint driver into a fatal exit without OS trickery (issue #220).
+    #[derive(Debug)]
+    struct ControllableSocket {
+        addr: SocketAddr,
+        fail_with: Mutex<Option<io::ErrorKind>>,
+        recv_calls: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct NoopSender;
+
+    impl UdpSender for NoopSender {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _transmit: &quinn_udp::Transmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncUdpSocket for ControllableSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(NoopSender)
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.recv_calls.fetch_add(1, Ordering::Relaxed);
+            match *self.fail_with.lock().unwrap() {
+                Some(kind) => Poll::Ready(Err(io::Error::new(kind, "injected fatal recv error"))),
+                None => Poll::Pending,
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    /// Build the endpoint internals the way `new_with_abstract_socket` does,
+    /// returning the root ref plus a clone of the inner Arc so tests can
+    /// inspect state without disturbing `ref_count` accounting.
+    fn test_endpoint_ref(
+        socket: Arc<ControllableSocket>,
+    ) -> (EndpointRef, Arc<EndpointInner>, Arc<dyn Runtime>) {
+        let runtime = default_runtime().expect("tests run inside a tokio runtime");
+        let rc = EndpointRef::new(
+            socket,
+            crate::endpoint::Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None),
+            false,
+            runtime.clone(),
+        );
+        let inner = rc.0.clone();
+        (rc, inner, runtime)
+    }
+
+    /// Unbindable TEST-NET address: the supervisor's rebind attempt fails on
+    /// it, so the respawned driver retries on the same controllable socket.
+    fn unbindable_addr() -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 1), 12345))
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !condition() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    fn recv_calls(socket: &ControllableSocket) -> usize {
+        socket.recv_calls.load(Ordering::Relaxed)
+    }
+
+    /// Insert a stand-in connection channel, returning the receiver the test
+    /// must keep alive for the channel to stay open.
+    fn insert_fake_connection(
+        inner: &EndpointInner,
+    ) -> (ConnectionHandle, mpsc::Receiver<ConnectionEvent>) {
+        let (tx, rx) = mpsc::channel(RECV_EVENT_BOUND);
+        let handle = ConnectionHandle(0);
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .recv_state
+            .connections
+            .senders
+            .insert(
+                handle,
+                ConnectionChannels {
+                    sender: tx,
+                    recv_overflows: AtomicU64::new(0),
+                },
+            );
+        (handle, rx)
+    }
+
+    /// WHY (issue #220): a fatal driver exit used to be terminal — driver_lost
+    /// failed every future connect and the socket was never polled again. The
+    /// supervisor must respawn the driver instead, and clean shutdown (all
+    /// handles dropped) must still end the loop.
+    #[tokio::test]
+    async fn fatal_driver_exit_is_respawned_and_shutdown_stays_clean() {
+        let socket = Arc::new(ControllableSocket {
+            addr: unbindable_addr(),
+            fail_with: Mutex::new(Some(io::ErrorKind::PermissionDenied)),
+            recv_calls: AtomicUsize::new(0),
+        });
+        let (rc, inner, runtime) = test_endpoint_ref(socket.clone());
+        let user_handle = rc.clone();
+        spawn_supervised_driver(rc, runtime);
+
+        // The first driver dies on the injected fatal error...
+        assert!(
+            wait_until(|| recv_calls(&socket) >= 1, Duration::from_secs(5)).await,
+            "driver must poll the socket"
+        );
+        // ...and the supervisor respawns it despite the socket still failing.
+        assert!(
+            wait_until(|| recv_calls(&socket) >= 2, Duration::from_secs(5)).await,
+            "supervisor must respawn the driver after a fatal exit"
+        );
+        assert!(
+            !inner.state.lock().unwrap().driver_lost,
+            "supervised driver death must not set driver_lost"
+        );
+
+        // Recover the socket; the next respawn stays up (poll_recv pends).
+        *socket.fail_with.lock().unwrap() = None;
+        let calls = recv_calls(&socket);
+        assert!(
+            wait_until(|| recv_calls(&socket) > calls, Duration::from_secs(5)).await,
+            "respawned driver must poll the recovered socket"
+        );
+
+        // Clean shutdown: dropping the last user handle lets the driver exit
+        // and the supervisor task end, releasing all refs.
+        drop(user_handle);
+        assert!(
+            wait_until(|| Arc::strong_count(&inner) == 1, Duration::from_secs(5)).await,
+            "driver and supervisor must release the endpoint after the last handle drops"
+        );
+    }
+
+    /// A supervised driver death must not tear down live connections: their
+    /// channels stay in place so the respawned driver (and a rebind) can
+    /// resume I/O for them (issue #220).
+    #[tokio::test]
+    async fn respawn_preserves_connection_channels() {
+        let socket = Arc::new(ControllableSocket {
+            addr: unbindable_addr(),
+            fail_with: Mutex::new(Some(io::ErrorKind::PermissionDenied)),
+            recv_calls: AtomicUsize::new(0),
+        });
+        let (rc, inner, runtime) = test_endpoint_ref(socket.clone());
+        let _user_handle = rc.clone();
+        let (handle, _rx) = insert_fake_connection(&inner);
+        spawn_supervised_driver(rc, runtime);
+
+        assert!(
+            wait_until(|| recv_calls(&socket) >= 2, Duration::from_secs(5)).await,
+            "supervisor must respawn the driver after a fatal exit"
+        );
+        let state = inner.state.lock().unwrap();
+        assert!(
+            state.recv_state.connections.senders.contains_key(&handle),
+            "respawn must preserve live connection channels"
+        );
+        assert!(!state.driver_lost);
+
+        // Stop the failure spam before the test runtime tears the task down.
+        *socket.fail_with.lock().unwrap() = None;
+    }
+
+    /// An intentional close must never resurrect I/O: the supervisor observes
+    /// the close reason and lets the driver stay dead, with terminal teardown
+    /// (driver_lost, connection channels dropped) as before (issue #220).
+    #[tokio::test]
+    async fn closed_endpoint_driver_is_not_respawned() {
+        let socket = Arc::new(ControllableSocket {
+            addr: unbindable_addr(),
+            fail_with: Mutex::new(Some(io::ErrorKind::PermissionDenied)),
+            recv_calls: AtomicUsize::new(0),
+        });
+        let (rc, inner, runtime) = test_endpoint_ref(socket.clone());
+        let _user_handle = rc.clone();
+        let (_handle, _rx) = insert_fake_connection(&inner);
+        inner.state.lock().unwrap().recv_state.connections.close =
+            Some((VarInt::from_u32(0), Bytes::new()));
+        spawn_supervised_driver(rc, runtime);
+
+        assert!(
+            wait_until(|| recv_calls(&socket) >= 1, Duration::from_secs(5)).await,
+            "driver must poll the socket once"
+        );
+        // Well past the initial backoff, there must be no second poll: the
+        // supervisor respected the close instead of respawning.
+        tokio::time::sleep(DRIVER_RESPAWN_INITIAL_BACKOFF * 5).await;
+        assert_eq!(
+            recv_calls(&socket),
+            1,
+            "driver on a closed endpoint must not be respawned"
+        );
+        let state = inner.state.lock().unwrap();
+        assert!(
+            state.driver_lost,
+            "terminal teardown on a closed endpoint must set driver_lost"
+        );
+        assert!(
+            state.recv_state.connections.senders.is_empty(),
+            "terminal teardown must drop connection channels"
+        );
+    }
+
+    /// `Endpoint::close` must record the close reason: new incoming connection
+    /// attempts are rejected, `accept` drains, and the supervisor can tell an
+    /// intentional close apart from a fatal driver exit (issue #220).
+    #[tokio::test]
+    async fn close_marks_endpoint_closed() {
+        let socket = Arc::new(ControllableSocket {
+            addr: unbindable_addr(),
+            fail_with: Mutex::new(None),
+            recv_calls: AtomicUsize::new(0),
+        });
+        let runtime = default_runtime().expect("tests run inside a tokio runtime");
+        let endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("endpoint construction");
+
+        endpoint.close(VarInt::from_u32(0), b"done");
+        assert!(
+            endpoint
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .recv_state
+                .connections
+                .close
+                .is_some(),
+            "close must record the close reason"
+        );
+        assert!(
+            endpoint.accept().await.is_none(),
+            "accept must drain once the endpoint is closed"
+        );
+    }
+
+    /// The supervisor's rebind helper must be able to take over the address
+    /// once the old socket is gone, and must fail (so the old socket is kept)
+    /// while the old socket still owns it (issue #220).
+    #[cfg(not(wasm_browser))]
+    #[test]
+    fn replacement_socket_rebinds_after_old_socket_gone() {
+        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let first = bind_replacement_socket(addr).expect("initial bind");
+        let bound = first.local_addr().expect("local addr");
+        assert!(
+            bind_replacement_socket(bound).is_err(),
+            "rebind must fail while the old socket owns the address"
+        );
+        drop(first);
+        let second = bind_replacement_socket(bound).expect("rebind after old socket is gone");
+        assert_eq!(
+            second.local_addr().expect("local addr"),
+            bound,
+            "replacement socket must take over the old address"
+        );
     }
 }
