@@ -3558,6 +3558,84 @@ mod tests {
         assert_eq!(name, "Windows (WinRT)");
     }
 
+    // Issue #177: regression coverage for the macOS packaging guard. Plain
+    // CLI/test binaries must fail gracefully (no Core Bluetooth access without
+    // an app bundle declaring NSBluetoothAlwaysUsageDescription); only real
+    // .app layouts may proceed.
+    #[cfg(target_os = "macos")]
+    mod macos_packaging {
+        use super::*;
+
+        #[test]
+        fn app_bundle_info_plist_accepts_bundle_layout() {
+            let executable =
+                std::path::Path::new("/Applications/AntQuic.app/Contents/MacOS/ant-quic");
+            let plist = BleTransport::app_bundle_info_plist(executable);
+            assert_eq!(
+                plist.as_deref(),
+                Some(std::path::Path::new(
+                    "/Applications/AntQuic.app/Contents/Info.plist"
+                ))
+            );
+        }
+
+        #[test]
+        fn app_bundle_info_plist_rejects_plain_cli_layouts() {
+            for plain in [
+                "/usr/local/bin/ant-quic",
+                "/tmp/ant-quic",
+                "/Users/dev/ant-quic/target/debug/ant-quic",
+                "/opt/homebrew/bin/ant-quic",
+            ] {
+                assert!(
+                    BleTransport::app_bundle_info_plist(std::path::Path::new(plain)).is_none(),
+                    "plain CLI path {plain} should not resolve to an app-bundle Info.plist"
+                );
+            }
+        }
+
+        #[test]
+        fn file_declares_macos_bluetooth_usage_matches_usage_keys() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            let with_key = dir.path().join("Info-with-key.plist");
+            std::fs::write(
+                &with_key,
+                b"<?xml version=\"1.0\"?><plist><dict>\
+<key>NSBluetoothAlwaysUsageDescription</key><string>BLE</string></dict></plist>",
+            )
+            .expect("write plist with key");
+            assert!(BleTransport::file_declares_macos_bluetooth_usage(&with_key));
+
+            let without_key = dir.path().join("Info-without-key.plist");
+            std::fs::write(
+                &without_key,
+                b"<?xml version=\"1.0\"?><plist><dict/></plist>",
+            )
+            .expect("write plist without key");
+            assert!(!BleTransport::file_declares_macos_bluetooth_usage(
+                &without_key
+            ));
+
+            let missing = dir.path().join("does-not-exist.plist");
+            assert!(!BleTransport::file_declares_macos_bluetooth_usage(&missing));
+        }
+
+        #[test]
+        fn ensure_macos_usage_description_refuses_plain_test_binary() {
+            // `cargo test` runs a plain CLI binary, never an .app bundle, so
+            // the guard must refuse it with an actionable packaging message
+            // instead of letting Core Bluetooth crash the process.
+            let error = BleTransport::ensure_macos_usage_description()
+                .expect_err("plain test binaries must be refused BLE on macOS");
+            let message = format!("{error}");
+            assert!(
+                message.contains("NSBluetoothAlwaysUsageDescription"),
+                "error should name the required Info.plist key, got: {message}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     async fn test_ble_transport_creation() {
