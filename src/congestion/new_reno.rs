@@ -286,46 +286,87 @@ mod tests {
     }
 
     // Congestion event tests
+    //
+    // These use a single fixed base instant per test: the controller ignores
+    // events whose `sent` time is not after `recovery_start_time`, so comparing
+    // against fresh `Instant::now()` calls is non-deterministic under scheduler
+    // load (see issue #233).
 
     #[test]
     fn congestion_halves_window() {
-        let mut c = cc();
+        let t0 = now();
+        let mut c = NewReno::new(config(), t0, 1200);
         c.window = 50000;
-        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        c.on_congestion_event(
+            t0 + Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            false,
+            1200,
+        );
         assert_eq!(c.window, 25000);
     }
 
     #[test]
     fn congestion_sets_ssthresh() {
-        let mut c = cc();
+        let t0 = now();
+        let mut c = NewReno::new(config(), t0, 1200);
         c.window = 50000;
-        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        c.on_congestion_event(
+            t0 + Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            false,
+            1200,
+        );
         assert_eq!(c.ssthresh, c.window);
     }
 
     #[test]
     fn congestion_not_below_minimum() {
-        let mut c = cc();
+        let t0 = now();
+        let mut c = NewReno::new(config(), t0, 1200);
         c.window = 1000;
-        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        c.on_congestion_event(
+            t0 + Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            false,
+            1200,
+        );
         assert_eq!(c.window, c.minimum_window());
     }
 
     #[test]
     fn persistent_congestion_resets_to_min() {
-        let mut c = cc();
+        let t0 = now();
+        let mut c = NewReno::new(config(), t0, 1200);
         c.window = 50000;
-        c.on_congestion_event(now() + Duration::from_millis(100), now(), true, 1200);
+        c.on_congestion_event(
+            t0 + Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            true,
+            1200,
+        );
         assert_eq!(c.window, c.minimum_window());
     }
 
     #[test]
     fn duplicate_congestion_ignored_during_recovery() {
-        let mut c = cc();
+        let t0 = now();
+        let mut c = NewReno::new(config(), t0, 1200);
         c.window = 50000;
-        c.on_congestion_event(now() + Duration::from_millis(100), now(), false, 1200);
+        c.on_congestion_event(
+            t0 + Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            false,
+            1200,
+        );
         let after = c.window;
-        c.on_congestion_event(now() + Duration::from_millis(200), now(), false, 1200);
+        // Sent before the recovery period started, so it must be ignored.
+        c.on_congestion_event(
+            t0 + Duration::from_millis(200),
+            t0 + Duration::from_millis(50),
+            false,
+            1200,
+        );
         assert_eq!(c.window, after);
     }
 
