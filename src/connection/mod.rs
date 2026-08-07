@@ -1696,7 +1696,12 @@ impl Connection {
                 Timer::PathValidation => {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
+                        // The path we're abandoning owns in-flight packets whose accounting is
+                        // dropped along with it. Restart the restored path's window so those
+                        // packets can never be debited from it when they are later acked or
+                        // declared lost (issue #230).
                         self.path = prev;
+                        self.path.restart_in_flight();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;

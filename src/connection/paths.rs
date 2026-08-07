@@ -49,9 +49,16 @@ pub(super) struct PathData {
     pub(super) in_flight: InFlight,
     /// Number of the first packet sent on this path
     ///
-    /// Used to determine whether a packet was sent on an earlier path. Insufficient to determine if
-    /// a packet was sent on a later path.
+    /// Used to determine whether a packet was sent on an earlier path.
     first_packet: Option<u64>,
+    /// Number of the most recent packet sent on this path
+    ///
+    /// Used together with `first_packet` to determine whether a packet was sent on a *later* path.
+    /// `first_packet` alone is not sufficient: paths can be abandoned (see `Connection::migrate` and
+    /// the `PathValidation` timeout) while packets sent on them are still in flight, and without an
+    /// upper bound those packets would be wrongly debited from an older surviving path, underflowing
+    /// its in-flight counters (issue #230).
+    last_packet: Option<u64>,
 
     /// Snapshot of the qlog recovery metrics
     #[cfg(feature = "__qlog")]
@@ -110,6 +117,7 @@ impl PathData {
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
+            last_packet: None,
             #[cfg(feature = "__qlog")]
             congestion_metrics: CongestionMetrics::default(),
             address_info: PathAddressInfo::new(),
@@ -135,6 +143,7 @@ impl PathData {
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
             first_packet: None,
+            last_packet: None,
             #[cfg(feature = "__qlog")]
             congestion_metrics: prev.congestion_metrics.clone(),
             address_info: PathAddressInfo::new(), // Reset for new path
@@ -219,17 +228,50 @@ impl PathData {
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        self.in_flight.bytes -= space.sent(pn, packet);
+        // Packet numbers are not globally monotonic (they are per-space, and spaces are interleaved
+        // during the handshake), so take the maximum to keep this a true upper bound.
+        self.last_packet = Some(self.last_packet.map_or(pn, |last| cmp::max(last, pn)));
+        // `PacketSpace::sent` returns the byte count of any forgotten non-ack-eliciting tail
+        // packet evicted from the space to bound memory. Those bytes may have been sent on a
+        // *different* path (before a migration), so they were never counted in this path's
+        // `in_flight.bytes`. Subtracting them raw would underflow; use `saturating_sub` so a
+        // cross-path eviction produces a bounded accounting error (counter clamps at 0) rather
+        // than wrapping to ~2^64 and stalling congestion control permanently in release builds.
+        let forgotten_bytes = space.sent(pn, packet);
+        debug_assert!(
+            self.in_flight.bytes >= forgotten_bytes,
+            "InFlight::bytes underflow in PathData::sent: forgotten non-ack-eliciting tail \
+             bytes may belong to a previous path"
+        );
+        self.in_flight.bytes = self.in_flight.bytes.saturating_sub(forgotten_bytes);
     }
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
-    /// `false` if `pn` was sent before this path was established.
+    /// `false` if `pn` was not sent on this path.
     pub(super) fn remove_in_flight(&mut self, pn: u64, packet: &SentPacket) -> bool {
         if self.first_packet.is_none_or(|first| first > pn) {
             return false;
         }
+        // `pn` may have been sent on a *later* path which has since been abandoned, in which case
+        // its bytes were never inserted into this path's counters and must not be removed from them.
+        if self.last_packet.is_none_or(|last| last < pn) {
+            return false;
+        }
         self.in_flight.remove(packet);
         true
+    }
+
+    /// Forget every packet previously attributed to this path
+    ///
+    /// Used when a path is restored after the path that superseded it is abandoned. The abandoned
+    /// path's in-flight accounting dies with it, and the restored path's own accounting is stale by
+    /// at least three PTOs, so the only consistent state is a clean slate: without this, packets
+    /// sent on the abandoned path fall inside the restored path's packet-number window once it
+    /// resumes sending, and would be debited from counters that never held them.
+    pub(super) fn restart_in_flight(&mut self) {
+        self.in_flight = InFlight::new();
+        self.first_packet = None;
+        self.last_packet = None;
     }
 
     #[cfg(feature = "__qlog")]
@@ -499,8 +541,21 @@ impl InFlight {
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
     fn remove(&mut self, packet: &SentPacket) {
-        self.bytes -= u64::from(packet.size);
-        self.ack_eliciting -= u64::from(packet.ack_eliciting);
+        debug_assert!(
+            self.bytes >= u64::from(packet.size),
+            "InFlight::bytes underflow: removing packet never counted or already removed"
+        );
+        debug_assert!(
+            self.ack_eliciting >= u64::from(packet.ack_eliciting),
+            "InFlight::ack_eliciting underflow: removing packet never counted or already removed"
+        );
+        // `saturating_sub` bounds the accounting error to zero instead of wrapping to ~2^64 in
+        // release builds (where the debug_asserts above are elided). A root cause fix for the
+        // double-remove that triggers these is tracked separately (issue #230).
+        self.bytes = self.bytes.saturating_sub(u64::from(packet.size));
+        self.ack_eliciting = self
+            .ack_eliciting
+            .saturating_sub(u64::from(packet.ack_eliciting));
     }
 }
 
@@ -615,6 +670,7 @@ impl PathAddressInfo {
 
 #[cfg(test)]
 mod tests {
+    use super::super::spaces::ThinRetransmits;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -992,5 +1048,204 @@ mod tests {
         // Rate should be preserved, tokens should be reset
         assert_eq!(path.observation_rate_limiter.rate, 15.0);
         assert_eq!(path.observation_rate_limiter.tokens, 15.0); // Full tokens after reset
+    }
+
+    /// A minimal ack-eliciting packet for in-flight accounting tests
+    fn sent_packet(size: u16, now: Instant) -> SentPacket {
+        SentPacket {
+            time_sent: now,
+            size,
+            ack_eliciting: true,
+            largest_acked: None,
+            retransmits: ThinRetransmits::default(),
+            stream_frames: Default::default(),
+        }
+    }
+
+    /// issue #230: a second migration started before the first has validated drops the intermediate
+    /// path (`Connection::migrate`'s `if prev.challenge.is_none()` guard keeps the *older* path as
+    /// `prev_path`). Packets the intermediate path sent are still in `sent_packets`, and when they
+    /// are acked or declared lost `Connection::remove_in_flight` walks `[current, prev]`. The older
+    /// path must not claim them: their bytes were never inserted into its counters, so debiting
+    /// them underflows `InFlight::bytes` — a panic in debug builds and a permanently stalled
+    /// congestion window in release builds.
+    #[test]
+    fn abandoned_intermediate_path_packets_are_not_debited_from_older_path() {
+        let config = TransportConfig::default();
+        let now = Instant::now();
+        let remote1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let remote2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8080);
+        let remote3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 3)), 8080);
+        let mut space = PacketSpace::new(now);
+
+        // Original path sends two packets.
+        let mut original = PathData::new(remote1, false, None, now, &config);
+        original.sent(0, sent_packet(1200, now), &mut space);
+        original.sent(1, sent_packet(1200, now), &mut space);
+        assert_eq!(original.in_flight.bytes, 2400);
+
+        // First migration: the intermediate path becomes current and sends two more packets.
+        let mut intermediate = PathData::from_previous(remote2, &original, now);
+        intermediate.sent(2, sent_packet(1200, now), &mut space);
+        intermediate.sent(3, sent_packet(1200, now), &mut space);
+
+        // Second migration before the first validated: `current` becomes the new path, `original`
+        // is retained as `prev_path`, and `intermediate` is dropped with its counters.
+        let mut current = PathData::from_previous(remote3, &intermediate, now);
+        current.sent(4, sent_packet(1200, now), &mut space);
+        drop(intermediate);
+
+        // The original path's own packets are acked, emptying its counters.
+        assert!(original.remove_in_flight(0, &sent_packet(1200, now)));
+        assert!(original.remove_in_flight(1, &sent_packet(1200, now)));
+        assert_eq!(original.in_flight.bytes, 0);
+        assert_eq!(original.in_flight.ack_eliciting, 0);
+
+        // An ack for a packet sent on the abandoned intermediate path must be claimed by neither
+        // surviving path. Before the fix, `original` claimed it and underflowed.
+        assert!(!current.remove_in_flight(3, &sent_packet(1200, now)));
+        assert!(!original.remove_in_flight(3, &sent_packet(1200, now)));
+        assert_eq!(original.in_flight.bytes, 0);
+        assert_eq!(original.in_flight.ack_eliciting, 0);
+
+        // The current path still accounts for its own packets.
+        assert!(current.remove_in_flight(4, &sent_packet(1200, now)));
+        assert_eq!(current.in_flight.bytes, 0);
+    }
+
+    /// issue #230: when path validation times out the connection restores `prev_path` and drops the
+    /// unvalidated path, which by then carries all of the connection's in-flight application data.
+    /// Once the restored path resumes sending, the abandoned path's packet numbers fall inside its
+    /// window, so the packet-number range check alone cannot exclude them; the restored path's
+    /// accounting must be restarted instead.
+    #[test]
+    fn restored_path_forgets_accounting_after_validation_failure() {
+        let config = TransportConfig::default();
+        let now = Instant::now();
+        let remote1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let remote2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8080);
+        let mut space = PacketSpace::new(now);
+
+        let mut original = PathData::new(remote1, false, None, now, &config);
+        original.sent(0, sent_packet(1200, now), &mut space);
+        assert!(original.remove_in_flight(0, &sent_packet(1200, now)));
+        assert_eq!(original.in_flight.bytes, 0);
+
+        // Migration: application data now flows on the unvalidated path.
+        let mut migrated = PathData::from_previous(remote2, &original, now);
+        migrated.sent(1, sent_packet(1200, now), &mut space);
+        migrated.sent(2, sent_packet(1200, now), &mut space);
+
+        // Validation times out: `migrated` is dropped and `original` is restored as the live path.
+        drop(migrated);
+        original.restart_in_flight();
+
+        // The restored path resumes sending, moving its window past the abandoned path's numbers.
+        original.sent(3, sent_packet(1200, now), &mut space);
+        assert_eq!(original.in_flight.bytes, 1200);
+
+        // Late acks for the abandoned path's packets must not be debited from the restored path.
+        assert!(!original.remove_in_flight(1, &sent_packet(1200, now)));
+        assert!(!original.remove_in_flight(2, &sent_packet(1200, now)));
+        assert_eq!(original.in_flight.bytes, 1200);
+
+        // The restored path's own packet is still accounted correctly.
+        assert!(original.remove_in_flight(3, &sent_packet(1200, now)));
+        assert_eq!(original.in_flight.bytes, 0);
+        assert_eq!(original.in_flight.ack_eliciting, 0);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    /// Construct a minimal `SentPacket` for testing `InFlight` counters.
+    ///
+    /// `SentPacket` is private to the `connection` module; constructing it here is
+    /// acceptable because this test module is also inside that module tree.
+    fn make_packet(size: u16, ack_eliciting: bool) -> SentPacket {
+        SentPacket {
+            time_sent: Instant::now(),
+            size,
+            ack_eliciting,
+            largest_acked: None,
+            retransmits: Default::default(),
+            stream_frames: Default::default(),
+        }
+    }
+
+    /// A single insert followed by a single remove must bring both counters back to zero.
+    #[test]
+    fn in_flight_insert_remove_balances() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        assert_eq!(in_flight.bytes, 1200);
+        assert_eq!(in_flight.ack_eliciting, 1);
+
+        in_flight.remove(&packet);
+        assert_eq!(
+            in_flight.bytes, 0,
+            "bytes must return to zero after balanced remove"
+        );
+        assert_eq!(
+            in_flight.ack_eliciting, 0,
+            "ack_eliciting must return to zero after balanced remove"
+        );
+    }
+
+    /// A non-ack-eliciting packet (e.g. pure PADDING) counts bytes but not ack_eliciting.
+    #[test]
+    fn in_flight_non_ack_eliciting_packet() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(64, false);
+
+        in_flight.insert(&packet);
+        assert_eq!(in_flight.bytes, 64);
+        assert_eq!(in_flight.ack_eliciting, 0);
+
+        in_flight.remove(&packet);
+        assert_eq!(in_flight.bytes, 0);
+        assert_eq!(in_flight.ack_eliciting, 0);
+    }
+
+    /// In debug builds a double-remove must trip the `debug_assert!` with a message
+    /// containing "underflow", making the bug immediately visible rather than silently
+    /// wrapping to ~2^64.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "underflow")]
+    fn in_flight_double_remove_panics_in_debug() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        in_flight.remove(&packet); // first remove — OK
+        in_flight.remove(&packet); // double-remove — must panic
+    }
+
+    /// In release builds (no debug assertions) a double-remove must clamp both counters
+    /// at 0 via `saturating_sub` instead of wrapping to ~2^64 and freezing congestion
+    /// control. This is the fix for issue #230.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn in_flight_double_remove_saturates_in_release() {
+        let mut in_flight = InFlight::new();
+        let packet = make_packet(1200, true);
+
+        in_flight.insert(&packet);
+        in_flight.remove(&packet); // first remove — OK
+        in_flight.remove(&packet); // double-remove — must clamp, not wrap
+
+        assert_eq!(
+            in_flight.bytes, 0,
+            "bytes must saturate at 0 on double-remove, not wrap to ~2^64"
+        );
+        assert_eq!(
+            in_flight.ack_eliciting, 0,
+            "ack_eliciting must saturate at 0 on double-remove, not wrap"
+        );
     }
 }
