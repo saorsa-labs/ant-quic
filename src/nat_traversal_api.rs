@@ -4817,9 +4817,15 @@ impl NatTraversalEndpoint {
     // Private implementation methods
 
     fn build_nat_transport_config(config: &NatTraversalConfig) -> TransportConfig {
+        const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
         let mut transport_config = TransportConfig::default();
         transport_config.enable_address_discovery(true);
-        transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+        transport_config.max_idle_timeout(Some(
+            crate::VarInt::from_u32(MAX_IDLE_TIMEOUT.as_millis() as u32).into(),
+        ));
+        transport_config.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
         transport_config.max_concurrent_uni_streams(
             crate::VarInt::from_u32(config.max_concurrent_uni_streams).into(),
         );
@@ -7185,7 +7191,7 @@ impl NatTraversalEndpoint {
                     return ReaderExitOutcome::ConnectionReaped;
                 }
 
-                if let Some(connection) =
+                let connection =
                     self.connection_lifecycle
                         .read()
                         .get(peer_id)
@@ -7194,19 +7200,22 @@ impl NatTraversalEndpoint {
                                 .iter()
                                 .find(|entry| entry.stable_id() == snapshot.stable_id)
                                 .map(|entry| entry.connection.clone())
-                        })
+                        });
+                let transport_close_reason = connection
+                    .as_ref()
+                    .and_then(|connection| connection.close_reason())
+                    .map(|error| ConnectionCloseReason::from_connection_error(&error));
+                if let Some(connection) = connection
                     && connection.close_reason().is_none()
                     && let Some(code) = ConnectionCloseReason::ReaderExit.app_error_code()
                 {
                     connection.close(code, ConnectionCloseReason::ReaderExit.reason_bytes());
                 }
+                let default_close_reason =
+                    transport_close_reason.unwrap_or(ConnectionCloseReason::ReaderExit);
                 let close_reason = self
-                    .mark_connection_closed(
-                        peer_id,
-                        snapshot.stable_id,
-                        ConnectionCloseReason::ReaderExit,
-                    )
-                    .unwrap_or(ConnectionCloseReason::ReaderExit);
+                    .mark_connection_closed(peer_id, snapshot.stable_id, default_close_reason)
+                    .unwrap_or(default_close_reason);
                 self.connections.remove(peer_id);
                 self.emitted_established_events.remove(peer_id);
                 let mut lifecycle = self.connection_lifecycle.write();
@@ -11193,7 +11202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_nat_transport_config_uses_transport_default_keepalive() {
+    fn test_build_nat_transport_config_enables_keepalive_below_idle_timeout() {
         let config = NatTraversalConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             timeouts: crate::config::nat_timeouts::TimeoutConfig {
@@ -11207,9 +11216,17 @@ mod tests {
         };
 
         let transport_config = NatTraversalEndpoint::build_nat_transport_config(&config);
-        let default_keepalive = TransportConfig::default().keep_alive_interval;
 
-        assert_eq!(transport_config.keep_alive_interval, default_keepalive);
+        assert_eq!(
+            transport_config.keep_alive_interval,
+            Some(Duration::from_secs(10))
+        );
+        assert!(
+            transport_config
+                .keep_alive_interval
+                .is_some_and(|interval| { interval < Duration::from_secs(30) }),
+            "QUIC keepalive must fire before the 30s idle timeout"
+        );
         assert_ne!(
             transport_config.keep_alive_interval,
             Some(config.timeouts.nat_traversal.retry_interval),
