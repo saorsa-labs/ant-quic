@@ -65,7 +65,7 @@ use crate::{EndpointConfig, VarInt};
 /// Raw errnos cover platform gaps in `io::ErrorKind` mapping: 49
 /// (EADDRNOTAVAIL, macOS), 51/65 (ENETUNREACH/EHOSTUNREACH, macOS),
 /// 101/113 (ENETUNREACH/EHOSTUNREACH, Linux).
-fn is_transient_socket_error(error: &io::Error) -> bool {
+pub(crate) fn is_transient_socket_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::AddrNotAvailable
