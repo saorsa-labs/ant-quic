@@ -239,6 +239,14 @@ impl StreamsState {
         self.connection_blocked.clear();
     }
 
+    /// Sum of end offsets of all receive streams, i.e. a monotonic count of the
+    /// stream bytes the peer has delivered to us. Advances only for offsets we
+    /// have not seen before, so retransmissions of already-received data leave
+    /// it unchanged.
+    pub(crate) fn data_recvd(&self) -> u64 {
+        self.data_recvd
+    }
+
     /// Process incoming stream frame
     ///
     /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted

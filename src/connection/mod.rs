@@ -224,6 +224,12 @@ pub struct Connection {
     /// (zombie-connection defense; deliberate deviation from RFC 9000 §10.1 —
     /// see x0x#278).
     ack_progress_at: Instant,
+    /// Instant at which the peer last delivered application payload we had not
+    /// already received (new stream bytes or a datagram). `None` until the peer
+    /// delivers any. Distinguishes a peer doing useful work in the receive
+    /// direction — which must never be reaped while it keeps doing so — from a
+    /// zombie that only emits retransmits, keepalives and junk (x0x#234).
+    peer_payload_at: Option<Instant>,
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
@@ -381,6 +387,7 @@ impl Connection {
                 Some(dur) => Some(Duration::from_millis(dur.0)),
             },
             ack_progress_at: now,
+            peer_payload_at: None,
             timers: TimerTable::default(),
             authentication_failures: 0,
             error: None,
@@ -2475,10 +2482,24 @@ impl Connection {
         //
         // When we hold no ack-eliciting data we reset unconditionally (healthy
         // keepalive, RFC 9000 §10.1 compatible). When we DO hold such data we
-        // only reset while the peer is making ACK progress within the idle
-        // window; otherwise we let `Timer::Idle` reap the connection. This is a
-        // deliberate hardening deviation from RFC 9000 §10.1.
-        if self.no_unacked_data() || self.ack_progress_recent(now) {
+        // reset while the peer is making ACK progress within the idle window.
+        //
+        // Neither of those covers a half-broken path: our packets are not
+        // reaching the peer (so it cannot ACK) while the peer's packets are
+        // reaching us and carrying application payload. The original gate reaped
+        // that connection at the idle timeout even though the peer was demonstrably
+        // alive and the receive direction was doing useful work, and — because an
+        // idle kill sends no CONNECTION_CLOSE — the peer never learned, leaving a
+        // permanent half-open link (x0x#234). Receipt of *new* application payload
+        // therefore also resets the timer.
+        //
+        // Payload receipt is the discriminator rather than packet receipt: the
+        // x0x#278 zombies did keep transmitting authenticated packets, so resetting
+        // on any authenticated packet would restore that leak verbatim. A peer that
+        // only retransmits data we already hold, PINGs and sends junk advances no
+        // offsets, so it still times out.
+        if self.no_unacked_data() || self.ack_progress_recent(now) || self.peer_payload_recent(now)
+        {
             self.reset_idle_timeout(now, space_id);
         }
         self.permit_idle_reset = true;
@@ -2542,6 +2563,21 @@ impl Connection {
             Some(d) => d,
         };
         now.saturating_duration_since(self.ack_progress_at) < timeout
+    }
+
+    /// Whether the peer delivered application payload we had not already received
+    /// within the current idle window. Such a peer is doing useful work in the
+    /// receive direction and must not be reaped merely because our own sends are
+    /// going unacknowledged (x0x#234).
+    fn peer_payload_recent(&self, now: Instant) -> bool {
+        let timeout = match self.idle_timeout {
+            None => return true,
+            Some(d) => d,
+        };
+        match self.peer_payload_at {
+            None => false,
+            Some(at) => now.saturating_duration_since(at) < timeout,
+        }
     }
 
     fn reset_keep_alive(&mut self, now: Instant) {
@@ -3346,6 +3382,10 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
+        // Snapshot the peer's delivered stream bytes so we can tell new payload
+        // from a retransmission of data we already hold (x0x#234 idle gate).
+        let stream_bytes_before = self.streams.data_recvd();
+        let mut datagram_received = false;
         for result in frame::Iter::new(payload)? {
             let frame = result?;
             let span = match frame {
@@ -3639,6 +3679,7 @@ impl Connection {
                     token_store.insert(server_name, token);
                 }
                 Frame::Datagram(datagram) => {
+                    datagram_received = true;
                     let result = self
                         .datagrams
                         .received(datagram, &self.config.datagram_receive_buffer_size)?;
@@ -3712,6 +3753,12 @@ impl Connection {
                     self.handle_try_connect_to_response(&response)?;
                 }
             }
+        }
+
+        // Datagrams are never retransmitted, so any that arrived are new payload;
+        // stream frames count only where they advanced offsets we had not seen.
+        if datagram_received || self.streams.data_recvd() > stream_bytes_before {
+            self.peer_payload_at = Some(now);
         }
 
         let space = &mut self.spaces[SpaceId::Data];
