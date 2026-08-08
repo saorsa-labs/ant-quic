@@ -593,6 +593,12 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Pins that `select_family` routes IPv4-mapped destinations (`::ffff:x.x.x.x`) through the
+    /// v4 socket, not the v6 socket. The discriminating assertion is the egress source port: since
+    /// the two sender sockets are bound independently (OS assigns ephemeral ports from separate
+    /// pools for AF_INET vs AF_INET6), their ports will differ. If `select_family`'s IPv4-mapped
+    /// arm is broken — e.g. inverted to route to v6 — the receiver sees the v6 sender port and
+    /// the assertion fails with a clear message.
     #[tokio::test]
     async fn test_send_routing_ipv4_mapped() {
         // Create a v4 receiver
@@ -600,14 +606,26 @@ mod tests {
         receiver.set_nonblocking(true).unwrap();
         let recv_port = receiver.local_addr().unwrap().port();
 
-        // Create dual-stack socket — await writability before try_send
+        // Create dual-stack socket — await writability before try_send.
+        // Bind v4 and v6 independently so they get distinct OS-assigned ports.
+        // v6 is bound to [::] (not [::1]) so that under mutation the send to an
+        // IPv4-mapped destination succeeds from the v6 socket; the packet arrives at
+        // the receiver from a different source port, triggering the discriminating assertion.
         let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         v4.writable().await.unwrap();
-        let v6 = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let v6 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
         v6.writable().await.unwrap();
         let ds = DualStackSocket::new(Some(v4), Some(v6)).unwrap();
 
-        // Send to an IPv4-mapped IPv6 address — should route to v4 socket
+        // Capture sender ports before the sockets are moved into the sender.
+        let v4_port = ds.local_addr_v4().unwrap().port();
+        let v6_port = ds.local_addr_v6().unwrap().port();
+        assert_ne!(
+            v4_port, v6_port,
+            "test requires distinct v4/v6 sender ports to discriminate egress socket"
+        );
+
+        // Send to an IPv4-mapped IPv6 address — select_family must route to the v4 socket.
         let mapped_dest: SocketAddr = format!("[::ffff:127.0.0.1]:{recv_port}").parse().unwrap();
         let transmit = Transmit {
             destination: mapped_dest,
@@ -621,13 +639,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify receipt on the v4 receiver
+        // Verify receipt on the v4 receiver and check the egress socket by source port.
         let mut buf = [0u8; 64];
         let mut received = false;
         for _ in 0..50 {
             match receiver.recv_from(&mut buf) {
-                Ok((len, _)) => {
+                Ok((len, sender_addr)) => {
                     assert_eq!(&buf[..len], b"hello-v4-mapped");
+                    // The packet must have egressed the v4 socket, not the v6 socket.
+                    // Under mutation (IPv4-mapped arm inverted to route to v6), the
+                    // source port would be v6_port and this assertion catches it.
+                    assert_eq!(
+                        sender_addr.port(),
+                        v4_port,
+                        "reply must egress the v4 socket (port {v4_port}), saw port {} (v6 socket is {v6_port})",
+                        sender_addr.port()
+                    );
                     received = true;
                     break;
                 }
@@ -640,6 +667,10 @@ mod tests {
         assert!(received, "v4 receiver should get the IPv4-mapped datagram");
     }
 
+    /// Pins that `select_family` routes native IPv6 destinations (`::1`) through the v6 socket.
+    /// This test does not carry the egress-port discriminator (that is in
+    /// `test_send_routing_ipv4_mapped`); it verifies that a native-v6 send reaches a v6 receiver
+    /// at all — covering the `SocketAddr::V6(_)` arm of `select_family`.
     #[tokio::test]
     async fn test_send_routing_native_v6() {
         // Create a v6 receiver
@@ -758,5 +789,336 @@ mod tests {
         std::future::poll_fn(|cx| socket.poll_recv(cx, bufs, meta))
             .await
             .unwrap()
+    }
+
+    // ─── Inbound reply path (ant-quic #234/#235) ─────────────────────────────
+    //
+    // Field failure: host B dials host A over IPv4 on a shared LAN. A binds true
+    // dual-stack, so A's endpoint reports `local_addr() == [::]:port` and runs
+    // with `ipv6 = true`; every peer address A handles is therefore the
+    // IPv4-mapped form `[::ffff:192.168.1.108]:port`. B's packets kept arriving
+    // at A for minutes, but no application data A sent ever reached B.
+    //
+    // The two tests below pin the invariants that inbound replies depend on.
+
+    /// A datagram received on the IPv4 socket must be answered *from* the IPv4
+    /// socket.
+    ///
+    /// This mirrors what the QUIC endpoint does: it takes the peer address
+    /// `poll_recv` reports (handed back IPv4-mapped) and feeds that same address
+    /// straight back as a `Transmit` destination. If the wrapper routed that
+    /// mapped address to the IPv6 socket, a native-IPv4 peer would never see the
+    /// reply — the field symptom.
+    /// Pins that `select_family` routes IPv4-mapped destinations back through the v4 socket.
+    ///
+    /// The sockets are bound independently (not via `create_dual_stack_sockets(0)`, which
+    /// co-allocates both to the same port) so that the OS assigns each a distinct ephemeral
+    /// port. The final assertion checks the source port: under the mutation that inverts the
+    /// v4-mapped arm of `select_family` to route to the v6 socket, the receiver sees the v6
+    /// port and the assertion fails with a clear message. Without distinct ports the assertion
+    /// is non-discriminating (both sockets share the same port).
+    #[tokio::test]
+    async fn reply_to_v4_mapped_peer_egresses_from_the_v4_socket() {
+        // Independent binds → OS assigns separate ephemeral ports to AF_INET and AF_INET6.
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_v4_port = v4.local_addr().unwrap().port();
+        // v6 is bound to [::] (not [::1]) so that under mutation the send to an
+        // IPv4-mapped destination succeeds from the v6 socket; the packet then arrives
+        // from the v6 source port, triggering the discriminating port assertion.
+        let v6 = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let listener_v6_port = v6.local_addr().unwrap().port();
+        assert_ne!(
+            listener_v4_port, listener_v6_port,
+            "test requires distinct v4/v6 listener ports to discriminate egress socket"
+        );
+
+        let dual = wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack");
+
+        // Stand in for the remote LAN host: a plain IPv4 socket that knows
+        // nothing about IPv6, dialling the listener's IPv4 port as host B did.
+        let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        peer.send_to(b"dial", (Ipv4Addr::LOCALHOST, listener_v4_port))
+            .unwrap();
+
+        let mut buf = [0u8; 512];
+        let mut bufs = [IoSliceMut::new(&mut buf)];
+        let mut meta = [RecvMeta::default()];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| dual.poll_recv(cx, &mut bufs, &mut meta)),
+        )
+        .await
+        .expect("listener should receive the dial")
+        .expect("poll_recv should succeed");
+        assert_eq!(n, 1);
+
+        // The wrapper reports the peer IPv4-mapped because the endpoint believes
+        // it owns an IPv6 socket. This is the address the connection records as
+        // its remote, and the address every reply is sent to.
+        let learned_peer = meta[0].addr;
+        assert!(
+            matches!(learned_peer, SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some()),
+            "peer learned on the v4 socket should be reported IPv4-mapped, got {learned_peer}"
+        );
+        assert_eq!(learned_peer.port(), peer_port);
+
+        let transmit = Transmit {
+            destination: learned_peer,
+            ecn: None,
+            contents: b"reply",
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut sender = dual.create_sender();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| sender.as_mut().poll_send(&transmit, cx)),
+        )
+        .await
+        .expect("send should not stall")
+        .expect("send should succeed");
+
+        // The native-IPv4 peer must see it, and must see it from the listener's
+        // IPv4 address — not from an IPv6 source it never talked to.
+        let mut reply = [0u8; 512];
+        let (len, src) = peer
+            .recv_from(&mut reply)
+            .expect("native-IPv4 peer must receive the reply; a v6 egress black-holes it");
+        assert_eq!(&reply[..len], b"reply");
+        assert_eq!(
+            src,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, listener_v4_port)),
+            "reply must egress the v4 socket (port {listener_v4_port}), saw port {} \
+             (v6 socket is {listener_v6_port}); check select_family's IPv4-mapped arm",
+            src.port()
+        );
+    }
+
+    /// An inbound IPv4 connection into a true-dual-stack listener must carry
+    /// application data back to the dialer.
+    ///
+    /// The field failure completed its handshake and reached Live on both hosts,
+    /// then black-holed every server->client byte, so this asserts on delivered
+    /// stream payload in the server->client direction. A connect-only assertion
+    /// would have stayed green throughout the outage.
+    /// Pins that an inbound IPv4 QUIC connection delivers server→client stream data.
+    ///
+    /// Uses distinct v4/v6 listener ports (independent binds, not `create_dual_stack_sockets(0)`)
+    /// so that if `select_family`'s IPv4-mapped arm routes replies to the v6 socket, the QUIC
+    /// client sees packets from an unexpected source and the connection/read fails.
+    #[tokio::test]
+    async fn inbound_ipv4_connection_delivers_server_to_client_data() {
+        use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
+        use crate::high_level::{Endpoint, TokioRuntime};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // Independent binds ensure v4 and v6 get distinct OS-assigned ports.
+        // v6 is bound to [::] so that under mutation the v6 socket can reach IPv4-mapped
+        // destinations; distinct ports cause QUIC to reject the mis-routed packets.
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_v4_port = v4.local_addr().unwrap().port();
+        let v6 = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let listener_v6_port = v6.local_addr().unwrap().port();
+        assert_ne!(
+            listener_v4_port, listener_v6_port,
+            "test requires distinct v4/v6 listener ports to discriminate egress socket"
+        );
+        let _ = listener_v6_port; // captured for the assert_ne; QUIC discriminates through peer mismatch
+
+        let dual: Arc<dyn AsyncUdpSocket> =
+            Arc::new(wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack"));
+
+        // Precondition that makes this test meaningful: the endpoint must
+        // believe it is IPv6, which is what forces every peer address through
+        // the IPv4-mapped representation.
+        assert!(
+            dual.local_addr().unwrap().is_ipv6(),
+            "true dual-stack listener must report an IPv6 local_addr"
+        );
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let cert_der = CertificateDer::from(cert.cert);
+        let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        let chain = vec![cert_der];
+        let server_cfg =
+            ServerConfig::with_single_cert(chain.clone(), key_der).expect("server config");
+
+        let server_ep = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(server_cfg),
+            dual,
+            Arc::new(TokioRuntime),
+        )
+        .expect("dual-stack server endpoint");
+
+        // The server echoes on a bidirectional stream; everything it writes
+        // travels in the direction that died in the field.
+        let server = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("server handshake");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("server accept_bi");
+            let got = recv.read_to_end(64).await.expect("server read");
+            assert_eq!(got, b"ping");
+            send.write_all(b"pong").await.expect("server write");
+            send.finish().expect("server finish");
+            // Hold the connection open until the client has drained the reply:
+            // dropping here could close before delivery and mask a real failure
+            // as a clean shutdown.
+            conn.closed().await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for c in chain {
+            roots.add(c).expect("add server cert to roots");
+        }
+        let client_cfg =
+            ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config");
+
+        // The dialer is plain IPv4, exactly like the LAN host in the field report.
+        let mut client_ep =
+            Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint");
+        client_ep.set_default_client_config(client_cfg);
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_ep
+                .connect((Ipv4Addr::LOCALHOST, listener_v4_port).into(), "localhost")
+                .expect("start connect"),
+        )
+        .await
+        .expect("handshake must not stall")
+        .expect("client connected");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("client open_bi");
+        send.write_all(b"ping").await.expect("client write");
+        send.finish().expect("client finish");
+
+        // The assertion the field bug fails: handshake succeeded, but no server
+        // payload ever arrived.
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(64))
+            .await
+            .expect("server->client data must arrive on an inbound dual-stack connection")
+            .expect("client read");
+        assert_eq!(
+            echoed, b"pong",
+            "server reply must reach the IPv4 dialer intact"
+        );
+
+        conn.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
+
+    /// The exact field topology: *both* peers bind true dual-stack, and the
+    /// dialer reaches the listener over IPv4.
+    ///
+    /// This differs from the test above in that the dialer's endpoint also
+    /// reports an IPv6 `local_addr`, so both sides record the peer in
+    /// IPv4-mapped form and both must route their sends back down to the IPv4
+    /// socket. Host A and host B were both dual-stack in the field, so this is
+    /// the configuration that actually failed.
+    /// Pins the field topology: both peers true dual-stack, dial over IPv4.
+    ///
+    /// Uses distinct v4/v6 ports per peer (independent binds, not `create_dual_stack_sockets(0)`)
+    /// so that the mutation — routing IPv4-mapped sends to the v6 socket — produces packets from
+    /// an unexpected source port, causing QUIC to reject them and the test to fail.
+    #[tokio::test]
+    async fn dual_stack_peers_exchange_data_over_an_ipv4_dial() {
+        use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
+        use crate::high_level::{Endpoint, TokioRuntime};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // Independent binds ensure v4 and v6 get distinct OS-assigned ports per endpoint.
+        let make_dual = || {
+            let v4 = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind v4");
+            let v4_port = v4.local_addr().unwrap().port();
+            let v6 = std::net::UdpSocket::bind("[::]:0").expect("bind v6");
+            let v6_port = v6.local_addr().unwrap().port();
+            assert_ne!(
+                v4_port, v6_port,
+                "test requires distinct v4/v6 ports to discriminate egress socket"
+            );
+            let socket: Arc<dyn AsyncUdpSocket> =
+                Arc::new(wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack"));
+            (socket, v4_port)
+        };
+
+        let (server_socket, server_v4_port) = make_dual();
+        let (client_socket, _client_v4_port) = make_dual();
+        assert!(server_socket.local_addr().unwrap().is_ipv6());
+        assert!(client_socket.local_addr().unwrap().is_ipv6());
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let cert_der = CertificateDer::from(cert.cert);
+        let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        let chain = vec![cert_der];
+        let server_cfg =
+            ServerConfig::with_single_cert(chain.clone(), key_der).expect("server config");
+
+        let server_ep = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(server_cfg),
+            server_socket,
+            Arc::new(TokioRuntime),
+        )
+        .expect("dual-stack server endpoint");
+
+        let server = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("server handshake");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("server accept_bi");
+            let got = recv.read_to_end(64).await.expect("server read");
+            assert_eq!(got, b"ping");
+            send.write_all(b"pong").await.expect("server write");
+            send.finish().expect("server finish");
+            conn.closed().await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for c in chain {
+            roots.add(c).expect("add server cert to roots");
+        }
+        let client_cfg =
+            ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config");
+
+        let mut client_ep = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            client_socket,
+            Arc::new(TokioRuntime),
+        )
+        .expect("dual-stack client endpoint");
+        client_ep.set_default_client_config(client_cfg);
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_ep
+                .connect((Ipv4Addr::LOCALHOST, server_v4_port).into(), "localhost")
+                .expect("start connect"),
+        )
+        .await
+        .expect("handshake must not stall")
+        .expect("client connected");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("client open_bi");
+        send.write_all(b"ping").await.expect("client write");
+        send.finish().expect("client finish");
+
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(64))
+            .await
+            .expect("server->client data must arrive between two dual-stack peers")
+            .expect("client read");
+        assert_eq!(echoed, b"pong");
+
+        conn.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 }
