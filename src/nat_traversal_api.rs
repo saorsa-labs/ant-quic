@@ -7201,18 +7201,28 @@ impl NatTraversalEndpoint {
                                 .find(|entry| entry.stable_id() == snapshot.stable_id)
                                 .map(|entry| entry.connection.clone())
                         });
-                let transport_close_reason = connection
-                    .as_ref()
-                    .and_then(|connection| connection.close_reason())
-                    .map(|error| ConnectionCloseReason::from_connection_error(&error));
-                if let Some(connection) = connection
+                let mut closed_by_reader_exit = false;
+                if let Some(connection) = &connection
                     && connection.close_reason().is_none()
                     && let Some(code) = ConnectionCloseReason::ReaderExit.app_error_code()
                 {
                     connection.close(code, ConnectionCloseReason::ReaderExit.reason_bytes());
+                    closed_by_reader_exit = true;
                 }
-                let default_close_reason =
-                    transport_close_reason.unwrap_or(ConnectionCloseReason::ReaderExit);
+                // Observe the transport reason only after the close attempt: a
+                // transport close landing between the guard above and this read
+                // would otherwise be reported as ReaderExit, which
+                // `mark_connection_closed` treats as authoritative and never
+                // re-checks against the connection.
+                let default_close_reason = if closed_by_reader_exit {
+                    ConnectionCloseReason::ReaderExit
+                } else {
+                    connection
+                        .as_ref()
+                        .and_then(|connection| connection.close_reason())
+                        .map(|error| ConnectionCloseReason::from_connection_error(&error))
+                        .unwrap_or(ConnectionCloseReason::ReaderExit)
+                };
                 let close_reason = self
                     .mark_connection_closed(peer_id, snapshot.stable_id, default_close_reason)
                     .unwrap_or(default_close_reason);
@@ -11221,11 +11231,21 @@ mod tests {
             transport_config.keep_alive_interval,
             Some(Duration::from_secs(10))
         );
+        // Compare against the idle timeout this config actually sets, not a
+        // literal: pinning 30s here would keep passing if the idle timeout were
+        // lowered below the keepalive interval, which is the failure this
+        // assertion exists to catch.
+        let idle_timeout = transport_config
+            .max_idle_timeout
+            .map(|timeout| Duration::from_millis(timeout.into_inner()));
         assert!(
-            transport_config
-                .keep_alive_interval
-                .is_some_and(|interval| { interval < Duration::from_secs(30) }),
-            "QUIC keepalive must fire before the 30s idle timeout"
+            matches!(
+                (transport_config.keep_alive_interval, idle_timeout),
+                (Some(keepalive), Some(idle)) if keepalive < idle
+            ),
+            "QUIC keepalive ({:?}) must fire before the configured idle timeout ({:?})",
+            transport_config.keep_alive_interval,
+            idle_timeout
         );
         assert_ne!(
             transport_config.keep_alive_interval,
