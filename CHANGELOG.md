@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.37] - 2026-08-08
+
+### Fixed
+
+- **Transient socket send errors no longer permanently kill the connection
+  driver** (#242). `State::drive_transmit` returned `Err` for every
+  non-`WouldBlock` send error, ending the connection driver task permanently.
+  A single unreachable NAT candidate (e.g. EHOSTUNREACH, os error 65) was
+  enough to silence the connection while `is_closed()` stayed false — the
+  peer appeared connected, ACKs and PTO probes stopped, and the silent
+  half-open wedge persisted until the idle timeout fired (often minutes).
+  The transient error class already classified by `is_transient_socket_error`
+  (added for the endpoint receive path in 0.27.34) is now applied on the send
+  path: transient errors log at debug level, drop the datagram, and let QUIC
+  loss recovery retransmit over a working path.
+- **Real transport close reason reported on reader exit** (#240). Reader-exit
+  handling always recorded `ReaderExit`, hiding the actual close reason (e.g.
+  `TimedOut` for an idle timeout) under a generic label that made log-based
+  diagnosis significantly harder.
+
+### Changed
+
+- **Dual-stack reply path test hardening** (#239): three new mutation-verified
+  integration tests pin the inbound reply path for IPv4 dials into a
+  true-dual-stack listener, asserting delivered stream payload in the
+  server-to-client direction (the direction that died in the field). These
+  serve as a regression gate and as a harness for further environment-specific
+  investigation.
+
 ## [0.27.35] - 2026-07-23
 
 ### Fixed
