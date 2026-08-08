@@ -7185,7 +7185,7 @@ impl NatTraversalEndpoint {
                     return ReaderExitOutcome::ConnectionReaped;
                 }
 
-                if let Some(connection) =
+                let connection =
                     self.connection_lifecycle
                         .read()
                         .get(peer_id)
@@ -7194,19 +7194,32 @@ impl NatTraversalEndpoint {
                                 .iter()
                                 .find(|entry| entry.stable_id() == snapshot.stable_id)
                                 .map(|entry| entry.connection.clone())
-                        })
+                        });
+                let mut closed_by_reader_exit = false;
+                if let Some(connection) = &connection
                     && connection.close_reason().is_none()
                     && let Some(code) = ConnectionCloseReason::ReaderExit.app_error_code()
                 {
                     connection.close(code, ConnectionCloseReason::ReaderExit.reason_bytes());
+                    closed_by_reader_exit = true;
                 }
+                // Observe the transport reason only after the close attempt: a
+                // transport close landing between the guard above and this read
+                // would otherwise be reported as ReaderExit, which
+                // `mark_connection_closed` treats as authoritative and never
+                // re-checks against the connection.
+                let default_close_reason = if closed_by_reader_exit {
+                    ConnectionCloseReason::ReaderExit
+                } else {
+                    connection
+                        .as_ref()
+                        .and_then(|connection| connection.close_reason())
+                        .map(|error| ConnectionCloseReason::from_connection_error(&error))
+                        .unwrap_or(ConnectionCloseReason::ReaderExit)
+                };
                 let close_reason = self
-                    .mark_connection_closed(
-                        peer_id,
-                        snapshot.stable_id,
-                        ConnectionCloseReason::ReaderExit,
-                    )
-                    .unwrap_or(ConnectionCloseReason::ReaderExit);
+                    .mark_connection_closed(peer_id, snapshot.stable_id, default_close_reason)
+                    .unwrap_or(default_close_reason);
                 self.connections.remove(peer_id);
                 self.emitted_established_events.remove(peer_id);
                 let mut lifecycle = self.connection_lifecycle.write();
@@ -11210,6 +11223,22 @@ mod tests {
         let default_keepalive = TransportConfig::default().keep_alive_interval;
 
         assert_eq!(transport_config.keep_alive_interval, default_keepalive);
+        // Compare against the idle timeout this config actually sets, not a
+        // literal: pinning 30s here would keep passing if the idle timeout were
+        // lowered below the keepalive interval, which is the failure this
+        // assertion exists to catch.
+        let idle_timeout = transport_config
+            .max_idle_timeout
+            .map(|timeout| Duration::from_millis(timeout.into_inner()));
+        assert!(
+            matches!(
+                (transport_config.keep_alive_interval, idle_timeout),
+                (Some(keepalive), Some(idle)) if keepalive < idle
+            ),
+            "QUIC keepalive ({:?}) must fire before the configured idle timeout ({:?})",
+            transport_config.keep_alive_interval,
+            idle_timeout
+        );
         assert_ne!(
             transport_config.keep_alive_interval,
             Some(config.timeouts.nat_traversal.retry_interval),
