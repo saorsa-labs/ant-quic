@@ -593,6 +593,12 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Pins that `select_family` routes IPv4-mapped destinations (`::ffff:x.x.x.x`) through the
+    /// v4 socket, not the v6 socket. The discriminating assertion is the egress source port: since
+    /// the two sender sockets are bound independently (OS assigns ephemeral ports from separate
+    /// pools for AF_INET vs AF_INET6), their ports will differ. If `select_family`'s IPv4-mapped
+    /// arm is broken — e.g. inverted to route to v6 — the receiver sees the v6 sender port and
+    /// the assertion fails with a clear message.
     #[tokio::test]
     async fn test_send_routing_ipv4_mapped() {
         // Create a v4 receiver
@@ -600,14 +606,26 @@ mod tests {
         receiver.set_nonblocking(true).unwrap();
         let recv_port = receiver.local_addr().unwrap().port();
 
-        // Create dual-stack socket — await writability before try_send
+        // Create dual-stack socket — await writability before try_send.
+        // Bind v4 and v6 independently so they get distinct OS-assigned ports.
+        // v6 is bound to [::] (not [::1]) so that under mutation the send to an
+        // IPv4-mapped destination succeeds from the v6 socket; the packet arrives at
+        // the receiver from a different source port, triggering the discriminating assertion.
         let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         v4.writable().await.unwrap();
-        let v6 = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let v6 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
         v6.writable().await.unwrap();
         let ds = DualStackSocket::new(Some(v4), Some(v6)).unwrap();
 
-        // Send to an IPv4-mapped IPv6 address — should route to v4 socket
+        // Capture sender ports before the sockets are moved into the sender.
+        let v4_port = ds.local_addr_v4().unwrap().port();
+        let v6_port = ds.local_addr_v6().unwrap().port();
+        assert_ne!(
+            v4_port, v6_port,
+            "test requires distinct v4/v6 sender ports to discriminate egress socket"
+        );
+
+        // Send to an IPv4-mapped IPv6 address — select_family must route to the v4 socket.
         let mapped_dest: SocketAddr = format!("[::ffff:127.0.0.1]:{recv_port}").parse().unwrap();
         let transmit = Transmit {
             destination: mapped_dest,
@@ -621,13 +639,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify receipt on the v4 receiver
+        // Verify receipt on the v4 receiver and check the egress socket by source port.
         let mut buf = [0u8; 64];
         let mut received = false;
         for _ in 0..50 {
             match receiver.recv_from(&mut buf) {
-                Ok((len, _)) => {
+                Ok((len, sender_addr)) => {
                     assert_eq!(&buf[..len], b"hello-v4-mapped");
+                    // The packet must have egressed the v4 socket, not the v6 socket.
+                    // Under mutation (IPv4-mapped arm inverted to route to v6), the
+                    // source port would be v6_port and this assertion catches it.
+                    assert_eq!(
+                        sender_addr.port(),
+                        v4_port,
+                        "reply must egress the v4 socket (port {v4_port}), saw port {} (v6 socket is {v6_port})",
+                        sender_addr.port()
+                    );
                     received = true;
                     break;
                 }
@@ -640,6 +667,10 @@ mod tests {
         assert!(received, "v4 receiver should get the IPv4-mapped datagram");
     }
 
+    /// Pins that `select_family` routes native IPv6 destinations (`::1`) through the v6 socket.
+    /// This test does not carry the egress-port discriminator (that is in
+    /// `test_send_routing_ipv4_mapped`); it verifies that a native-v6 send reaches a v6 receiver
+    /// at all — covering the `SocketAddr::V6(_)` arm of `select_family`.
     #[tokio::test]
     async fn test_send_routing_native_v6() {
         // Create a v6 receiver
@@ -778,13 +809,28 @@ mod tests {
     /// straight back as a `Transmit` destination. If the wrapper routed that
     /// mapped address to the IPv6 socket, a native-IPv4 peer would never see the
     /// reply — the field symptom.
-    #[cfg(feature = "network-discovery")]
+    /// Pins that `select_family` routes IPv4-mapped destinations back through the v4 socket.
+    ///
+    /// The sockets are bound independently (not via `create_dual_stack_sockets(0)`, which
+    /// co-allocates both to the same port) so that the OS assigns each a distinct ephemeral
+    /// port. The final assertion checks the source port: under the mutation that inverts the
+    /// v4-mapped arm of `select_family` to route to the v6 socket, the receiver sees the v6
+    /// port and the assertion fails with a clear message. Without distinct ports the assertion
+    /// is non-discriminating (both sockets share the same port).
     #[tokio::test]
     async fn reply_to_v4_mapped_peer_egresses_from_the_v4_socket() {
-        let (v4, v6) = create_dual_stack_sockets(0).expect("bind dual-stack sockets");
-        let v4 = v4.expect("IPv4 socket required for this test");
-        let v6 = v6.expect("IPv6 socket required for this test");
+        // Independent binds → OS assigns separate ephemeral ports to AF_INET and AF_INET6.
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let listener_v4_port = v4.local_addr().unwrap().port();
+        // v6 is bound to [::] (not [::1]) so that under mutation the send to an
+        // IPv4-mapped destination succeeds from the v6 socket; the packet then arrives
+        // from the v6 source port, triggering the discriminating port assertion.
+        let v6 = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let listener_v6_port = v6.local_addr().unwrap().port();
+        assert_ne!(
+            listener_v4_port, listener_v6_port,
+            "test requires distinct v4/v6 listener ports to discriminate egress socket"
+        );
 
         let dual = wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack");
 
@@ -845,7 +891,9 @@ mod tests {
         assert_eq!(
             src,
             SocketAddr::from((Ipv4Addr::LOCALHOST, listener_v4_port)),
-            "reply must come from the listener's IPv4 socket so the dialer accepts it"
+            "reply must egress the v4 socket (port {listener_v4_port}), saw port {} \
+             (v6 socket is {listener_v6_port}); check select_family's IPv4-mapped arm",
+            src.port()
         );
     }
 
@@ -856,7 +904,11 @@ mod tests {
     /// then black-holed every server->client byte, so this asserts on delivered
     /// stream payload in the server->client direction. A connect-only assertion
     /// would have stayed green throughout the outage.
-    #[cfg(feature = "network-discovery")]
+    /// Pins that an inbound IPv4 QUIC connection delivers server→client stream data.
+    ///
+    /// Uses distinct v4/v6 listener ports (independent binds, not `create_dual_stack_sockets(0)`)
+    /// so that if `select_family`'s IPv4-mapped arm routes replies to the v6 socket, the QUIC
+    /// client sees packets from an unexpected source and the connection/read fails.
     #[tokio::test]
     async fn inbound_ipv4_connection_delivers_server_to_client_data() {
         use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
@@ -865,10 +917,18 @@ mod tests {
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let (v4, v6) = create_dual_stack_sockets(0).expect("bind dual-stack sockets");
-        let v4 = v4.expect("IPv4 socket required for this test");
-        let v6 = v6.expect("IPv6 socket required for this test");
+        // Independent binds ensure v4 and v6 get distinct OS-assigned ports.
+        // v6 is bound to [::] so that under mutation the v6 socket can reach IPv4-mapped
+        // destinations; distinct ports cause QUIC to reject the mis-routed packets.
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let listener_v4_port = v4.local_addr().unwrap().port();
+        let v6 = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let listener_v6_port = v6.local_addr().unwrap().port();
+        assert_ne!(
+            listener_v4_port, listener_v6_port,
+            "test requires distinct v4/v6 listener ports to discriminate egress socket"
+        );
+        let _ = listener_v6_port; // captured for the assert_ne; QUIC discriminates through peer mismatch
 
         let dual: Arc<dyn AsyncUdpSocket> =
             Arc::new(wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack"));
@@ -962,7 +1022,11 @@ mod tests {
     /// IPv4-mapped form and both must route their sends back down to the IPv4
     /// socket. Host A and host B were both dual-stack in the field, so this is
     /// the configuration that actually failed.
-    #[cfg(feature = "network-discovery")]
+    /// Pins the field topology: both peers true dual-stack, dial over IPv4.
+    ///
+    /// Uses distinct v4/v6 ports per peer (independent binds, not `create_dual_stack_sockets(0)`)
+    /// so that the mutation — routing IPv4-mapped sends to the v6 socket — produces packets from
+    /// an unexpected source port, causing QUIC to reject them and the test to fail.
     #[tokio::test]
     async fn dual_stack_peers_exchange_data_over_an_ipv4_dial() {
         use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
@@ -971,11 +1035,16 @@ mod tests {
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+        // Independent binds ensure v4 and v6 get distinct OS-assigned ports per endpoint.
         let make_dual = || {
-            let (v4, v6) = create_dual_stack_sockets(0).expect("bind dual-stack sockets");
-            let v4 = v4.expect("IPv4 socket required for this test");
-            let v6 = v6.expect("IPv6 socket required for this test");
+            let v4 = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind v4");
             let v4_port = v4.local_addr().unwrap().port();
+            let v6 = std::net::UdpSocket::bind("[::]:0").expect("bind v6");
+            let v6_port = v6.local_addr().unwrap().port();
+            assert_ne!(
+                v4_port, v6_port,
+                "test requires distinct v4/v6 ports to discriminate egress socket"
+            );
             let socket: Arc<dyn AsyncUdpSocket> =
                 Arc::new(wrap_dual_stack(Some(v4), Some(v6)).expect("wrap dual-stack"));
             (socket, v4_port)
