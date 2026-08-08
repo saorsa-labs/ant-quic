@@ -26,6 +26,7 @@ use tracing::{Instrument, Span, debug, debug_span, error};
 
 use super::{
     ConnectionEvent,
+    endpoint::is_transient_socket_error,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender},
@@ -1448,6 +1449,24 @@ impl State {
                     }
                 }
                 Poll::Ready(Err(e)) => {
+                    // A destination the host cannot reach (a peer-advertised
+                    // NAT candidate on an unreachable subnet or address family)
+                    // must not be fatal. Returning `Err` here ends the
+                    // connection driver task for good: the connection stays
+                    // `Live` to the application while emitting no ACKs, no PTO
+                    // probes and no idle-timeout CONNECTION_CLOSE, so the peer
+                    // sees a black hole while this side reports a healthy
+                    // connection indefinitely. Drop the datagram and let loss
+                    // recovery retransmit over a path that works — the same
+                    // treatment the endpoint receive path already gives this
+                    // error class (x0x issue #262).
+                    if is_transient_socket_error(&e) {
+                        debug!(
+                            "ignoring transient socket send error to {}: {}",
+                            t.destination, e
+                        );
+                        continue;
+                    }
                     // X0X-0043: a hard error from the kernel send path is
                     // the closest measurable proxy for a "partial send"
                     // today. When the runtime is rewritten to use
