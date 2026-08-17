@@ -29,21 +29,28 @@ SSH_OPTS=(
     -o StrictHostKeyChecking=accept-new
 )
 
-PUBLIC_NAMES=("saorsa1" "saorsa2" "vultr1" "vultr2")
+# Default public fleet: the six x0x bootstrap VPS nodes
+# (docs: ../x0x/docs/ecosystem.md). Override per-run with *_CSV env vars.
+PUBLIC_NAMES=("saorsa-2" "saorsa-3" "saorsa-6" "saorsa-7" "saorsa-8" "saorsa-9")
 PUBLIC_TARGETS=(
-    "root@77.42.75.115"
     "root@142.93.199.50"
-    "root@149.28.156.231"
-    "root@45.77.176.184"
+    "root@147.182.234.192"
+    "root@65.21.157.229"
+    "root@116.203.101.172"
+    "root@152.42.210.67"
+    "root@170.64.176.102"
 )
 PUBLIC_IPV4S=(
-    "77.42.75.115"
     "142.93.199.50"
-    "149.28.156.231"
-    "45.77.176.184"
+    "147.182.234.192"
+    "65.21.157.229"
+    "116.203.101.172"
+    "152.42.210.67"
+    "170.64.176.102"
 )
 
 LOCAL_NAMES=("macbook" "studio1" "studio2")
+# studio2 is currently offline; override with LOCAL_NAMES_CSV/LOCAL_TARGETS_CSV
 LOCAL_TARGETS=("LOCAL" "studio1@studio1.local" "studio2@studio2.local")
 
 REMOTE_LINUX_BINARY_PATH="/root/ant-quic-matrix/bin/ant-quic"
