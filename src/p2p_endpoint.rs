@@ -13212,6 +13212,10 @@ mod tests {
     /// peer (candidate replacement marks the older one Superseded while it stays
     /// open); `handle_reader_exit` is invoked directly on the current Live
     /// winner. No reader tasks, no broadcast polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn reader_exit_winner_repromotes_open_superseded_survivor_keeps_peer_routable() {
         async fn build_endpoint() -> P2pEndpoint {
@@ -13496,6 +13500,10 @@ mod tests {
     /// Deterministic: two real authenticated connections (Live winner + open
     /// Superseded survivor); the winner is closed directly; the read path is
     /// then exercised. No reader tasks, no polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn get_connection_lazy_repromotes_open_survivor_when_winner_dies_before_reader_exit() {
         async fn build_endpoint() -> P2pEndpoint {
@@ -13639,6 +13647,10 @@ mod tests {
     /// replacement) is registered in `self.inner`; the older outer/reader/direct
     /// state is installed directly. No reader tasks are spawned, no polling, no
     /// wall-clock races. If the guard were dropped, every assertion below fails.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn if_unroutable_cleanup_is_noop_when_inner_replacement_is_live() {
         async fn build_endpoint() -> P2pEndpoint {
@@ -13870,6 +13882,10 @@ mod tests {
     /// Deterministic: two real authenticated QUIC connections registered in
     /// `self.inner`; older outer/reader/direct state installed directly. No
     /// reader tasks, no polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn cleanup_connection_generation_closes_only_failed_generation_preserving_live_replacement()
      {
