@@ -2338,6 +2338,12 @@ impl std::fmt::Display for HolePunchAwaitError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CleanupScope {
+    Peer,
+    IfUnroutable,
+}
+
 /// Shared cleanup logic for removing a peer from all tracking structures.
 ///
 /// Used by both `P2pEndpoint::cleanup_connection()` and the background reaper
@@ -2358,14 +2364,23 @@ async fn do_cleanup_connection(
     peer_id: &PeerId,
     reason: DisconnectReason,
     close_reason: ConnectionCloseReason,
+    scope: CleanupScope,
 ) -> bool {
-    let lifecycle_snapshot = inner
-        .get_connection(peer_id)
-        .ok()
-        .flatten()
-        .and_then(|connection| {
-            inner.connection_snapshot_by_stable_id(peer_id, connection.stable_id())
-        });
+    let if_unroutable = matches!(scope, CleanupScope::IfUnroutable);
+    if if_unroutable && inner.is_peer_connected(peer_id) {
+        return false;
+    }
+    let lifecycle_snapshot = if if_unroutable {
+        None
+    } else {
+        inner
+            .get_connection(peer_id)
+            .ok()
+            .flatten()
+            .and_then(|connection| {
+                inner.connection_snapshot_by_stable_id(peer_id, connection.stable_id())
+            })
+    };
 
     if let Some(snapshot) = lifecycle_snapshot {
         emit_peer_lifecycle_event(
@@ -2379,8 +2394,9 @@ async fn do_cleanup_connection(
         );
     }
 
-    let _ = inner.remove_connection_with_reason(peer_id, close_reason);
-    direct_path_statuses.write().remove(peer_id);
+    if !if_unroutable {
+        let _ = inner.remove_connection_with_reason(peer_id, close_reason);
+    }
 
     if let Some(snapshot) = lifecycle_snapshot {
         emit_peer_lifecycle_event(
@@ -2402,14 +2418,38 @@ async fn do_cleanup_connection(
     // Tear down all background readers for this peer. Cooperative cancel first
     // (allows any in-flight `read_to_end()` to complete and deliver its bytes),
     // then `abort()` as a backstop in case a reader is wedged.
-    if let Some(handles) = reader_handles.write().await.remove(peer_id) {
+    let handles = if if_unroutable {
+        let mut handles = reader_handles.write().await;
+        if inner.is_peer_connected(peer_id) {
+            return false;
+        }
+        handles.remove(peer_id)
+    } else {
+        reader_handles.write().await.remove(peer_id)
+    };
+    if let Some(handles) = handles {
         for handle in handles {
             handle.cancel.cancel();
             handle.abort_handle.abort();
         }
     }
 
-    let removed = remove_connected_peer(connected_peers, stats, event_tx, peer_id, reason).await;
+    let removed = if if_unroutable {
+        remove_connected_peer_if_unroutable(
+            connected_peers,
+            inner,
+            stats,
+            event_tx,
+            peer_id,
+            reason,
+        )
+        .await
+    } else {
+        remove_connected_peer(connected_peers, stats, event_tx, peer_id, reason).await
+    };
+    if removed {
+        direct_path_statuses.write().remove(peer_id);
+    }
     if removed {
         info!("Cleaned up connection for peer {:?}", peer_id);
     }
@@ -2523,7 +2563,38 @@ async fn remove_connected_peer(
     reason: DisconnectReason,
 ) -> bool {
     let removed = connected_peers.write().await.remove(peer_id);
+    record_connected_peer_removed(stats, event_tx, peer_id, reason, removed).await
+}
 
+/// Remove the outer peer record only while the inner transport remains
+/// unroutable. Holding the outer write lock across the final inner check makes
+/// a concurrent registration land after this removal rather than be erased by
+/// stale cleanup.
+async fn remove_connected_peer_if_unroutable(
+    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    inner: &NatTraversalEndpoint,
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: &PeerId,
+    reason: DisconnectReason,
+) -> bool {
+    let removed = {
+        let mut peers = connected_peers.write().await;
+        if inner.is_peer_connected(peer_id) {
+            return false;
+        }
+        peers.remove(peer_id)
+    };
+    record_connected_peer_removed(stats, event_tx, peer_id, reason, removed).await
+}
+
+async fn record_connected_peer_removed(
+    stats: &RwLock<EndpointStats>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    peer_id: &PeerId,
+    reason: DisconnectReason,
+    removed: Option<PeerConnection>,
+) -> bool {
     if let Some(peer_conn) = removed {
         {
             let mut s = stats.write().await;
@@ -6529,6 +6600,67 @@ impl P2pEndpoint {
             peer_id,
             reason,
             close_reason,
+            CleanupScope::Peer,
+        )
+        .await;
+    }
+
+    /// Close one failed transport generation while preserving a replacement
+    /// that may have registered after the failure was observed.
+    async fn cleanup_connection_generation(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        reason: DisconnectReason,
+    ) {
+        let Some(snapshot) = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, stable_id)
+        else {
+            return;
+        };
+        let close_reason = close_reason_for_disconnect(&reason);
+        emit_peer_lifecycle_event(
+            &self.peer_event_tx,
+            self.peer_event_channels.as_ref(),
+            *peer_id,
+            PeerLifecycleEvent::Closing {
+                generation: snapshot.generation,
+                reason: close_reason,
+            },
+        );
+        if !self
+            .inner
+            .remove_connection_generation_with_reason(peer_id, stable_id, close_reason)
+        {
+            return;
+        }
+        emit_peer_lifecycle_event(
+            &self.peer_event_tx,
+            self.peer_event_channels.as_ref(),
+            *peer_id,
+            PeerLifecycleEvent::Closed {
+                generation: snapshot.generation,
+                reason: close_reason,
+            },
+        );
+        fail_ack_waiters_for_connection(self.ack_waiters.as_ref(), stable_id, close_reason);
+
+        do_cleanup_connection(
+            &*self.connected_peers,
+            &*self.inner,
+            &*self.reader_handles,
+            &*self.direct_path_statuses,
+            &*self.stats,
+            &self.event_tx,
+            &self.peer_event_tx,
+            self.peer_event_channels.as_ref(),
+            self.peer_event_generations.as_ref(),
+            self.ack_waiters.as_ref(),
+            peer_id,
+            reason,
+            close_reason,
+            CleanupScope::IfUnroutable,
         )
         .await;
     }
@@ -7012,12 +7144,9 @@ impl P2pEndpoint {
         // the same (peer, stable_id) — vanishingly unlikely but defensive —
         // gets a clean slate.
         self.ack_liveness.forget(peer_id, stable_id);
-        // cleanup_connection is the source-of-truth disconnect path. With
-        // DisconnectReason::LivenessTimeout it threads LivenessTimeout through
-        // every layer: lifecycle events, inner state machine, ACK waiters,
-        // reader handles, connected_peers, stats, and the user-facing event
-        // channel. After this returns, `is_connected(peer_id)` is false.
-        self.cleanup_connection(&peer_id, DisconnectReason::LivenessTimeout)
+        // Retire only the generation that accumulated the failures. A newer
+        // winner may have registered since the threshold was observed.
+        self.cleanup_connection_generation(&peer_id, stable_id, DisconnectReason::LivenessTimeout)
             .await;
     }
 
@@ -8097,6 +8226,7 @@ impl P2pEndpoint {
             .read()
             .await
             .values()
+            .filter(|peer| self.inner.is_peer_connected(&peer.peer_id))
             .cloned()
             .collect()
     }
@@ -8104,6 +8234,7 @@ impl P2pEndpoint {
     /// Check if a peer is connected
     pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.connected_peers.read().await.contains_key(peer_id)
+            && self.inner.is_peer_connected(peer_id)
     }
 
     /// Check if a peer is authenticated
@@ -8112,8 +8243,8 @@ impl P2pEndpoint {
             .read()
             .await
             .get(peer_id)
-            .map(|p| p.authenticated)
-            .unwrap_or(false)
+            .is_some_and(|peer| peer.authenticated)
+            && self.inner.is_peer_connected(peer_id)
     }
 
     // === Lifecycle ===
@@ -8637,9 +8768,13 @@ impl P2pEndpoint {
     /// drain window. This lets in-flight request/ACK streams on the old
     /// generation finish before the reader exits at its next accept boundary.
     fn schedule_reader_generation_cancel(&self, peer_id: PeerId, generation: u64, after: Duration) {
+        let inner = Arc::clone(&self.inner);
         let reader_handles = Arc::clone(&self.reader_handles);
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
+            if !inner.close_superseded_connection_if_current(&peer_id, generation) {
+                return;
+            }
             let handles = reader_handles.read().await;
             if let Some(handle) = handles
                 .get(&peer_id)
@@ -9400,12 +9535,14 @@ impl P2pEndpoint {
                         );
                         continue;
                     }
-                    crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped => {
+                    crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped {
+                        close_reason,
+                    } => {
                         if let Some(snapshot) = snapshot_before {
                             fail_ack_waiters_for_connection(
                                 ack_waiters.as_ref(),
                                 snapshot.stable_id,
-                                ConnectionCloseReason::Superseded,
+                                close_reason,
                             );
                             match snapshot.state {
                                 crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
@@ -9416,7 +9553,7 @@ impl P2pEndpoint {
                                         peer_id,
                                         PeerLifecycleEvent::Closed {
                                             generation: snapshot.generation,
-                                            reason: ConnectionCloseReason::Superseded,
+                                            reason: close_reason,
                                         },
                                     );
                                 }
@@ -9424,11 +9561,51 @@ impl P2pEndpoint {
                                 | crate::connection_lifecycle::ConnectionLifecycleState::Closed { .. } => {}
                             }
                         }
+                        // `ConnectionReaped` means this generation lost the
+                        // connection race (superseded / closing / closed). That
+                        // must NOT suppress peer-wide cleanup unless a live
+                        // replacement reader/connection actually exists.
+                        //
+                        // Under supersession churn the winner map can already
+                        // point at a dead connection by the time the *final*
+                        // reader exits; the previous unconditional skip left the
+                        // peer stranded in `connected_peers` (and therefore
+                        // `is_peer_connected()`-true for x0x reconnect
+                        // suppression) with no reader left to drive cleanup.
+                        //
+                        // Defer only when a surviving reader remains
+                        // (`!last_reader`) or a live connection still occupies
+                        // the winner map (`is_peer_connected`) — i.e. a genuine
+                        // replacement exists. Otherwise run the normal disconnect
+                        // path so the peer is removed and reconnect is unsuppressed.
+                        if !last_reader || inner.is_peer_connected(&peer_id) {
+                            debug!(
+                                "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped, live replacement remains",
+                                peer_id, generation, conn_stable_id
+                            );
+                            continue;
+                        }
                         debug!(
-                            "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped",
+                            "Last reader task for peer {:?} (generation {}, conn stable_id {}) reaped with no live replacement — triggering peer cleanup",
                             peer_id, generation, conn_stable_id
                         );
-                        continue;
+                        do_cleanup_connection(
+                            &*connected_peers,
+                            &*inner,
+                            &*reader_handles,
+                            &*direct_path_statuses,
+                            &*stats,
+                            &event_tx,
+                            &peer_event_tx,
+                            peer_event_channels.as_ref(),
+                            peer_event_generations.as_ref(),
+                            ack_waiters.as_ref(),
+                            &peer_id,
+                            DisconnectReason::ConnectionLost,
+                            ConnectionCloseReason::ReaderExit,
+                            CleanupScope::IfUnroutable,
+                        )
+                        .await;
                     }
                     crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected {
                         close_reason,
@@ -9469,6 +9646,14 @@ impl P2pEndpoint {
                             continue;
                         }
 
+                        if inner.is_peer_connected(&peer_id) {
+                            debug!(
+                                "Last reader exited for peer {:?}, but a replacement registered before cleanup",
+                                peer_id
+                            );
+                            continue;
+                        }
+
                         debug!(
                             "Last live reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
                             peer_id, generation, conn_stable_id
@@ -9488,6 +9673,7 @@ impl P2pEndpoint {
                             &peer_id,
                             DisconnectReason::ConnectionLost,
                             close_reason,
+                            CleanupScope::IfUnroutable,
                         )
                         .await;
                     }
@@ -9561,6 +9747,7 @@ impl P2pEndpoint {
                         peer_id,
                         DisconnectReason::Timeout,
                         ConnectionCloseReason::TimedOut,
+                        CleanupScope::IfUnroutable,
                     )
                     .await;
                 }
@@ -13004,6 +13191,925 @@ mod tests {
         assert_eq!(accepted.0, a_id, "app stream from the connected peer");
         send_a.finish().ok();
         drop(starved_send);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+    /// Regression for the winner-map repromotion defect (x0x "dead pair").
+    ///
+    /// When a peer has two tracked connections — a Live *winner* occupying the
+    /// single-slot winner map and an open *Superseded* survivor still draining in
+    /// the lifecycle Vec — the winner's reader exiting must NOT strand outbound
+    /// routability. The endpoint must repromote the best usable survivor back to
+    /// Live and re-alias the winner map onto it, reporting `ConnectionReaped`
+    /// (not `PeerDisconnected`).
+    ///
+    /// Pre-fix, the Live branch of `handle_reader_exit` unconditionally removed
+    /// the peer from the winner map and returned `PeerDisconnected`, leaving the
+    /// still-open Superseded connection stranded: outbound sends failed while the
+    /// survivor kept delivering inbound data and reconnect stayed suppressed.
+    ///
+    /// Deterministic: two real authenticated connections are registered for one
+    /// peer (candidate replacement marks the older one Superseded while it stays
+    /// open); `handle_reader_exit` is invoked directly on the current Live
+    /// winner. No reader tasks, no broadcast polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn reader_exit_winner_repromotes_open_superseded_survivor_keeps_peer_routable() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two distinct, fully-authenticated QUIC connections from a -> b.
+        // `attempt_direct_handshake` performs only the handshake — it does NOT
+        // register the connection or spawn a reader — so lifecycle registration
+        // is controlled explicitly below (zero real-reader interference).
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        let stable0 = c0.stable_id();
+        let stable1 = c1.stable_id();
+        assert_ne!(stable0, stable1, "two independent connections required");
+
+        // Probe clones share the underlying connection state, so their
+        // close_reason() reports whether the lifecycle code closed the
+        // superseded connection (it must not — the survivor stays open).
+        let c0_probe = c0.clone();
+        let c1_probe = c1.clone();
+
+        // Register both generations for the same peer: candidate replacement
+        // marks the older connection Superseded while it remains open; the
+        // newer one becomes the Live winner aliased by the winner map.
+        a.inner
+            .add_connection_with_outcome(b_id, c0)
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1)
+            .expect("register c1");
+
+        let winner_conn = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("a winner is live");
+        let winner_stable = winner_conn.stable_id();
+        let other_stable = if winner_stable == stable0 {
+            stable1
+        } else {
+            stable0
+        };
+        let winner_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, winner_stable)
+            .expect("winner lifecycle snapshot");
+        let other_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, other_stable)
+            .expect("non-winner lifecycle snapshot");
+        assert!(
+            matches!(
+                winner_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Live
+            ),
+            "winner must be Live, got {:?}",
+            winner_snap.state
+        );
+        assert!(
+            matches!(
+                other_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
+            ),
+            "candidate replacement must mark the older connection Superseded, got {:?}",
+            other_snap.state
+        );
+        let other_probe = if winner_stable == stable0 {
+            c1_probe
+        } else {
+            c0_probe
+        };
+        assert!(
+            other_probe.close_reason().is_none(),
+            "the Superseded connection must remain OPEN for drain (close_reason must be None)"
+        );
+
+        // (1) The current Live winner's reader exits while the open Superseded
+        // survivor is still tracked. The fix must repromote the survivor instead
+        // of clearing the winner map and reporting PeerDisconnected.
+        let outcome = a
+            .inner
+            .handle_reader_exit(&b_id, winner_snap.generation, winner_stable);
+        assert!(
+            matches!(
+                outcome,
+                crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped { .. }
+            ),
+            "winner exit with an open survivor must reap (repromote), not disconnect; got {:?}",
+            outcome
+        );
+
+        // The older, previously-Superseded connection is repromoted to Live.
+        let repromoted = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, other_stable)
+            .expect("survivor snapshot after repromotion");
+        assert!(
+            matches!(
+                repromoted.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Live
+            ),
+            "surviving connection must be repromoted to Live, got {:?}",
+            repromoted.state
+        );
+
+        // The single-slot winner map is restored onto the survivor, so outbound
+        // routability survives the winner's death.
+        let routed = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("a routable connection must remain");
+        assert_eq!(
+            routed.stable_id(),
+            other_stable,
+            "winner map must alias the repromoted survivor"
+        );
+        assert!(
+            a.inner.is_peer_connected(&b_id),
+            "peer must remain routable after the winner reader exits"
+        );
+
+        // (2) Regression guard: repromotion must not break the normal
+        // last-reader teardown. When the repromoted survivor itself exits with no
+        // further replacement, the endpoint cleanly disconnects.
+        let final_outcome = a
+            .inner
+            .handle_reader_exit(&b_id, other_snap.generation, other_stable);
+        assert!(
+            matches!(
+                final_outcome,
+                crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected { .. }
+            ),
+            "final survivor exit with no replacement must disconnect; got {:?}",
+            final_outcome
+        );
+        assert!(
+            !a.inner.is_peer_connected(&b_id),
+            "peer must be unreachable after the final disconnect"
+        );
+        assert!(
+            a.inner.get_connection(&b_id).ok().flatten().is_none(),
+            "winner map must be cleared on the final disconnect"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Regression for the public connection-status gating introduced by the
+    /// atomic-connection-lifecycle hardening.
+    ///
+    /// A peer can be stranded in the outer `connected_peers` map while the
+    /// inner `NatTraversalEndpoint` has no live connection for it (reader-exit
+    /// stranding, supersession churn, or a stale map entry). Before the fix,
+    /// the three public async accessors surfaced such a peer purely from the
+    /// outer-map entry. They must instead gate on `inner.is_peer_connected`, so
+    /// a peer with no routable inner connection is never reported as present,
+    /// connected, or authenticated.
+    ///
+    /// Deterministic: no real peer connection is established. The stranded
+    /// entry is installed through the production `register_connected_peer`
+    /// helper (which writes only the outer map + stats/events, never the inner
+    /// endpoint), then all three accessors are asserted absent.
+    #[tokio::test]
+    async fn status_surface_ignores_peer_stranded_in_outer_connected_map() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+
+        // A synthetic peer `a` has never formed any inner connection with.
+        let stranded_id = PeerId([0x42; 32]);
+        assert_ne!(
+            stranded_id,
+            a.peer_id(),
+            "fixture: synthetic peer id must not collide with the endpoint's own id"
+        );
+
+        // Install the peer ONLY in the outer connected_peers map. The helper
+        // writes the outer map (+ stats/events) but never registers a
+        // connection in self.inner, reproducing the stranded state. The entry
+        // is deliberately marked authenticated to prove authentication is gated
+        // on a live connection rather than on the outer-map flag.
+        a.register_connected_peer(PeerConnection {
+            peer_id: stranded_id,
+            remote_addr: TransportAddr::Udp(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                9,
+            )),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+
+        // Precondition: the stranded state is real — the outer map holds the
+        // entry while the inner endpoint reports no routable connection.
+        assert!(
+            a.connected_peers.read().await.contains_key(&stranded_id),
+            "fixture: stranded peer must be present in the outer connected_peers map"
+        );
+        assert!(
+            !a.inner.is_peer_connected(&stranded_id),
+            "fixture: inner endpoint must have no live connection for the stranded peer"
+        );
+
+        // (1) connected_peers() must filter out peers with no inner connection.
+        let snapshot = a.connected_peers().await;
+        assert!(
+            !snapshot.iter().any(|p| p.peer_id == stranded_id),
+            "connected_peers() must not surface a peer stranded in the outer map; \
+             snapshot contained {:?}",
+            snapshot.iter().map(|p| p.peer_id).collect::<Vec<_>>()
+        );
+
+        // (2) is_connected() must be false despite the outer-map entry.
+        assert!(
+            !a.is_connected(&stranded_id).await,
+            "is_connected() must be false for a peer with no live inner connection, \
+             even when present in the outer connected_peers map"
+        );
+
+        // (3) is_authenticated() must be false even though the outer entry is
+        //     marked authenticated — auth status is gated on a live connection.
+        assert!(
+            !a.is_authenticated(&stranded_id).await,
+            "is_authenticated() must be false for a peer with no live inner connection, \
+             even when the outer-map entry carries authenticated=true"
+        );
+
+        a.shutdown().await;
+    }
+
+    /// Regression for the secondary (lazy) read path of winner-map self-heal.
+    ///
+    /// If the current winner connection dies *before* its reader task reports
+    /// the exit (e.g. a transport close races ahead of `handle_reader_exit`),
+    /// the single-slot winner map is left holding a dead connection while an
+    /// open Superseded survivor is still draining in the lifecycle Vec. A
+    /// subsequent read via `get_connection` / `is_peer_connected` must lazily
+    /// evict the dead winner and repromote the open survivor rather than report
+    /// the peer as unreachable (silent pre-reader-exit eviction).
+    ///
+    /// Deterministic: two real authenticated connections (Live winner + open
+    /// Superseded survivor); the winner is closed directly; the read path is
+    /// then exercised. No reader tasks, no polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn get_connection_lazy_repromotes_open_survivor_when_winner_dies_before_reader_exit() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        let stable0 = c0.stable_id();
+        let stable1 = c1.stable_id();
+        assert_ne!(stable0, stable1, "two independent connections required");
+
+        // Register both: the newer connection wins (Live, aliased by the winner
+        // map); the older is Superseded but left OPEN for drain.
+        a.inner
+            .add_connection_with_outcome(b_id, c0)
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1)
+            .expect("register c1");
+
+        let winner = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("a winner is live");
+        let winner_stable = winner.stable_id();
+        let survivor_stable = if winner_stable == stable0 {
+            stable1
+        } else {
+            stable0
+        };
+        let survivor_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, survivor_stable)
+            .expect("survivor lifecycle snapshot");
+        assert!(
+            matches!(
+                survivor_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
+            ),
+            "precondition: older connection must be Superseded, got {:?}",
+            survivor_snap.state
+        );
+
+        // Kill the winner directly — BEFORE any reader-exit is reported. The
+        // winner map now aliases a dead connection while the survivor remains
+        // open in the lifecycle Vec.
+        winner.close(crate::VarInt::from_u32(0), b"test winner pre-exit death");
+        assert!(
+            winner.close_reason().is_some(),
+            "fixture: winner must report closed immediately after explicit close"
+        );
+
+        // Secondary read path: get_connection must lazily evict the dead winner
+        // and repromote the open survivor — NOT return None.
+        let healed = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy self-heal must repromote the open survivor, not report None");
+        assert_eq!(
+            healed.stable_id(),
+            survivor_stable,
+            "lazy read must repromote the open Superseded survivor into the winner map"
+        );
+        assert!(
+            healed.close_reason().is_none(),
+            "repromoted survivor must be open (routable)"
+        );
+
+        // The winner map and connection-status surface now reflect the survivor.
+        let again = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("winner map must hold the repromoted survivor");
+        assert_eq!(
+            again.stable_id(),
+            survivor_stable,
+            "winner map must alias the repromoted survivor on repeat reads"
+        );
+        assert!(
+            a.inner.is_peer_connected(&b_id),
+            "is_peer_connected must report true via the repromoted survivor"
+        );
+
+        // The repromoted survivor's lifecycle state advanced to Live.
+        let repromoted_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, survivor_stable)
+            .expect("survivor snapshot after lazy repromotion");
+        assert!(
+            matches!(
+                repromoted_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Live
+            ),
+            "survivor must be repromoted to Live by the lazy read path, got {:?}",
+            repromoted_snap.state
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+    /// Regression: `do_cleanup_connection(... CleanupScope::IfUnroutable)` must
+    /// be a complete no-op when a live inner replacement exists for the peer,
+    /// even though an older outer `connected_peers` entry, a reader-task handle,
+    /// and a direct-path status are all still installed.
+    ///
+    /// The reader-exit and stale-reaper paths run cleanup with
+    /// `CleanupScope::IfUnroutable`. If a new connection has registered in the
+    /// inner endpoint (making `inner.is_peer_connected` true) by the time the
+    /// reaper fires, tearing down the outer/reader/direct state would erase the
+    /// freshly registered connection's bookkeeping and emit a spurious
+    /// `PeerDisconnected`. The `is_peer_connected` guard — checked under each
+    /// held lock — keeps cleanup inert.
+    ///
+    /// Deterministic: one real authenticated QUIC connection (the live
+    /// replacement) is registered in `self.inner`; the older outer/reader/direct
+    /// state is installed directly. No reader tasks are spawned, no polling, no
+    /// wall-clock races. If the guard were dropped, every assertion below fails.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn if_unroutable_cleanup_is_noop_when_inner_replacement_is_live() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Live inner replacement: one real authenticated QUIC connection,
+        // registered ONLY in the inner endpoint (no reader spawned).
+        let replacement =
+            tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+                .await
+                .expect("handshake timeout")
+                .expect("handshake ok");
+        let replacement_stable = replacement.stable_id();
+        let replacement_probe = replacement.clone();
+        a.inner
+            .add_connection_with_outcome(b_id, replacement)
+            .expect("register live replacement");
+
+        // Precondition: the inner endpoint routes the peer, the connection is
+        // open, and it is the current winner-map slot.
+        assert!(
+            a.inner.is_peer_connected(&b_id),
+            "fixture: replacement must register as a live inner connection"
+        );
+        assert_eq!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .expect("inner has a routable winner")
+                .stable_id(),
+            replacement_stable,
+            "fixture: winner slot must alias the live replacement"
+        );
+        assert!(
+            replacement_probe.close_reason().is_none(),
+            "fixture: replacement must be open"
+        );
+
+        // Older outer state installed directly: a connected_peers entry
+        // (distinct Relay metadata so it is unambiguously the pre-replacement
+        // record), a reader-task handle, and a direct-path status.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                9,
+            )),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+
+        // Reader-task handle whose liveness we can observe deterministically.
+        // `probe_cancel` is OUR release; cleanup would only touch the handle's
+        // own `cancel`/`abort_handle`, never `probe_cancel`. If cleanup reaches
+        // the remove+abort branch, the JoinHandle resolves to a cancelled error.
+        let probe_cancel = CancellationToken::new();
+        let task_token = probe_cancel.clone();
+        let probe_join: tokio::task::JoinHandle<u8> = tokio::spawn(async move {
+            task_token.cancelled().await;
+            42
+        });
+        {
+            let mut handles = a.reader_handles.write().await;
+            handles.insert(
+                b_id,
+                vec![ReaderTaskHandle {
+                    generation: 1,
+                    cancel: CancellationToken::new(),
+                    abort_handle: probe_join.abort_handle(),
+                }],
+            );
+        }
+
+        let direct_status = DirectPathStatus::Established {
+            remote_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4242),
+        };
+        a.direct_path_statuses
+            .write()
+            .insert(b_id, direct_status.clone());
+
+        // Sanity: all four state stores hold the peer before cleanup.
+        assert!(
+            a.connected_peers.read().await.contains_key(&b_id),
+            "fixture: outer entry installed"
+        );
+        assert!(
+            a.reader_handles.read().await.contains_key(&b_id),
+            "fixture: reader handle installed"
+        );
+        assert_eq!(
+            a.direct_path_status(b_id),
+            Some(direct_status.clone()),
+            "fixture: direct status installed"
+        );
+
+        let mut events = a.subscribe();
+
+        // The contract: conditional cleanup must not erase a routable peer.
+        let removed = do_cleanup_connection(
+            &*a.connected_peers,
+            &*a.inner,
+            &*a.reader_handles,
+            &*a.direct_path_statuses,
+            &*a.stats,
+            &a.event_tx,
+            &a.peer_event_tx,
+            a.peer_event_channels.as_ref(),
+            a.peer_event_generations.as_ref(),
+            a.ack_waiters.as_ref(),
+            &b_id,
+            DisconnectReason::ConnectionLost,
+            close_reason_for_disconnect(&DisconnectReason::ConnectionLost),
+            CleanupScope::IfUnroutable,
+        )
+        .await;
+
+        // (1) Reports nothing removed.
+        assert!(
+            !removed,
+            "IfUnroutable cleanup must report no removal when the inner peer is routable"
+        );
+
+        // (2) The live replacement is untouched: still routable, still the
+        // current winner slot, still open. If the conditional path called the
+        // peer-wide remove_connection_with_reason, the connection would be
+        // closed and the winner slot cleared.
+        assert!(
+            a.inner.is_peer_connected(&b_id),
+            "replacement must remain routable in the inner endpoint"
+        );
+        assert_eq!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .expect("winner slot must still hold the replacement")
+                .stable_id(),
+            replacement_stable,
+            "winner slot must still alias the live replacement (not cleared/rotated)"
+        );
+        assert!(
+            replacement_probe.close_reason().is_none(),
+            "replacement must remain open; IfUnroutable must not call the peer-wide \
+             remove_connection_with_reason (that is Peer-scope teardown)"
+        );
+
+        // (3) The older outer entry is preserved. Fails if cleanup removed the
+        // outer peer without rechecking inner routability.
+        assert!(
+            a.connected_peers.read().await.contains_key(&b_id),
+            "outer connected_peers entry must survive conditional cleanup"
+        );
+
+        // (4) The reader handle is preserved AND was not aborted. Fails if
+        // cleanup removed the reader state without rechecking inner. We release
+        // the probe via OUR token: a clean Ok(42) proves the task was never
+        // aborted; a cancelled JoinError would mean cleanup aborted it.
+        assert!(
+            a.reader_handles.read().await.contains_key(&b_id),
+            "reader handle must not be removed by conditional cleanup"
+        );
+        probe_cancel.cancel();
+        let probe_outcome = probe_join.await;
+        assert!(
+            probe_outcome.is_ok(),
+            "reader task must not have been aborted by cleanup, got {:?}",
+            probe_outcome
+        );
+        assert_eq!(
+            probe_outcome.unwrap(),
+            42,
+            "probe task must exit cleanly via our token, confirming it survived cleanup"
+        );
+
+        // (5) The direct-path status is preserved.
+        assert_eq!(
+            a.direct_path_status(b_id),
+            Some(direct_status),
+            "direct-path status must survive conditional cleanup"
+        );
+
+        // (6) No PeerDisconnected event was emitted (no teardown happened).
+        let drained = collect_broadcast_events(&mut events);
+        assert!(
+            !drained.iter().any(|ev| matches!(
+                ev,
+                P2pEvent::PeerDisconnected { peer_id: p, .. } if *p == b_id
+            )),
+            "IfUnroutable cleanup must not emit PeerDisconnected for a routable peer, got {:?}",
+            drained
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+    /// Regression for the generation-scoped liveness close
+    /// (`cleanup_connection_generation`): retiring one failed transport
+    /// generation must close ONLY that generation, leaving a concurrent live
+    /// replacement (and all outer/reader/direct bookkeeping) intact.
+    ///
+    /// Models the documented race: the ACK-liveness tracker observes failures
+    /// on generation W, but by the time `cleanup_connection_generation(W,
+    /// LivenessTimeout)` runs a newer connection N has registered and become the
+    /// Live winner (W is now Superseded). Production retires W via the inner
+    /// `remove_connection_generation_with_reason` (closes W, leaves the winner
+    /// map on N) and then runs `do_cleanup_connection(IfUnroutable)`, which is a
+    /// no-op because N is routable.
+    ///
+    /// Deterministic: two real authenticated QUIC connections registered in
+    /// `self.inner`; older outer/reader/direct state installed directly. No
+    /// reader tasks, no polling, no wall-clock races.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn cleanup_connection_generation_closes_only_failed_generation_preserving_live_replacement()
+     {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // W registered first, N second: N becomes the Live winner, W is
+        // Superseded but left OPEN for drain — the state W would be in if a
+        // replacement landed between liveness detection and the close.
+        let w = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("w handshake timeout")
+            .expect("w handshake ok");
+        let n = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("n handshake timeout")
+            .expect("n handshake ok");
+        let stable_w = w.stable_id();
+        let stable_n = n.stable_id();
+        assert_ne!(stable_w, stable_n, "two independent connections required");
+        let w_probe = w.clone();
+        let n_probe = n.clone();
+        a.inner
+            .add_connection_with_outcome(b_id, w)
+            .expect("register w");
+        a.inner
+            .add_connection_with_outcome(b_id, n)
+            .expect("register n");
+
+        // Precondition: N is the current Live winner; W is Superseded + open.
+        assert_eq!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .expect("a winner is live")
+                .stable_id(),
+            stable_n,
+            "fixture: N must be the live winner"
+        );
+        let w_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, stable_w)
+            .expect("w lifecycle snapshot");
+        assert!(
+            matches!(
+                w_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
+            ),
+            "fixture: W must be Superseded (replacement landed), got {:?}",
+            w_snap.state
+        );
+        assert!(
+            w_probe.close_reason().is_none(),
+            "fixture: W must be open before the generation close"
+        );
+        assert!(
+            n_probe.close_reason().is_none(),
+            "fixture: N must be open before the generation close"
+        );
+
+        // Older outer/reader/direct state — all of which a peer-wide teardown
+        // would wrongly destroy.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                9,
+            )),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+
+        let probe_cancel = CancellationToken::new();
+        let task_token = probe_cancel.clone();
+        let probe_join: tokio::task::JoinHandle<u8> = tokio::spawn(async move {
+            task_token.cancelled().await;
+            42
+        });
+        {
+            let mut handles = a.reader_handles.write().await;
+            handles.insert(
+                b_id,
+                vec![ReaderTaskHandle {
+                    generation: 1,
+                    cancel: CancellationToken::new(),
+                    abort_handle: probe_join.abort_handle(),
+                }],
+            );
+        }
+
+        let direct_status = DirectPathStatus::Established {
+            remote_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4242),
+        };
+        a.direct_path_statuses
+            .write()
+            .insert(b_id, direct_status.clone());
+
+        let mut events = a.subscribe();
+        let mut peer_events = a.subscribe_all_peer_events();
+
+        // Retire only W. If this used the peer-wide
+        // remove_connection_with_reason instead of the generation-scoped
+        // remove_connection_generation_with_reason, N would be closed too.
+        a.cleanup_connection_generation(&b_id, stable_w, DisconnectReason::LivenessTimeout)
+            .await;
+
+        // (1) W is closed AND tagged with LivenessTimeout. A locally-initiated
+        // close reports as LocallyClosed on the transport handle, so the reason
+        // is asserted through the lifecycle event the retire emits (the same
+        // surface downstream observers watch), and the close itself through the
+        // transport handle.
+        assert!(
+            w_probe.close_reason().is_some(),
+            "W's transport connection must be closed by the generation retire"
+        );
+        let lifecycle: Vec<_> = std::iter::from_fn(|| peer_events.try_recv().ok()).collect();
+        assert!(
+            lifecycle.iter().any(|(pid, ev)| *pid == b_id
+                && matches!(
+                    ev,
+                    PeerLifecycleEvent::Closed {
+                        generation,
+                        reason: ConnectionCloseReason::LivenessTimeout,
+                        ..
+                    } if *generation == w_snap.generation
+                )),
+            "W must emit a Closed(LivenessTimeout) lifecycle event for its generation, got {:?}",
+            lifecycle
+        );
+
+        // (2) N is untouched: still the current winner, still open, still Live.
+        assert_eq!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .expect("N must remain the routable winner")
+                .stable_id(),
+            stable_n,
+            "N must remain the current winner after W is retired"
+        );
+        assert!(
+            n_probe.close_reason().is_none(),
+            "N must remain open — generation retire must not close the replacement"
+        );
+        assert!(
+            a.inner.is_peer_connected(&b_id),
+            "peer must stay routable via N after W is retired"
+        );
+        let n_snap = a
+            .inner
+            .connection_snapshot_by_stable_id(&b_id, stable_n)
+            .expect("n lifecycle snapshot after retire");
+        assert!(
+            matches!(
+                n_snap.state,
+                crate::connection_lifecycle::ConnectionLifecycleState::Live
+            ),
+            "N must remain Live after W is retired, got {:?}",
+            n_snap.state
+        );
+
+        // (3) Outer peer preserved (IfUnroutable no-op because N is routable).
+        assert!(
+            a.connected_peers.read().await.contains_key(&b_id),
+            "outer connected_peers entry must survive the generation close"
+        );
+
+        // (4) Reader handle preserved and not aborted.
+        assert!(
+            a.reader_handles.read().await.contains_key(&b_id),
+            "reader handle must not be removed by the generation close"
+        );
+        probe_cancel.cancel();
+        let probe_outcome = probe_join.await;
+        assert!(
+            probe_outcome.is_ok(),
+            "reader task must not have been aborted by the generation close, got {:?}",
+            probe_outcome
+        );
+        assert_eq!(
+            probe_outcome.unwrap(),
+            42,
+            "probe task must exit cleanly, confirming it survived the generation close"
+        );
+
+        // (5) Direct-path status preserved.
+        assert_eq!(
+            a.direct_path_status(b_id),
+            Some(direct_status),
+            "direct-path status must survive the generation close"
+        );
+
+        // (6) No PeerDisconnected — only W was retired, the peer is still routed.
+        let drained = collect_broadcast_events(&mut events);
+        assert!(
+            !drained.iter().any(|ev| matches!(
+                ev,
+                P2pEvent::PeerDisconnected { peer_id: p, .. } if *p == b_id
+            )),
+            "generation close must not emit PeerDisconnected while N routes the peer, got {:?}",
+            drained
+        );
+
         a.shutdown().await;
         b.shutdown().await;
     }

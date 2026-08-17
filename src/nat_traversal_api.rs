@@ -409,7 +409,7 @@ pub(crate) enum ConnectionRegistrationOutcome {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReaderExitOutcome {
     Noop,
-    ConnectionReaped,
+    ConnectionReaped { close_reason: ConnectionCloseReason },
     PeerDisconnected { close_reason: ConnectionCloseReason },
 }
 
@@ -6509,26 +6509,23 @@ impl NatTraversalEndpoint {
             }
 
             if let Some(pending) = self.pending_accepts.lock().pop_front() {
-                let still_live = self
-                    .lifecycle_snapshot_for_generation(&pending.peer_id, pending.generation)
-                    .is_some_and(|snapshot| {
-                        matches!(snapshot.state, ConnectionLifecycleState::Live)
+                let connection = self
+                    .connection_lifecycle
+                    .read()
+                    .get(&pending.peer_id)
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| {
+                                entry.generation == pending.generation
+                                    && matches!(entry.state, ConnectionLifecycleState::Live)
+                            })
+                            .map(|entry| entry.connection.clone())
                     });
-                if !still_live {
+                let Some(connection) = connection else {
                     debug!(
                         "Skipping stale pending accept for peer {:?}: generation {:?} no longer live",
                         pending.peer_id, pending.generation
-                    );
-                    continue;
-                }
-                let Some(connection) = self
-                    .connections
-                    .get(&pending.peer_id)
-                    .map(|entry| entry.value().clone())
-                else {
-                    debug!(
-                        "Skipping stale pending accept for peer {:?}: connection no longer in storage",
-                        pending.peer_id
                     );
                     continue;
                 };
@@ -6914,6 +6911,23 @@ impl NatTraversalEndpoint {
                 entries.push(tracked.clone());
             }
             Self::prune_closed_lifecycle_entries(entries);
+
+            // Winner-map update MUST be atomic with the supersede decision
+            // above. Previously this insert ran *after* the lifecycle
+            // write-lock was released, so a registration whose locked
+            // outcome was "first Live" could execute its insert AFTER a
+            // concurrent same-peer registration already marked it
+            // Superseded — leaving `connections[peer]` pointing at the
+            // loser while a Live survivor exists in the Vec. `is_peer_connected`
+            // and the stale-reaper read only that single winner and tore
+            // down the SURVIVOR reader (x0x "dead pair"). Bounding the
+            // insert to the locked decision keeps the winner map aliasing
+            // the unique Live entry. Lock-order safe: nothing holds a
+            // `connections` guard and then takes the lifecycle lock.
+            if rejected_connection.is_none() {
+                connections.insert(peer_id, connection.clone());
+                emitted_established_events.remove(&peer_id);
+            }
         }
 
         if let Some((rejected_connection, winner_generation)) = rejected_connection {
@@ -6925,8 +6939,6 @@ impl NatTraversalEndpoint {
             return ConnectionRegistrationOutcome::Rejected { winner_generation };
         }
 
-        connections.insert(peer_id, connection);
-        emitted_established_events.remove(&peer_id);
         ConnectionRegistrationOutcome::Live {
             generation,
             superseded_generation,
@@ -7102,6 +7114,199 @@ impl NatTraversalEndpoint {
         Some(effective_reason)
     }
 
+    /// Close a reader generation only if it is still superseded.
+    ///
+    /// A superseded connection can be promoted back to `Live` when the current
+    /// winner exits during its drain window. Claiming the `Closing` transition
+    /// under the lifecycle lock prevents the delayed reader-cancellation task
+    /// from cancelling a connection after such a promotion.
+    pub(crate) fn close_superseded_connection_if_current(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+    ) -> bool {
+        let connection = {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let Some(entries) = lifecycle.get_mut(peer_id) else {
+                return false;
+            };
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.generation == generation)
+            else {
+                return false;
+            };
+            if !matches!(entry.state, ConnectionLifecycleState::Superseded { .. }) {
+                return false;
+            }
+
+            Self::log_lifecycle_transition(
+                peer_id,
+                entry.generation,
+                &entry.connection_id,
+                entry.stable_id(),
+                entry.state.name(),
+                ConnectionLifecycleState::Closing {
+                    reason: ConnectionCloseReason::Superseded,
+                }
+                .name(),
+                ConnectionCloseReason::Superseded,
+            );
+            entry.state = ConnectionLifecycleState::Closing {
+                reason: ConnectionCloseReason::Superseded,
+            };
+            entry.connection.clone()
+        };
+
+        if connection.close_reason().is_none()
+            && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+        {
+            connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+        }
+        true
+    }
+
+    /// Restore the best usable survivor when the winner is unavailable.
+    ///
+    /// Superseded readers intentionally remain open for a short drain window.
+    /// If the winner dies during that window, leaving the single-slot winner
+    /// map empty would make outbound sends fail while the survivor continues to
+    /// deliver inbound data. Promotion keeps the lifecycle vector and winner
+    /// map atomic under the same lock used by registration.
+    fn repromote_surviving_connection(
+        &self,
+        peer_id: &PeerId,
+        exiting_stable_id: Option<usize>,
+    ) -> Option<InnerConnection> {
+        let mut lifecycle = self.connection_lifecycle.write();
+        let entries = lifecycle.get_mut(peer_id)?;
+        if let Some(exiting_stable_id) = exiting_stable_id {
+            entries.retain(|entry| entry.stable_id() != exiting_stable_id);
+        }
+
+        let replacement_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live)
+                    && entry.connection.is_alive()
+                    && entry.connection.close_reason().is_none()
+            })
+            .or_else(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        matches!(entry.state, ConnectionLifecycleState::Superseded { .. })
+                            && entry.connection.is_alive()
+                            && entry.connection.close_reason().is_none()
+                    })
+                    .max_by(|(_, left), (_, right)| {
+                        Self::canonical_sort_key_cmp(
+                            Self::canonical_sort_key(
+                                left.connection_family_id,
+                                left.connection_id,
+                                left.generation,
+                                left.established_at_unix_ms,
+                                left.stable_id(),
+                            ),
+                            Self::canonical_sort_key(
+                                right.connection_family_id,
+                                right.connection_id,
+                                right.generation,
+                                right.established_at_unix_ms,
+                                right.stable_id(),
+                            ),
+                        )
+                    })
+                    .map(|(index, _)| index)
+            });
+
+        let Some(replacement_index) = replacement_index else {
+            if entries.is_empty() {
+                lifecycle.remove(peer_id);
+            }
+            return None;
+        };
+
+        let replacement = &mut entries[replacement_index];
+        if !matches!(replacement.state, ConnectionLifecycleState::Live) {
+            info!(
+                target: "ant_quic::p2p_endpoint::lifecycle",
+                peer_id = %Self::lifecycle_peer_prefix(peer_id),
+                generation = replacement.generation,
+                from_state = replacement.state.name(),
+                to_state = "Live",
+                reason = "WinnerUnavailableFallback",
+                connection_id = %replacement.connection_id_hex(),
+                stable_id = replacement.stable_id(),
+                "connection lifecycle transition"
+            );
+            replacement.state = ConnectionLifecycleState::Live;
+        }
+        let connection = replacement.connection.clone();
+        self.connections.insert(*peer_id, connection.clone());
+        self.emitted_established_events.insert(*peer_id);
+        Some(connection)
+    }
+
+    /// Retire exactly the observed connection generation and restore any
+    /// usable survivor without touching a concurrent replacement.
+    fn retire_connection_if_current(
+        &self,
+        peer_id: &PeerId,
+        connection: &InnerConnection,
+        default_reason: ConnectionCloseReason,
+    ) -> Option<InnerConnection> {
+        let stable_id = connection.stable_id();
+        let effective_reason = self
+            .mark_connection_closed(peer_id, stable_id, default_reason)
+            .unwrap_or(default_reason);
+        let removed = self
+            .connections
+            .remove_if(peer_id, |_, current| current.stable_id() == stable_id)
+            .is_some();
+
+        if connection.close_reason().is_none()
+            && let Some(code) = effective_reason.app_error_code()
+        {
+            connection.close(code, effective_reason.reason_bytes());
+        }
+        if removed && let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.remove(&connection.remote_address());
+        }
+
+        let replacement = self.repromote_surviving_connection(peer_id, Some(stable_id));
+        if replacement.is_none() && !self.connections.contains_key(peer_id) {
+            self.emitted_established_events.remove(peer_id);
+        }
+        replacement
+    }
+
+    /// Close one tracked generation without evicting a newer winner for the
+    /// same peer. Returns `false` when that generation is already gone.
+    pub(crate) fn remove_connection_generation_with_reason(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        close_reason: ConnectionCloseReason,
+    ) -> bool {
+        let connection = self
+            .connection_lifecycle
+            .read()
+            .get(peer_id)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.stable_id() == stable_id)
+                    .map(|entry| entry.connection.clone())
+            });
+        let Some(connection) = connection else {
+            return false;
+        };
+        let _ = self.retire_connection_if_current(peer_id, &connection, close_reason);
+        true
+    }
+
     pub(crate) fn handle_reader_exit(
         &self,
         peer_id: &PeerId,
@@ -7145,7 +7350,9 @@ impl NatTraversalEndpoint {
                         lifecycle.remove(peer_id);
                     }
                 }
-                ReaderExitOutcome::ConnectionReaped
+                ReaderExitOutcome::ConnectionReaped {
+                    close_reason: ConnectionCloseReason::Superseded,
+                }
             }
             ConnectionLifecycleState::Live => {
                 let current_live_stable_id = self
@@ -7182,7 +7389,9 @@ impl NatTraversalEndpoint {
                             lifecycle.remove(peer_id);
                         }
                     }
-                    return ReaderExitOutcome::ConnectionReaped;
+                    return ReaderExitOutcome::ConnectionReaped {
+                        close_reason: ConnectionCloseReason::Superseded,
+                    };
                 }
 
                 let connection =
@@ -7220,18 +7429,22 @@ impl NatTraversalEndpoint {
                 let close_reason = self
                     .mark_connection_closed(peer_id, snapshot.stable_id, default_close_reason)
                     .unwrap_or(default_close_reason);
-                self.connections.remove(peer_id);
-                self.emitted_established_events.remove(peer_id);
-                let mut lifecycle = self.connection_lifecycle.write();
-                if let Some(entries) = lifecycle.get_mut(peer_id) {
-                    entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
-                    if entries.is_empty() {
-                        lifecycle.remove(peer_id);
-                    }
+                if self
+                    .repromote_surviving_connection(peer_id, Some(snapshot.stable_id))
+                    .is_some()
+                {
+                    return ReaderExitOutcome::ConnectionReaped { close_reason };
                 }
+                let _ = self.connections.remove_if(peer_id, |_, current| {
+                    current.stable_id() == snapshot.stable_id
+                });
+                if self.is_peer_connected(peer_id) {
+                    return ReaderExitOutcome::ConnectionReaped { close_reason };
+                }
+                self.emitted_established_events.remove(peer_id);
                 ReaderExitOutcome::PeerDisconnected { close_reason }
             }
-            ConnectionLifecycleState::Closing { .. } | ConnectionLifecycleState::Closed { .. } => {
+            ConnectionLifecycleState::Closing { reason } => {
                 let mut lifecycle = self.connection_lifecycle.write();
                 if let Some(entries) = lifecycle.get_mut(peer_id) {
                     entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
@@ -7239,7 +7452,21 @@ impl NatTraversalEndpoint {
                         lifecycle.remove(peer_id);
                     }
                 }
-                ReaderExitOutcome::ConnectionReaped
+                ReaderExitOutcome::ConnectionReaped {
+                    close_reason: reason,
+                }
+            }
+            ConnectionLifecycleState::Closed { reason, .. } => {
+                let mut lifecycle = self.connection_lifecycle.write();
+                if let Some(entries) = lifecycle.get_mut(peer_id) {
+                    entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
+                    if entries.is_empty() {
+                        lifecycle.remove(peer_id);
+                    }
+                }
+                ReaderExitOutcome::ConnectionReaped {
+                    close_reason: reason,
+                }
             }
         }
     }
@@ -7250,14 +7477,23 @@ impl NatTraversalEndpoint {
     /// from the connection table and returns `false`. This enables automatic
     /// cleanup of phantom connections during deduplication checks.
     pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
-        if let Some(conn) = self.connections.get(peer_id) {
-            if conn.is_alive() && conn.close_reason().is_none() {
-                return true;
-            }
-            drop(conn);
-            let _ = self.remove_connection(peer_id);
+        let Some(connection) = self
+            .connections
+            .get(peer_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return self.repromote_surviving_connection(peer_id, None).is_some();
+        };
+        if connection.is_alive() && connection.close_reason().is_none() {
+            return true;
         }
-        false
+        let reason = connection
+            .close_reason()
+            .as_ref()
+            .map(ConnectionCloseReason::from_connection_error)
+            .unwrap_or(ConnectionCloseReason::LifecycleCleanup);
+        self.retire_connection_if_current(peer_id, &connection, reason)
+            .is_some()
     }
 
     /// Get an active live connection by peer ID.
@@ -7270,14 +7506,14 @@ impl NatTraversalEndpoint {
             .get(peer_id)
             .map(|entry| entry.value().clone())
         else {
-            return Ok(None);
+            return Ok(self.repromote_surviving_connection(peer_id, None));
         };
         if let Some(reason) = connection.close_reason() {
-            let _ = self.remove_connection_with_reason(
+            return Ok(self.retire_connection_if_current(
                 peer_id,
+                &connection,
                 ConnectionCloseReason::from_connection_error(&reason),
-            );
-            return Ok(None);
+            ));
         }
         Ok(Some(connection))
     }
@@ -12881,5 +13117,516 @@ mod tests {
         );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // close_superseded_connection_if_current — delayed-drain safety
+    //
+    // A superseded reader is intentionally left open for a short drain
+    // window. If the current winner exits during that window the superseded
+    // entry can be *promoted back to Live*. The delayed reader-cancellation
+    // task must therefore only close a generation that is *still* Superseded
+    // — claiming the Closing transition atomically under the lifecycle lock
+    // — and must leave a since-promoted Live generation untouched.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build one real, fully authenticated QUIC connection over loopback
+    /// between two minimal endpoints. The returned handle is alive and has
+    /// no close reason. Both endpoints are retained so their IO drivers keep
+    /// the connection healthy for the duration of the test; the connection is
+    /// deliberately *not* registered through `add_connection`, so no
+    /// lifecycle/watch background task touches it.
+    async fn loopback_quic_connection()
+    -> (NatTraversalEndpoint, NatTraversalEndpoint, InnerConnection) {
+        fn test_config() -> NatTraversalConfig {
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("valid bind addr")),
+                ..Default::default()
+            }
+        }
+        let server = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("server endpoint binds");
+        let client = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("client endpoint binds");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound to a local address");
+        let connecting = client
+            .get_endpoint()
+            .expect("client endpoint present")
+            .connect(server_addr, "peer")
+            .expect("initiate client connection");
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+            .await
+            .expect("loopback handshake must not hang")
+            .expect("loopback handshake must succeed");
+        (server, client, conn)
+    }
+
+    /// Seed a single tracked generation for `peer_id` directly into the
+    /// lifecycle map in the requested state, bypassing registration so the
+    /// state is exactly what the test needs.
+    fn seed_lifecycle_entry(
+        endpoint: &NatTraversalEndpoint,
+        peer_id: PeerId,
+        generation: u64,
+        connection: InnerConnection,
+        state: ConnectionLifecycleState,
+    ) {
+        endpoint.connection_lifecycle.write().insert(
+            peer_id,
+            vec![TrackedConnection {
+                connection,
+                generation,
+                established_at_unix_ms: 0,
+                connection_family_id: [0u8; 32],
+                connection_id: [0u8; 32],
+                state,
+            }],
+        );
+    }
+
+    /// A still-`Superseded` generation is claimed atomically: the entry
+    /// advances to `Closing { Superseded }` under the lifecycle lock and the
+    /// underlying connection is closed with the reserved `Superseded`
+    /// application error code.
+    #[tokio::test]
+    async fn close_superseded_claims_and_closes_still_superseded_generation() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xAA; 32]);
+        let generation = 7u64;
+        seed_lifecycle_entry(
+            &client,
+            peer_id,
+            generation,
+            conn.clone(),
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: generation + 1,
+            },
+        );
+        // Preconditions: connection open, entry is the seeded Superseded state.
+        assert!(
+            conn.close_reason().is_none(),
+            "precondition: connection open"
+        );
+        assert!(
+            matches!(
+                client
+                    .lifecycle_snapshot_for_generation(&peer_id, generation)
+                    .expect("seeded entry must be present")
+                    .state,
+                ConnectionLifecycleState::Superseded { .. }
+            ),
+            "precondition: entry must be Superseded"
+        );
+
+        let claimed = client.close_superseded_connection_if_current(&peer_id, generation);
+
+        assert!(claimed, "a still-Superseded generation must be claimed");
+        // The entry was claimed under the lock and advanced to Closing.
+        assert!(
+            matches!(
+                client
+                    .lifecycle_snapshot_for_generation(&peer_id, generation)
+                    .expect("claimed entry must remain tracked")
+                    .state,
+                ConnectionLifecycleState::Closing {
+                    reason: ConnectionCloseReason::Superseded
+                }
+            ),
+            "claimed entry must be Closing(Superseded)"
+        );
+        // The function closed the connection. In this codebase
+        // `high_level::Connection::close` records the close locally as
+        // `LocallyClosed` (the `Superseded` application code is carried on the
+        // wire to the peer; the local handle reports `LocallyClosed`), so the
+        // open→closed transition — `None` immediately before the call,
+        // `LocallyClosed` after — is exactly the function's effect and not a
+        // stray peer/idle close.
+        assert!(
+            matches!(
+                conn.close_reason(),
+                Some(crate::ConnectionError::LocallyClosed)
+            ),
+            "claimed connection must be locally closed by the function, got {:?}",
+            conn.close_reason()
+        );
+    }
+
+    /// A generation that has been promoted back to `Live` — exactly the race
+    /// the atomic claim protects against — is left untouched: the call
+    /// returns `false`, the entry stays `Live`, and the connection is NOT
+    /// closed.
+    #[tokio::test]
+    async fn close_superseded_leaves_promoted_live_generation_open() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xBB; 32]);
+        let generation = 3u64;
+        seed_lifecycle_entry(
+            &client,
+            peer_id,
+            generation,
+            conn.clone(),
+            ConnectionLifecycleState::Live,
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "precondition: connection open"
+        );
+
+        let claimed = client.close_superseded_connection_if_current(&peer_id, generation);
+
+        assert!(!claimed, "a Live generation must not be claimed");
+        assert!(
+            matches!(
+                client
+                    .lifecycle_snapshot_for_generation(&peer_id, generation)
+                    .expect("entry must remain tracked")
+                    .state,
+                ConnectionLifecycleState::Live
+            ),
+            "promoted generation must remain Live"
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "promoted connection must stay open"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // retire_connection_if_current — stable-id conditional winner eviction
+    //
+    // A caller may hold a *stale observed winner* handle W — the handle it
+    // cloned when W was current — while a concurrent install has since placed
+    // a different, live connection N in the single-slot winner map. Retiring
+    // that stale W observation must evict W alone; it must never tear down N.
+    // The guard is `DashMap::remove_if(|_, c| c.stable_id() == W)`: when the
+    // slot already holds N (stable_id != W) the removal is a no-op and N
+    // survives.
+    //
+    // The race window lives *between* the public read of the winner slot and
+    // the internal `remove_if` — there is no production seam to hook there, so
+    // this drives the scoped retirement directly into the post-race state
+    // (slot already holds N, stale W handle is what is retired) and then
+    // re-checks the survivor through the public `is_peer_connected` /
+    // `get_connection` surface that the fix must keep correct.
+    //
+    // N is deliberately left *untracked* in the lifecycle map. That isolates
+    // the `remove_if` invariant: if retire wrongly evicted N, there is no
+    // survivor for `repromote_surviving_connection` to restore it from, so a
+    // regression to an unconditional peer-keyed `remove` is observable instead
+    // of being silently healed by repromotion.
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn retire_stale_winner_leaves_concurrent_live_replacement_current() {
+        let (_server_a, endpoint, w_conn) = loopback_quic_connection().await;
+        // A second, independent loopback connection keeps a distinct stable_id
+        // (stable_id is the connection-state pointer). Both endpoint pairs are
+        // retained so each connection's IO driver keeps it healthy.
+        let (_server_b, _client_b, n_conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0x07; 32]);
+        let w_id = w_conn.stable_id();
+        let n_id = n_conn.stable_id();
+        assert_ne!(
+            w_id, n_id,
+            "precondition: W and N must be distinct connections"
+        );
+
+        // W is the stale observed winner: it is tracked in the lifecycle map ...
+        seed_lifecycle_entry(
+            &endpoint,
+            peer_id,
+            1,
+            w_conn.clone(),
+            ConnectionLifecycleState::Live,
+        );
+        // ... but a concurrent install has since replaced it in the winner slot
+        // with the live N. This is exactly the state the retire path would see
+        // if N landed between the public read and the internal `remove_if`.
+        endpoint.connections.insert(peer_id, n_conn.clone());
+
+        assert!(w_conn.close_reason().is_none(), "precondition: W open");
+        assert!(n_conn.close_reason().is_none(), "precondition: N open");
+        assert_eq!(
+            endpoint
+                .connections
+                .get(&peer_id)
+                .map(|entry| entry.value().stable_id()),
+            Some(n_id),
+            "precondition: winner slot holds N, not W"
+        );
+
+        // Retire the stale W observation. This is the call get_connection /
+        // is_peer_connected make when they find the current entry closed;
+        // invoking it directly removes the timing dependency we cannot inject.
+        let replacement = endpoint.retire_connection_if_current(
+            &peer_id,
+            &w_conn,
+            ConnectionCloseReason::LifecycleCleanup,
+        );
+
+        // The winner slot still holds N: `remove_if` refused to evict an entry
+        // whose stable_id differs from the retired W. Under an unconditional
+        // peer-keyed `remove`, N would be gone here and, untracked in the
+        // lifecycle map, nothing would restore it — this assertion reddens.
+        assert_eq!(
+            endpoint
+                .connections
+                .get(&peer_id)
+                .map(|entry| entry.value().stable_id()),
+            Some(n_id),
+            "concurrent live replacement N must remain the current winner"
+        );
+        // N was untouched: retire must never close a connection it did not own.
+        assert!(
+            n_conn.close_reason().is_none(),
+            "N must remain open after retiring the stale W"
+        );
+        // W alone was retired: its handle is now closed.
+        assert!(
+            w_conn.close_reason().is_some(),
+            "stale winner W must be closed by retirement"
+        );
+        // No phantom promotion overwrote the already-live N.
+        assert!(
+            replacement.is_none(),
+            "no survivor should be promoted while live N already holds the slot"
+        );
+
+        // The public surface agrees the peer is still connected via N. Under an
+        // unconditional remove the slot would be empty, so is_peer_connected
+        // would fall through to a fruitless repromote and report false, and
+        // get_connection would return None — both assertions reddens.
+        assert!(
+            endpoint.is_peer_connected(&peer_id),
+            "is_peer_connected must observe the surviving live N"
+        );
+        let observed = endpoint
+            .get_connection(&peer_id)
+            .expect("get_connection must not error");
+        assert_eq!(
+            observed.map(|conn| conn.stable_id()),
+            Some(n_id),
+            "get_connection must return the surviving live N"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // handle_reader_exit — Live winner reader exit repromotes with ReaderExit
+    //
+    // When the reader task for the *current Live winner* exits and a drained
+    // (Superseded) survivor is still open, the endpoint closes the winner with
+    // the reserved ReaderExit application code, promotes the survivor back to
+    // Live, and reports `ConnectionReaped { close_reason: ReaderExit }`.
+    // The reason mapping is load-bearing: an earlier version reported
+    // `Superseded` here, mislabeling an active reader-exit close as a passive
+    // supersession and corrupting downstream drain/telemetry decisions. This
+    // pins the exact variant a repromoting reader exit must surface.
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn reader_exit_of_live_winner_repromotes_with_reader_exit_reason() {
+        let (_server_a, endpoint, w_conn) = loopback_quic_connection().await;
+        let (_server_b, _client_b, s_conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0x08; 32]);
+        let w_id = w_conn.stable_id();
+        let s_id = s_conn.stable_id();
+        assert_ne!(w_id, s_id, "precondition: winner and survivor are distinct");
+
+        // W is the current Live winner; S is a drained survivor that an earlier
+        // supersession left open for its short drain window. Seeding both
+        // directly fixes the exact state the reader-exit path branches on.
+        let w_generation = 5u64;
+        endpoint.connection_lifecycle.write().insert(
+            peer_id,
+            vec![
+                TrackedConnection {
+                    connection: s_conn.clone(),
+                    generation: w_generation - 1,
+                    established_at_unix_ms: 0,
+                    connection_family_id: [0u8; 32],
+                    connection_id: [0u8; 32],
+                    state: ConnectionLifecycleState::Superseded {
+                        replaced_by_generation: w_generation,
+                    },
+                },
+                TrackedConnection {
+                    connection: w_conn.clone(),
+                    generation: w_generation,
+                    established_at_unix_ms: 1,
+                    connection_family_id: [0u8; 32],
+                    connection_id: [0u8; 32],
+                    state: ConnectionLifecycleState::Live,
+                },
+            ],
+        );
+        // W occupies the winner slot, so the reader-exit path takes the
+        // Live-and-current branch — not the "a different live connection has
+        // already replaced it" branch that reports Superseded.
+        endpoint.connections.insert(peer_id, w_conn.clone());
+
+        assert!(w_conn.close_reason().is_none(), "precondition: W open");
+        assert!(s_conn.close_reason().is_none(), "precondition: S open");
+
+        let outcome = endpoint.handle_reader_exit(&peer_id, w_generation, w_id);
+
+        // A survivor was found, so the peer stays connected: ConnectionReaped,
+        // not PeerDisconnected.
+        let ReaderExitOutcome::ConnectionReaped { close_reason } = outcome else {
+            panic!("expected ConnectionReaped for a repromoting reader exit, got {outcome:?}");
+        };
+        // The reason MUST be ReaderExit. A regression that reports Superseded
+        // for an active close of the Live winner reddens here.
+        assert_eq!(
+            close_reason,
+            ConnectionCloseReason::ReaderExit,
+            "Live winner reader exit repromoting a survivor must report ReaderExit"
+        );
+
+        // The survivor was promoted back to Live and now holds the winner slot.
+        assert_eq!(
+            endpoint
+                .connections
+                .get(&peer_id)
+                .map(|entry| entry.value().stable_id()),
+            Some(s_id),
+            "survivor S must be promoted into the winner slot"
+        );
+        assert!(
+            s_conn.close_reason().is_none(),
+            "promoted survivor S must remain open"
+        );
+        assert!(
+            w_conn.close_reason().is_some(),
+            "exited Live winner W must be closed"
+        );
+        assert!(
+            matches!(
+                endpoint
+                    .lifecycle_snapshot_for_generation(&peer_id, w_generation - 1)
+                    .expect("survivor must remain tracked")
+                    .state,
+                ConnectionLifecycleState::Live
+            ),
+            "survivor S must be promoted back to Live"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // accept_connection — generation-bound ticket resolution
+    //
+    // A pending accept ticket carries the generation it was raised against.
+    // When that generation has since been superseded (G1 no longer Live while
+    // a newer G2 is the current winner), the ticket must NOT be satisfied by
+    // handing out the current G2 connection: a caller waiting on G1 would
+    // silently receive a different generation's handle. Production resolves
+    // the handle directly from the lifecycle entry matching
+    // (ticket.generation, Live) under a read lock, so a stale ticket finds no
+    // Live entry and is skipped instead of falling back to the current winner.
+    //
+    // Two peers make the regression observable through the public return: a
+    // stale G1 ticket for peer A (superseded; A's current winner is G2_A) is
+    // queued ahead of a live ticket for peer B (G2_B). If accept wrongly
+    // resolved the stale G1 ticket to A's current winner, the first accept
+    // would return peer A / G2_A; correctly it skips G1 and returns peer B /
+    // G2_B for the live ticket only.
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn accept_skips_stale_generation_ticket_and_binds_only_live_generation() {
+        let (_sut_server, endpoint, g1_conn) = loopback_quic_connection().await;
+        let (_s2, _c2, g2_a_conn) = loopback_quic_connection().await;
+        let (_s3, _c3, g2_b_conn) = loopback_quic_connection().await;
+        let peer_a = PeerId([0xA1; 32]);
+        let peer_b = PeerId([0xB2; 32]);
+        let g2_a_id = g2_a_conn.stable_id();
+        let g2_b_id = g2_b_conn.stable_id();
+        assert_ne!(
+            g2_a_id, g2_b_id,
+            "precondition: the two current winners must differ"
+        );
+
+        // Peer A: G1 was superseded by G2_A, which is now the Live winner.
+        endpoint.connection_lifecycle.write().insert(
+            peer_a,
+            vec![
+                TrackedConnection {
+                    connection: g1_conn.clone(),
+                    generation: 1,
+                    established_at_unix_ms: 0,
+                    connection_family_id: [0u8; 32],
+                    connection_id: [0u8; 32],
+                    state: ConnectionLifecycleState::Superseded {
+                        replaced_by_generation: 2,
+                    },
+                },
+                TrackedConnection {
+                    connection: g2_a_conn.clone(),
+                    generation: 2,
+                    established_at_unix_ms: 1,
+                    connection_family_id: [0u8; 32],
+                    connection_id: [0u8; 32],
+                    state: ConnectionLifecycleState::Live,
+                },
+            ],
+        );
+        endpoint.connections.insert(peer_a, g2_a_conn.clone());
+
+        // Peer B: a single Live generation, the current winner.
+        endpoint.connection_lifecycle.write().insert(
+            peer_b,
+            vec![TrackedConnection {
+                connection: g2_b_conn.clone(),
+                generation: 1,
+                established_at_unix_ms: 0,
+                connection_family_id: [0u8; 32],
+                connection_id: [0u8; 32],
+                state: ConnectionLifecycleState::Live,
+            }],
+        );
+        endpoint.connections.insert(peer_b, g2_b_conn.clone());
+
+        // Queue the stale G1 ticket for peer A FIRST, then the live ticket for B.
+        {
+            let mut queue = endpoint.pending_accepts.lock();
+            queue.push_back(PendingAccept {
+                peer_id: peer_a,
+                generation: 1,
+            });
+            queue.push_back(PendingAccept {
+                peer_id: peer_b,
+                generation: 1,
+            });
+        }
+
+        // accept must skip the stale G1 ticket (no Live generation-1 entry for
+        // A) and resolve only the live ticket — returning peer B / G2_B. A
+        // regression that resolves the stale ticket to A's current winner
+        // returns peer A / G2_A on the first accept instead.
+        let (returned_peer, returned_conn) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            endpoint.accept_connection(),
+        )
+        .await
+        .expect("accept must resolve: a live ticket is queued")
+        .expect("accept must succeed");
+
+        assert_eq!(
+            returned_peer, peer_b,
+            "stale G1 ticket must be skipped; only the live G2_B ticket may resolve"
+        );
+        assert_eq!(
+            returned_conn.stable_id(),
+            g2_b_id,
+            "must bind peer B's live G2_B connection, not peer A's current G2_A winner"
+        );
+        // The stale G1 ticket was consumed by the skip — not left queued for a
+        // later accept to wrongly satisfy with the current winner.
+        assert!(
+            endpoint.pending_accepts.lock().is_empty(),
+            "stale G1 ticket must be consumed by the skip, not left queued"
+        );
     }
 }
