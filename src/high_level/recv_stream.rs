@@ -446,9 +446,18 @@ impl<T> From<(Option<T>, Option<crate::ReadError>)> for ReadStatus<T> {
 }
 
 /// Future produced by `RecvStream::read_to_end()`.
+///
+/// CRITICAL: Chunks are copied into owned `Vec<u8>` immediately on arrival,
+/// NOT stored as `Bytes` references. This is because `Bytes` slices alias
+/// decrypted packet allocations that the QUIC stack recycles under concurrent
+/// multi-stream load. Holding `Bytes` references across `.await` points
+/// (between `poll_read_chunk` calls) creates a window where another reader
+/// task can trigger packet processing that overwrites the aliased allocation,
+/// producing a torn read. Copying to `Vec<u8>` on arrival closes this window.
+/// See: FINDING-recv-boundary-aliasing.md
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
-    read: Vec<(Bytes, u64)>,
+    read: Vec<(Vec<u8>, u64)>,
     start: u64,
     end: u64,
     size_limit: usize,
@@ -466,7 +475,11 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
                     self.end = self.end.max(end);
-                    self.read.push((chunk.bytes, chunk.offset));
+                    // Copy bytes into an owned Vec<u8> IMMEDIATELY, dropping
+                    // the Bytes reference before the next poll cycle. This
+                    // prevents aliasing corruption from recycled packet
+                    // allocations under concurrent multi-stream load.
+                    self.read.push((chunk.bytes.to_vec(), chunk.offset));
                 }
                 None => {
                     if self.end == 0 {
@@ -494,7 +507,18 @@ impl Future for ReadToEnd<'_> {
 /// present once, with no gaps and no overlaps. A `None` means part of the
 /// stream was consumed but never delivered to this reader; zero-filling the
 /// holes (the previous behavior) would silently corrupt the result.
-fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) -> Option<Vec<u8>> {
+///
+/// Overlapping chunks (from retransmissions or the ordered→unordered
+/// transition) are expected to carry identical data at the same offsets.
+/// If overlapping bytes DIFFER, the transport has delivered corrupt content
+/// — a data-integrity violation. This function fails loud (returns `None`)
+/// rather than silently assembling mismatched bytes, and logs a diagnostic
+/// so the root cause can be identified.
+fn assemble_unordered_chunks(
+    chunks: &mut [(Vec<u8>, u64)],
+    start: u64,
+    end: u64,
+) -> Option<Vec<u8>> {
     chunks.sort_unstable_by_key(|&(_, offset)| offset);
     let mut buffer = Vec::with_capacity((end - start) as usize);
     for (data, offset) in chunks.iter() {
@@ -508,6 +532,29 @@ fn assemble_unordered_chunks(chunks: &mut [(Bytes, u64)], start: u64, end: u64) 
         // Benign overlap (duplicate delivery, e.g. across the
         // ordered->unordered transition): skip the already-assembled prefix.
         let skip = (expected - *offset) as usize;
+        if skip > 0 && skip <= data.len() {
+            // Data-integrity check: when chunks overlap, the overlapping
+            // bytes MUST be identical (QUIC RFC 9000 §13.1 requires
+            // retransmissions to carry the same data). If they differ, the
+            // transport has delivered corrupt content. Fail loud rather
+            // than silently assembling mismatched bytes.
+            let prev = &buffer[buffer.len() - skip..];
+            let curr = &data[..skip];
+            if prev != curr {
+                let first_diff = prev.iter().zip(curr).position(|(a, b)| a != b);
+                tracing::error!(
+                    target: "ant_quic::data_integrity",
+                    stream_offset = offset,
+                    overlap_len = skip,
+                    first_diff_within_overlap = first_diff,
+                    "DATA INTEGRITY VIOLATION: overlapping stream chunks have \
+                     different byte content at the same offset — the transport \
+                     delivered corrupt data. Dropping message to prevent silent \
+                     corruption of signed payloads."
+                );
+                return None;
+            }
+        }
         if skip < data.len() {
             buffer.extend_from_slice(&data[skip..]);
         }
@@ -745,10 +792,10 @@ impl Future for ReadChunks<'_> {
 mod tests {
     use super::*;
 
-    fn chunks_of(payload: &[u8], ranges: &[(usize, usize)]) -> Vec<(Bytes, u64)> {
+    fn chunks_of(payload: &[u8], ranges: &[(usize, usize)]) -> Vec<(Vec<u8>, u64)> {
         ranges
             .iter()
-            .map(|&(start, end)| (Bytes::copy_from_slice(&payload[start..end]), start as u64))
+            .map(|&(start, end)| (payload[start..end].to_vec(), start as u64))
             .collect()
     }
 

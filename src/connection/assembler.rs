@@ -157,7 +157,7 @@ impl Assembler {
     pub(super) fn insert(
         &mut self,
         mut offset: u64,
-        mut bytes: Bytes,
+        bytes: Bytes,
         allocation_size: usize,
     ) -> Result<(), TooManyChunks> {
         debug_assert!(
@@ -166,6 +166,12 @@ impl Assembler {
             allocation_size,
             bytes.len()
         );
+        // Copy to owned storage IMMEDIATELY. The input Bytes references a
+        // decrypted packet allocation that the QUIC stack may recycle under
+        // concurrent multi-stream load. Without this copy, out-of-order
+        // reassembly can read stale/overwritten data from the recycled
+        // allocation (torn read). See: FINDING-recv-boundary-aliasing.md
+        let mut bytes: Bytes = Bytes::copy_from_slice(&bytes);
         self.end = self.end.max(offset + bytes.len() as u64);
         if let State::Unordered { ref mut recvd } = self.state {
             // Discard duplicate data
@@ -866,6 +872,50 @@ mod test {
         assert!(
             erred_at < MAX_INSERTS,
             "TooManyChunks fired only at the loop bound, not because of the cap"
+        );
+    }
+
+    /// Regression test for recv-boundary-aliasing corruption
+    /// (FINDING-recv-boundary-aliasing.md).
+    ///
+    /// Verifies that insert() copies data to a fully-owned allocation,
+    /// independent of the input Bytes's backing storage. Without this copy,
+    /// the assembler would store a Bytes reference to a decrypted packet
+    /// allocation that the QUIC stack can recycle under concurrent
+    /// multi-stream load, producing torn reads during out-of-order assembly.
+    #[test]
+    fn insert_copies_to_owned_storage_preventing_aliasing() {
+        let mut x = Assembler::new();
+
+        // Use a payload large enough to force heap allocation (avoids
+        // Bytes inline-storage optimization that could alias addresses).
+        let original: Vec<u8> = (0..256).map(|i| (i % 250 + 1) as u8).collect();
+        let input = Bytes::copy_from_slice(&original);
+        let input_ptr = input.as_ptr();
+
+        // Insert into assembler — with the fix, this copies to a NEW allocation.
+        x.insert(0, input.clone(), 256).unwrap();
+
+        // The input Bytes must still be valid and unchanged.
+        assert_eq!(&input[..], &original[..]);
+
+        // Read from assembler — data must match the original exactly.
+        let chunk = x.read(256, true).expect("data must be readable");
+        assert_eq!(
+            &chunk.bytes[..],
+            &original[..],
+            "Assembler data must match original"
+        );
+
+        // The assembler's stored data must be at a DIFFERENT memory address
+        // than the input. This proves insert() made an independent copy,
+        // not a reference to the input's allocation. Without the fix,
+        // this assertion would fail (same pointer = alias, not copy).
+        assert_ne!(
+            chunk.bytes.as_ptr(),
+            input_ptr,
+            "Assembler must store data at a different address than the input \
+             (owned copy, not alias to recyclable packet allocation)"
         );
     }
 
