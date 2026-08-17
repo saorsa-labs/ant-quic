@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.38] - 2026-08-17
+
+### Fixed
+
+- **Actively-alive peers are no longer reaped by the zombie idle gate** (#241).
+  The x0x#278 hardening gated the idle-timer reset on ACK progress whenever
+  unacked ack-eliciting data was outstanding. A peer delivering application
+  data over a path whose reverse direction was broken looked identical to a
+  zombie from the ACK side and was reaped without a CONNECTION_CLOSE,
+  producing the permanent half-open links reported in #234. Received
+  application payload within the idle window now also resets the idle timer,
+  preserving the zombie protection for peers that send nothing but junk.
+- **Connection lifecycle replacement made atomic** (#229). Winner-map
+  replacement is now generation-safe: a dying winner repromotes an open
+  superseded survivor instead of stranding outbound routability ("dead pair"),
+  stale accept tickets are skipped and consumed, and cleanup closes only the
+  failed generation while preserving a live replacement.
+- **Assembler Bytes-aliasing corruption fixed at the root** (#209). Chunks
+  inserted into the out-of-order assembler are copied to owned storage at
+  insert time. Previously the stored `Bytes` referenced a decrypted packet
+  allocation that the QUIC stack could recycle under concurrent multi-stream
+  load, producing torn reads; the fix is adapted to coexist with the
+  GHSA-4w2j-m93h-cj5j gap cap.
+
+### Changed
+
+- **Hermetic lifecycle tests** (#245): the connection-lifecycle suite now uses
+  a per-process isolated bootstrap cache, so `connect_peer` error tests no
+  longer turn into full NAT-traversal attempts on machines with a populated
+  real-world cache.
+- **Connectivity matrix now defaults to the x0x bootstrap fleet** (#245):
+  the six saorsa VPS nodes replace the dead/repurposed defaults; validated
+  with a full green matrix run of v0.27.37 (base connectivity, NAT probes,
+  IPv6 matrix, mDNS discovery).
+
+### Known issues
+
+- A no-default-features build cannot accept loopback connections — the
+  fallback `create_dual_stack_sockets` does not propagate the v6-assigned
+  port to the v4 bind (#246).
+
 ## [0.27.37] - 2026-08-08
 
 ### Fixed
