@@ -157,7 +157,7 @@ impl Assembler {
     pub(super) fn insert(
         &mut self,
         mut offset: u64,
-        mut bytes: Bytes,
+        bytes: Bytes,
         allocation_size: usize,
     ) -> Result<(), TooManyChunks> {
         debug_assert!(
@@ -871,7 +871,8 @@ mod test {
         );
         assert!(
             erred_at < MAX_INSERTS,
-            "TooManyChunks fired only at the loop bound, not because of the cap"        );
+            "TooManyChunks fired only at the loop bound, not because of the cap"
+        );
     }
 
     /// Regression test for recv-boundary-aliasing corruption
@@ -893,7 +894,7 @@ mod test {
         let input_ptr = input.as_ptr();
 
         // Insert into assembler — with the fix, this copies to a NEW allocation.
-        x.insert(0, input.clone(), 256);
+        x.insert(0, input.clone(), 256).unwrap();
 
         // The input Bytes must still be valid and unchanged.
         assert_eq!(&input[..], &original[..]);
