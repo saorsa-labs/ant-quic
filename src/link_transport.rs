@@ -1245,6 +1245,15 @@ pub struct ConnectionStats {
 }
 
 /// A send stream for writing data to a peer.
+///
+/// # Dropping
+///
+/// Dropping a send stream that has not been [`finish`](LinkSendStream::finish)ed
+/// resets it, and the peer observes a stream error. This is deliberate: an
+/// abandoned write — a cancelled future, an aborted task — would otherwise reach
+/// the peer as a graceful end-of-stream at whatever offset writing happened to
+/// stop, which is indistinguishable from a complete but shorter message. Callers
+/// that intend a graceful close must say so by calling `finish`.
 pub trait LinkSendStream: Send + Sync {
     /// Write data to the stream.
     fn write<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, LinkResult<usize>>;
@@ -1253,6 +1262,8 @@ pub trait LinkSendStream: Send + Sync {
     fn write_all<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, LinkResult<()>>;
 
     /// Finish the stream (signal end of data).
+    ///
+    /// Required for a graceful close; see the trait-level "Dropping" note.
     fn finish(&mut self) -> LinkResult<()>;
 
     /// Reset the stream with an error code.

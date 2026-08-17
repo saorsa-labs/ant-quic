@@ -5532,12 +5532,17 @@ impl NatTraversalEndpoint {
 
                         let response_frame = encode_relay_response_frame(&response);
                         if let Err(e) = send_stream.write_all(&response_frame).await {
+                            // The response may be half-written. Returning drops the
+                            // stream unfinished, which resets it, so the client sees
+                            // a stream error instead of parsing a truncated frame.
                             warn!("Failed to send relay response to {}: {}", client_addr, e);
                             return;
                         }
 
-                        // Do NOT call finish() — successful relay streams stay
-                        // open for forwarding.
+                        // Do NOT call finish() on the success path — the response is
+                        // only a preamble and the stream stays open for forwarding.
+                        // `run_stream_forwarding_loop` takes ownership and decides how
+                        // to tear the stream down.
                         if is_success
                             && let Some(session_info) =
                                 relay_server.get_session_for_client(client_addr).await
@@ -5553,6 +5558,21 @@ impl NatTraversalEndpoint {
                                     recv_stream,
                                 )
                                 .await;
+                            return;
+                        }
+
+                        // Either the relay rejected the request, or it accepted but
+                        // has no session to forward for. The response frame is the
+                        // client's entire answer and it must survive: finish so the
+                        // client can read it. Dropping unfinished would reset the
+                        // stream, and a reset lets the peer discard data it has
+                        // already buffered — turning a structured rejection the
+                        // client parses into an opaque stream error.
+                        if let Err(e) = send_stream.finish() {
+                            debug!(
+                                "Failed to finish relay response stream to {}: {}",
+                                client_addr, e
+                            );
                         }
                     }
                     Err(e) => {
@@ -6381,9 +6401,24 @@ impl NatTraversalEndpoint {
             public_address
         );
 
-        // Create the MasqueRelaySocket from the open streams
-        let relay_socket = public_address
-            .map(|addr| crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr));
+        // Create the MasqueRelaySocket from the open streams. The socket takes
+        // ownership of both halves and keeps them open for data forwarding, which
+        // is why the handshake above deliberately does not finish the send half.
+        let relay_socket = match public_address {
+            Some(addr) => Some(crate::masque::MasqueRelaySocket::new(
+                send_stream,
+                recv_stream,
+                addr,
+            )),
+            None => {
+                // No public address means there is no socket to hand the streams
+                // to, so they end here. Finish explicitly rather than letting the
+                // drop reset them: the CONNECT-UDP exchange itself succeeded, so
+                // the relay should see a clean end-of-stream, not a protocol error.
+                let _ = send_stream.finish();
+                None
+            }
+        };
 
         // Store the session
         let session = RelaySession {
