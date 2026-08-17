@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::{
-    EndpointError, NatConfig, P2pConfig, P2pEndpoint, PeerId, PqcConfig, transport::TransportAddr,
+    EndpointError, NatConfig, P2pConfig, P2pEndpoint, PeerId, PqcConfig,
+    bootstrap_cache::BootstrapCacheConfig, transport::TransportAddr,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -60,6 +61,18 @@ fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
     P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .known_peers(known_peers)
+        // Isolate from any real bootstrap cache on this machine: a populated
+        // cache would surface coordinator candidates for connect_peer, turning
+        // the unknown-peer error tests into full NAT-traversal attempts.
+        .bootstrap_cache(
+            BootstrapCacheConfig::builder()
+                .cache_dir(
+                    std::env::temp_dir()
+                        .join(format!("ant-quic-lifecycle-tests-{}", std::process::id())),
+                )
+                .persist(false)
+                .build(),
+        )
         .nat(NatConfig {
             enable_relay_fallback: false,
             ..Default::default()
