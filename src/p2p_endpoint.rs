@@ -9823,6 +9823,7 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap_cache::BootstrapCacheConfig;
     use crate::coordinator_control::RejectionReason;
 
     fn collect_broadcast_events(
@@ -12230,10 +12231,16 @@ mod tests {
         endpoint.shutdown().await;
     }
 
-    /// Isolate the `upsert_peer_hints` family from any on-disk bootstrap cache
-    /// on the developer machine. A populated default cache makes bounded
-    /// selectors such as `select_relays_for_target` return host peers, so
-    /// "after runtime hints clear" is no longer empty (issue #247 / #245).
+    /// Endpoint config for the `upsert_peer_hints` tests, isolated from any
+    /// real bootstrap cache on this machine.
+    ///
+    /// The default cache dir is shared per user, so a populated cache both
+    /// crowds freshly hinted peers out of the capped relay/coordinator
+    /// selections these tests assert on, and takes on the tests' synthetic
+    /// peers when the endpoint saves (issue #247 / #245). The explicit
+    /// `cache_dir` is inert while `persist(false)` holds — nothing is read,
+    /// written, or created — but keeps the tests isolated if persistence is
+    /// ever re-enabled here.
     fn isolated_upsert_peer_hints_config() -> P2pConfig {
         P2pConfig::builder()
             .bind_addr(SocketAddr::new(
@@ -12242,7 +12249,7 @@ mod tests {
             ))
             .port_mapping_enabled(false)
             .bootstrap_cache(
-                crate::bootstrap_cache::BootstrapCacheConfig::builder()
+                BootstrapCacheConfig::builder()
                     .cache_dir(std::env::temp_dir().join(format!(
                         "ant-quic-upsert-peer-hints-tests-{}",
                         std::process::id()
