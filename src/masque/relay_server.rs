@@ -954,6 +954,11 @@ impl MasqueRelayServer {
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
     ) {
+        // Both bail-outs below drop `send_stream` without finishing it, which resets
+        // the stream. That is the intended signal: the relay accepted a CONNECT-UDP
+        // session and then could not serve it, so the client must see an error and
+        // re-establish. A graceful finish here would look to the client like a relay
+        // session that opened and closed normally, having forwarded nothing.
         let udp_socket = {
             let sessions = self.sessions.read().await;
             match sessions.get(&session_id) {
@@ -986,9 +991,11 @@ impl MasqueRelayServer {
         let stats = self.stats();
         let stats2 = self.stats();
 
-        tokio::select! {
+        // `true` once the forwarding loop ends with no half-written frame on the
+        // send stream, which is the only state in which a graceful finish is safe.
+        let send_stream_intact = tokio::select! {
             // Direction 1: UDP → Stream (target → relay → client)
-            _ = async {
+            intact = async {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match socket.recv_from(&mut buf).await {
@@ -1006,25 +1013,29 @@ impl MasqueRelayServer {
 
                             // Write length-prefixed frame to stream
                             let frame_len = encoded.len() as u32;
+                            // A failed write may have left a partial frame on the
+                            // wire, so the stream is no longer safe to finish.
                             if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
                                 tracing::debug!(session_id, error = %e, "Stream write error (length)");
-                                break;
+                                break false;
                             }
                             if let Err(e) = send_stream.write_all(&encoded).await {
                                 tracing::debug!(session_id, error = %e, "Stream write error (data)");
-                                break;
+                                break false;
                             }
 
                             stats.record_bytes(encoded.len() as u64);
                             stats.record_datagram();
                         }
                         Err(e) => {
+                            // The UDP side died between frames; every frame written
+                            // so far is complete, so a graceful finish is correct.
                             tracing::debug!(session_id, error = %e, "UDP recv error");
-                            break;
+                            break true;
                         }
                     }
                 }
-            } => {},
+            } => intact,
 
             // Direction 2: Stream → UDP (client → relay → target)
             _ = async {
@@ -1071,8 +1082,25 @@ impl MasqueRelayServer {
                         }
                     }
                 }
-            } => {},
+            } => {
+                // The read direction ended first, so `select!` cancelled the write
+                // direction at an arbitrary await point — possibly midway through a
+                // frame. Treat the send stream as compromised.
+                false
+            },
+        };
+
+        if send_stream_intact {
+            // Graceful teardown: finishing keeps QUIC retransmitting frames that are
+            // written but not yet acknowledged, so the last relayed packets still
+            // reach the client. Resetting here would discard them.
+            if let Err(e) = send_stream.finish() {
+                tracing::debug!(session_id, error = %e, "Error finishing relay send stream");
+            }
         }
+        // Otherwise `send_stream` is dropped unfinished and therefore reset, so a
+        // partial trailing frame surfaces at the client as a stream error instead of
+        // a truncated frame that its length-prefixed reader would misparse.
 
         tracing::info!(session_id, "Stream-based relay forwarding loop ended");
         if let Err(e) = self.close_session(session_id).await {

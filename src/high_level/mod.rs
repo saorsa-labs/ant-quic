@@ -31,7 +31,7 @@ pub use self::endpoint::{Accept, Endpoint, EndpointStats};
 pub use self::incoming::{Incoming, IncomingFuture, RetryError};
 pub use self::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
 pub use self::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, default_runtime};
-pub use self::send_stream::{SendStream, StoppedError, WriteError};
+pub use self::send_stream::{DROPPED_UNFINISHED_ERROR_CODE, SendStream, StoppedError, WriteError};
 pub use crate::path::{Path, PathId, WeakPathHandle};
 
 // TokioRuntime is always available (tokio is a required dependency)

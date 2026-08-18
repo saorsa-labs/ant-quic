@@ -19,10 +19,25 @@ use thiserror::Error;
 use super::connection::{ConnectionRef, State};
 use crate::VarInt;
 
+/// Application error code used to [`reset()`] a stream that is dropped without having been
+/// explicitly [`finish()`]ed.
+///
+/// The value is deliberately distinctive so that it is unambiguous in packet captures and peer-side
+/// logs, and so that it is vanishingly unlikely to collide with an application's own error codes,
+/// which conventionally start at 0.
+///
+/// [`reset()`]: SendStream::reset
+/// [`finish()`]: SendStream::finish
+pub const DROPPED_UNFINISHED_ERROR_CODE: VarInt = VarInt::from_u32(0xA17C_0244);
+
 /// A stream that can only be used to send data
 ///
-/// If dropped, streams that haven't been explicitly [`reset()`] will be implicitly [`finish()`]ed,
-/// continuing to (re)transmit previously written data until it has been fully acknowledged or the
+/// If dropped without an explicit [`finish()`], the stream is [`reset()`] with
+/// [`DROPPED_UNFINISHED_ERROR_CODE`], so that the peer observes a stream error rather than a
+/// graceful end-of-stream at whatever offset writing happened to reach. Dropping is therefore safe
+/// in the face of a cancelled write: an abandoned transfer cannot masquerade as a complete one.
+/// A sender that wants the graceful path must call [`finish()`] itself, after which the stream will
+/// continue to (re)transmit previously written data until it has been fully acknowledged or the
 /// connection is closed.
 ///
 /// # Cancellation
@@ -40,6 +55,13 @@ pub struct SendStream {
     conn: ConnectionRef,
     stream: StreamId,
     is_0rtt: bool,
+    /// Whether the application explicitly asked for a graceful close.
+    ///
+    /// `Drop` needs this to tell an intentional end-of-stream from an abandoned one. It cannot be
+    /// recovered from the underlying stream state, because `reset()` is legal *after* `finish()`
+    /// (it abandons still-buffered data), so a dropped stream that reset unconditionally would
+    /// destroy every well-behaved sender's graceful close.
+    finished: bool,
 }
 
 impl SendStream {
@@ -48,6 +70,7 @@ impl SendStream {
             conn,
             stream,
             is_0rtt,
+            finished: false,
         }
     }
 
@@ -152,13 +175,17 @@ impl SendStream {
         let mut conn = self.conn.state.lock("finish");
         match conn.inner.send_stream(self.stream).finish() {
             Ok(()) => {
+                self.finished = true;
                 conn.wake();
                 Ok(())
             }
             Err(FinishError::ClosedStream) => Err(ClosedStream::default()),
             // Harmless. If the application needs to know about stopped streams at this point, it
             // should call `stopped`.
-            Err(FinishError::Stopped(_)) => Ok(()),
+            Err(FinishError::Stopped(_)) => {
+                self.finished = true;
+                Ok(())
+            }
             Err(FinishError::ConnectionClosed) => Err(ClosedStream::default()),
         }
     }
@@ -309,6 +336,24 @@ impl Drop for SendStream {
         if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
             return;
         }
+
+        if !self.finished {
+            // The application abandoned this stream mid-transfer — a cancelled `write_all`, an
+            // aborted task. Finishing here would hand the peer a well-formed FIN at whatever offset
+            // writing reached, which reads as a complete but silently truncated message. Reset
+            // instead, so the truncation surfaces as a stream error. Already reset or already gone
+            // yields `ClosedStream`, which is fine.
+            if conn
+                .inner
+                .send_stream(self.stream)
+                .reset(DROPPED_UNFINISHED_ERROR_CODE)
+                .is_ok()
+            {
+                conn.wake();
+            }
+            return;
+        }
+
         match conn.inner.send_stream(self.stream).finish() {
             Ok(()) => conn.wake(),
             Err(FinishError::Stopped(reason)) => {

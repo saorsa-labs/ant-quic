@@ -14,6 +14,7 @@ mod connection_tests;
 mod crypto_tests;
 mod frame_tests;
 mod pure_pq_rpk_tests;
+mod send_stream_drop_tests;
 mod token_binding_tests;
 mod token_v2_server_side_tests;
 

@@ -816,6 +816,10 @@ impl Node {
     /// let (mut send, mut recv) = node.open_bi(&peer_id).await?;
     /// use tokio::io::AsyncWriteExt;
     /// send.write_all(b"hello").await?;
+    /// // Always finish explicitly. A send stream dropped without `finish()` is
+    /// // reset, so the peer observes a stream error instead of a short read that
+    /// // looks like a complete message.
+    /// send.finish()?;
     /// ```
     ///
     /// # Errors

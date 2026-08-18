@@ -128,15 +128,30 @@ impl MasqueRelaySocket {
 
         // Background task: write queued outbound packets to relay stream
         tokio::spawn(async move {
-            while let Some(encoded) = send_rx.recv().await {
+            loop {
+                let Some(encoded) = send_rx.recv().await else {
+                    // Every sender is gone, i.e. the socket was dropped. Nothing is
+                    // half-written, so finish gracefully: QUIC keeps retransmitting
+                    // frames that are queued but not yet acknowledged, so packets
+                    // already handed to the relay still arrive.
+                    if let Err(e) = send_stream.finish() {
+                        tracing::debug!(error = %e, "MasqueRelaySocket: stream finish error");
+                    }
+                    return;
+                };
+
+                // A failed write may have left a partial frame on the wire. Return
+                // without finishing so the drop resets the stream, and the relay's
+                // length-prefixed reader sees a stream error rather than misparsing
+                // a truncated frame.
                 let frame_len = encoded.len() as u32;
                 if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (length)");
-                    break;
+                    return;
                 }
                 if let Err(e) = send_stream.write_all(&encoded).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (data)");
-                    break;
+                    return;
                 }
             }
         });
