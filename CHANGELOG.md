@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.40] - 2026-08-18
+
+### Fixed
+
+- **h2 0.4.16** closes RUSTSEC-2026-0258 (unbounded empty DATA frames). Lockfile-only
+  transitive bump from 0.4.15. Crate version 0.27.39 -> 0.27.40 so the clean
+  release is distinct from the v0.27.39 tag whose Security Audit jobs failed.
+
 ## [0.27.38] - 2026-08-17
 
 ### Fixed
