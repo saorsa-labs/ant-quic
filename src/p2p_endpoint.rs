@@ -9823,6 +9823,7 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap_cache::BootstrapCacheConfig;
     use crate::coordinator_control::RejectionReason;
 
     fn collect_broadcast_events(
@@ -12230,20 +12231,38 @@ mod tests {
         endpoint.shutdown().await;
     }
 
+    /// Endpoint config for the `upsert_peer_hints` tests, isolated from any real
+    /// bootstrap cache on this machine.
+    ///
+    /// The default cache dir is shared per user, so a populated cache both
+    /// crowds freshly hinted peers out of the capped relay/coordinator
+    /// selections these tests assert on, and takes on the tests' synthetic peers
+    /// when the endpoint saves.
+    fn peer_hint_test_config() -> P2pConfig {
+        P2pConfig::builder()
+            .bind_addr(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                0,
+            ))
+            .port_mapping_enabled(false)
+            .bootstrap_cache(
+                BootstrapCacheConfig::builder()
+                    .cache_dir(
+                        std::env::temp_dir()
+                            .join(format!("ant-quic-peer-hint-tests-{}", std::process::id())),
+                    )
+                    .persist(false)
+                    .build(),
+            )
+            .build()
+            .expect("config should build")
+    }
+
     #[tokio::test]
     async fn test_upsert_peer_hints_ignores_synthetic_peer_id() {
-        let endpoint = P2pEndpoint::new(
-            P2pConfig::builder()
-                .bind_addr(SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    0,
-                ))
-                .port_mapping_enabled(false)
-                .build()
-                .expect("config should build"),
-        )
-        .await
-        .expect("endpoint should bind");
+        let endpoint = P2pEndpoint::new(peer_hint_test_config())
+            .await
+            .expect("endpoint should bind");
 
         let hinted_addr: SocketAddr = "127.0.0.1:9001".parse().expect("valid addr");
         let peer_id = peer_id_from_socket_addr(hinted_addr);
@@ -12260,18 +12279,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_peer_hints_feeds_coordinator_candidates() {
-        let endpoint = P2pEndpoint::new(
-            P2pConfig::builder()
-                .bind_addr(SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    0,
-                ))
-                .port_mapping_enabled(false)
-                .build()
-                .expect("config should build"),
-        )
-        .await
-        .expect("endpoint should bind");
+        let endpoint = P2pEndpoint::new(peer_hint_test_config())
+            .await
+            .expect("endpoint should bind");
 
         let peer_id = PeerId([0x5a; 32]);
         let hinted_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid addr");
@@ -12295,18 +12305,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_peer_hints_feeds_relay_cache_selection_after_runtime_hints_clear() {
-        let endpoint = P2pEndpoint::new(
-            P2pConfig::builder()
-                .bind_addr(SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    0,
-                ))
-                .port_mapping_enabled(false)
-                .build()
-                .expect("config should build"),
-        )
-        .await
-        .expect("endpoint should bind");
+        let endpoint = P2pEndpoint::new(peer_hint_test_config())
+            .await
+            .expect("endpoint should bind");
 
         let peer_id = PeerId([0x6b; 32]);
         let hinted_addr: SocketAddr = "198.51.100.61:9000".parse().expect("valid addr");
@@ -12344,18 +12345,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_peer_hints_merge_addrs_and_roles() {
-        let endpoint = P2pEndpoint::new(
-            P2pConfig::builder()
-                .bind_addr(SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    0,
-                ))
-                .port_mapping_enabled(false)
-                .build()
-                .expect("config should build"),
-        )
-        .await
-        .expect("endpoint should bind");
+        let endpoint = P2pEndpoint::new(peer_hint_test_config())
+            .await
+            .expect("endpoint should bind");
 
         let peer_id = PeerId([0x7c; 32]);
         let addr_a: SocketAddr = "198.51.100.71:9000".parse().expect("valid addr");
