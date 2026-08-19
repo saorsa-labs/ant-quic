@@ -991,6 +991,13 @@ impl MasqueRelayServer {
         let stats = self.stats();
         let stats2 = self.stats();
 
+        // `true` while a length/data write pair is mid-flight in the write
+        // direction below. If `select!` cancels that direction while this is
+        // set, a partial frame may be on the wire and the stream must not be
+        // finished. Shared by reference: both `select!` branches are polled on
+        // this task, and the outer read happens after one of them has won.
+        let mid_frame = std::sync::atomic::AtomicBool::new(false);
+
         // `true` once the forwarding loop ends with no half-written frame on the
         // send stream, which is the only state in which a graceful finish is safe.
         let send_stream_intact = tokio::select! {
@@ -1013,8 +1020,12 @@ impl MasqueRelayServer {
 
                             // Write length-prefixed frame to stream
                             let frame_len = encoded.len() as u32;
-                            // A failed write may have left a partial frame on the
-                            // wire, so the stream is no longer safe to finish.
+                            // A frame write is in flight from here until the data
+                            // write completes; a cancelled write in between may
+                            // have left a partial frame on the wire, and a failed
+                            // write certainly may have, so the stream is no longer
+                            // safe to finish.
+                            mid_frame.store(true, Ordering::Relaxed);
                             if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
                                 tracing::debug!(session_id, error = %e, "Stream write error (length)");
                                 break false;
@@ -1023,6 +1034,7 @@ impl MasqueRelayServer {
                                 tracing::debug!(session_id, error = %e, "Stream write error (data)");
                                 break false;
                             }
+                            mid_frame.store(false, Ordering::Relaxed);
 
                             stats.record_bytes(encoded.len() as u64);
                             stats.record_datagram();
@@ -1038,25 +1050,39 @@ impl MasqueRelayServer {
             } => intact,
 
             // Direction 2: Stream → UDP (client → relay → target)
-            _ = async {
+            read_clean = async {
                 loop {
                     // Read 4-byte length prefix
                     let mut len_buf = [0u8; 4];
-                    if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
-                        tracing::debug!(session_id, error = %e, "Stream read error (length)");
-                        break;
+                    match recv_stream.read_exact(&mut len_buf).await {
+                        Ok(()) => {}
+                        // The client half-closed exactly at a frame boundary:
+                        // zero bytes of the next prefix arrived before the FIN.
+                        // This is the only clean end — anything else (a torn
+                        // prefix, a torn frame body, a stream error) is not.
+                        Err(crate::high_level::ReadExactError::FinishedEarly(0)) => {
+                            tracing::debug!(
+                                session_id,
+                                "Client half-closed at a frame boundary"
+                            );
+                            break true;
+                        }
+                        Err(e) => {
+                            tracing::debug!(session_id, error = %e, "Stream read error (length)");
+                            break false;
+                        }
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
                     if frame_len > 65536 {
                         tracing::warn!(session_id, frame_len, "Oversized stream frame, dropping");
-                        break;
+                        break false;
                     }
 
                     // Read frame data
                     let mut frame_buf = vec![0u8; frame_len];
                     if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
                         tracing::debug!(session_id, error = %e, "Stream read error (data)");
-                        break;
+                        break false;
                     }
 
                     // Decode and forward
@@ -1083,10 +1109,18 @@ impl MasqueRelayServer {
                     }
                 }
             } => {
-                // The read direction ended first, so `select!` cancelled the write
-                // direction at an arbitrary await point — possibly midway through a
-                // frame. Treat the send stream as compromised.
-                false
+                // The read direction ended first, so `select!` cancelled the
+                // write direction at an arbitrary await point. A graceful
+                // finish is still correct when the client half-closed cleanly
+                // AND the cancellation landed between frames (#249): the
+                // frames already written are complete, and finishing keeps
+                // QUIC retransmitting any that are unacknowledged, so relayed
+                // datagrams already in flight still reach the client. A
+                // mid-frame cancellation may have left a partial frame on the
+                // wire, and a torn or errored read is a protocol fault — both
+                // must reset so the client's length-prefixed reader sees a
+                // stream error instead of misparsing a truncated frame.
+                read_clean && !mid_frame.load(Ordering::Relaxed)
             },
         };
 
@@ -1779,5 +1813,220 @@ mod tests {
 
         // bind_any has no target, so no bridging
         assert!(!info.is_bridging);
+    }
+
+    // ==== #249: teardown classification for clean client half-close ====
+
+    fn gen_self_signed_cert() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        (vec![cert_der], key_der)
+    }
+
+    /// Loopback QUIC pair for driving `run_stream_forwarding_loop` directly:
+    /// the "client" holds one half of a bidirectional stream, the relay-side
+    /// halves are handed to the real forwarding loop.
+    async fn relay_loopback_pair() -> (crate::high_level::Connection, crate::high_level::Connection)
+    {
+        let (chain, key) = gen_self_signed_cert();
+        let server_cfg =
+            crate::config::ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
+        let server = crate::high_level::Endpoint::server(server_cfg, ([127, 0, 0, 1], 0).into())
+            .expect("server ep");
+        let addr: SocketAddr = server.local_addr().unwrap();
+
+        let accept = tokio::spawn(async move {
+            let inc = tokio::time::timeout(std::time::Duration::from_secs(10), server.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), inc)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for c in chain {
+            roots.add(c).unwrap();
+        }
+        let client_cfg =
+            crate::config::ClientConfig::with_root_certificates(std::sync::Arc::new(roots))
+                .unwrap();
+        let mut client =
+            crate::high_level::Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client ep");
+        client.set_default_client_config(client_cfg);
+        let c_conn: crate::high_level::Connection = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.connect(addr, "localhost").expect("start"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let s_conn = accept.await.unwrap();
+        (c_conn, s_conn)
+    }
+
+    /// A live session on `server` plus the local address its UDP socket is
+    /// bound to — what a forwarding target sends datagrams to.
+    async fn live_session_with_socket(server: &MasqueRelayServer) -> (u64, SocketAddr) {
+        server
+            .handle_connect_request(&ConnectUdpRequest::bind_any(), client_addr(9))
+            .await
+            .expect("connect request");
+        let session_id = server.active_session_ids().await[0];
+        let sessions = server.sessions.read().await;
+        let session = sessions.get(&session_id).expect("session present");
+        let socket = session.udp_socket().expect("session socket").clone();
+        // The session socket binds INADDR_ANY (an IPv4 client address keeps
+        // it in the v4 family), so `local_addr` reports 0.0.0.0 — unreachable
+        // as a destination. Graft the bound port onto loopback, which the
+        // wildcard socket receives.
+        let bound = socket.local_addr().expect("socket local addr");
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound.port());
+        (session_id, local)
+    }
+
+    /// Read one length-prefixed frame, bounded: every await is wrapped so a
+    /// wedged runner fails the test instead of hanging until the CI job's
+    /// timeout cancels it.
+    async fn read_relay_frame(recv: &mut crate::high_level::RecvStream) -> UncompressedDatagram {
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            recv.read_exact(&mut len_buf),
+        )
+        .await
+        .expect("frame read bounded")
+        .expect("frame length");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            recv.read_exact(&mut buf),
+        )
+        .await
+        .expect("frame read bounded")
+        .expect("frame body");
+        let mut cursor = Bytes::from(buf);
+        UncompressedDatagram::decode(&mut cursor).expect("datagram decode")
+    }
+
+    /// #249: a client that half-closes its send side exactly at a frame
+    /// boundary, while the relay's write direction is idle between frames, must
+    /// get a graceful FIN — complete reverse frames already written (even if
+    /// unacknowledged) are retransmitted and delivered, not discarded by a
+    /// reset. Before #249 every read-direction exit reset the reverse stream.
+    #[tokio::test]
+    async fn client_half_close_at_frame_boundary_finishes_relay_stream() {
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            test_addr(9000),
+        ));
+        let (session_id, session_local) = live_session_with_socket(&server).await;
+
+        let (client_conn, relay_conn) = relay_loopback_pair().await;
+        let (mut client_send, mut client_recv) = client_conn.open_bi().await.unwrap();
+        // ant-quic opens streams lazily: the peer only observes the stream
+        // once bytes (or a FIN) are sent — production clients send their
+        // CONNECT-UDP preamble first. Prime the stream with a valid
+        // zero-length frame so `accept_bi` below can resolve; the relay's
+        // length-prefixed reader skips a zero-length frame it cannot decode.
+        client_send.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let (relay_send, relay_recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), relay_conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let loop_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop_server
+                .run_stream_forwarding_loop(session_id, relay_send, relay_recv)
+                .await;
+        });
+
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        target.send_to(b"frame-one", session_local).await.unwrap();
+        target.send_to(b"frame-two", session_local).await.unwrap();
+
+        // Read both frames in full: receiving frame two proves the relay's
+        // write direction completed both write pairs and is idle between
+        // frames when the half-close lands.
+        let first = read_relay_frame(&mut client_recv).await;
+        let second = read_relay_frame(&mut client_recv).await;
+        let mut payloads: Vec<&[u8]> = vec![&first.payload, &second.payload];
+        payloads.sort_unstable();
+        assert_eq!(payloads, vec![b"frame-one" as &[u8], b"frame-two"]);
+        assert_eq!(first.target, target_addr);
+        assert_eq!(second.target, target_addr);
+
+        client_send.finish().unwrap();
+
+        let tail = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_recv.read_to_end(64 * 1024),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tail.is_ok(),
+            "clean half-close at a frame boundary must finish the relay stream, got {tail:?}"
+        );
+        assert!(
+            tail.unwrap().is_empty(),
+            "no further frames were expected after the half-close"
+        );
+    }
+
+    /// #249 counterpart: a torn half-close — FIN arriving partway through a
+    /// length prefix — is a protocol fault and must keep the conservative
+    /// drop-reset teardown. A graceful FIN after a torn prefix would hand the
+    /// client's length-prefixed reader a truncated frame.
+    #[tokio::test]
+    async fn torn_half_close_still_resets_relay_stream() {
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            test_addr(9000),
+        ));
+        let (session_id, _session_local) = live_session_with_socket(&server).await;
+
+        let (client_conn, relay_conn) = relay_loopback_pair().await;
+        let (mut client_send, mut client_recv) = client_conn.open_bi().await.unwrap();
+        // Prime the lazy-opened stream, mirroring the graceful-path test.
+        client_send.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let (relay_send, relay_recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), relay_conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let loop_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop_server
+                .run_stream_forwarding_loop(session_id, relay_send, relay_recv)
+                .await;
+        });
+
+        client_send.write_all(&[0x00, 0x00]).await.unwrap();
+        client_send.finish().unwrap();
+
+        let tail = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_recv.read_to_end(64 * 1024),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tail.is_err(),
+            "torn half-close must reset the relay stream, got {tail:?}"
+        );
     }
 }
