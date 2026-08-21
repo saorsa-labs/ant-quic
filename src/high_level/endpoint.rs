@@ -369,10 +369,11 @@ impl Endpoint {
 
         let socket = endpoint.socket.clone();
         endpoint.stats.outgoing_handshakes += 1;
+        let registry = endpoint.buffered_registry.clone();
         Ok(endpoint
             .recv_state
             .connections
-            .insert(ch, conn, socket, self.runtime.clone()))
+            .insert(ch, conn, socket, self.runtime.clone(), registry))
     }
 
     /// Switch to a new UDP socket
@@ -540,6 +541,18 @@ impl Endpoint {
             .lock()
             .map(|state| state.inner.open_connections())
             .unwrap_or(0)
+    }
+
+    /// #368 gate 5: (send_unacked, recv_buffered, recv_streams_with_unread,
+    /// connections_counted) summed over EVERY live proto connection including
+    /// draining ones. `#[doc(hidden)]` instrumentation — no behaviour change.
+    #[doc(hidden)]
+    pub fn buffered_bytes_totals(&self) -> (u64, u64, usize, usize) {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.buffered_registry.totals())
+            .unwrap_or((0, 0, 0, 0))
     }
 
     /// Set the maximum number of simultaneously live connections the endpoint
@@ -910,10 +923,11 @@ impl EndpointInner {
                 state.stats.accepted_handshakes += 1;
                 let socket = state.socket.clone();
                 let runtime = state.runtime.clone();
+                let registry = state.buffered_registry.clone();
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, socket, runtime))
+                    .insert(handle, conn, socket, runtime, registry))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -985,6 +999,8 @@ pub(crate) struct State {
     /// Channel for forwarding peer address updates to the upper layer.
     peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
     socket_released_for_shutdown: bool,
+    /// #368 gate 5: per-connection buffered-bytes snapshots (draining incl.).
+    buffered_registry: Arc<BufferedBytesRegistry>,
 }
 
 #[derive(Debug)]
@@ -1146,7 +1162,58 @@ struct ConnectionChannels {
     recv_overflows: AtomicU64,
 }
 
-#[derive(Debug)]
+/// #368 gate 5: per-endpoint aggregate of live proto-connection buffered
+/// bytes. Each connection driver refreshes its absolute snapshot (throttled)
+/// into this registry; terminal connections remove their entry. Summed by
+/// [`Endpoint::buffered_bytes_totals`]. Instrumentation only.
+#[derive(Debug, Default)]
+pub(crate) struct BufferedBytesRegistry {
+    entries: std::sync::Mutex<FxHashMap<usize, ConnBufferedSnapshot>>,
+}
+
+/// One connection's buffered-bytes snapshot (all absolute values).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConnBufferedSnapshot {
+    pub(crate) send_unacked: u64,
+    pub(crate) recv_buffered: u64,
+    pub(crate) recv_streams_with_unread: usize,
+}
+
+impl BufferedBytesRegistry {
+    pub(crate) fn update(&self, handle: usize, snap: ConnBufferedSnapshot) {
+        if let Ok(mut m) = self.entries.lock() {
+            m.insert(handle, snap);
+        }
+    }
+
+    pub(crate) fn remove(&self, handle: usize) {
+        if let Ok(mut m) = self.entries.lock() {
+            m.remove(&handle);
+        }
+    }
+
+    pub(crate) fn totals(&self) -> (u64, u64, usize, usize) {
+        match self.entries.lock() {
+            Ok(m) => {
+                let mut send_unacked = 0u64;
+                let mut recv_buffered = 0u64;
+                let mut streams = 0usize;
+                for s in m.values() {
+                    send_unacked += s.send_unacked;
+                    recv_buffered += s.recv_buffered;
+                    streams += s.recv_streams_with_unread;
+                }
+                (send_unacked, recv_buffered, streams, m.len())
+            }
+            Err(poisoned) => {
+                let m = poisoned.into_inner();
+                let n = m.len();
+                (0, 0, 0, n)
+            }
+        }
+    }
+}
+
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
     senders: FxHashMap<ConnectionHandle, ConnectionChannels>,
@@ -1166,6 +1233,7 @@ impl ConnectionSet {
         conn: crate::Connection,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        buffered_registry: Arc<BufferedBytesRegistry>,
     ) -> Connecting {
         let (send, recv) = mpsc::channel(RECV_EVENT_BOUND);
         if let Some((error_code, ref reason)) = self.close {
@@ -1183,7 +1251,15 @@ impl ConnectionSet {
                 recv_overflows: AtomicU64::new(0),
             },
         );
-        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+        Connecting::new(
+            handle,
+            conn,
+            self.sender.clone(),
+            recv,
+            socket,
+            runtime,
+            buffered_registry,
+        )
     }
 
     fn is_empty(&self) -> bool {
@@ -1319,6 +1395,7 @@ impl EndpointRef {
                 stats: EndpointStats::default(),
                 peer_address_update_tx: None,
                 socket_released_for_shutdown: false,
+                buffered_registry: Arc::new(BufferedBytesRegistry::default()),
             }),
         }))
     }
@@ -1501,7 +1578,7 @@ impl fmt::Debug for RecvState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("RecvState")
             .field("incoming", &self.incoming)
-            .field("connections", &self.connections)
+            .field("connections", &self.connections.senders.len())
             // recv_buf too large
             .field("recv_limiter", &self.recv_limiter)
             .finish_non_exhaustive()

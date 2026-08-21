@@ -28,6 +28,12 @@ pub(super) struct Recv {
 }
 
 impl Recv {
+    /// #368 gate 5: bytes currently buffered in this stream's assembler.
+    /// Instrumentation only.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.assembler.buffered_bytes()
+    }
+
     pub(super) fn new(initial_max_data: u64) -> Box<Self> {
         Box::new(Self {
             state: RecvState::default(),

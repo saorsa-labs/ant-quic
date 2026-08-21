@@ -310,6 +310,13 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// #368 gate 5 instrumentation: (send_unacked, recv_buffered,
+    /// recv_streams_with_unread) for this connection's streams.
+    /// Instrumentation only — no behaviour.
+    pub(crate) fn buffered_snapshot(&self) -> (u64, u64, usize) {
+        self.streams.buffered_snapshot()
+    }
+
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
         config: Arc<TransportConfig>,
