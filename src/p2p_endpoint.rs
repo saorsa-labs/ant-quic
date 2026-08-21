@@ -7811,6 +7811,51 @@ impl P2pEndpoint {
         self.stats.read().await.clone()
     }
 
+    // === #368 churn-residue instrumentation (test/368-churn-residue) ===
+    // Instrumentation only: no behaviour change. These expose the
+    // connection-accounting surfaces the x0x leak bisection needs
+    // (issue #368 gate 3); nothing here is on any production path.
+
+    /// Proto-level open connection count (includes draining/retained
+    /// generations) — the divergence signal versus [`Self::stats`]'s
+    /// active_connections.
+    #[doc(hidden)]
+    pub fn quic_open_connections(&self) -> usize {
+        self.inner
+            .get_endpoint()
+            .map_or(0, |ep| ep.open_connections())
+    }
+
+    /// Number of per-peer reader-task handles currently tracked
+    /// (`reader_handles` map entries, summed over peers).
+    #[doc(hidden)]
+    pub async fn reader_handle_count(&self) -> usize {
+        self.reader_handles
+            .read()
+            .await
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Number of distinct peers in the reader-handles map.
+    #[doc(hidden)]
+    pub async fn reader_handle_peer_count(&self) -> usize {
+        self.reader_handles.read().await.len()
+    }
+
+    /// Number of per-peer activity records (`peer_activity` map entries).
+    #[doc(hidden)]
+    pub async fn peer_activity_count(&self) -> usize {
+        self.peer_activity.read().await.len()
+    }
+
+    /// Number of entries in the connected-peers map.
+    #[doc(hidden)]
+    pub async fn connected_peers_map_len(&self) -> usize {
+        self.connected_peers.read().await.len()
+    }
+
     /// Snapshot stage-by-stage ACK-v2 latency and outcome diagnostics.
     pub fn ack_diagnostics(&self) -> AckDiagnosticsSnapshot {
         self.ack_diagnostics.snapshot()
