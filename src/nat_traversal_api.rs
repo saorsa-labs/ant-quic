@@ -388,7 +388,7 @@ pub(crate) struct ConnectionLifecycleSnapshot {
 
 /// #368 F6 test helper: build a tracked lifecycle entry with an explicit
 /// generation and establishment time (0 = aged past every grace).
-#[cfg(test)]
+#[cfg(all(test, feature = "network-discovery"))]
 pub(crate) fn tracked_connection_for_test(
     connection: InnerConnection,
     generation: u64,
@@ -7233,6 +7233,7 @@ impl NatTraversalEndpoint {
         true
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
     /// #368 F6 test helper: true when no lifecycle entries remain for the
     /// peer.
     #[cfg(test)]
@@ -7240,6 +7241,7 @@ impl NatTraversalEndpoint {
         self.connection_lifecycle.read().get(peer_id).is_none()
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
     /// #368 F6 test helper: seed a tracked lifecycle entry directly.
     #[cfg(test)]
     pub(crate) fn seed_lifecycle_entry_for_test(&self, peer_id: PeerId, entry: TrackedConnection) {

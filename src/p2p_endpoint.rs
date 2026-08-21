@@ -10020,6 +10020,7 @@ impl Clone for P2pEndpoint {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(test, feature = "network-discovery"))]
     async fn shim_node() -> Arc<P2pEndpoint> {
         Arc::new(
             P2pEndpoint::new(
@@ -10041,6 +10042,7 @@ mod tests {
         )
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
     fn shim_addr(node: &Arc<P2pEndpoint>) -> std::net::SocketAddr {
         let addr = node.local_addr().expect("bound");
         if addr.ip().is_unspecified() {
@@ -10053,6 +10055,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
     fn shim_accept(node: &Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
         let n = Arc::clone(node);
         tokio::spawn(async move { while n.accept().await.is_some() {} })
@@ -10060,6 +10063,8 @@ mod tests {
 
     /// F1 (#368 r1): under a HELD write lock on reader_handles the probe
     /// must report ALIVE (contended ⇒ alive), never yield an orphan closure.
+    /// Loopback bind/accept needs the default socket path (ant-quic #246).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn probe_under_held_write_lock_reports_alive() {
         let a = shim_node().await;
@@ -10088,6 +10093,8 @@ mod tests {
     /// seeded aged readerless-open lifecycle entry. Deterministic: the
     /// entry is seeded directly (established_at = 0, Live, open, no reader
     /// for its generation) so only the janitor logic can close it.
+    /// Loopback bind/accept needs the default socket path (ant-quic #246).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn janitor_closes_readerless_open_connection() {
         let (a, _b, conn) = loopback_quic_pair().await;
@@ -10111,6 +10118,7 @@ mod tests {
         assert!(a.inner.lifecycle_empty_for_test(&peer_id), "entry removed");
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
     async fn loopback_quic_pair() -> (
         Arc<P2pEndpoint>,
         Arc<P2pEndpoint>,
@@ -10138,6 +10146,7 @@ mod tests {
     use super::*;
     use crate::bootstrap_cache::BootstrapCacheConfig;
     use crate::coordinator_control::RejectionReason;
+    #[cfg(all(test, feature = "network-discovery"))]
     use crate::nat_traversal_api::tracked_connection_for_test;
 
     fn collect_broadcast_events(
