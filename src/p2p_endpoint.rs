@@ -50,7 +50,7 @@
 //! ```
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -373,6 +373,11 @@ struct ReaderTaskHandle {
     /// connections (simultaneous-open races, coordinated + direct paths
     /// converging); each has its own reader, uniquely identified by this id.
     generation: u64,
+    /// The connection's stable id — readers spawned from
+    /// `session_connection()` carry `generation = conn_stable_id`, which can
+    /// differ from the lifecycle generation after registration; the
+    /// reader-liveness probe matches EITHER (F3, #368 r1).
+    conn_stable_id: usize,
     /// Cooperative shutdown signal. Honored only at stream-accept boundaries,
     /// so an in-flight `read_to_end()` always completes before the task exits.
     /// This prevents silent loss of already-ACKed bytes during connection
@@ -382,6 +387,9 @@ struct ReaderTaskHandle {
     /// explicit `cleanup_connection` after cooperative cancellation.
     abort_handle: tokio::task::AbortHandle,
 }
+
+/// #368 F2: per-peer bound on exited-reader tombstones.
+const EXITED_READER_TOMBSTONE_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct ReaderExitEvent {
@@ -863,6 +871,12 @@ pub struct P2pEndpoint {
     /// so ACKed bytes in flight on the old connection are always delivered
     /// (issue #166).
     reader_handles: Arc<RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>>,
+
+    /// #368 F2: bounded tombstones of READER-EXITED generations per peer,
+    /// so the liveness probe can distinguish "never spawned" (register →
+    /// spawn-reader window — legitimate, age-gated) from "exited" (the
+    /// reader ran and is gone — reject immediately at repromotion).
+    exited_reader_generations: Arc<RwLock<HashMap<PeerId, VecDeque<u64>>>>,
 
     /// Directional application activity timestamps per peer.
     peer_activity: Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
@@ -3163,11 +3177,14 @@ impl P2pEndpoint {
         // Create channel for data received from background reader tasks
         let data_tx_capacity = config.data_channel_capacity;
         let (data_tx, data_rx) = mpsc::channel(data_tx_capacity);
+        let reader_handles: Arc<RwLock<HashMap<PeerId, Vec<ReaderTaskHandle>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let exited_reader_generations: Arc<RwLock<HashMap<PeerId, VecDeque<u64>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let data_tx_diagnostics = Arc::new(DataChannelDiagnostics::default());
         // Bounded channel for inbound *application* bi-stream handles (not bytes).
         let (app_bi_tx, app_bi_rx) = mpsc::channel(APP_BIDI_CHANNEL_CAPACITY);
         let (reader_exit_tx, reader_exit_rx) = mpsc::unbounded_channel();
-        let reader_handles = Arc::new(RwLock::new(HashMap::new()));
         let peer_activity = Arc::new(RwLock::new(HashMap::new()));
         let ack_waiters = Arc::new(ParkingRwLock::new(HashMap::new()));
         let ack_diagnostics = Arc::new(AckDiagnostics::default());
@@ -3212,6 +3229,7 @@ impl P2pEndpoint {
             reader_exit_tx,
             reader_exit_rx: Arc::new(tokio::sync::Mutex::new(reader_exit_rx)),
             reader_handles,
+            exited_reader_generations,
             peer_activity,
             ack_waiters,
             ack_diagnostics,
@@ -7866,14 +7884,39 @@ impl P2pEndpoint {
     /// on task exit, so absence means no reader.
     fn install_reader_liveness_probe(&self) {
         let reader_handles = Arc::clone(&self.reader_handles);
+        let exited_reader_generations = Arc::clone(&self.exited_reader_generations);
         self.inner
             .set_reader_liveness_probe(Arc::new(move |peer_id, generation| {
-                // Best-effort synchronous check: a contended instant
-                // reports "alive" (false negatives are impossible; false
-                // positives self-correct within one janitor interval).
-                reader_handles.try_read().is_ok_and(|handles| {
+                // F2 (#368 r1): an EXITED reader is dead regardless of the
+                // spawn-grace age gate — tombstones first. Contended
+                // tombstone reads conservatively skip this fast-path (the
+                // handle check below still applies).
+                if let Ok(exited) = exited_reader_generations.try_read() {
+                    if exited
+                        .get(peer_id)
+                        .is_some_and(|gens| gens.contains(&generation))
+                    {
+                        return false;
+                    }
+                }
+                // F1 (#368 r1): tokio's RwLock is write-preferring, so
+                // try_read() fails whenever a writer holds OR is queued —
+                // every spawn/exit/cleanup, i.e. exactly during churn. A
+                // contended instant therefore reports ALIVE (false
+                // negatives would let the janitor kill healthy Live
+                // winners; false positives self-correct within one janitor
+                // interval). F3: readers spawned from session_connection()
+                // carry generation = conn_stable_id, which can differ from
+                // the lifecycle generation — match either. F4: a panicked
+                // reader's handle is only removed at the end of the task
+                // body, so also require the task not finished.
+                reader_handles.try_read().map_or(true, |handles| {
                     handles.get(peer_id).is_some_and(|entries| {
-                        entries.iter().any(|entry| entry.generation == generation)
+                        entries.iter().any(|entry| {
+                            (entry.generation == generation
+                                || entry.conn_stable_id == generation as usize)
+                                && !entry.abort_handle.is_finished()
+                        })
                     })
                 })
             }));
@@ -7884,7 +7927,15 @@ impl P2pEndpoint {
     /// no live reader for the whole 10 s grace — each pins every inbound
     /// datagram (recv Assembler never drained) up to the receive window.
     fn spawn_orphan_connection_janitor(&self) {
+        // F5 (#368 r1): test kill switch — proving the harness fails with
+        // the fix disabled requires running the same code without the
+        // janitor+invariant.
+        if std::env::var_os("ANT_QUIC_TEST_DISABLE_368_JANITOR").is_some() {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
+        let event_tx = self.event_tx.clone();
+        let peer_event_tx = self.peer_event_tx.clone();
         let shutdown = self.shutdown_token();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -7908,6 +7959,19 @@ impl P2pEndpoint {
                         stable_id,
                         crate::connection_lifecycle::ConnectionCloseReason::NoReader,
                     );
+                    // F7 (#368 r1): surface the disconnect so x0x's redial
+                    // does not wait for the 30 s IfUnroutable reaper.
+                    let _ = event_tx.send(P2pEvent::PeerDisconnected {
+                        peer_id,
+                        reason: DisconnectReason::ConnectionLost,
+                    });
+                    let _ = peer_event_tx.send((
+                        peer_id,
+                        crate::PeerLifecycleEvent::Closed {
+                            generation: 0,
+                            reason: crate::connection_lifecycle::ConnectionCloseReason::NoReader,
+                        },
+                    ));
                 }
             }
         });
@@ -9281,6 +9345,7 @@ impl P2pEndpoint {
         let mut handles = self.reader_handles.write().await;
         handles.entry(peer_id).or_default().push(ReaderTaskHandle {
             generation,
+            conn_stable_id,
             cancel,
             abort_handle,
         });
@@ -9589,8 +9654,9 @@ impl P2pEndpoint {
         let connected_peers = Arc::clone(&self.connected_peers);
         let inner = Arc::clone(&self.inner);
         let reader_handles = Arc::clone(&self.reader_handles);
-        let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
+        let exited_reader_generations = Arc::clone(&self.exited_reader_generations);
         let stats = Arc::clone(&self.stats);
+        let direct_path_statuses = Arc::clone(&self.direct_path_statuses);
         let event_tx = self.event_tx.clone();
         let peer_event_tx = self.peer_event_tx.clone();
         let peer_event_channels = Arc::clone(&self.peer_event_channels);
@@ -9626,6 +9692,17 @@ impl P2pEndpoint {
                 // peer-wide cleanup. Remove the exiting handle from the vec; if
                 // other readers remain, this peer is still alive on another
                 // connection and we skip cleanup.
+                // #368 F2: record the exited generation so the liveness
+                // probe can reject an exited-reader survivor immediately
+                // (bounded per peer).
+                {
+                    let mut exited = exited_reader_generations.write().await;
+                    let deque = exited.entry(peer_id).or_default();
+                    deque.push_back(generation);
+                    while deque.len() > EXITED_READER_TOMBSTONE_CAP {
+                        deque.pop_front();
+                    }
+                }
                 let last_reader = {
                     let mut handles = reader_handles.write().await;
                     match handles.get_mut(&peer_id) {
@@ -9923,6 +10000,7 @@ impl Clone for P2pEndpoint {
             reader_exit_tx: self.reader_exit_tx.clone(),
             reader_exit_rx: Arc::clone(&self.reader_exit_rx),
             reader_handles: Arc::clone(&self.reader_handles),
+            exited_reader_generations: Arc::clone(&self.exited_reader_generations),
             peer_activity: Arc::clone(&self.peer_activity),
             ack_waiters: Arc::clone(&self.ack_waiters),
             ack_diagnostics: Arc::clone(&self.ack_diagnostics),
@@ -9942,9 +10020,125 @@ impl Clone for P2pEndpoint {
 
 #[cfg(test)]
 mod tests {
+    async fn shim_node() -> Arc<P2pEndpoint> {
+        Arc::new(
+            P2pEndpoint::new(
+                P2pConfig::builder()
+                    .bind_addr(std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .nat(crate::NatConfig {
+                        enable_relay_fallback: false,
+                        ..Default::default()
+                    })
+                    .pqc(crate::PqcConfig::default())
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("node"),
+        )
+    }
+
+    fn shim_addr(node: &Arc<P2pEndpoint>) -> std::net::SocketAddr {
+        let addr = node.local_addr().expect("bound");
+        if addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                addr.port(),
+            )
+        } else {
+            addr
+        }
+    }
+
+    fn shim_accept(node: &Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
+        let n = Arc::clone(node);
+        tokio::spawn(async move { while n.accept().await.is_some() {} })
+    }
+
+    /// F1 (#368 r1): under a HELD write lock on reader_handles the probe
+    /// must report ALIVE (contended ⇒ alive), never yield an orphan closure.
+    #[tokio::test]
+    async fn probe_under_held_write_lock_reports_alive() {
+        let a = shim_node().await;
+        let b = shim_node().await;
+        let b_addr = shim_addr(&b);
+        let _accept_b = shim_accept(&b);
+        let _accept_a = shim_accept(&a);
+        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect");
+
+        // Hold the write lock across the probe call.
+        let _guard = a.reader_handles.write().await;
+        // The probe is the closure installed at construction; call it via
+        // the janitor's sweep source: orphaned_open_generations with 0 age
+        // must NOT report the live connection while contended.
+        let orphans = a.inner.orphaned_open_generations(0);
+        assert!(
+            orphans.is_empty(),
+            "contended probe must not orphan a healthy connection: {orphans:?}"
+        );
+    }
+
+    /// F6 (#368 r1): the janitor sweep finds and the close path closes a
+    /// seeded aged readerless-open lifecycle entry. Deterministic: the
+    /// entry is seeded directly (established_at = 0, Live, open, no reader
+    /// for its generation) so only the janitor logic can close it.
+    #[tokio::test]
+    async fn janitor_closes_readerless_open_connection() {
+        let (a, _b, conn) = loopback_quic_pair().await;
+        let peer_id = crate::PeerId([0xEE; 32]);
+        a.inner.seed_lifecycle_entry_for_test(
+            peer_id,
+            tracked_connection_for_test(conn.clone(), 42, 0),
+        );
+
+        let orphans = a.inner.orphaned_open_generations(10_000);
+        assert_eq!(orphans.len(), 1, "seeded orphan must be found");
+        let _ = a.inner.remove_connection_generation_with_reason(
+            &peer_id,
+            orphans[0].1,
+            crate::connection_lifecycle::ConnectionCloseReason::NoReader,
+        );
+        assert!(
+            conn.close_reason().is_some(),
+            "janitor path must close the orphan connection"
+        );
+        assert!(a.inner.lifecycle_empty_for_test(&peer_id), "entry removed");
+    }
+
+    async fn loopback_quic_pair() -> (
+        Arc<P2pEndpoint>,
+        Arc<P2pEndpoint>,
+        crate::high_level::Connection,
+    ) {
+        let a = shim_node().await;
+        let b = shim_node().await;
+        let b_addr = shim_addr(&b);
+        let _accept_b = shim_accept(&b);
+        let _accept_a = shim_accept(&a);
+        let peer_conn = tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect");
+        // The tracked entry wants the inner connection handle; fetch it
+        // via the endpoint's own map after the handshake.
+        let inner_conn = a
+            .inner
+            .get_connection(&peer_conn.peer_id)
+            .expect("get_connection ok")
+            .expect("winner present");
+        (a, b, inner_conn)
+    }
+
     use super::*;
     use crate::bootstrap_cache::BootstrapCacheConfig;
     use crate::coordinator_control::RejectionReason;
+    use crate::nat_traversal_api::tracked_connection_for_test;
 
     fn collect_broadcast_events(
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
@@ -13859,6 +14053,7 @@ mod tests {
                 b_id,
                 vec![ReaderTaskHandle {
                     generation: 1,
+                    conn_stable_id: 0,
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],
@@ -14111,6 +14306,7 @@ mod tests {
                 b_id,
                 vec![ReaderTaskHandle {
                     generation: 1,
+                    conn_stable_id: 0,
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],

@@ -358,7 +358,7 @@ struct ObservedAddressReport {
 }
 
 #[derive(Debug, Clone)]
-struct TrackedConnection {
+pub(crate) struct TrackedConnection {
     connection: InnerConnection,
     generation: u64,
     established_at_unix_ms: u64,
@@ -384,6 +384,24 @@ pub(crate) struct ConnectionLifecycleSnapshot {
     pub connection_id: [u8; 32],
     pub state: ConnectionLifecycleState,
     pub established_at_unix_ms: u64,
+}
+
+/// #368 F6 test helper: build a tracked lifecycle entry with an explicit
+/// generation and establishment time (0 = aged past every grace).
+#[cfg(test)]
+pub(crate) fn tracked_connection_for_test(
+    connection: InnerConnection,
+    generation: u64,
+    established_at_unix_ms: u64,
+) -> TrackedConnection {
+    TrackedConnection {
+        connection,
+        generation,
+        established_at_unix_ms,
+        connection_family_id: [0u8; 32],
+        connection_id: [0u8; 32],
+        state: ConnectionLifecycleState::Live,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7213,6 +7231,21 @@ impl NatTraversalEndpoint {
             connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
         }
         true
+    }
+
+    /// #368 F6 test helper: true when no lifecycle entries remain for the
+    /// peer.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_empty_for_test(&self, peer_id: &PeerId) -> bool {
+        self.connection_lifecycle.read().get(peer_id).is_none()
+    }
+
+    /// #368 F6 test helper: seed a tracked lifecycle entry directly.
+    #[cfg(test)]
+    pub(crate) fn seed_lifecycle_entry_for_test(&self, peer_id: PeerId, entry: TrackedConnection) {
+        self.connection_lifecycle
+            .write()
+            .insert(peer_id, vec![entry]);
     }
 
     /// #368: install the p2p-layer reader-liveness probe (the p2p endpoint
