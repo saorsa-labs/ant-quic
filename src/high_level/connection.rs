@@ -69,6 +69,7 @@ impl Connecting {
         conn_events: mpsc::Receiver<ConnectionEvent>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        buffered_registry: Arc<crate::high_level::endpoint::BufferedBytesRegistry>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -81,6 +82,7 @@ impl Connecting {
             on_connected_send,
             socket,
             runtime.clone(),
+            buffered_registry,
         );
 
         let driver = ConnectionDriver(conn.clone());
@@ -282,6 +284,9 @@ impl Future for ZeroRttAccepted {
 /// terminate (yielding `Ok(())`) if the connection was closed without error. Unlike other
 /// connection-related futures, this waits for the draining period to complete to ensure that
 /// packets still in flight from the peer are handled gracefully.
+/// Throttle for the #368 buffered-bytes snapshot refresh (4 Hz).
+const BUFFERED_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
 struct ConnectionDriver(ConnectionRef);
@@ -297,6 +302,7 @@ impl Future for ConnectionDriver {
 
         if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
             conn.terminate(e, &self.0.shared);
+            conn.buffered_registry.remove(conn.handle.0);
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = conn.drive_transmit(cx)?;
@@ -305,6 +311,25 @@ impl Future for ConnectionDriver {
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.0.shared);
+
+        // #368 gate 5: refresh this connection's buffered-bytes snapshot
+        // into the endpoint registry, throttled to 4 Hz — polls are hot, the
+        // absolute sums must not be. Instrumentation only.
+        let refresh_due = conn
+            .last_buffered_refresh
+            .is_none_or(|at| at.elapsed() >= BUFFERED_REFRESH_INTERVAL);
+        if refresh_due {
+            let (send_unacked, recv_buffered, streams) = conn.inner.buffered_snapshot();
+            conn.buffered_registry.update(
+                conn.handle.0,
+                crate::high_level::endpoint::ConnBufferedSnapshot {
+                    send_unacked,
+                    recv_buffered,
+                    recv_streams_with_unread: streams,
+                },
+            );
+            conn.last_buffered_refresh = Some(Instant::now());
+        }
 
         // Kick off automatic channel binding once connected, if configured
         if conn.connected && !conn.binding_started {
@@ -372,6 +397,7 @@ impl Future for ConnectionDriver {
         if conn.error.is_none() {
             unreachable!("drained connections always have an error");
         }
+        conn.buffered_registry.remove(conn.handle.0);
         Poll::Ready(Ok(()))
     }
 }
@@ -1269,6 +1295,7 @@ impl ConnectionRef {
         on_connected: oneshot::Sender<bool>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        buffered_registry: Arc<crate::high_level::endpoint::BufferedBytesRegistry>,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -1294,6 +1321,8 @@ impl ConnectionRef {
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
                 binding_started: false,
+                buffered_registry,
+                last_buffered_refresh: None,
             }),
             shared: Shared::default(),
         }))
@@ -1381,6 +1410,11 @@ pub(crate) struct State {
     buffered_transmit: Option<crate::Transmit>,
     /// True once we've initiated automatic channel binding (if enabled)
     binding_started: bool,
+    /// #368 gate 5: endpoint-wide buffered-bytes registry this connection
+    /// reports into (driver poll, throttled).
+    buffered_registry: Arc<crate::high_level::endpoint::BufferedBytesRegistry>,
+    /// Last #368 snapshot refresh (throttle anchor).
+    last_buffered_refresh: Option<Instant>,
 }
 
 impl State {

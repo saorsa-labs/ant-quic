@@ -36,6 +36,12 @@ impl Assembler {
         Self::default()
     }
 
+    /// #368 gate 5: total bytes currently buffered (including duplicates in
+    /// ordered mode) awaiting application reads. Instrumentation only.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buffered
+    }
+
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
