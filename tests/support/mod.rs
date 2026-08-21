@@ -132,6 +132,39 @@ pub fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
         .expect("test config")
 }
 
+/// #368 harness: node on a REUSABLE keypair so reconnects supersede on the
+/// peer's side (same PeerId), exercising the repromotion path.
+pub async fn make_node_with_keypair(
+    known_peers: Vec<SocketAddr>,
+    keypair: (ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey),
+) -> Arc<P2pEndpoint> {
+    Arc::new(
+        P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .known_peers(known_peers)
+                .nat(NatConfig {
+                    enable_relay_fallback: false,
+                    ..Default::default()
+                })
+                .pqc(PqcConfig::default())
+                .keypair(keypair.0, keypair.1)
+                .build()
+                .expect("test config"),
+        )
+        .await
+        .expect("node creation"),
+    )
+}
+
+/// #368 harness: the reusable keypair type.
+pub type ReusableKeypair = (ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey);
+
+/// #368 harness: generate a reusable keypair.
+pub fn reusable_keypair() -> ReusableKeypair {
+    ant_quic::generate_ml_dsa_keypair().expect("keypair")
+}
+
 pub async fn make_node(known_peers: Vec<SocketAddr>) -> Arc<P2pEndpoint> {
     Arc::new(
         P2pEndpoint::new(test_node_config(known_peers))

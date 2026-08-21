@@ -358,7 +358,7 @@ struct ObservedAddressReport {
 }
 
 #[derive(Debug, Clone)]
-struct TrackedConnection {
+pub(crate) struct TrackedConnection {
     connection: InnerConnection,
     generation: u64,
     established_at_unix_ms: u64,
@@ -384,6 +384,24 @@ pub(crate) struct ConnectionLifecycleSnapshot {
     pub connection_id: [u8; 32],
     pub state: ConnectionLifecycleState,
     pub established_at_unix_ms: u64,
+}
+
+/// #368 F6 test helper: build a tracked lifecycle entry with an explicit
+/// generation and establishment time (0 = aged past every grace).
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn tracked_connection_for_test(
+    connection: InnerConnection,
+    generation: u64,
+    established_at_unix_ms: u64,
+) -> TrackedConnection {
+    TrackedConnection {
+        connection,
+        generation,
+        established_at_unix_ms,
+        connection_family_id: [0u8; 32],
+        connection_id: [0u8; 32],
+        state: ConnectionLifecycleState::Live,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,6 +523,16 @@ pub struct NatTraversalEndpoint {
     /// Lifecycle state for all tracked connections, including superseded/closed
     /// entries retained briefly for diagnostics and deterministic replacement.
     connection_lifecycle: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
+    /// #368: reader-liveness probe installed by the p2p layer (which owns
+    /// reader_handles). `(&PeerId, generation) -> true` when a live,
+    /// non-cancelled reader exists for that generation. Consulted at
+    /// repromotion and by the orphan sweep so a Superseded survivor whose
+    /// reader's 5 s cancel already fired is closed (`NoReader`) instead of
+    /// being promoted to a Live-but-readerless connection that pins every
+    /// inbound datagram.
+    reader_liveness_probe: ParkingRwLock<Option<Arc<dyn Fn(&PeerId, u64) -> bool + Send + Sync>>>,
+    /// #368: orphan connections closed by repromotion refusal or the janitor.
+    orphan_connections_closed: std::sync::atomic::AtomicU64,
     /// Monotonic local generation counter used for tracked connections.
     next_connection_generation: Arc<AtomicU64>,
     /// Local peer ID
@@ -1867,6 +1895,8 @@ impl NatTraversalEndpoint {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
+            reader_liveness_probe: ParkingRwLock::new(None),
+            orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
@@ -2377,6 +2407,8 @@ impl NatTraversalEndpoint {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
+            reader_liveness_probe: ParkingRwLock::new(None),
+            orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
@@ -7201,6 +7233,83 @@ impl NatTraversalEndpoint {
         true
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
+    /// #368 F6 test helper: true when no lifecycle entries remain for the
+    /// peer.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_empty_for_test(&self, peer_id: &PeerId) -> bool {
+        self.connection_lifecycle.read().get(peer_id).is_none()
+    }
+
+    #[cfg(all(test, feature = "network-discovery"))]
+    /// #368 F6 test helper: seed a tracked lifecycle entry directly.
+    #[cfg(test)]
+    pub(crate) fn seed_lifecycle_entry_for_test(&self, peer_id: PeerId, entry: TrackedConnection) {
+        self.connection_lifecycle
+            .write()
+            .insert(peer_id, vec![entry]);
+    }
+
+    /// #368: install the p2p-layer reader-liveness probe (the p2p endpoint
+    /// owns `reader_handles`). Must be called once at construction, before
+    /// any connection churn.
+    pub(crate) fn set_reader_liveness_probe(
+        &self,
+        probe: Arc<dyn Fn(&PeerId, u64) -> bool + Send + Sync>,
+    ) {
+        *self.reader_liveness_probe.write() = Some(probe);
+    }
+
+    /// #368: grace before reader-absence is treated as orphaning — covers
+    /// the register → spawn-reader → insert-handle window.
+    const ORPHAN_SPAWN_GRACE_MS: u64 = 10_000;
+
+    /// #368: true when the probe says a live reader exists for this
+    /// generation (no probe installed ⇒ assume alive — inner-only tests).
+    fn generation_has_live_reader(&self, peer_id: &PeerId, generation: u64) -> bool {
+        self.reader_liveness_probe
+            .read()
+            .as_ref()
+            .is_none_or(|probe| probe(peer_id, generation))
+    }
+
+    /// #368 orphan sweep: `(peer, stable_id)` for every tracked connection
+    /// that is open (alive, `close_reason` none, Live or Superseded),
+    /// established at least `min_age_ms` ago, and has NO live reader for its
+    /// generation. Each of these pins every inbound datagram (recv
+    /// Assembler never drained) up to the receive window — the #368 leak.
+    pub(crate) fn orphaned_open_generations(&self, min_age_ms: u64) -> Vec<(PeerId, usize)> {
+        let now_ms = now_unix_ms();
+        let lifecycle = self.connection_lifecycle.read();
+        let mut orphans = Vec::new();
+        for (peer_id, entries) in lifecycle.iter() {
+            for entry in entries {
+                let open = matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Live | ConnectionLifecycleState::Superseded { .. }
+                ) && entry.connection.is_alive()
+                    && entry.connection.close_reason().is_none();
+                if !open {
+                    continue;
+                }
+                if now_ms.saturating_sub(entry.established_at_unix_ms) < min_age_ms {
+                    continue;
+                }
+                if !self.generation_has_live_reader(peer_id, entry.generation) {
+                    orphans.push((*peer_id, entry.stable_id()));
+                }
+            }
+        }
+        orphans
+    }
+
+    /// #368: orphan connections closed (repromotion refusal + janitor).
+    #[doc(hidden)]
+    pub fn orphan_connections_closed(&self) -> u64 {
+        self.orphan_connections_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Restore the best usable survivor when the winner is unavailable.
     ///
     /// Superseded readers intentionally remain open for a short drain window.
@@ -7219,46 +7328,99 @@ impl NatTraversalEndpoint {
             entries.retain(|entry| entry.stable_id() != exiting_stable_id);
         }
 
-        let replacement_index = entries
-            .iter()
-            .position(|entry| {
-                matches!(entry.state, ConnectionLifecycleState::Live)
-                    && entry.connection.is_alive()
-                    && entry.connection.close_reason().is_none()
-            })
-            .or_else(|| {
-                entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| {
-                        matches!(entry.state, ConnectionLifecycleState::Superseded { .. })
-                            && entry.connection.is_alive()
-                            && entry.connection.close_reason().is_none()
-                    })
-                    .max_by(|(_, left), (_, right)| {
-                        Self::canonical_sort_key_cmp(
-                            Self::canonical_sort_key(
-                                left.connection_family_id,
-                                left.connection_id,
-                                left.generation,
-                                left.established_at_unix_ms,
-                                left.stable_id(),
-                            ),
-                            Self::canonical_sort_key(
-                                right.connection_family_id,
-                                right.connection_id,
-                                right.generation,
-                                right.established_at_unix_ms,
-                                right.stable_id(),
-                            ),
-                        )
-                    })
-                    .map(|(index, _)| index)
-            });
+        // #368: an open connection with NO reader never drains its recv
+        // Assembler, pinning every inbound datagram up to the receive
+        // window. A Superseded survivor whose 5 s reader cancel already
+        // fired is exactly that. Readerless candidates are closed
+        // (`NoReader`) instead of promoted — but the close bookkeeping
+        // (`mark_connection_closed`) re-acquires this same write lock, so
+        // orphan closures are deferred until after the guard drops.
+        let mut orphan_closures: Vec<(u64, usize, InnerConnection)> = Vec::new();
+        let replacement_index = loop {
+            let candidate = entries
+                .iter()
+                .position(|entry| {
+                    matches!(entry.state, ConnectionLifecycleState::Live)
+                        && entry.connection.is_alive()
+                        && entry.connection.close_reason().is_none()
+                })
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| {
+                            matches!(entry.state, ConnectionLifecycleState::Superseded { .. })
+                                && entry.connection.is_alive()
+                                && entry.connection.close_reason().is_none()
+                        })
+                        .max_by(|(_, left), (_, right)| {
+                            Self::canonical_sort_key_cmp(
+                                Self::canonical_sort_key(
+                                    left.connection_family_id,
+                                    left.connection_id,
+                                    left.generation,
+                                    left.established_at_unix_ms,
+                                    left.stable_id(),
+                                ),
+                                Self::canonical_sort_key(
+                                    right.connection_family_id,
+                                    right.connection_id,
+                                    right.generation,
+                                    right.established_at_unix_ms,
+                                    right.stable_id(),
+                                ),
+                            )
+                        })
+                        .map(|(index, _)| index)
+                });
+
+            let Some(index) = candidate else {
+                break None;
+            };
+
+            let (generation, stable_id, connection) = {
+                let entry = &entries[index];
+                (
+                    entry.generation,
+                    entry.stable_id(),
+                    entry.connection.clone(),
+                )
+            };
+            // Reader-liveness is only authoritative past the spawn grace
+            // window: a freshly registered connection's reader task may not
+            // have inserted its handle yet, and that registration flow is
+            // legitimate (same threshold as the janitor).
+            let aged = now_unix_ms().saturating_sub(entries[index].established_at_unix_ms)
+                >= Self::ORPHAN_SPAWN_GRACE_MS;
+            if !aged || self.generation_has_live_reader(peer_id, generation) {
+                break Some(index);
+            }
+
+            // Readerless: defer the close, remove the entry, retry with the
+            // next-best candidate.
+            info!(
+                target: "ant_quic::p2p_endpoint::lifecycle",
+                peer_id = %Self::lifecycle_peer_prefix(peer_id),
+                generation,
+                stable_id,
+                reason = "NoReaderAtPromotion",
+                "#368: refusing to promote a readerless connection; closing as NoReader"
+            );
+            orphan_closures.push((generation, stable_id, connection));
+            entries.retain(|entry| entry.stable_id() != stable_id);
+        };
 
         let Some(replacement_index) = replacement_index else {
-            if entries.is_empty() {
-                lifecycle.remove(peer_id);
+            drop(lifecycle);
+            self.finalize_orphan_closures(peer_id, orphan_closures);
+            // Re-check emptiness under a fresh guard.
+            if self
+                .connection_lifecycle
+                .read()
+                .get(peer_id)
+                .is_some_and(Vec::is_empty)
+            {
+                self.connection_lifecycle.write().remove(peer_id);
             }
             return None;
         };
@@ -7281,7 +7443,32 @@ impl NatTraversalEndpoint {
         let connection = replacement.connection.clone();
         self.connections.insert(*peer_id, connection.clone());
         self.emitted_established_events.insert(*peer_id);
+        drop(lifecycle);
+        self.finalize_orphan_closures(peer_id, orphan_closures);
         Some(connection)
+    }
+
+    /// #368: close + bookkeep + count orphaned generations discovered during
+    /// repromotion. MUST be called without the lifecycle write lock held.
+    fn finalize_orphan_closures(
+        &self,
+        peer_id: &PeerId,
+        orphans: Vec<(u64, usize, InnerConnection)>,
+    ) {
+        let n = orphans.len();
+        for (_generation, stable_id, connection) in orphans {
+            if connection.close_reason().is_none()
+                && let Some(code) = ConnectionCloseReason::NoReader.app_error_code()
+            {
+                connection.close(code, ConnectionCloseReason::NoReader.reason_bytes());
+            }
+            let _ =
+                self.mark_connection_closed(peer_id, stable_id, ConnectionCloseReason::NoReader);
+        }
+        if n > 0 {
+            self.orphan_connections_closed
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Retire exactly the observed connection generation and restore any
@@ -7480,6 +7667,25 @@ impl NatTraversalEndpoint {
                 ReaderExitOutcome::PeerDisconnected { close_reason }
             }
             ConnectionLifecycleState::Closing { reason } => {
+                // #368 audit fix: the entry is Closing, but the connection
+                // handle itself may still be OPEN with no close reason —
+                // removing the lifecycle entry without closing it leaves a
+                // readerless open connection pinning inbound datagrams.
+                if let Some(connection) =
+                    self.connection_lifecycle
+                        .read()
+                        .get(peer_id)
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.stable_id() == snapshot.stable_id)
+                                .map(|entry| entry.connection.clone())
+                        })
+                    && connection.close_reason().is_none()
+                    && let Some(code) = reason.app_error_code()
+                {
+                    connection.close(code, reason.reason_bytes());
+                }
                 let mut lifecycle = self.connection_lifecycle.write();
                 if let Some(entries) = lifecycle.get_mut(peer_id) {
                     entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
@@ -7492,6 +7698,24 @@ impl NatTraversalEndpoint {
                 }
             }
             ConnectionLifecycleState::Closed { reason, .. } => {
+                // #368 audit fix: same as the Closing arm — a Closed
+                // lifecycle record can still hold an open connection handle
+                // (mark closed without a transport close); close it.
+                if let Some(connection) =
+                    self.connection_lifecycle
+                        .read()
+                        .get(peer_id)
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.stable_id() == snapshot.stable_id)
+                                .map(|entry| entry.connection.clone())
+                        })
+                    && connection.close_reason().is_none()
+                    && let Some(code) = reason.app_error_code()
+                {
+                    connection.close(code, reason.reason_bytes());
+                }
                 let mut lifecycle = self.connection_lifecycle.write();
                 if let Some(entries) = lifecycle.get_mut(peer_id) {
                     entries.retain(|entry| entry.stable_id() != snapshot.stable_id);
@@ -13223,6 +13447,188 @@ mod tests {
                 state,
             }],
         );
+    }
+
+    /// #368 audit: every `handle_reader_exit` arm must leave the exiting
+    /// generation closed or closing — no arm may return while the
+    /// connection is still open with `close_reason() == None` (that is the
+    /// orphan that pins inbound datagrams). Exercised per lifecycle state.
+    #[tokio::test]
+    async fn reader_exit_in_every_lifecycle_state_leaves_connection_closed() {
+        for state in [
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 9,
+            },
+            ConnectionLifecycleState::Live,
+            ConnectionLifecycleState::Closing {
+                reason: ConnectionCloseReason::LifecycleCleanup,
+            },
+            ConnectionLifecycleState::Closed {
+                reason: ConnectionCloseReason::PeerShutdown,
+                closed_at_unix_ms: 0,
+            },
+        ] {
+            let (_server, client, conn) = loopback_quic_connection().await;
+            let peer_id = PeerId([0xAB; 32]);
+            seed_lifecycle_entry(&client, peer_id, 3, conn.clone(), state);
+            let _ = client.handle_reader_exit(&peer_id, 3, conn.stable_id());
+            let open = conn.is_alive() && conn.close_reason().is_none();
+            assert!(
+                !open,
+                "reader exit in state {:?} must not leave an open connection",
+                state.name()
+            );
+            // And no lifecycle entry lingers for the exited generation.
+            assert!(
+                client.connection_lifecycle.read().get(&peer_id).is_none(),
+                "reader exit in state {:?} must remove the entry",
+                state.name()
+            );
+        }
+    }
+
+    /// #368: a readerless survivor must NOT be promoted — that would create
+    /// a Live, open, readerless connection pinning every inbound datagram.
+    /// With a probe installed that reports no reader for the survivor's
+    /// generation, repromotion closes it (NoReader), counts the orphan, and
+    /// reports no replacement.
+    #[tokio::test]
+    async fn repromotion_of_readerless_survivor_closes_it_as_no_reader() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xBB; 32]);
+        // The exiting winner (generation 1) is already gone; the Superseded
+        // survivor (generation 2) has no reader — the probe says so.
+        client.set_reader_liveness_probe(Arc::new(|_peer, _generation| false));
+        seed_lifecycle_entry(
+            &client,
+            peer_id,
+            2,
+            conn.clone(),
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 1,
+            },
+        );
+
+        assert!(conn.close_reason().is_none(), "precondition: survivor open");
+        let replacement = client.repromote_surviving_connection(&peer_id, None);
+        assert!(
+            replacement.is_none(),
+            "a readerless survivor must not be promoted"
+        );
+        assert!(
+            conn.close_reason().is_some(),
+            "the readerless survivor must be closed (NoReader)"
+        );
+        assert_eq!(client.orphan_connections_closed(), 1);
+        assert!(
+            client.connection_lifecycle.read().get(&peer_id).is_none(),
+            "the orphan's lifecycle entry is removed"
+        );
+    }
+
+    /// #368 control: with a live reader the survivor IS promoted — the
+    /// invariant must not break the legitimate recovery path.
+    #[tokio::test]
+    async fn repromotion_of_read_alive_survivor_still_promotes() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xBC; 32]);
+        client.set_reader_liveness_probe(Arc::new(|_peer, _generation| true));
+        seed_lifecycle_entry(
+            &client,
+            peer_id,
+            2,
+            conn.clone(),
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 1,
+            },
+        );
+
+        let replacement = client.repromote_surviving_connection(&peer_id, None);
+        assert!(
+            replacement.is_some(),
+            "survivor with a live reader promotes"
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "the promoted survivor stays open"
+        );
+        assert_eq!(client.orphan_connections_closed(), 0);
+    }
+
+    /// #368: no probe installed (inner-only usage) keeps the old
+    /// behaviour — promote — so the p2p layer controls the invariant.
+    #[tokio::test]
+    async fn repromotion_without_probe_promotes_as_before() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xBD; 32]);
+        seed_lifecycle_entry(
+            &client,
+            peer_id,
+            2,
+            conn.clone(),
+            ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 1,
+            },
+        );
+        let replacement = client.repromote_surviving_connection(&peer_id, None);
+        assert!(replacement.is_some());
+    }
+
+    /// #368: the orphan sweep reports open, aged, readerless generations
+    /// (and only those).
+    #[tokio::test]
+    async fn orphaned_open_generations_reports_only_aged_readerless_opens() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_server, client, _conn) = loopback_quic_connection().await;
+
+        // Probe answers per-generation: gen 1 readerless, gen 2 alive.
+        let verdicts: Arc<std::collections::HashMap<u64, bool>> =
+            Arc::new(std::collections::HashMap::from([
+                (1u64, false),
+                (2u64, true),
+            ]));
+        let v = Arc::clone(&verdicts);
+        client.set_reader_liveness_probe(Arc::new(move |_peer, generation| {
+            v.get(&generation).copied().unwrap_or(false)
+        }));
+
+        // Seed via a real second loopback connection for the entry handle.
+        let (_s2, _c2, conn2) = loopback_quic_connection().await;
+        let peer = PeerId([0xBE; 32]);
+        {
+            let mut lifecycle = client.connection_lifecycle.write();
+            lifecycle.insert(
+                peer,
+                vec![
+                    TrackedConnection {
+                        connection: conn2.clone(),
+                        generation: 1,
+                        established_at_unix_ms: 0, // ancient → aged
+                        connection_family_id: [0u8; 32],
+                        connection_id: [0u8; 32],
+                        state: ConnectionLifecycleState::Live,
+                    },
+                    TrackedConnection {
+                        connection: conn2.clone(),
+                        generation: 2,
+                        established_at_unix_ms: now_unix_ms(), // fresh → not aged
+                        connection_family_id: [0u8; 32],
+                        connection_id: [0u8; 32],
+                        state: ConnectionLifecycleState::Live,
+                    },
+                ],
+            );
+        }
+
+        let orphans = client.orphaned_open_generations(10_000);
+        assert_eq!(
+            orphans.len(),
+            1,
+            "only the aged readerless generation is an orphan: {orphans:?}"
+        );
+        assert_eq!(orphans[0].1, conn2.stable_id());
+        let _ = AtomicU64::new(0);
+        let _ = Ordering::Relaxed;
     }
 
     /// A still-`Superseded` generation is claimed atomically: the entry
