@@ -12,6 +12,8 @@ const CLOSE_CODE_PEER_SHUTDOWN: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x02;
 const CLOSE_CODE_BANNED: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x03;
 const CLOSE_CODE_LIFECYCLE_CLEANUP: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x04;
 const CLOSE_CODE_LIVENESS_TIMEOUT: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x05;
+/// #368: closed because the connection was open with no live reader (orphan).
+const CLOSE_CODE_NO_READER: u32 = ANT_QUIC_CLOSE_CODE_BASE + 0x06;
 
 /// ant-quic lifecycle-aware connection close reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +28,10 @@ pub enum ConnectionCloseReason {
     Banned,
     /// Generic lifecycle cleanup.
     LifecycleCleanup,
+    /// #368: the connection was open with no live reader — nothing would
+    /// ever drain its recv Assembler, pinning every inbound datagram up to
+    /// the receive window. Closed at repromotion or by the orphan janitor.
+    NoReader,
     /// X0X-0062: the local endpoint detected the application data path is
     /// dead (repeated `send_with_receive_ack` retries failed within a short
     /// window) while the underlying QUIC connection still reports as `Live`.
@@ -61,6 +67,7 @@ impl ConnectionCloseReason {
             Self::Banned => CLOSE_CODE_BANNED,
             Self::LifecycleCleanup => CLOSE_CODE_LIFECYCLE_CLEANUP,
             Self::LivenessTimeout => CLOSE_CODE_LIVENESS_TIMEOUT,
+            Self::NoReader => CLOSE_CODE_NO_READER,
             Self::ApplicationClosed
             | Self::ConnectionClosed
             | Self::TimedOut
@@ -83,6 +90,7 @@ impl ConnectionCloseReason {
             Self::Banned => "Banned",
             Self::LifecycleCleanup => "LifecycleCleanup",
             Self::LivenessTimeout => "LivenessTimeout",
+            Self::NoReader => "NoReader",
             Self::ApplicationClosed => "ApplicationClosed",
             Self::ConnectionClosed => "ConnectionClosed",
             Self::TimedOut => "TimedOut",

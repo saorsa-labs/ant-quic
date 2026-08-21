@@ -3303,6 +3303,10 @@ impl P2pEndpoint {
         endpoint.spawn_port_mapping_task();
         endpoint.spawn_mdns_task();
         endpoint.spawn_proactive_relay_manager();
+        // #368: give the inner endpoint a reader-liveness probe (we own
+        // reader_handles) and start the orphan-connection janitor.
+        endpoint.install_reader_liveness_probe();
+        endpoint.spawn_orphan_connection_janitor();
 
         Ok(endpoint)
     }
@@ -7854,6 +7858,66 @@ impl P2pEndpoint {
     #[doc(hidden)]
     pub async fn connected_peers_map_len(&self) -> usize {
         self.connected_peers.read().await.len()
+    }
+
+    /// #368: install the reader-liveness probe into the inner endpoint.
+    /// A generation has a live reader when `reader_handles` still holds an
+    /// entry for it whose cancel token has NOT fired — entries are removed
+    /// on task exit, so absence means no reader.
+    fn install_reader_liveness_probe(&self) {
+        let reader_handles = Arc::clone(&self.reader_handles);
+        self.inner
+            .set_reader_liveness_probe(Arc::new(move |peer_id, generation| {
+                // Best-effort synchronous check: a contended instant
+                // reports "alive" (false negatives are impossible; false
+                // positives self-correct within one janitor interval).
+                reader_handles.try_read().is_ok_and(|handles| {
+                    handles.get(peer_id).is_some_and(|entries| {
+                        entries.iter().any(|entry| entry.generation == generation)
+                    })
+                })
+            }));
+    }
+
+    /// #368 backstop janitor: every 5 s, close open tracked connections
+    /// (Live or Superseded, alive, no close reason) whose generation has had
+    /// no live reader for the whole 10 s grace — each pins every inbound
+    /// datagram (recv Assembler never drained) up to the receive window.
+    fn spawn_orphan_connection_janitor(&self) {
+        let inner = Arc::clone(&self.inner);
+        let shutdown = self.shutdown_token();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                let orphans = inner.orphaned_open_generations(10_000);
+                for (peer_id, stable_id) in orphans {
+                    info!(
+                        target: "ant_quic::p2p_endpoint::lifecycle",
+                        peer_id = %format!("{:02x}{:02x}", peer_id.0[0], peer_id.0[1]),
+                        stable_id,
+                        reason = "NoReader",
+                        "#368 orphan janitor: closing readerless open connection"
+                    );
+                    inner.remove_connection_generation_with_reason(
+                        &peer_id,
+                        stable_id,
+                        crate::connection_lifecycle::ConnectionCloseReason::NoReader,
+                    );
+                }
+            }
+        });
+    }
+
+    /// #368: orphan connections closed by repromotion refusal or the
+    /// janitor (proof counter for the churn experiment).
+    #[doc(hidden)]
+    pub fn orphan_connections_closed(&self) -> u64 {
+        self.inner.orphan_connections_closed()
     }
 
     /// #368 gate 5: (send_unacked, recv_buffered, recv_streams_with_unread,
