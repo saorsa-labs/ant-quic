@@ -144,6 +144,26 @@ pub struct StreamsState {
 }
 
 impl StreamsState {
+    /// #368 gate 5 instrumentation: (send_unacked, recv_buffered,
+    /// recv_streams_with_unread). `send_unacked` is the aggregate
+    /// `unacked_data` (absolute field); `recv_buffered` sums every open
+    /// receive stream's assembler backlog; streams counted only when they
+    /// actually hold unread bytes. Instrumentation only — no behaviour.
+    pub(crate) fn buffered_snapshot(&self) -> (u64, u64, usize) {
+        let mut recv_buffered: u64 = 0;
+        let mut streams_with_unread = 0usize;
+        for sr in self.recv.values().flatten() {
+            if let Some(r) = sr.as_open_recv() {
+                let b = r.buffered_bytes();
+                if b > 0 {
+                    recv_buffered += b as u64;
+                    streams_with_unread += 1;
+                }
+            }
+        }
+        (self.unacked_data, recv_buffered, streams_with_unread)
+    }
+
     pub fn new(
         side: Side,
         max_remote_uni: VarInt,

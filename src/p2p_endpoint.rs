@@ -7856,6 +7856,17 @@ impl P2pEndpoint {
         self.connected_peers.read().await.len()
     }
 
+    /// #368 gate 5: (send_unacked, recv_buffered, recv_streams_with_unread,
+    /// connections_counted) summed over every live proto connection including
+    /// draining ones — the buffered-bytes decision signal. Instrumentation
+    /// only.
+    #[doc(hidden)]
+    pub fn buffered_bytes_totals(&self) -> (u64, u64, usize, usize) {
+        self.inner
+            .get_endpoint()
+            .map_or((0, 0, 0, 0), |ep| ep.buffered_bytes_totals())
+    }
+
     /// Snapshot stage-by-stage ACK-v2 latency and outcome diagnostics.
     pub fn ack_diagnostics(&self) -> AckDiagnosticsSnapshot {
         self.ack_diagnostics.snapshot()
