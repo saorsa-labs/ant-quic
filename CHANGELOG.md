@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bounded concurrent per-stream reads — reader head-of-line blocking removed (#255 fix C).**
+  The per-connection reader accepted and read ONE uni stream at a time inline,
+  so a single stalled sender (no FIN, congested, or wedged) pinned the lane
+  while every other stream piled up in the assembler — the
+  `recv_streams_with_unread` growth to the advertised stream budget and the
+  ~30-min drain sawtooth (x0x#378). Uni streams (one gossip message each) are
+  now read in spawned tasks under a per-connection budget semaphore
+  (`READER_STREAM_BUDGET` = 64, acquired before spawn so accepted-but-unfinished
+  streams are capped), each with a per-stream read deadline
+  (`P2pConfig::stream_read_deadline`, default 60 s; expiry issues STOP_SENDING
+  via drop and counts in `P2pEndpoint::stream_read_deadlines_hit()`). Bidi
+  control streams (ACK-v2, probes, app-bi, relay) stay inline and serialised —
+  plus a new endpoint-wide ACK-handling lane, because the ACK request-dedupe is
+  a check-then-act that per-stream concurrency could race into double delivery.
+  Cross-stream ordering was never guaranteed (each stream is one self-contained
+  message); per-stream `data_tx` ordering is unchanged.
+
+## [Unreleased]
+
 ### Fixed
 
 - **Stream-scoped read errors no longer kill the connection reader (#255 fix A).** A peer

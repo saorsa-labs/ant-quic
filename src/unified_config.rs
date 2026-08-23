@@ -276,6 +276,15 @@ pub struct P2pConfig {
     /// high message throughput should increase this to avoid stream exhaustion.
     /// Default: 100.
     pub max_concurrent_uni_streams: u32,
+
+    /// #255 fix C: per-stream read deadline for the per-connection reader's
+    /// spawned stream tasks. A stream whose sender stalls mid-message (never
+    /// sends FIN — congested, wedged, or malicious) is stopped after this
+    /// deadline instead of pinning one of the bounded concurrent-read permits
+    /// forever. Default: 60 s. Dropping the stream also issues QUIC
+    /// STOP_SENDING, so a genuinely wedged sender observes the stop rather
+    /// than retransmitting into a dead lane.
+    pub stream_read_deadline: Duration,
 }
 // v0.13.0: enable_coordinator removed - all nodes are coordinators
 
@@ -462,6 +471,7 @@ impl Default for P2pConfig {
             data_channel_capacity: Self::DEFAULT_DATA_CHANNEL_CAPACITY,
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stream_read_deadline: Duration::from_secs(60),
         }
     }
 }
@@ -557,6 +567,7 @@ pub struct P2pConfigBuilder {
     data_channel_capacity: Option<usize>,
     max_message_size: Option<usize>,
     max_concurrent_uni_streams: Option<u32>,
+    stream_read_deadline: Option<Duration>,
 }
 
 /// Error type for configuration validation
@@ -1025,6 +1036,13 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// #255 fix C: per-stream read deadline for spawned reader tasks
+    /// (default 60 s). See the field docs on [`P2pConfig`].
+    pub fn stream_read_deadline(mut self, deadline: Duration) -> Self {
+        self.stream_read_deadline = Some(deadline);
+        self
+    }
+
     /// Set the maximum application-layer message size in bytes.
     ///
     /// This is a read-side guard only — it caps the bytes `read_to_end()` will
@@ -1073,6 +1091,9 @@ impl P2pConfigBuilder {
             keypair: self.keypair,
             bootstrap_cache: self.bootstrap_cache.unwrap_or_default(),
             transport_registry: self.transport_registry.unwrap_or_default(),
+            stream_read_deadline: self
+                .stream_read_deadline
+                .unwrap_or_else(|| Duration::from_secs(60)),
             data_channel_capacity: self
                 .data_channel_capacity
                 .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY),

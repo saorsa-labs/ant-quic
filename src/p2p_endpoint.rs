@@ -213,6 +213,12 @@ const APP_BIDI_CHANNEL_CAPACITY: usize = 256;
 /// half-opened stream so the opener observes backpressure. Generous enough to
 /// absorb slow or congested links. Shortened under `cfg(test)` so the guard is
 /// exercisable without slowing the suite.
+/// #255 fix C: per-connection budget of concurrently-read streams. Bounds
+/// spawned reader tasks (and therefore accepted-but-unfinished streams) per
+/// connection; a stalled stream pins at most one permit for at most
+/// `P2pConfig::stream_read_deadline`.
+const READER_STREAM_BUDGET: usize = 64;
+
 const BIDI_PREFIX_READ_TIMEOUT: Duration = if cfg!(test) {
     // Under test (and CI) the runtime can be starved by many concurrent test
     // processes, so allow more grace than the unit value would suggest while
@@ -838,6 +844,12 @@ pub struct P2pEndpoint {
     /// stream instead of tearing the connection down. Each event here used to
     /// cost a full generation replacement (reader exit → close → reconnect).
     stream_read_errors_survived: Arc<std::sync::atomic::AtomicU64>,
+    /// #255 fix C: streams abandoned at the per-stream read deadline
+    /// (`P2pConfig::stream_read_deadline`, default 60 s) — the sender never
+    /// delivered FIN, the stream was stopped, and its budget permit returned
+    /// to the connection's read budget. Non-zero means wedged or congested
+    /// senders are being shed instead of pinning read lanes.
+    stream_read_deadlines_hit: Arc<std::sync::atomic::AtomicU64>,
 
     /// Sender side of the channel that hands inbound **application**
     /// bidirectional stream handles from each reader task to
@@ -900,6 +912,13 @@ pub struct P2pEndpoint {
 
     /// Receiver-side ACK-v2 request-id dedupe cache.
     ack_request_dedupe: Arc<AckRequestDedupeCache>,
+    /// #255 fix C: endpoint-wide ACK-bidi handling serialization. The ACK
+    /// request-dedupe is a check-then-act across two lock acquisitions; with
+    /// per-stream concurrency, duplicates that land on different readers
+    /// (cross-generation, constrained bridge) would race into double
+    /// delivery. Ack control volume is tiny, so one process-wide lane costs
+    /// nothing measurable and keeps the dedupe sound.
+    ack_bidi_serialization: Arc<tokio::sync::Mutex<()>>,
 
     /// Probe single-flight/cache state keyed by peer.
     probe_flights: Arc<TokioMutex<HashMap<ProbeFlightKey, ProbeFlightState>>>,
@@ -3248,6 +3267,7 @@ impl P2pEndpoint {
             data_tx_capacity,
             data_tx_diagnostics,
             stream_read_errors_survived: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stream_read_deadlines_hit: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             app_bi_tx,
             app_bi_rx: Arc::new(tokio::sync::Mutex::new(app_bi_rx)),
             reader_exit_tx,
@@ -3259,6 +3279,7 @@ impl P2pEndpoint {
             ack_diagnostics,
             ack_liveness,
             ack_request_dedupe,
+            ack_bidi_serialization: Arc::new(tokio::sync::Mutex::new(())),
             probe_flights,
             active_probe_requests_sent,
             probe_semaphore,
@@ -6125,7 +6146,154 @@ impl P2pEndpoint {
         }
     }
 
+    /// #255 fix C: bidi control streams (ACK-v2, probes, app-bi, relay) are
+    /// handled INLINE by the accept loop, serialised per connection -- the
+    /// ACK request-dedupe is a check-then-act across two lock acquisitions,
+    /// so concurrent handling would race duplicates into double delivery.
+    /// Returns `false` when the reader must exit (channel-closed while
+    /// handling).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_bidi_stream_inline(
+        ack_bidi_serialization: &Arc<tokio::sync::Mutex<()>>,
+        inner: &NatTraversalEndpoint,
+        ack_diagnostics: &AckDiagnostics,
+        ack_request_dedupe: &Arc<AckRequestDedupeCache>,
+        connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
+        peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
+        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx_diagnostics: &DataChannelDiagnostics,
+        data_tx_capacity: usize,
+        event_tx: &broadcast::Sender<P2pEvent>,
+        ack_response_drop_injection: &Arc<AtomicUsize>,
+        app_bi_tx: &mpsc::Sender<(
+            PeerId,
+            crate::high_level::SendStream,
+            crate::high_level::RecvStream,
+        )>,
+        connection: &crate::high_level::Connection,
+        peer_id: PeerId,
+        conn_stable_id: usize,
+        mut send: crate::high_level::SendStream,
+        mut recv: crate::high_level::RecvStream,
+        max_read_bytes: usize,
+    ) -> bool {
+        let _ = (&mut send, &mut recv);
+        let accepted_at = Instant::now();
+        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
+        match timeout(BIDI_PREFIX_READ_TIMEOUT, recv.read_exact(&mut prefix)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!(
+                    "Reader task for peer {:?} (conn stable_id={}): bidi prefix read error: {}",
+                    peer_id, conn_stable_id, e
+                );
+                return true;
+            }
+            Err(_) => {
+                // DoS guard (BIDI_PREFIX_READ_TIMEOUT): the peer
+                // opened a bidirectional stream but never sent
+                // the 8-byte prefix. Reset it so the opener
+                // observes backpressure and move on — without
+                // this the reader task would block forever,
+                // freezing this connection's recv / ACK-v2 /
+                // shutdown handling.
+                let _ = send.reset(crate::VarInt::from_u32(0));
+                debug!(
+                    "Reader task for peer {:?} (conn stable_id={}): \
+                             bidi prefix read timed out after {:?}; resetting stream",
+                    peer_id, conn_stable_id, BIDI_PREFIX_READ_TIMEOUT
+                );
+                return true;
+            }
+        }
+
+        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
+            // #255 fix C: serialize ACK handling endpoint-wide so the
+            // replay/remember dedupe cannot race across readers.
+            let _ack_lane = ack_bidi_serialization.lock().await;
+            if !Self::handle_ack_bidi_stream(
+                ack_diagnostics,
+                ack_request_dedupe,
+                &connected_peers,
+                &peer_activity,
+                &data_tx,
+                data_tx_diagnostics,
+                data_tx_capacity,
+                &event_tx,
+                peer_id,
+                conn_stable_id,
+                send,
+                recv,
+                prefix,
+                accepted_at,
+                max_read_bytes,
+                &ack_response_drop_injection,
+            )
+            .await
+            {
+                debug!(
+                    "Reader task for peer {:?}: channel closed, exiting",
+                    peer_id
+                );
+                return false;
+            }
+            return true;
+        }
+
+        // Application bidirectional byte-stream (`Node::open_bi`
+        // / `accept_bi`). Checked BEFORE the relay handler: the
+        // relay handler reads the prefix's first 4 bytes as a
+        // big-endian length and consumes the stream whenever a
+        // relay server is present, so an app magic must be
+        // recognized here first. The 8-byte magic has already
+        // been drained into `prefix`, so the forwarded
+        // `RecvStream` starts cleanly at application byte 0.
+        if prefix.as_slice() == &APP_BIDI_STREAM_MAGIC[..] {
+            match app_bi_tx.try_send((peer_id, send, recv)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Endpoint is shutting down; stop draining.
+                    return false;
+                }
+                Err(mpsc::error::TrySendError::Full((_, mut surplus_send, _))) => {
+                    // Defensive ceiling: the app consumer is
+                    // not calling `accept_bi` fast enough. Reset
+                    // the surplus inbound stream so the opener
+                    // observes backpressure and may retry,
+                    // rather than blocking this reader task and
+                    // stalling ACK-v2 / relay / `recv()` traffic
+                    // on the same connection. In practice the
+                    // queue depth is bounded by the peer's
+                    // `max_concurrent_bidi_streams`, so this path
+                    // is not hit in steady state.
+                    let _ = surplus_send.reset(crate::VarInt::from_u32(0));
+                    debug!(
+                        peer_id = ?peer_id,
+                        conn_stable_id,
+                        "application bi-stream channel full; \
+                         resetting inbound app stream"
+                    );
+                }
+            }
+            return true;
+        }
+
+        if inner
+            .handle_relay_bidi_stream_from_app_reader(connection.clone(), send, recv, prefix)
+            .await
+        {
+            return true;
+        }
+
+        debug!(
+            "Reader task for peer {:?} (conn stable_id={}): unknown bidi stream prefix",
+            peer_id, conn_stable_id
+        );
+
+        true
+    }
+
     async fn handle_ack_bidi_stream(
         ack_diagnostics: &AckDiagnostics,
         ack_request_dedupe: &AckRequestDedupeCache,
@@ -8011,6 +8179,15 @@ impl P2pEndpoint {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #255 fix C: streams abandoned at the per-stream read deadline (sender
+    /// never sent FIN). Each increment is one shed wedge + one returned
+    /// budget permit. Surface via `/diagnostics/transport`-style snapshots
+    /// (`stream_read_deadlines_hit`).
+    pub fn stream_read_deadlines_hit(&self) -> u64 {
+        self.stream_read_deadlines_hit
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #368: orphan connections closed by repromotion refusal or the
     /// janitor (proof counter for the churn experiment).
     #[doc(hidden)]
@@ -9024,12 +9201,22 @@ impl P2pEndpoint {
         let data_tx = self.data_tx.clone();
         let data_tx_diagnostics = Arc::clone(&self.data_tx_diagnostics);
         let stream_read_errors_survived = Arc::clone(&self.stream_read_errors_survived);
+        let stream_read_deadlines_hit = Arc::clone(&self.stream_read_deadlines_hit);
+        // #255 fix C: the per-connection stream budget. Acquired BEFORE
+        // accept, so accepted-but-unfinished streams (spawned read tasks) are
+        // capped at READER_STREAM_BUDGET even under a flood — the unread
+        // pileup the accept side can hold is bounded by this semaphore, and
+        // beyond it the remote's advertised stream credit is the only other
+        // reservoir (see max_concurrent_uni_streams).
+        let stream_budget = Arc::new(tokio::sync::Semaphore::new(READER_STREAM_BUDGET));
+        let stream_read_deadline = self.config.stream_read_deadline;
         let data_tx_capacity = self.data_tx_capacity;
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
         let ack_waiters = Arc::clone(&self.ack_waiters);
         let ack_diagnostics = Arc::clone(&self.ack_diagnostics);
         let ack_request_dedupe = Arc::clone(&self.ack_request_dedupe);
+        let ack_bidi_serialization = Arc::clone(&self.ack_bidi_serialization);
         let event_tx = self.event_tx.clone();
         let inner = Arc::clone(&self.inner);
         let reader_exit_tx = self.reader_exit_tx.clone();
@@ -9072,9 +9259,10 @@ impl P2pEndpoint {
 
         let join_handle = tokio::spawn(async move {
             loop {
-                // Cancel only between streams. If the token fires while we're
-                // mid-`read_to_end()`, the read completes first (Quinn already
-                // holds the ACKed bytes) and the NEXT iteration exits here.
+                // Cancel only between streams. If the token fires while a
+                // spawned stream task is mid-`read_to_end()`, that task keeps
+                // the #166 uncancellable-drain property and finishes; the
+                // ACCEPT loop exits here.
                 let incoming = tokio::select! {
                     biased;
                     _ = reader_cancel.cancelled() => {
@@ -9106,290 +9294,296 @@ impl P2pEndpoint {
                     }
                 };
 
-                let mut recv_stream = match incoming {
-                    IncomingStream::AckBidi { mut send, mut recv } => {
-                        let accepted_at = Instant::now();
-                        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
-                        match timeout(BIDI_PREFIX_READ_TIMEOUT, recv.read_exact(&mut prefix)).await
+                // #255 fix C: split by stream direction.
+                //
+                // BIDI (ACK-v2 control, probes, app-bi, relay) stays INLINE
+                // and serialised per connection: its request-dedupe
+                // (AckRequestDedupeCache replay/remember) is a check-then-
+                // act over two lock acquisitions, which concurrent handling
+                // would race into double deliveries. Control volume is tiny;
+                // the head-of-line pathology being fixed is the UNI flood.
+                //
+                // UNI (one stream per gossip message) is the throughput lane:
+                // read in a spawned task under the per-connection budget
+                // below, so ONE stalled sender can no longer block every
+                // other stream — the mechanism behind `recv_streams_with_unread`
+                // pileups to the advertised stream budget (x0x#378).
+                //
+                // Ordering note (deliberate, documented): cross-stream
+                // ordering was NEVER guaranteed — each uni stream carries one
+                // self-contained message. What changes is which stream gets
+                // read first, which QUIC never ordered anyway.
+                let recv_stream = match incoming {
+                    IncomingStream::AckBidi { send, recv } => {
+                        if !Self::handle_bidi_stream_inline(
+                            &ack_bidi_serialization,
+                            &inner,
+                            &ack_diagnostics,
+                            &ack_request_dedupe,
+                            &connected_peers,
+                            &peer_activity,
+                            &data_tx,
+                            &data_tx_diagnostics,
+                            data_tx_capacity,
+                            &event_tx,
+                            &ack_response_drop_injection,
+                            &app_bi_tx,
+                            &connection,
+                            peer_id,
+                            conn_stable_id,
+                            send,
+                            recv,
+                            max_read_bytes,
+                        )
+                        .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                debug!(
-                                    "Reader task for peer {:?} (conn stable_id={}): bidi prefix read error: {}",
-                                    peer_id, conn_stable_id, e
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                // DoS guard (BIDI_PREFIX_READ_TIMEOUT): the peer
-                                // opened a bidirectional stream but never sent
-                                // the 8-byte prefix. Reset it so the opener
-                                // observes backpressure and move on — without
-                                // this the reader task would block forever,
-                                // freezing this connection's recv / ACK-v2 /
-                                // shutdown handling.
-                                let _ = send.reset(crate::VarInt::from_u32(0));
-                                debug!(
-                                    "Reader task for peer {:?} (conn stable_id={}): \
-                                     bidi prefix read timed out after {:?}; resetting stream",
-                                    peer_id, conn_stable_id, BIDI_PREFIX_READ_TIMEOUT
-                                );
-                                continue;
-                            }
+                            break;
                         }
-
-                        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
-                            if !Self::handle_ack_bidi_stream(
-                                ack_diagnostics.as_ref(),
-                                ack_request_dedupe.as_ref(),
-                                &connected_peers,
-                                &peer_activity,
-                                &data_tx,
-                                data_tx_diagnostics.as_ref(),
-                                data_tx_capacity,
-                                &event_tx,
-                                peer_id,
-                                conn_stable_id,
-                                send,
-                                recv,
-                                prefix,
-                                accepted_at,
-                                max_read_bytes,
-                                &ack_response_drop_injection,
-                            )
-                            .await
-                            {
-                                debug!(
-                                    "Reader task for peer {:?}: channel closed, exiting",
-                                    peer_id
-                                );
-                                break;
-                            }
-                            continue;
-                        }
-
-                        // Application bidirectional byte-stream (`Node::open_bi`
-                        // / `accept_bi`). Checked BEFORE the relay handler: the
-                        // relay handler reads the prefix's first 4 bytes as a
-                        // big-endian length and consumes the stream whenever a
-                        // relay server is present, so an app magic must be
-                        // recognized here first. The 8-byte magic has already
-                        // been drained into `prefix`, so the forwarded
-                        // `RecvStream` starts cleanly at application byte 0.
-                        if prefix.as_slice() == &APP_BIDI_STREAM_MAGIC[..] {
-                            match app_bi_tx.try_send((peer_id, send, recv)) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    // Endpoint is shutting down; stop draining.
-                                    break;
-                                }
-                                Err(mpsc::error::TrySendError::Full((_, mut surplus_send, _))) => {
-                                    // Defensive ceiling: the app consumer is
-                                    // not calling `accept_bi` fast enough. Reset
-                                    // the surplus inbound stream so the opener
-                                    // observes backpressure and may retry,
-                                    // rather than blocking this reader task and
-                                    // stalling ACK-v2 / relay / `recv()` traffic
-                                    // on the same connection. In practice the
-                                    // queue depth is bounded by the peer's
-                                    // `max_concurrent_bidi_streams`, so this path
-                                    // is not hit in steady state.
-                                    let _ = surplus_send.reset(crate::VarInt::from_u32(0));
-                                    debug!(
-                                        peer_id = ?peer_id,
-                                        conn_stable_id,
-                                        "application bi-stream channel full; \
-                                         resetting inbound app stream"
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-
-                        if inner
-                            .handle_relay_bidi_stream_from_app_reader(
-                                connection.clone(),
-                                send,
-                                recv,
-                                prefix,
-                            )
-                            .await
-                        {
-                            continue;
-                        }
-
-                        debug!(
-                            "Reader task for peer {:?} (conn stable_id={}): unknown bidi stream prefix",
-                            peer_id, conn_stable_id
-                        );
                         continue;
                     }
                     IncomingStream::Uni(stream) => stream,
                 };
 
-                // Uncancellable: drain the already-ACKed bytes. Cancelling here
-                // would silently lose data the sender has already seen as ACKed
-                // (the root cause of issue #166).
-                let data = match recv_stream.read_to_end(max_read_bytes).await {
-                    Ok(data) if data.is_empty() => continue,
-                    Ok(data) => data,
-                    Err(e) => {
-                        // #255 fix A: classify before acting. A stream-scoped
-                        // error — the peer reset this one stream mid-message
-                        // (the fork's Drop⇒RESET abandonment class: a sender
-                        // whose write timed out drops `write_all` mid-flight,
-                        // `0xA17C0244`), an oversized stream, or missing
-                        // ranges after a cancelled read — describes ONE bad
-                        // stream, not the connection. Breaking here used to
-                        // tear down the entire healthy connection (reader
-                        // exit → generation replacement), which is the
-                        // `reader_exited` ≈1,600/h / `generations_replaced`
-                        // ≈800/h churn measured in x0x#380. Only
-                        // connection-scoped loss may end the reader.
-                        if read_to_end_error_is_connection_scoped(&e) {
-                            debug!(
-                                "Reader task for peer {:?} (conn stable_id={}): \
-                                 connection-scoped read_to_end error, ending reader: {}",
-                                peer_id, conn_stable_id, e
-                            );
-                            break;
-                        }
-                        stream_read_errors_survived
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Acquire a budget permit BEFORE spawning the read: the
+                // semaphore bounds accepted-but-unfinished uni streams, so
+                // the unread pileup behind the reader is capped at
+                // READER_STREAM_BUDGET even under a flood. Beyond it the
+                // accept loop itself parks (backpressure to the peer's
+                // advertised stream credit).
+                let _budget_permit = tokio::select! {
+                    biased;
+                    _ = reader_cancel.cancelled() => {
                         debug!(
-                            peer_id = ?peer_id,
-                            conn_stable_id,
-                            "Reader task skipped stream-scoped read error (connection kept): {}",
-                            e
+                            "Reader task for peer {:?} (conn stable_id={}) exiting on graceful cancel",
+                            peer_id, conn_stable_id
                         );
-                        continue;
+                        break;
+                    }
+                    permit = stream_budget.clone().acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        // The budget Arc outlives this loop; closure is
+                        // impossible while we still hold it. Treat the
+                        // impossible as reader exit rather than panicking.
+                        Err(_) => break,
                     }
                 };
-
-                let data_len = data.len();
-                tracing::trace!(
-                    "Reader task: {} bytes from peer {:?} (conn stable_id={})",
-                    data_len,
-                    peer_id,
-                    conn_stable_id
-                );
-
-                match inner
-                    .handle_coordinator_control_message(peer_id, connection.clone(), &data)
-                    .await
                 {
-                    Ok(true) => {
-                        tracing::trace!(
-                            "Reader task: handled coordinator control payload from peer {:?}",
-                            peer_id
-                        );
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            "Reader task for peer {:?}: failed to handle coordinator control payload: {}",
-                            peer_id,
-                            e
-                        );
-                        continue;
-                    }
-                }
+                    let inner = Arc::clone(&inner);
+                    let data_tx = data_tx.clone();
+                    let data_tx_diagnostics = Arc::clone(&data_tx_diagnostics);
+                    let connected_peers = Arc::clone(&connected_peers);
+                    let peer_activity = Arc::clone(&peer_activity);
+                    let ack_waiters = Arc::clone(&ack_waiters);
+                    let event_tx = event_tx.clone();
+                    let connection = connection.clone();
+                    let stream_read_errors_survived = Arc::clone(&stream_read_errors_survived);
+                    let deadlines_hit = Arc::clone(&stream_read_deadlines_hit);
+                    let task_cancel = reader_cancel.clone();
+                    let recv_stream = recv_stream;
+                    let _budget_permit = _budget_permit;
+                    let peer_id = peer_id;
+                    let conn_stable_id = conn_stable_id;
+                    let max_read_bytes = max_read_bytes;
+                    let stream_read_deadline = stream_read_deadline;
+                    tokio::spawn(async move {
+                        // #255 fix C: the deadline bounds the WHOLE
+                        // per-stream pipeline — the sender-side read (a
+                        // stream whose sender stalls mid-message never sends
+                        // FIN) AND the downstream `data_tx.send().await`
+                        // wait. On expiry the stream is abandoned: dropping
+                        // the RecvStream issues STOP_SENDING so a wedged
+                        // sender observes the stop, an already-read payload
+                        // awaiting a full bounded channel is shed (counted —
+                        // visible overload, not a silent pin), and the permit
+                        // returns to the connection budget. Bounded lanes,
+                        // bounded residency.
+                        if tokio::time::timeout(
+                            stream_read_deadline,
+                            async {
+            let mut recv_stream = recv_stream;
 
-                if let Some((tag, outcome)) = decode_ack_control(&data) {
-                    let waiter_result = match outcome {
-                        AckControlOutcome::Accepted => AckWaiterResult::Accepted,
-                        AckControlOutcome::Rejected(reason) => AckWaiterResult::Rejected(reason),
-                        AckControlOutcome::Closed(reason) => AckWaiterResult::Closed(reason),
-                    };
-                    let resolved = resolve_ack_waiter(
-                        ack_waiters.as_ref(),
-                        conn_stable_id,
-                        tag,
-                        waiter_result,
-                    );
-                    if !resolved {
+
+            // Uncancellable: drain the already-ACKed bytes. Cancelling here
+            // would silently lose data the sender has already seen as ACKed
+            // (the root cause of issue #166).
+            let data = match recv_stream.read_to_end(max_read_bytes).await {
+                Ok(data) if data.is_empty() => return,
+                Ok(data) => data,
+                Err(e) => {
+                    // #255 fix A: classify before acting. A stream-scoped
+                    // error — the peer reset this one stream mid-message
+                    // (the fork's Drop⇒RESET abandonment class: a sender
+                    // whose write timed out drops `write_all` mid-flight,
+                    // `0xA17C0244`), an oversized stream, or missing
+                    // ranges after a cancelled read — describes ONE bad
+                    // stream, not the connection. Breaking here used to
+                    // tear down the entire healthy connection (reader
+                    // exit → generation replacement), which is the
+                    // `reader_exited` ≈1,600/h / `generations_replaced`
+                    // ≈800/h churn measured in x0x#380. Only
+                    // connection-scoped loss may end the reader.
+                    if read_to_end_error_is_connection_scoped(&e) {
                         debug!(
-                            peer_id = ?peer_id,
-                            conn_stable_id,
-                            "received ACK control frame with no matching waiter"
+                            "Reader task for peer {:?} (conn stable_id={}): \
+                             connection-scoped read_to_end error, ending reader: {}",
+                            peer_id, conn_stable_id, e
                         );
+                        task_cancel.cancel();
+                        return;
                     }
-                    continue;
-                }
-
-                // Probe-liveness request: reply with an Accepted ACK control frame
-                // and do NOT forward to data_tx / DataReceived. Probes are invisible
-                // to the application.
-                if let Some(tag) = decode_probe_request(&data) {
-                    note_peer_activity(
-                        &connected_peers,
-                        &peer_activity,
-                        peer_id,
-                        PeerActivityKind::Received,
-                        Instant::now(),
-                    )
-                    .await;
-                    Self::send_ack_control_frame(
-                        connection.clone(),
-                        peer_id,
+                    stream_read_errors_survived
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!(
+                        peer_id = ?peer_id,
                         conn_stable_id,
-                        tag,
-                        AckControlOutcome::Accepted,
-                    )
-                    .await;
-                    continue;
+                        "Reader task skipped stream-scoped read error (connection kept): {}",
+                        e
+                    );
+                    return;
                 }
+            };
 
-                // Defensive reallocation: ensure the delivered bytes are in a
-                // fully independent allocation that cannot alias any internal
-                // QUIC reassembly buffer. Under concurrent multi-stream load,
-                // the Vec<u8> from read_to_end is assembled from Bytes slices
-                // that reference decrypted packet allocations. These allocations
-                // can be recycled by the QUIC stack before the consumer copies
-                // the data, causing aliasing corruption at the recv boundary.
-                // See: FINDING-recv-boundary-aliasing.md
-                let payload = data.clone();
-                let payload_len = payload.len();
+            let data_len = data.len();
+            tracing::trace!(
+                "Reader task: {} bytes from peer {:?} (conn stable_id={})",
+                data_len,
+                peer_id,
+                conn_stable_id
+            );
 
-                let now = Instant::now();
+            match inner
+                .handle_coordinator_control_message(peer_id, connection.clone(), &data)
+                .await
+            {
+                Ok(true) => {
+                    tracing::trace!(
+                        "Reader task: handled coordinator control payload from peer {:?}",
+                        peer_id
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Reader task for peer {:?}: failed to handle coordinator control payload: {}",
+                        peer_id,
+                        e
+                    );
+                    return;
+                }
+            }
+
+            if let Some((tag, outcome)) = decode_ack_control(&data) {
+                let waiter_result = match outcome {
+                    AckControlOutcome::Accepted => AckWaiterResult::Accepted,
+                    AckControlOutcome::Rejected(reason) => AckWaiterResult::Rejected(reason),
+                    AckControlOutcome::Closed(reason) => AckWaiterResult::Closed(reason),
+                };
+                let resolved = resolve_ack_waiter(
+                    ack_waiters.as_ref(),
+                    conn_stable_id,
+                    tag,
+                    waiter_result,
+                );
+                if !resolved {
+                    debug!(
+                        peer_id = ?peer_id,
+                        conn_stable_id,
+                        "received ACK control frame with no matching waiter"
+                    );
+                }
+                return;
+            }
+
+            // Probe-liveness request: reply with an Accepted ACK control frame
+            // and do NOT forward to data_tx / DataReceived. Probes are invisible
+            // to the application.
+            if let Some(tag) = decode_probe_request(&data) {
                 note_peer_activity(
                     &connected_peers,
                     &peer_activity,
                     peer_id,
                     PeerActivityKind::Received,
-                    now,
+                    Instant::now(),
                 )
                 .await;
-
-                // Fire-and-forget sends keep the existing backpressure policy:
-                // wait for capacity rather than dropping silently. We sample
-                // pre-send pressure so saturation events surface as observable
-                // counters even when the eventual `send().await` succeeds
-                // after a brief block (X0X-0039).
-                data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
-                if data_tx.send((peer_id, payload)).await.is_err() {
-                    debug!(
-                        "Reader task for peer {:?}: channel closed, exiting",
-                        peer_id
-                    );
-                    break;
-                }
-
-                // Emit DataReceived event — HIGH priority: upper layer missed inbound data
-                if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                Self::send_ack_control_frame(
+                    connection.clone(),
                     peer_id,
-                    bytes: payload_len,
-                }) {
-                    tracing::warn!(
-                        target: "ant_quic::silent_drop",
-                        kind = "event_tx_data_received_reader",
-                        peer_id = ?peer_id,
-                        bytes = payload_len,
-                        error = %e,
-                        "HIGH: silent drop"
-                    );
-                }
+                    conn_stable_id,
+                    tag,
+                    AckControlOutcome::Accepted,
+                )
+                .await;
+                return;
+            }
+
+            // Defensive reallocation: ensure the delivered bytes are in a
+            // fully independent allocation that cannot alias any internal
+            // QUIC reassembly buffer. Under concurrent multi-stream load,
+            // the Vec<u8> from read_to_end is assembled from Bytes slices
+            // that reference decrypted packet allocations. These allocations
+            // can be recycled by the QUIC stack before the consumer copies
+            // the data, causing aliasing corruption at the recv boundary.
+            // See: FINDING-recv-boundary-aliasing.md
+            let payload = data.clone();
+            let payload_len = payload.len();
+
+            let now = Instant::now();
+            note_peer_activity(
+                &connected_peers,
+                &peer_activity,
+                peer_id,
+                PeerActivityKind::Received,
+                now,
+            )
+            .await;
+
+            // Fire-and-forget sends keep the existing backpressure policy:
+            // wait for capacity rather than dropping silently. We sample
+            // pre-send pressure so saturation events surface as observable
+            // counters even when the eventual `send().await` succeeds
+            // after a brief block (X0X-0039).
+            data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
+            if data_tx.send((peer_id, payload)).await.is_err() {
+                debug!(
+                    "Reader task for peer {:?}: channel closed, exiting",
+                    peer_id
+                );
+                task_cancel.cancel();
+                return;
+            }
+
+            // Emit DataReceived event — HIGH priority: upper layer missed inbound data
+            if let Err(e) = event_tx.send(P2pEvent::DataReceived {
+                peer_id,
+                bytes: payload_len,
+            }) {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "event_tx_data_received_reader",
+                    peer_id = ?peer_id,
+                    bytes = payload_len,
+                    error = %e,
+                    "HIGH: silent drop"
+                );
+            }
+
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            deadlines_hit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!(
+                                peer_id = ?peer_id,
+                                conn_stable_id,
+                                deadline_ms = stream_read_deadline.as_millis() as u64,
+                                "per-stream read deadline hit — stream abandoned (STOP_SENDING via drop)"
+                            );
+                        }
+                    });
+                };
             }
 
             let _ = reader_exit_tx.send(ReaderExitEvent {
@@ -10055,6 +10249,7 @@ impl Clone for P2pEndpoint {
             data_tx_capacity: self.data_tx_capacity,
             data_tx_diagnostics: Arc::clone(&self.data_tx_diagnostics),
             stream_read_errors_survived: Arc::clone(&self.stream_read_errors_survived),
+            stream_read_deadlines_hit: Arc::clone(&self.stream_read_deadlines_hit),
             app_bi_tx: self.app_bi_tx.clone(),
             app_bi_rx: Arc::clone(&self.app_bi_rx),
             reader_exit_tx: self.reader_exit_tx.clone(),
@@ -10066,6 +10261,7 @@ impl Clone for P2pEndpoint {
             ack_diagnostics: Arc::clone(&self.ack_diagnostics),
             ack_liveness: Arc::clone(&self.ack_liveness),
             ack_request_dedupe: Arc::clone(&self.ack_request_dedupe),
+            ack_bidi_serialization: Arc::clone(&self.ack_bidi_serialization),
             probe_flights: Arc::clone(&self.probe_flights),
             active_probe_requests_sent: Arc::clone(&self.active_probe_requests_sent),
             probe_semaphore: Arc::clone(&self.probe_semaphore),
@@ -13153,14 +13349,12 @@ mod tests {
                     0,
                 ))
                 .port_mapping_enabled(false)
-                .known_peer(localhost_addr(
-                    endpoint_a.local_addr().expect("endpoint_a addr"),
-                ))
                 .build()
                 .expect("config should build"),
         )
         .await
         .expect("endpoint_b should bind");
+        let a_addr = localhost_addr(endpoint_a.local_addr().expect("endpoint_a addr"));
 
         let a_id = endpoint_a.peer_id();
         // Inbound connections only progress (reader spawn, stream accept)
@@ -13175,11 +13369,11 @@ mod tests {
             })
         };
         let connected =
-            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_known_peers())
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_addr(a_addr))
                 .await
                 .expect("connect should not time out")
                 .expect("connect should succeed");
-        assert_eq!(connected, 1, "b should connect to a");
+        assert_eq!(connected.peer_id, a_id);
         assert!(
             await_connected(&endpoint_a, &endpoint_b.peer_id()).await,
             "a must admit the inbound connection"
@@ -13283,6 +13477,175 @@ mod tests {
         endpoint_b.shutdown().await;
     }
 
+    /// #255 fix C: a burst of 500 uni streams with ONE stalled stream must
+    /// not head-of-line block the rest. Before fix C the per-connection
+    /// reader read ONE stream at a time inline, so a stream whose sender
+    /// never sent FIN pinned the lane and the other 499 piled up in the
+    /// assembler (the `recv_streams_with_unread` sawtooth, x0x#378). Now the
+    /// accept loop spawns bounded per-stream read tasks, so the healthy 499
+    /// are delivered while the stalled one is abandoned at its deadline
+    /// (config-shortened here) and counted.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn burst_of_uni_streams_with_one_stalled_stream_is_not_head_of_line_blocked() {
+        // Shorten the per-stream deadline so the test observes the abandon
+        // path without waiting the production 60 s.
+        let stream_read_deadline = Duration::from_millis(750);
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .stream_read_deadline(stream_read_deadline)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+        let a_addr = localhost_addr(endpoint_a.local_addr().expect("endpoint_a addr"));
+
+        let a_id = endpoint_a.peer_id();
+        let accept_pump = {
+            let endpoint_a = endpoint_a.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_a.accept().await {} })
+        };
+        let connected =
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_addr(a_addr))
+                .await
+                .expect("connect should not time out")
+                .expect("connect should succeed");
+        assert_eq!(connected.peer_id, a_id);
+        assert!(
+            await_connected(&endpoint_a, &endpoint_b.peer_id()).await,
+            "a must admit the inbound connection"
+        );
+
+        let conn_b_to_a = endpoint_b
+            .inner
+            .get_connection(&a_id)
+            .ok()
+            .flatten()
+            .expect("b holds a connection to a");
+
+        // Stream 0: STALLED — written but never finished, and the sender
+        // stays alive holding the stream open. Before fix C this pinned the
+        // single reader lane forever.
+        let mut stalled = conn_b_to_a.open_uni().await.expect("open stalled stream");
+        stalled
+            .write_all(b"stalled-never-finished")
+            .await
+            .expect("write stalled prefix");
+        // Keep the SendStream alive (no drop ⇒ no reset): hold it in scope
+        // for the whole test so the receiver genuinely observes a stall
+        // rather than a reset.
+
+        // Streams 1..=500: complete messages. These must be delivered even
+        // though stream 0 never finishes.
+        const BURST: usize = 500;
+        let burst_spawn = tokio::time::Instant::now();
+        for i in 0..BURST {
+            let mut s = conn_b_to_a.open_uni().await.expect("open burst stream");
+            s.write_all(format!("burst-{i:04}").as_bytes())
+                .await
+                .expect("write burst");
+            s.finish().expect("finish burst");
+        }
+        let burst_spawn_elapsed = burst_spawn.elapsed();
+
+        // Drain: all BURST messages must arrive even while stream 0 is
+        // stalled. Generous wall-clock budget, but each individual recv
+        // bounded so a regression to head-of-line blocking cannot pass by
+        // waiting out the test.
+        let mut got = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while got < BURST && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), endpoint_a.recv()).await {
+                Ok(Ok((_peer, data))) => {
+                    let text = String::from_utf8_lossy(&data).into_owned();
+                    assert!(
+                        text.starts_with("burst-"),
+                        "unexpected payload while draining burst: {text:?}"
+                    );
+                    got += 1;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert_eq!(
+            got, BURST,
+            "all {BURST} healthy streams must be delivered around the stalled one"
+        );
+        let drain_elapsed = burst_spawn.elapsed();
+        // Sanity: the drain completes in seconds, not the stalled stream's
+        // lifetime — the essence of de-head-of-line-blocking.
+        assert!(
+            drain_elapsed < Duration::from_secs(25),
+            "burst drain took {drain_elapsed:?} (spawn phase {burst_spawn_elapsed:?}) — reader is still head-of-line blocked"
+        );
+
+        // The stalled stream is abandoned at its (shortened) deadline and
+        // counted; its budget permit returns, so the connection keeps
+        // working — prove it with one more stream.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while endpoint_a.stream_read_deadlines_hit() < 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            endpoint_a.stream_read_deadlines_hit(),
+            1,
+            "the stalled stream must be abandoned at the deadline and counted"
+        );
+
+        drop(stalled);
+        {
+            let mut s = conn_b_to_a
+                .open_uni()
+                .await
+                .expect("open post-stall stream");
+            s.write_all(b"after-stall").await.expect("write post-stall");
+            s.finish().expect("finish post-stall");
+        }
+        let mut got_post = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), endpoint_a.recv()).await {
+                Ok(Ok((_peer, data))) => {
+                    assert_eq!(data, b"after-stall".to_vec());
+                    got_post = true;
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(
+            got_post,
+            "the connection must keep delivering after a stalled stream was shed"
+        );
+        assert!(
+            endpoint_a.is_connected(&endpoint_b.peer_id()).await,
+            "connection stays Live throughout"
+        );
+
+        accept_pump.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
+    }
+
     /// #255 fix A complement: connection-scoped loss must still end the
     /// reader (and trigger the normal disconnect path) — the classification
     /// must not swallow real connection death.
@@ -13309,14 +13672,12 @@ mod tests {
                     0,
                 ))
                 .port_mapping_enabled(false)
-                .known_peer(localhost_addr(
-                    endpoint_a.local_addr().expect("endpoint_a addr"),
-                ))
                 .build()
                 .expect("config should build"),
         )
         .await
         .expect("endpoint_b should bind");
+        let a_addr = localhost_addr(endpoint_a.local_addr().expect("endpoint_a addr"));
 
         let a_id = endpoint_a.peer_id();
         let b_id = endpoint_b.peer_id();
@@ -13325,11 +13686,11 @@ mod tests {
             tokio::spawn(async move { while let Some(_conn) = endpoint_a.accept().await {} })
         };
         let connected =
-            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_known_peers())
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_addr(a_addr))
                 .await
                 .expect("connect should not time out")
                 .expect("connect should succeed");
-        assert_eq!(connected, 1);
+        assert_eq!(connected.peer_id, a_id);
         assert!(
             await_connected(&endpoint_a, &b_id).await,
             "a must admit the inbound connection"
