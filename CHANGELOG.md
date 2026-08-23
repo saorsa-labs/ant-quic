@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.45] - 2026-08-23
+
 ### Fixed
 
 - **Stream-scoped read errors no longer kill the connection reader (#255 fix A).** A peer
