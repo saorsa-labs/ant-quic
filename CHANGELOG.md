@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stream-scoped read errors no longer kill the connection reader (#255 fix A).** A peer
+  resetting one stream mid-message (the fork's Drop⇒RESET abandonment class, `0xA17C0244` —
+  e.g. a gossip sender whose 2.5 s write timeout drops `write_all` mid-flight) used to
+  `break` the per-connection reader loop, tearing down the entire healthy connection:
+  reader exit → generation replacement → reconnect. That feedback loop is the
+  `reader_exited` ≈1,600/h / `generations_replaced` ≈800/h churn measured on prod
+  (x0x#380). The reader now classifies `read_to_end` errors: only
+  `ReadError::ConnectionLost` ends the reader; stream-scoped errors (`Reset`, `TooLong`,
+  `MissingData`, `ClosedStream`, `IllegalOrderedRead`, `ZeroRttRejected`) skip the stream
+  and keep the connection. New proof counter `P2pEndpoint::stream_read_errors_survived()`
+  (each increment = one avoided connection teardown; wire it into x0x
+  `/diagnostics/transport`).
+
+## [Unreleased]
+
 ## [0.27.40] - 2026-08-18
 
 ### Fixed

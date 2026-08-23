@@ -176,7 +176,7 @@ fn bench_rate_limit_cleanup(c: &mut Criterion) {
                         let cutoff = now - Duration::from_secs(60);
 
                         // Cleanup old entries (current inefficient approach)
-                        for (_, timestamps) in rate_limits.iter_mut() {
+                        for timestamps in rate_limits.values_mut() {
                             while let Some(&front) = timestamps.front() {
                                 if front < cutoff {
                                     timestamps.pop_front();
