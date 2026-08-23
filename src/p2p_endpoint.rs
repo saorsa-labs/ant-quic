@@ -832,6 +832,12 @@ pub struct P2pEndpoint {
 
     /// Saturation diagnostics for `data_tx` (X0X-0039).
     data_tx_diagnostics: Arc<DataChannelDiagnostics>,
+    /// #255 fix A: stream-scoped `read_to_end` errors (peer reset a stream
+    /// mid-message — the fork's Drop⇒RESET abandonment class — oversized, or
+    /// missing-data) that the per-connection reader survived by skipping the
+    /// stream instead of tearing the connection down. Each event here used to
+    /// cost a full generation replacement (reader exit → close → reconnect).
+    stream_read_errors_survived: Arc<std::sync::atomic::AtomicU64>,
 
     /// Sender side of the channel that hands inbound **application**
     /// bidirectional stream handles from each reader task to
@@ -2195,6 +2201,23 @@ fn endpoint_error_from_write_error(error: crate::high_level::WriteError) -> Endp
     }
 }
 
+/// Whether a `read_to_end` error describes the whole connection (reader must
+/// end) or just one stream (reader must skip the stream and keep the
+/// connection, #255 fix A).
+///
+/// Connection-scoped: only [`ReadError::ConnectionLost`] — the QUIC
+/// connection itself failed, so no further accept/read can succeed.
+/// Everything else (`Reset`, `TooLong`, `MissingData`, `ClosedStream`,
+/// `IllegalOrderedRead`, `ZeroRttRejected`) is stream-local by QUIC
+/// definition: streams multiplex independently and one failed stream says
+/// nothing about the others.
+fn read_to_end_error_is_connection_scoped(error: &crate::high_level::ReadToEndError) -> bool {
+    matches!(
+        error,
+        crate::high_level::ReadToEndError::Read(crate::high_level::ReadError::ConnectionLost(_))
+    )
+}
+
 fn endpoint_error_from_read_error(error: crate::high_level::ReadError) -> EndpointError {
     match error {
         crate::high_level::ReadError::ConnectionLost(error) => {
@@ -3224,6 +3247,7 @@ impl P2pEndpoint {
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             data_tx_capacity,
             data_tx_diagnostics,
+            stream_read_errors_survived: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             app_bi_tx,
             app_bi_rx: Arc::new(tokio::sync::Mutex::new(app_bi_rx)),
             reader_exit_tx,
@@ -7977,6 +8001,16 @@ impl P2pEndpoint {
         });
     }
 
+    /// #255 fix A: stream-scoped `read_to_end` errors the per-connection
+    /// readers survived by skipping the stream (peer-reset mid-message,
+    /// oversized, missing-data). Each increment is one avoided connection
+    /// teardown + generation replacement. Surface via
+    /// `/diagnostics/transport`-style snapshots (`stream_read_errors_survived`).
+    pub fn stream_read_errors_survived(&self) -> u64 {
+        self.stream_read_errors_survived
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #368: orphan connections closed by repromotion refusal or the
     /// janitor (proof counter for the churn experiment).
     #[doc(hidden)]
@@ -8989,6 +9023,7 @@ impl P2pEndpoint {
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let data_tx_diagnostics = Arc::clone(&self.data_tx_diagnostics);
+        let stream_read_errors_survived = Arc::clone(&self.stream_read_errors_survived);
         let data_tx_capacity = self.data_tx_capacity;
         let connected_peers = Arc::clone(&self.connected_peers);
         let peer_activity = Arc::clone(&self.peer_activity);
@@ -9199,11 +9234,35 @@ impl P2pEndpoint {
                     Ok(data) if data.is_empty() => continue,
                     Ok(data) => data,
                     Err(e) => {
+                        // #255 fix A: classify before acting. A stream-scoped
+                        // error — the peer reset this one stream mid-message
+                        // (the fork's Drop⇒RESET abandonment class: a sender
+                        // whose write timed out drops `write_all` mid-flight,
+                        // `0xA17C0244`), an oversized stream, or missing
+                        // ranges after a cancelled read — describes ONE bad
+                        // stream, not the connection. Breaking here used to
+                        // tear down the entire healthy connection (reader
+                        // exit → generation replacement), which is the
+                        // `reader_exited` ≈1,600/h / `generations_replaced`
+                        // ≈800/h churn measured in x0x#380. Only
+                        // connection-scoped loss may end the reader.
+                        if read_to_end_error_is_connection_scoped(&e) {
+                            debug!(
+                                "Reader task for peer {:?} (conn stable_id={}): \
+                                 connection-scoped read_to_end error, ending reader: {}",
+                                peer_id, conn_stable_id, e
+                            );
+                            break;
+                        }
+                        stream_read_errors_survived
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         debug!(
-                            "Reader task for peer {:?} (conn stable_id={}): read_to_end error: {}",
-                            peer_id, conn_stable_id, e
+                            peer_id = ?peer_id,
+                            conn_stable_id,
+                            "Reader task skipped stream-scoped read error (connection kept): {}",
+                            e
                         );
-                        break;
+                        continue;
                     }
                 };
 
@@ -9995,6 +10054,7 @@ impl Clone for P2pEndpoint {
             data_rx: Arc::clone(&self.data_rx),
             data_tx_capacity: self.data_tx_capacity,
             data_tx_diagnostics: Arc::clone(&self.data_tx_diagnostics),
+            stream_read_errors_survived: Arc::clone(&self.stream_read_errors_survived),
             app_bi_tx: self.app_bi_tx.clone(),
             app_bi_rx: Arc::clone(&self.app_bi_rx),
             reader_exit_tx: self.reader_exit_tx.clone(),
@@ -13047,6 +13107,250 @@ mod tests {
         endpoint_a.shutdown().await;
         node_b.shutdown().await;
         let _ = accept_handle.await;
+    }
+
+    /// Poll until `endpoint` reports `peer` connected (inbound admission on
+    /// the accepting side is asynchronous w.r.t. the dialer's connect call).
+    async fn await_connected(endpoint: &P2pEndpoint, peer: &PeerId) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if endpoint.is_connected(peer).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// #255 fix A: a sender whose `write_all` is dropped mid-flight resets
+    /// the stream (fork Drop⇒RESET, `0xA17C0244`). The receiver's reader used
+    /// to `break` on the resulting stream-scoped read error — tearing down
+    /// the whole healthy connection (reader exit → generation replacement,
+    /// the `reader_exited`/`generations_replaced` churn in x0x#380). It must
+    /// instead skip the reset stream, deliver its neighbours, keep the
+    /// connection Live, and count the survival.
+    #[tokio::test]
+    async fn reader_survives_peer_reset_stream_and_keeps_connection() {
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .known_peer(localhost_addr(
+                    endpoint_a.local_addr().expect("endpoint_a addr"),
+                ))
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+
+        let a_id = endpoint_a.peer_id();
+        // Inbound connections only progress (reader spawn, stream accept)
+        // while someone calls accept() — same as production callers.
+        let accept_pump = {
+            let endpoint_a = endpoint_a.clone();
+            tokio::spawn(async move {
+                while let Some(_conn) = endpoint_a.accept().await {
+                    // Connection admission is enough; the per-connection
+                    // reader task is spawned by the endpoint.
+                }
+            })
+        };
+        let connected =
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_known_peers())
+                .await
+                .expect("connect should not time out")
+                .expect("connect should succeed");
+        assert_eq!(connected, 1, "b should connect to a");
+        assert!(
+            await_connected(&endpoint_a, &endpoint_b.peer_id()).await,
+            "a must admit the inbound connection"
+        );
+
+        // B opens THREE uni streams on the live connection: 1 and 3 complete
+        // normally; 2 is dropped mid-write so Drop⇒RESET resets it.
+        let conn_b_to_a = endpoint_b
+            .inner
+            .get_connection(&a_id)
+            .ok()
+            .flatten()
+            .expect("b holds a connection to a");
+
+        // Stream 1: complete message.
+        {
+            let mut s = conn_b_to_a.open_uni().await.expect("open stream 1");
+            s.write_all(b"stream-one-payload").await.expect("write 1");
+            s.finish().expect("finish 1");
+        }
+        // Stream 2: partial write, then abandon (drop without finish) —
+        // SendStream::Drop resets it mid-stream.
+        {
+            let mut s = conn_b_to_a.open_uni().await.expect("open stream 2");
+            // Larger than the peer will read? No: just write and abandon.
+            s.write_all(b"stream-two-abandoned").await.expect("write 2");
+            // `s` drops here unfinished ⇒ RESET (0xA17C0244).
+        }
+        // Stream 3: complete message.
+        {
+            let mut s = conn_b_to_a.open_uni().await.expect("open stream 3");
+            s.write_all(b"stream-three-payload").await.expect("write 3");
+            s.finish().expect("finish 3");
+        }
+
+        // A delivers streams 1 and 3; stream 2's reset is skipped, counted,
+        // and the connection stays Live.
+        let mut delivered = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while delivered.len() < 2 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), endpoint_a.recv()).await {
+                Ok(Ok((_peer, data))) => delivered.push(data),
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            vec![
+                b"stream-one-payload".to_vec(),
+                b"stream-three-payload".to_vec()
+            ],
+            "streams 1 and 3 must be delivered around the reset stream"
+        );
+
+        // The reset was counted as survived.
+        let survived = endpoint_a.stream_read_errors_survived();
+        assert!(
+            survived >= 1,
+            "the reset stream must be counted as survived, got {survived}"
+        );
+
+        // The connection is still alive on BOTH sides.
+        assert!(
+            endpoint_a.is_connected(&endpoint_b.peer_id()).await,
+            "connection must survive a stream-scoped reset"
+        );
+        assert!(
+            endpoint_b.is_connected(&a_id).await,
+            "sender side must also see the connection alive"
+        );
+
+        // A late stream on the SAME connection still flows — the reader kept
+        // accepting instead of exiting.
+        {
+            let mut s = conn_b_to_a.open_uni().await.expect("open late stream");
+            s.write_all(b"late-stream-after-reset")
+                .await
+                .expect("write late");
+            s.finish().expect("finish late");
+        }
+        let mut got_late = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), endpoint_a.recv()).await {
+                Ok(Ok((_peer, data))) => {
+                    assert_eq!(data, b"late-stream-after-reset".to_vec());
+                    got_late = true;
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(
+            got_late,
+            "the reader must still accept new streams after a survived reset"
+        );
+
+        accept_pump.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
+    }
+
+    /// #255 fix A complement: connection-scoped loss must still end the
+    /// reader (and trigger the normal disconnect path) — the classification
+    /// must not swallow real connection death.
+    #[tokio::test]
+    async fn reader_still_exits_on_connection_scoped_loss() {
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .known_peer(localhost_addr(
+                    endpoint_a.local_addr().expect("endpoint_a addr"),
+                ))
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+
+        let a_id = endpoint_a.peer_id();
+        let b_id = endpoint_b.peer_id();
+        let accept_pump = {
+            let endpoint_a = endpoint_a.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_a.accept().await {} })
+        };
+        let connected =
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_known_peers())
+                .await
+                .expect("connect should not time out")
+                .expect("connect should succeed");
+        assert_eq!(connected, 1);
+        assert!(
+            await_connected(&endpoint_a, &b_id).await,
+            "a must admit the inbound connection"
+        );
+
+        // B tears the connection down. A's reader must observe the
+        // connection-scoped loss, exit, and clear the peer.
+        endpoint_b
+            .disconnect(&a_id)
+            .await
+            .expect("b disconnects from a");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while endpoint_a.is_connected(&b_id).await && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !endpoint_a.is_connected(&b_id).await,
+            "connection-scoped loss must still tear down the peer connection"
+        );
+
+        accept_pump.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
     }
 
     #[tokio::test]
