@@ -13111,6 +13111,7 @@ mod tests {
 
     /// Poll until `endpoint` reports `peer` connected (inbound admission on
     /// the accepting side is asynchronous w.r.t. the dialer's connect call).
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     async fn await_connected(endpoint: &P2pEndpoint, peer: &PeerId) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
@@ -13129,6 +13130,7 @@ mod tests {
     /// the `reader_exited`/`generations_replaced` churn in x0x#380). It must
     /// instead skip the reset stream, deliver its neighbours, keep the
     /// connection Live, and count the survival.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn reader_survives_peer_reset_stream_and_keeps_connection() {
         let endpoint_a = P2pEndpoint::new(
@@ -13284,6 +13286,7 @@ mod tests {
     /// #255 fix A complement: connection-scoped loss must still end the
     /// reader (and trigger the normal disconnect path) — the classification
     /// must not swallow real connection death.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn reader_still_exits_on_connection_scoped_loss() {
         let endpoint_a = P2pEndpoint::new(
