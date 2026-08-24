@@ -1782,6 +1782,11 @@ pub struct EndpointStats {
 
     /// Direct connections (no coordinator or relay needed)
     pub direct_connections: u64,
+    /// #262: connections established via coordinated hole punching
+    /// (cumulative). Together with `direct_connections` /
+    /// `relayed_connections` this is the per-method success split of the
+    /// traversal ladder.
+    pub holepunched_connections: u64,
 
     /// Currently active direct inbound connections from peers.
     pub active_direct_incoming_connections: u64,
@@ -1825,6 +1830,7 @@ impl Default for EndpointStats {
             last_direct_local_at: None,
             last_direct_global_at: None,
             relayed_connections: 0,
+            holepunched_connections: 0,
             total_bootstrap_nodes: 0,
             connected_bootstrap_nodes: 0,
             start_time: Instant::now(),
@@ -2559,11 +2565,20 @@ async fn record_connection_established(
             match peer_conn.traversal_method {
                 TraversalMethod::Direct => {
                     s.direct_connections += 1;
+                    // #262: plain direct dials are NOT traversal successes.
+                    // The aggregate counter now counts only traversal-class
+                    // establishments (hole punch / relay), so
+                    // `nat_traversal_successes <= nat_traversal_attempts`
+                    // per class on a healthy node.
                 }
                 TraversalMethod::Relay => {
                     s.relayed_connections += 1;
+                    s.nat_traversal_successes += 1;
                 }
-                TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+                TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {
+                    s.holepunched_connections += 1;
+                    s.nat_traversal_successes += 1;
+                }
             }
         }
 
@@ -2858,12 +2873,23 @@ async fn bridge_nat_traversal_event(
         NatTraversalEvent::CoordinationRequested { .. } => {
             stats.write().await.nat_traversal_attempts += 1;
         }
+        // #262: a punch session is also an attempt when it starts locally
+        // (the HolePunchingStarted event fires once per punching round on
+        // the initiating side and when the passive side adopts a
+        // PUNCH_ME_NOW), so attempts no longer undercount sessions that
+        // never reach a coordinator request.
+        NatTraversalEvent::HolePunchingStarted { .. } => {
+            stats.write().await.nat_traversal_attempts += 1;
+        }
         NatTraversalEvent::ConnectionEstablished {
             peer_id,
             remote_address,
             ..
         } => {
-            stats.write().await.nat_traversal_successes += 1;
+            // #262: the aggregate success counter is now incremented at the
+            // connection-store site where TraversalMethod is known, so
+            // plain direct dials stop inflating traversal successes; this
+            // arm keeps the path-status publication only.
             publish_direct_path_status(
                 direct_path_statuses,
                 event_tx,
@@ -5172,6 +5198,13 @@ impl P2pEndpoint {
                     let target = target_ipv4
                         .or(target_ipv6)
                         .ok_or(EndpointError::NoAddress)?;
+
+                    // #262: a punch session is starting — make sure the
+                    // local half of the candidate table is populated from
+                    // everything the endpoint knows (reflexive + UPnP
+                    // addresses), or no pair can ever succeed regardless of
+                    // coordination quality.
+                    let _ = self.inner.seed_traversal_candidates();
 
                     info!(
                         "Trying hole-punch to {} via {} (round {})",
@@ -11349,7 +11382,11 @@ mod tests {
         .await;
 
         let stats = stats.read().await;
-        assert_eq!(stats.nat_traversal_successes, 1);
+        // #262: the event alone no longer increments traversal successes —
+        // counting happens where TraversalMethod is known (connection
+        // store), so a bare ConnectionEstablished (e.g. a plain direct
+        // dial's event) must leave the traversal counter untouched.
+        assert_eq!(stats.nat_traversal_successes, 0);
         assert_eq!(stats.active_connections, 0);
         assert_eq!(stats.successful_connections, 0);
         drop(stats);
@@ -13176,6 +13213,104 @@ mod tests {
         );
 
         endpoint.shutdown().await;
+    }
+
+    /// #262: plain direct dials must leave the traversal counters
+    /// untouched. `nat_traversal_attempts` counts coordination/punch
+    /// session starts; `nat_traversal_successes` counts traversal-class
+    /// establishments only. A plain connect that never touches the strategy
+    /// ladder must move neither.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn plain_direct_dial_leaves_traversal_counters_untouched() {
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+        let a_addr = localhost_addr(endpoint_a.local_addr().expect("endpoint_a addr"));
+
+        let accept_pump = {
+            let endpoint_a = endpoint_a.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_a.accept().await {} })
+        };
+        let connected =
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_addr(a_addr))
+                .await
+                .expect("connect should not time out")
+                .expect("connect should succeed");
+        assert_eq!(connected.peer_id, endpoint_a.peer_id());
+        assert!(
+            await_connected(&endpoint_a, &endpoint_b.peer_id()).await,
+            "a must admit the inbound connection"
+        );
+
+        let stats = endpoint_a.stats().await;
+        assert_eq!(
+            stats.nat_traversal_attempts, 0,
+            "plain direct dial: no coordination/punch session started"
+        );
+        assert_eq!(
+            stats.nat_traversal_successes, 0,
+            "plain direct dial: successes must not count (was the attempts<successes bug)"
+        );
+        assert_eq!(stats.holepunched_connections, 0);
+        assert!(
+            stats.direct_connections >= 1,
+            "sanity: the dial was counted as direct"
+        );
+
+        accept_pump.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
+    }
+
+    /// #262: a punch session start increments attempts exactly once per
+    /// HolePunchingStarted event (one round ⇒ one increment).
+    #[tokio::test]
+    async fn hole_punching_started_increments_attempts_once() {
+        let stats = Arc::new(RwLock::new(EndpointStats::default()));
+        let (event_tx, _event_rx) = broadcast::channel(64);
+        let direct_path_statuses = ParkingRwLock::new(HashMap::new());
+        let peer = crate::PeerId([9u8; 32]);
+
+        bridge_nat_traversal_event(
+            &stats,
+            &event_tx,
+            &direct_path_statuses,
+            NatTraversalEvent::HolePunchingStarted {
+                peer_id: peer,
+                targets: vec![SocketAddr::from(([198, 51, 100, 20], 5483))],
+            },
+        )
+        .await;
+
+        let snapshot = stats.read().await.clone();
+        assert_eq!(
+            snapshot.nat_traversal_attempts, 1,
+            "one punching round increments attempts exactly once"
+        );
+        assert_eq!(snapshot.nat_traversal_successes, 0);
     }
 
     #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]

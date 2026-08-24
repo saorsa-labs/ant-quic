@@ -3982,6 +3982,73 @@ mod tests {
     use super::*;
 
     // v0.13.0: Role parameter removed - all nodes are symmetric P2P nodes
+    /// #262: seeding local candidates (the endpoint-side fix) makes pairs
+    /// formable. Before the fix the local half was only populated as a
+    /// side effect of BROADCASTING an external address, so a node that had
+    /// not advertised anything entered hole punching with zero local
+    /// candidates — no pair could form and `migrate_to_nat_traversal_path`
+    /// could only ever fail with "No validated NAT traversal paths".
+    #[test]
+    fn seeded_local_candidates_form_pairs_with_remote_advertisement() {
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Endpoint-side seeding equivalent: reflexive address inserted as a
+        // local candidate (Observed source, as seed_local_traversal_candidates does).
+        state.add_local_candidate(
+            SocketAddr::from(([203, 0, 113, 7], 5483)),
+            CandidateSource::Observed { by_node: None },
+            now,
+        );
+        assert_eq!(state.local_candidates.len(), 1, "local side seeded");
+
+        // The peer advertises its own address (ADD_ADDRESS equivalent).
+        state
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                SocketAddr::from(([93, 184, 215, 123], 6000)),
+                VarInt::from_u32(100),
+                now,
+            )
+            .expect("remote candidate accepted");
+
+        assert!(
+            !state.candidate_pairs.is_empty(),
+            "a seeded local candidate + a remote advertisement must form a pair"
+        );
+    }
+
+    /// #262: the migration precondition is reachable after seeding — the
+    /// exact `get_best_succeeded_pairs()` non-empty check that used to be
+    /// dead because pairs never formed.
+    #[test]
+    fn seeded_and_succeeded_pair_satisfies_migration_precondition() {
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        state.add_local_candidate(
+            SocketAddr::from(([203, 0, 113, 7], 5483)),
+            CandidateSource::Observed { by_node: None },
+            now,
+        );
+        let remote_addr = SocketAddr::from(([93, 184, 215, 123], 6000));
+        state
+            .add_remote_candidate(VarInt::from_u32(1), remote_addr, VarInt::from_u32(100), now)
+            .expect("remote candidate accepted");
+
+        assert!(
+            state.mark_pair_succeeded(remote_addr),
+            "the formed pair must be markable succeeded"
+        );
+        let best = state.get_best_succeeded_pairs();
+        assert_eq!(
+            best.len(),
+            1,
+            "migration precondition: best pairs non-empty"
+        );
+        assert_eq!(best[0].remote_addr, remote_addr);
+    }
+
     fn create_test_state() -> NatTraversalState {
         NatTraversalState::new(
             10,                      // max_candidates

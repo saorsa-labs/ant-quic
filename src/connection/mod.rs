@@ -65,9 +65,13 @@ use ack_frequency::AckFrequencyState;
 pub mod port_prediction;
 pub use self::port_prediction::{PortPredictor, PortPredictorConfig};
 
+/// #262: per-call cap on local-candidate seeding (dedupe + bound).
+pub(crate) const SEED_LOCAL_CANDIDATES_CAP: usize = 8;
+
 pub(crate) mod nat_traversal;
 use nat_traversal::NatTraversalState;
 // v0.13.0: NatTraversalRole removed - all nodes are symmetric P2P nodes
+use nat_traversal::{CandidateSource, CandidateState};
 pub(crate) use nat_traversal::{CoordinationPhase, NatTraversalError};
 
 mod assembler;
@@ -5518,6 +5522,58 @@ impl Connection {
     }
 
     // === PUBLIC NAT TRAVERSAL FRAME TRANSMISSION API ===
+
+    /// Seed this connection's local NAT candidates from the endpoint's known
+    /// address set (QUIC-discovered reflexive addresses and the UPnP-mapped
+    /// external address).
+    ///
+    /// This is the #262 fix: the local half of the candidate-pair table was
+    /// previously only populated as a side effect of broadcasting an
+    /// external address, so a node that had not yet discovered a reflexive
+    /// address entered hole punching with an empty local side, no pair
+    /// could ever succeed, and `migrate_to_nat_traversal_path` was a "No
+    /// validated NAT traversal paths" dead end. Unlike
+    /// [`Self::send_nat_address_advertisement`] this sends no frames. It
+    /// deduplicates against existing candidates and caps at
+    /// `SEED_LOCAL_CANDIDATES_CAP` inserts per call.
+    pub fn seed_local_traversal_candidates(&mut self, addresses: &[SocketAddr]) -> usize {
+        let Some(nat_state) = self.nat_traversal.as_mut() else {
+            // NAT traversal not negotiated on this connection yet; nothing
+            // to seed. Later negotiation re-runs endpoint-wide seeding.
+            return 0;
+        };
+        let now = Instant::now();
+        let mut added = 0;
+        for &address in addresses {
+            let normalized = crate::shared::normalize_socket_addr(address);
+            if !is_valid_nat_advertisement_address(normalized) {
+                continue;
+            }
+            let duplicate = nat_state.local_candidates.values().any(|candidate| {
+                crate::shared::normalize_socket_addr(candidate.address) == normalized
+                    && candidate.state != CandidateState::Removed
+            });
+            if duplicate {
+                continue;
+            }
+            nat_state.add_local_candidate(
+                normalized,
+                CandidateSource::Observed { by_node: None },
+                now,
+            );
+            added += 1;
+            if added >= SEED_LOCAL_CANDIDATES_CAP {
+                break;
+            }
+        }
+        if added > 0 {
+            debug!(
+                added,
+                "Seeded local NAT traversal candidates from endpoint address set"
+            );
+        }
+        added
+    }
 
     /// Send an ADD_ADDRESS frame to advertise a candidate address to the peer
     ///
