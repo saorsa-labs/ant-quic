@@ -5988,9 +5988,21 @@ impl P2pEndpoint {
         }
 
         if let Some(socket_addr) = peer_conn.remote_addr.as_socket_addr() {
-            bootstrap_cache
-                .observe_direct_reachability(peer_conn.peer_id, socket_addr)
-                .await;
+            // #262 fix 4 (capability honesty): only OUTBOUND-verified direct
+            // connections prove the peer is reachable at this address.
+            // Inbound accepts still cache the address as a redial candidate
+            // (single-socket: source port == listening port) but must not
+            // grant relay/coordinator capability — that let every NATed
+            // desktop that dialled a bootstrap advertise as a helper.
+            if peer_conn.side == Side::Client {
+                bootstrap_cache
+                    .observe_direct_reachability(peer_conn.peer_id, socket_addr)
+                    .await;
+            } else {
+                bootstrap_cache
+                    .observe_inbound_peer_address(peer_conn.peer_id, socket_addr)
+                    .await;
+            }
         }
     }
 
