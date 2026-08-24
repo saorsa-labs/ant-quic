@@ -13470,6 +13470,7 @@ mod tests {
         endpoint_relay.shutdown().await;
     }
 
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity() {
         let node_b = crate::Node::bind(SocketAddr::new(
