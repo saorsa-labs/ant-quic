@@ -753,6 +753,14 @@ impl Connection {
         conn.inner.send_nat_address_advertisement(address, priority)
     }
 
+    /// #262: seed local NAT traversal candidates on the underlying
+    /// connection (see the connection-level method of the same name). No
+    /// frames are sent. Returns the number of candidates inserted.
+    pub fn seed_local_traversal_candidates(&self, addresses: &[SocketAddr]) -> usize {
+        let conn = &mut *self.0.state.lock("seed_local_traversal_candidates");
+        conn.inner.seed_local_traversal_candidates(addresses)
+    }
+
     /// Queue a REMOVE_ADDRESS NAT traversal frame via the underlying connection
     pub fn send_nat_address_removal(&self, sequence: u64) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_address_removal");

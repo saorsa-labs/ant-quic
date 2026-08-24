@@ -1533,6 +1533,32 @@ impl CandidateDiscoveryManager {
     }
     /// Accept a QUIC-discovered address (from OBSERVED_ADDRESS frames)
     /// This replaces the need for STUN-based server reflexive discovery
+    /// #262: the local node's QUIC-discovered / UPnP-mapped addresses, for
+    /// seeding connection-local NAT candidates at traversal-session start.
+    ///
+    /// Both external-address feeds land in the local node's own discovery
+    /// session (`accept_quic_discovered_address(local_peer_id, …)`), so this
+    /// is the single read point. Deduplicated, filtered to routable
+    /// unicast, capped at 8.
+    pub fn local_seed_addresses(&self, local_peer_id: &PeerId) -> Vec<SocketAddr> {
+        let Some(session) = self.active_sessions.get(local_peer_id) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        session
+            .discovered_candidates
+            .iter()
+            .map(|candidate| candidate.address)
+            .filter(|address| {
+                !address.ip().is_loopback()
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast()
+            })
+            .filter(|address| seen.insert(*address))
+            .take(8)
+            .collect()
+    }
+
     pub fn accept_quic_discovered_address(
         &mut self,
         peer_id: PeerId,

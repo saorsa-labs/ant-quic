@@ -82,6 +82,24 @@ use crate::shared::normalize_socket_addr;
 /// This helper consolidates the duplicate broadcast logic throughout the codebase.
 /// It iterates over all connections and sends the NAT address advertisement frame
 /// to each peer, logging success or failure.
+/// #262: shared seeding core for both the event handler (which has borrowed
+/// parts) and [`NatTraversalEndpoint::seed_traversal_candidates`].
+fn seed_traversal_candidates_shared(
+    connections: &dashmap::DashMap<PeerId, InnerConnection>,
+    discovery_manager: &ParkingMutex<CandidateDiscoveryManager>,
+    local_peer_id: &PeerId,
+) -> usize {
+    let addresses = discovery_manager.lock().local_seed_addresses(local_peer_id);
+    if addresses.is_empty() {
+        return 0;
+    }
+    let mut seeded = 0;
+    for entry in connections.iter() {
+        seeded += entry.value().seed_local_traversal_candidates(&addresses);
+    }
+    seeded
+}
+
 fn broadcast_address_to_peers(
     connections: &dashmap::DashMap<PeerId, InnerConnection>,
     address: SocketAddr,
@@ -3687,6 +3705,23 @@ impl NatTraversalEndpoint {
         let _ = self.add_bootstrap_node(*addr);
     }
 
+    /// #262: seed every live connection's LOCAL NAT candidates from the
+    /// endpoint's known address set (QUIC-discovered reflexive addresses and
+    /// the UPnP-mapped external address — both land in the local node's
+    /// discovery session).
+    ///
+    /// Called when an external address is discovered and when a hole-punch
+    /// session begins, so `candidate_pairs` can form on the local side even
+    /// for connections opened before the address was known. Sends no frames.
+    /// Returns the total number of candidates inserted.
+    pub fn seed_traversal_candidates(&self) -> usize {
+        seed_traversal_candidates_shared(
+            &self.connections,
+            &self.discovery_manager,
+            &self.local_peer_id,
+        )
+    }
+
     pub fn add_local_external_candidate(
         &self,
         addr: SocketAddr,
@@ -5913,6 +5948,10 @@ impl NatTraversalEndpoint {
         if !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed) {
             broadcast_address_to_peers(connections, address, 100);
         }
+        // #262: an external address is also a LOCAL candidate for every live
+        // connection's traversal table — pairs cannot form without the
+        // local half, independent of whether we advertise it right now.
+        seed_traversal_candidates_shared(connections, &discovery_manager, &local_peer_id);
 
         Self::reconcile_relay_server_public_addresses_from_connections(connections, relay_server);
     }

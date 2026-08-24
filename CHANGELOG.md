@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NAT traversal: connection-local candidates are now seeded (#262).** The local half of the
+  per-connection candidate-pair table was only ever populated as a side effect of
+  *broadcasting* an external address, so a node that had not (yet) advertised anything entered
+  hole punching with zero local candidates — no pair could form, and
+  `migrate_to_nat_traversal_path` could only ever fail with "No validated NAT traversal paths".
+  Now every live connection's local candidates are seeded from the endpoint's known address set
+  (QUIC-discovered reflexive addresses + the UPnP-mapped external address, both of which land in
+  the local discovery session) whenever an external address is discovered and when a hole-punch
+  session begins (`connect_orchestrated`'s HolePunching stage entry). Deduplicated, capped at 8
+  inserts per call; sends no frames.
+
+### Changed
+
+- **Traversal counters are honest (#262).** `nat_traversal_attempts` now also increments on
+  `HolePunchingStarted` (session start — locally initiated or adopted from a received
+  PUNCH_ME_NOW), not only `CoordinationRequested`. `nat_traversal_successes` now counts only
+  traversal-class establishments (hole punch / relay) and is incremented where
+  `TraversalMethod` is known, so plain direct dials stop inflating it (the live
+  attempts<successes anomaly). New `holepunched_connections` field joins
+  `direct_connections`/`relayed_connections` as the per-method success split.
+
+## [Unreleased]
+
 ## [0.27.45] - 2026-08-23
 ### Changed
 
