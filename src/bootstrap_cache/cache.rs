@@ -345,6 +345,42 @@ impl BootstrapCache {
     /// This is observer-scoped evidence. A peer is considered suitable for
     /// relay/bootstrap/coordinator selection only after a direct connection to
     /// one of its addresses succeeds without coordinator or relay assistance.
+    /// Record an inbound peer's source address as a redial candidate WITHOUT
+    /// granting reachability-derived capabilities (x0x#398 / #262 fix 4).
+    ///
+    /// ant-quic uses one socket for inbound and outbound, so an inbound
+    /// peer's observed source port is its listening port and is a sound
+    /// redial candidate. It is NOT evidence the peer is globally reachable:
+    /// a NATed desktop dialling out through a cone NAT shows a global source
+    /// address that only *we* (or nobody, for symmetric NATs) can reach.
+    /// Granting `supports_relay`/`supports_coordination` from inbound
+    /// evidence made every desktop that ever dialled a bootstrap advertise
+    /// as a relay/coordinator, poisoning helper selection for third-party
+    /// hole punches.
+    pub async fn observe_inbound_peer_address(&self, peer_id: PeerId, address: SocketAddr) {
+        let mut data = self.data.write().await;
+        let now = SystemTime::now();
+        let peer = data
+            .peers
+            .entry(peer_id.0)
+            .or_insert_with(|| CachedPeer::new(peer_id, vec![address], PeerSource::Connection));
+        if !peer.addresses.contains(&address) {
+            peer.addresses.push(address);
+        }
+        peer.last_seen = now;
+        peer.stats.success_count = peer.stats.success_count.saturating_add(1);
+        self.refresh_cached_peer(peer, now);
+        let count = data.peers.len();
+        drop(data);
+        let _ = self
+            .event_tx
+            .send(CacheEvent::Updated { peer_count: count });
+    }
+
+    /// Record OUTBOUND-verified direct reachability: we dialled `address` and
+    /// the connection succeeded, so the peer is genuinely reachable there.
+    /// This is the only path that feeds capability derivation
+    /// (`supports_relay` / `supports_coordination`).
     pub async fn observe_direct_reachability(&self, peer_id: PeerId, address: SocketAddr) {
         let mut data = self.data.write().await;
         let now = SystemTime::now();
@@ -876,5 +912,37 @@ mod tests {
                 .any(|entry| entry.address == addr)
         );
         assert!(peer.success_rate() > 0.0);
+    }
+    /// #262 fix 4: an INBOUND peer's source address is a redial candidate but
+    /// must not grant relay/coordinator capability — a NATed desktop dialling
+    /// out shows a global source addr that is not proof of reachability.
+    #[tokio::test]
+    async fn inbound_observation_caches_address_without_capability_grant() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = create_test_cache(&temp_dir).await;
+        let peer_id = PeerId([41u8; 32]);
+        let addr: SocketAddr = "203.0.113.9:41000".parse().expect("addr");
+        cache.observe_inbound_peer_address(peer_id, addr).await;
+        let peer = cache.get(&peer_id).await.expect("cached");
+        assert!(peer.addresses.contains(&addr), "redial candidate kept");
+        assert!(
+            !peer.capabilities.supports_relay && !peer.capabilities.supports_coordination,
+            "inbound evidence must not grant helper capabilities"
+        );
+    }
+
+    /// #262 fix 4 counterpart: OUTBOUND-verified reachability still grants.
+    #[tokio::test]
+    async fn outbound_observation_still_grants_capability() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = create_test_cache(&temp_dir).await;
+        let peer_id = PeerId([42u8; 32]);
+        let addr: SocketAddr = "203.0.113.10:41001".parse().expect("addr");
+        cache.observe_direct_reachability(peer_id, addr).await;
+        let peer = cache.get(&peer_id).await.expect("cached");
+        assert!(
+            peer.capabilities.supports_relay && peer.capabilities.supports_coordination,
+            "outbound global evidence grants helper capabilities"
+        );
     }
 }
