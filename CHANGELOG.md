@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.47] - 2026-08-24
+
 ### Fixed
 
 - **Capability honesty: inbound accepts no longer grant relay/coordinator capability (#262 fix 4,
