@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Capability honesty: inbound accepts no longer grant relay/coordinator capability (#262 fix 4,
+  x0x#398).** `fn accept` recorded every inbound peer'''s NAT source address as global direct
+  reachability, so any desktop that dialled a bootstrap advertised `supports_relay`/
+  `supports_coordination` and poisoned helper selection for third-party hole punches. Inbound
+  evidence now caches the address as a redial candidate only
+  (`observe_inbound_peer_address`); capability derivation is fed exclusively by
+  OUTBOUND-verified connections (`side == Client`).
+
 ## [0.27.46] - 2026-08-24
 
 ### Fixed
