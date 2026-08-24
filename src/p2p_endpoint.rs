@@ -13215,7 +13215,6 @@ mod tests {
         endpoint.shutdown().await;
     }
 
-    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     /// #262: plain direct dials must leave the traversal counters
     /// untouched. `nat_traversal_attempts` counts coordination/punch
     /// session starts; `nat_traversal_successes` counts traversal-class
@@ -13314,6 +13313,7 @@ mod tests {
         assert_eq!(snapshot.nat_traversal_successes, 0);
     }
 
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     #[tokio::test]
     async fn test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity() {
         let node_b = crate::Node::bind(SocketAddr::new(
