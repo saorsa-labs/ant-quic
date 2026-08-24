@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MASQUE relay engagement (#262 fix 5).** Two defects kept the guaranteed-last-line relay from
+  ever running, with `relayed_connections` 0 fleet-wide:
+  1. A custom `StrategyConfig` was silently overridden — `coordinator: None` got a coordinator
+     force-injected and empty `relay_addrs` auto-populated, so callers asking for Relay-only
+     (or punch-free) dials got neither; the injected coordinator's unbounded pre-dial in
+     `start_hole_punch_session` could hang the whole connect. An explicitly supplied strategy is
+     now authoritative.
+  2. Hole-punch rounds could consume the entire connection-establishment budget; the relay arm
+     then observed `remaining == 0` and exhausted every relay with "budget exhausted" without a
+     single attempt — the dial ended `Unreachable` despite 20+ live relay-capable peers. The
+     punch stage deadline now reserves one `relay_timeout` slice of the overall budget.
+- **First runtime e2e proof of the MASQUE data plane** (`relay_only_data_plane_end_to_end`):
+  three loopback nodes A↔R↔B, Relay-only strategy — connection established with
+  `TraversalMethod::Relay`, `relayed_connections` incremented on the client, an application
+  payload delivered A→B through the relay, and relayed bytes accounted on R's server. ADR-006's
+  "✅ complete" table had never been runtime-verified; the plane itself is sound once the
+  strategy actually reaches it.
+
+## [Unreleased]
+
 ## [0.27.46] - 2026-08-24
 
 ### Fixed

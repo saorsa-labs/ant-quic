@@ -4886,10 +4886,16 @@ impl P2pEndpoint {
         // from authoritative timeout owners plus any RTT hints we have cached.
         let custom_strategy_supplied = strategy_config.is_some();
         let mut config = strategy_config.unwrap_or_default();
-        if config.coordinator.is_none() {
+        // #262 fix 5: an explicitly supplied strategy is authoritative —
+        // `coordinator: None` means "no punch coordination" (skip straight
+        // through the ladder to relay), and empty relay_addrs means "no
+        // relay". Auto-filling both silently overrode that intent and, with
+        // a bogus coordinator, made `start_hole_punch_session`'s unbounded
+        // pre-dial hang the whole connect.
+        if !custom_strategy_supplied && config.coordinator.is_none() {
             config.coordinator = self.coordinator_candidates().await.into_iter().next();
         }
-        if config.relay_addrs.is_empty() {
+        if !custom_strategy_supplied && config.relay_addrs.is_empty() {
             // Optimization: Try to find a high-quality relay from our cache first
             let target_addr = target_ipv4.or(target_ipv6);
             if let Some(addr) = target_addr {
@@ -5216,8 +5222,21 @@ impl P2pEndpoint {
                     // overall deadline applied, so one hole-punch round could
                     // consume the entire connection budget even though the
                     // strategy advertised a smaller holepunch_timeout.
-                    let stage_deadline = overall_deadline
-                        .min(tokio::time::Instant::now() + strategy.holepunch_timeout());
+                    // #262 fix 5: reserve a relay slice of the overall
+                    // budget. Without this, punch rounds could consume the
+                    // entire establishment budget; the relay arm would then
+                    // observe remaining == 0, exhaust every relay with
+                    // "budget exhausted" without a single attempt, and the
+                    // dial would end Unreachable despite live relay-capable
+                    // peers — exactly the fleet observation (relay never
+                    // engaged).
+                    let now = tokio::time::Instant::now();
+                    let relay_reserve = strategy.relay_timeout();
+                    let stage_deadline = match overall_deadline.checked_duration_since(now) {
+                        Some(remaining) => overall_deadline - relay_reserve.min(remaining),
+                        None => overall_deadline,
+                    }
+                    .min(now + strategy.holepunch_timeout());
 
                     match self
                         .start_hole_punch_session(coordinator, target_peer_id)
@@ -13314,6 +13333,143 @@ mod tests {
     }
 
     #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    /// #262 fix 5: the MASQUE relay data plane, end to end. Three nodes on
+    /// loopback — A (client), R (public relay), B (target). The strategy is
+    /// forced Relay-only (zero direct budgets, no coordinator, single
+    /// relay addr), so a success can ONLY come from A's QUIC traffic to B
+    /// being encapsulated through R's MASQUE relay. Asserts: connection
+    /// established with TraversalMethod::Relay, `relayed_connections`
+    /// increments on A, relay runtime activity on R, and an application
+    /// payload delivered A→B through the relay path.
+    ///
+    /// This is the runtime proof ADR-006's "✅ complete" table never had.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn relay_only_data_plane_end_to_end() {
+        let endpoint_relay = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("relay config should build"),
+        )
+        .await
+        .expect("relay endpoint should bind");
+        let relay_addr = localhost_addr(endpoint_relay.local_addr().expect("relay addr"));
+
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("a config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("b config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+        let b_addr = localhost_addr(endpoint_b.local_addr().expect("b addr"));
+        let b_id = endpoint_b.peer_id();
+
+        // B must accept inbound (its reader tasks spawn on accept).
+        let accept_pump_b = {
+            let endpoint_b = endpoint_b.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_b.accept().await {} })
+        };
+        // R accepts inbound too (its relay service rides the same socket).
+        let accept_pump_r = {
+            let endpoint_relay = endpoint_relay.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_relay.accept().await {} })
+        };
+
+        // Relay-only strategy: no direct budgets, no punch, exactly one relay.
+        let mut strategy = StrategyConfig::default();
+        strategy.ipv4_timeout = Duration::ZERO;
+        strategy.ipv6_timeout = Duration::ZERO;
+        strategy.ipv6_enabled = false;
+        strategy.holepunch_timeout = Duration::ZERO;
+        strategy.max_holepunch_rounds = 0;
+        strategy.coordinator = None;
+        strategy.relay_enabled = true;
+        strategy.relay_addrs = vec![relay_addr];
+        // The relay handshake itself needs a real budget.
+        strategy.relay_timeout = Duration::from_secs(10);
+
+        let (conn, method) = tokio::time::timeout(
+            Duration::from_secs(30),
+            endpoint_a.connect_with_fallback(Some(b_addr), None, Some(strategy), Some(b_id)),
+        )
+        .await
+        .expect("relay-only connect should resolve within budget")
+        .expect("relay-only connect should succeed");
+
+        assert!(
+            matches!(conn.traversal_method, TraversalMethod::Relay),
+            "the connection must be classified Relay, got {:?}",
+            conn.traversal_method
+        );
+        let _ = method;
+
+        let stats_a = endpoint_a.stats().await;
+        assert!(
+            stats_a.relayed_connections >= 1,
+            "relayed_connections must increment on the client (got {})",
+            stats_a.relayed_connections
+        );
+
+        // Data plane: an application payload A → B must flow through the
+        // relay path. B's reader delivers via recv().
+        endpoint_a
+            .send(&b_id, b"relay-data-plane-proof")
+            .await
+            .expect("send through the relayed connection");
+
+        let mut delivered = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), endpoint_b.recv()).await {
+                Ok(Ok((peer, data))) => {
+                    delivered = Some((peer, data));
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        let (peer, data) = delivered.expect("payload must arrive at B through the relay");
+        assert_eq!(peer, endpoint_a.peer_id(), "sender identity preserved");
+        assert_eq!(data, b"relay-data-plane-proof".to_vec());
+
+        // Relay-side proof: the MASQUE server observed real session traffic.
+        let (sessions, relayed_bytes) = endpoint_relay.inner.relay_server_runtime_metrics();
+        assert!(
+            relayed_bytes > 0,
+            "relay must account relayed bytes (active_sessions={sessions})"
+        );
+
+        accept_pump_b.abort();
+        accept_pump_r.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
+        endpoint_relay.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity() {
         let node_b = crate::Node::bind(SocketAddr::new(
