@@ -595,7 +595,7 @@ pub struct NatTraversalEndpoint {
     /// Transport registry for multi-transport support
     /// When present, allows using transport-provided sockets instead of creating new ones
     transport_registry: Option<Arc<TransportRegistry>>,
-    /// Channel for receiving peer address updates (ADD_ADDRESS → DHT bridge)
+    /// Channel for receiving peer address updates (ADD_ADDRESS → consumer notification)
     #[allow(dead_code)] // Used when full symmetric NAT relay is wired
     pub(crate) peer_address_update_rx:
         TokioMutex<mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
@@ -1539,7 +1539,7 @@ pub enum NatTraversalEvent {
     },
     /// A connected peer advertised a new reachable address (ADD_ADDRESS frame).
     ///
-    /// The upper layer should update its routing table so that future lookups
+    /// The upper layer should update its address book so that future lookups
     /// for this peer return the advertised address.
     PeerAddressUpdated {
         /// The connected peer that sent the advertisement
@@ -1889,7 +1889,7 @@ impl NatTraversalEndpoint {
         // Create channel for forwarding constrained engine events to P2pEndpoint
         let (constrained_event_tx, constrained_event_rx) = mpsc::unbounded_channel();
 
-        // Channel for peer address updates (ADD_ADDRESS → DHT bridge)
+        // Channel for peer address updates (ADD_ADDRESS → consumer notification)
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
@@ -2401,7 +2401,7 @@ impl NatTraversalEndpoint {
         // Create channel for forwarding constrained engine events to P2pEndpoint
         let (constrained_event_tx, constrained_event_rx) = mpsc::unbounded_channel();
 
-        // Channel for peer address updates (ADD_ADDRESS → DHT bridge)
+        // Channel for peer address updates (ADD_ADDRESS → consumer notification)
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
@@ -2721,7 +2721,7 @@ impl NatTraversalEndpoint {
 
     /// Check if a peer with the given ID has an active connection,
     /// returning its actual socket address if found. This is essential
-    /// for symmetric NAT where the peer's address in the DHT differs
+    /// for symmetric NAT where the address known to consumers differs
     /// from the connection's actual address.
     #[allow(dead_code)] // Used by try_hole_punch peer ID fallback path
     pub(crate) fn find_connection_by_peer_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {

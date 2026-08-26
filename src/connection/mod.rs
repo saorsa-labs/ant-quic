@@ -4898,7 +4898,7 @@ impl Connection {
                     normalized_addr, add_address.sequence, add_address.priority
                 );
 
-                // Notify the endpoint so the DHT routing table can be updated
+                // Notify the endpoint so consumer address books can be updated
                 self.endpoint_events.push_back(
                     crate::shared::EndpointEventInner::PeerAddressAdvertised {
                         peer_addr: self.path.remote,
