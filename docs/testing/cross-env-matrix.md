@@ -28,7 +28,7 @@ Single source of truth: `scripts/lib/topology.sh`. Borrowed verbatim from
 
 Cross-LAN discovery uses `--known-peers` listing every VPS IPv4 on port
 10000. No registry, no default bootstrap. mDNS handles LAN-only
-discovery for L1/L2/L3.
+discovery for L1/L2.
 
 Preflight probes each non-L1 node via SSH; unreachable nodes are recorded
 in `LOG_DIR/skipped.txt` and excluded from later steps.
