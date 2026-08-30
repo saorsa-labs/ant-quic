@@ -252,7 +252,7 @@ Initial provider set:
 1. static known peers
 2. optional mDNS
 3. existing bootstrap/discovery flows
-4. future registry/gossip/DHT integrations
+4. future registry/gossip integrations by consuming overlays
 
 All providers feed the same internal peer directory.
 

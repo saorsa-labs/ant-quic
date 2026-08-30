@@ -1982,7 +1982,7 @@ pub enum P2pEvent {
     /// This node established a MASQUE relay and is advertising a relay address.
     ///
     /// Emitted once when the relay becomes active. Upper layers should use this
-    /// to trigger a DHT self-lookup so that more peers learn the relay address.
+    /// to advertise the relay address through whatever discovery mechanism the overlay runs.
     RelayEstablished {
         /// The relay's public address (relay_IP:PORT)
         relay_addr: SocketAddr,
