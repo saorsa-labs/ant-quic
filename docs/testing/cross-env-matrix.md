@@ -19,7 +19,6 @@ Single source of truth: `scripts/lib/topology.sh`. Borrowed verbatim from
 |---|---|---|
 | L1 | this MacBook (loopback) | LAN, mDNS |
 | L2 | studio1.local | LAN, mDNS |
-| L3 | studio2.local | LAN, mDNS |
 | V_NYC | 142.93.199.50 (DigitalOcean NYC) | VPS |
 | V_SFO | 147.182.234.192 (DigitalOcean SFO) | VPS |
 | V_HEL | 65.21.157.229 (Hetzner Helsinki) | VPS |
@@ -29,7 +28,7 @@ Single source of truth: `scripts/lib/topology.sh`. Borrowed verbatim from
 
 Cross-LAN discovery uses `--known-peers` listing every VPS IPv4 on port
 10000. No registry, no default bootstrap. mDNS handles LAN-only
-discovery for L1/L2/L3.
+discovery for L1/L2.
 
 Preflight probes each non-L1 node via SSH; unreachable nodes are recorded
 in `LOG_DIR/skipped.txt` and excluded from later steps.
@@ -71,9 +70,8 @@ for ip in 142.93.199.50 147.182.234.192 65.21.157.229 116.203.101.172 149.28.156
     ssh root@${ip} 'chmod +x /opt/ant-quic-test/bin/ant-quic'
 done
 
-# 3. SSH reachability to LAN studios
+# 3. SSH reachability to the LAN studio
 ssh studio1@studio1.local true
-ssh studio2@studio2.local true
 
 # 4. Sudo on this MacBook (only required for C5 forced-relay's pfctl rule)
 sudo -v
