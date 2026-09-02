@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.48] - 2026-09-02
+
+### Changed
+
+- **Dependencies: `unicode-width` pin relaxed from `=0.2.0` to `0.2.2` (#268).** The exact pin
+  was a leftover from a ratatui requirement that no longer exists and conflicted with
+  saorsa-transport 0.36.2 (`=0.2.2`), so any crate linking both x0x 0.40.4 and ant-core 0.8.0
+  could not resolve a lockfile. The only in-tree consumer is the terminal UI, whose width API is
+  unchanged across 0.2.x.
+
+### Documentation
+
+- Retired studio2 from the cross-environment test matrix (#267).
+
 ## [0.27.47] - 2026-08-24
 
 ### Fixed
