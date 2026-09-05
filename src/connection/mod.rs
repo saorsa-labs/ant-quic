@@ -837,7 +837,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        let min_size = self.pqc_state.min_initial_size();
+                        let min_size = self.pqc_state.min_initial_size(self.path.current_mtu());
                         builder.pad_to(min_size);
                     }
 
@@ -1092,10 +1092,11 @@ impl Connection {
                     ) {
                         return None;
                     }
-                    buf.write(token);
                     self.stats.frame_tx.path_response += 1;
-                    let min_size = self.pqc_state.min_initial_size();
-                    builder.pad_to(min_size);
+                    // RFC 9000 §8.2.2: an off-path PATH_RESPONSE must be padded to at least the
+                    // smallest allowed maximum datagram size — not the larger PQC handshake floor,
+                    // which previously fragmented these datagrams post-handshake (ant-quic#270).
+                    builder.pad_to(MIN_INITIAL_SIZE);
                     builder.finish_and_track(
                         now,
                         self,
@@ -1177,11 +1178,10 @@ impl Connection {
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
         }
-
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                let min_size = self.pqc_state.min_initial_size();
+                let min_size = self.pqc_state.min_initial_size(self.path.current_mtu());
                 builder.pad_to(min_size);
             }
 
@@ -1375,7 +1375,7 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        buf.reserve(usize::from(MIN_INITIAL_SIZE));
         let buf_capacity = buf.capacity();
 
         let mut builder = PacketBuilder::new(
@@ -1403,9 +1403,10 @@ impl Connection {
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
-        let min_size = self.pqc_state.min_initial_size();
-        builder.pad_to(min_size);
-        builder.finish_and_track(now, self, None, buf);
+        // RFC 9000 §8.2.1: a PATH_CHALLENGE sent to a peer address must be padded to at least the
+        // smallest allowed maximum datagram size — not the larger PQC handshake floor
+        // (ant-quic#270).
+        builder.pad_to(MIN_INITIAL_SIZE);
 
         // Mark coordination as validating after packet is built
         if let Some(nat_traversal) = &mut self.nat_traversal {
@@ -1471,7 +1472,7 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        buf.reserve(usize::from(MIN_INITIAL_SIZE));
         let buf_capacity = buf.capacity();
 
         // Use current connection ID for NAT traversal PATH_CHALLENGE
@@ -1500,9 +1501,9 @@ impl Connection {
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
-        // PATH_CHALLENGE frames must be padded to at least 1200 bytes
-        let min_size = self.pqc_state.min_initial_size();
-        builder.pad_to(min_size);
+        // PATH_CHALLENGE frames must be padded to at least the smallest allowed maximum
+        // datagram size (RFC 9000 §8.2.1), not the larger PQC handshake floor (ant-quic#270)
+        builder.pad_to(MIN_INITIAL_SIZE);
 
         builder.finish_and_track(now, self, None, buf);
 
@@ -1535,7 +1536,7 @@ impl Connection {
             SpaceId::Data,
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        buf.reserve(usize::from(MIN_INITIAL_SIZE));
 
         let buf_capacity = buf.capacity();
 
@@ -1569,8 +1570,7 @@ impl Connection {
         // to at least the smallest allowed maximum datagram size of 1200 bytes,
         // unless the anti-amplification limit for the path does not permit
         // sending a datagram of this size
-        let min_size = self.pqc_state.min_initial_size();
-        builder.pad_to(min_size);
+        builder.pad_to(MIN_INITIAL_SIZE);
 
         builder.finish(self, buf);
         self.stats.udp_tx.on_sent(1, buf.len());
@@ -2720,14 +2720,10 @@ impl Connection {
         // Detect PQC usage from CRYPTO frame data before processing
         self.pqc_state.detect_pqc_from_crypto(&crypto.data, space);
 
-        // Check if we should trigger MTU discovery for PQC
-        if self.pqc_state.should_trigger_mtu_discovery() {
-            // Request larger MTU for PQC handshakes
-            self.path
-                .mtud
-                .reset(self.pqc_state.min_initial_size(), self.config.min_mtu);
-            trace!("Triggered MTU discovery for PQC handshake");
-        }
+        // PQC negotiation must NOT raise `path.current_mtu()` here: an unvalidated 4096-byte
+        // MTU made handshake datagrams rely on IP fragmentation, which fails on
+        // fragment-filtering networks (RFC 9000 §14, ant-quic#270). Larger datagrams are only
+        // authorized by DPLPMTUD probes after the handshake completes.
 
         let space = &mut self.spaces[space];
         let max = end.saturating_sub(space.crypto_stream.bytes_read());
@@ -2791,7 +2787,7 @@ impl Connection {
                 let frames = self.pqc_state.packet_handler.fragment_crypto_data(
                     &outgoing,
                     offset,
-                    self.pqc_state.min_initial_size() as usize,
+                    usize::from(self.pqc_state.min_initial_size(self.path.current_mtu())),
                 );
                 for frame in frames {
                     self.spaces[space].pending.crypto.push_back(frame);
@@ -6525,11 +6521,18 @@ impl PqcState {
         }
     }
 
-    /// Get the minimum initial packet size based on PQC state
-    fn min_initial_size(&self) -> u16 {
+    /// Get the minimum Initial datagram size based on PQC state
+    ///
+    /// RFC 9000 §14: datagrams must not exceed the smallest maximum datagram size the path is
+    /// known to support until a larger PLPMTU has been validated by DPLPMTUD probes (which only
+    /// run after the handshake). The PQC handshake's desire for larger uniform datagrams is
+    /// therefore capped at the current validated path MTU; PQ handshake volume flows as multiple
+    /// ≤MTU datagrams of split CRYPTO frames (ant-quic#270).
+    fn min_initial_size(&self, path_mtu: u16) -> u16 {
         if self.enabled && self.using_pqc {
-            // Use larger initial packet size for PQC handshakes
-            std::cmp::max(self.handshake_mtu, 4096)
+            let floor = Ord::max(self.handshake_mtu, MIN_INITIAL_SIZE);
+            let ceiling = Ord::max(path_mtu, MIN_INITIAL_SIZE);
+            Ord::min(floor, ceiling)
         } else {
             MIN_INITIAL_SIZE
         }
@@ -6558,11 +6561,6 @@ impl PqcState {
             // Update handshake MTU based on PQC detection
             self.handshake_mtu = self.packet_handler.get_min_packet_size(space);
         }
-    }
-
-    /// Check if MTU discovery should be triggered for PQC
-    fn should_trigger_mtu_discovery(&mut self) -> bool {
-        self.packet_handler.should_trigger_mtu_discovery()
     }
 
     /// Get PQC-aware MTU configuration
@@ -7098,6 +7096,10 @@ impl Connection {
         self.peer_params.ack_receive_v2
     }
 }
+
+#[cfg(test)]
+#[path = "pqc_mtu_regression_tests.rs"]
+mod pqc_mtu_regression_tests;
 
 #[cfg(test)]
 mod tests {

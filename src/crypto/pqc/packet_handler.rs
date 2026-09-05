@@ -45,8 +45,6 @@ pub struct PqcPacketHandler {
     pqc_detected: bool,
     /// Current estimated handshake size
     estimated_handshake_size: u32,
-    /// Whether we've initiated MTU discovery for PQC
-    mtu_discovery_triggered: bool,
 }
 
 impl PqcPacketHandler {
@@ -57,7 +55,6 @@ impl PqcPacketHandler {
         Self {
             pqc_detected: false,
             estimated_handshake_size: 0,
-            mtu_discovery_triggered: false,
         }
     }
 
@@ -112,16 +109,6 @@ impl PqcPacketHandler {
     fn pqc_handshake_size() -> u32 {
         // PQC handshake with ML-KEM-768 hybrid key exchange
         16384
-    }
-
-    /// Check if MTU discovery should be triggered for PQC
-    pub fn should_trigger_mtu_discovery(&mut self) -> bool {
-        if self.pqc_detected && !self.mtu_discovery_triggered {
-            self.mtu_discovery_triggered = true;
-            true
-        } else {
-            false
-        }
     }
 
     /// Get recommended MTU configuration for PQC
@@ -239,7 +226,6 @@ impl PqcPacketHandler {
     pub fn reset(&mut self) {
         self.pqc_detected = false;
         self.estimated_handshake_size = 0;
-        self.mtu_discovery_triggered = false;
     }
 }
 
@@ -273,22 +259,6 @@ mod tests {
         let handler = PqcPacketHandler::new();
         assert!(!handler.pqc_detected);
         assert_eq!(handler.estimated_handshake_size, 0);
-        assert!(!handler.mtu_discovery_triggered);
-    }
-
-    #[test]
-    fn test_mtu_discovery_trigger() {
-        let mut handler = PqcPacketHandler::new();
-
-        // Should not trigger without PQC detection
-        assert!(!handler.should_trigger_mtu_discovery());
-
-        // Simulate PQC detection
-        handler.pqc_detected = true;
-        assert!(handler.should_trigger_mtu_discovery());
-
-        // Should not trigger again
-        assert!(!handler.should_trigger_mtu_discovery());
     }
 
     #[test]
@@ -388,13 +358,11 @@ mod tests {
         let mut handler = PqcPacketHandler::new();
         handler.pqc_detected = true;
         handler.estimated_handshake_size = 16384;
-        handler.mtu_discovery_triggered = true;
 
         handler.reset();
 
         assert!(!handler.pqc_detected);
         assert_eq!(handler.estimated_handshake_size, 0);
-        assert!(!handler.mtu_discovery_triggered);
     }
 
     #[test]

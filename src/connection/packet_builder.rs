@@ -184,14 +184,21 @@ impl PacketBuilder {
 
     /// Append the minimum amount of padding to the packet such that, after encryption, the
     /// enclosing datagram will occupy at least `min_size` bytes
+    ///
+    /// The padding is capped at this packet's remaining capacity in the enclosing datagram
+    /// (`max_size`), so a datagram can never grow past the buffer allocated for it. Callers
+    /// historically requested PQC handshake padding larger than the path MTU, which silently
+    /// relied on IP fragmentation and failed on fragment-filtering networks (RFC 9000 §14,
+    /// ant-quic#270).
     pub(super) fn pad_to(&mut self, min_size: u16) {
         // The datagram might already have a larger minimum size than the caller is requesting, if
         // e.g. we're coalescing packets and have populated more than `min_size` bytes with packets
         // already.
-        self.min_size = Ord::max(
+        let target = Ord::max(
             self.min_size,
             self.datagram_start + (min_size as usize) - self.tag_len,
         );
+        self.min_size = Ord::min(target, self.max_size);
     }
 
     pub(super) fn finish_and_track(
