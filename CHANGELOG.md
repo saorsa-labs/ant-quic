@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **RFC 9000 §14 compliance: PQC handshakes no longer rely on IP fragmentation (#270, x0x#505).**
+  Three cooperating defects made PQC-negotiating endpoints emit 4096-byte UDP datagrams during
+  the handshake (and on post-handshake path validation), which fails outright on networks that
+  drop non-initial IP fragments (Oracle Cloud: `IpReasmReqds == IpReasmFails` at 16260/16260,
+  24/24 bootstraps unreachable): `PqcState::min_initial_size()` returned a 4096-byte floor that
+  padded Initials past the path MTU; `PacketBuilder::pad_to` could raise a packet's minimum
+  past the enclosing datagram's capacity; and PQC detection in CRYPTO bytes reset
+  `MtuDiscovery` to 4096 mid-handshake without any probe. Padding is now hard-capped at the
+  datagram builder's capacity, the PQC floor is clamped to the current validated PLPMTU
+  (1200 until DPLPMTUD probes confirm more), off-path PATH_RESPONSE and PATH_CHALLENGE
+  datagrams pad to the RFC-specified 1200-byte minimum, and PQC detection no longer raises the
+  path MTU. PQ handshake volume continues to flow as multiple ≤MTU datagrams of split CRYPTO
+  frames; the server's first flight was ~95% padding, not key material. Regression tests drive
+  a full PQC handshake through the low-level state machines and assert every transmit fits
+  1200 bytes (fails on the pre-fix code with three 4096-byte datagrams).
+
+
+
 ## [0.27.48] - 2026-09-02
 
 ### Changed

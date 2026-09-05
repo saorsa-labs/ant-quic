@@ -65,7 +65,9 @@ fn test_packet_handler_keeps_standard_limits_before_pqc_detection() {
 
     assert!(!handler.detect_pqc_handshake(&[], SpaceId::Initial));
     assert!(!handler.detect_pqc_handshake(&[1, 0, 0, 16], SpaceId::Data));
-    assert!(!handler.should_trigger_mtu_discovery());
+
+    // ant-quic#270: PQC detection no longer raises the path MTU mid-handshake; MTUD probes
+    // are the only mechanism that may authorize datagrams above 1200 bytes.
 
     assert_eq!(handler.get_min_packet_size(SpaceId::Initial), 1200);
     assert_eq!(
@@ -83,8 +85,8 @@ fn test_packet_handler_detects_pqc_handshake_and_adjusts_packet_limits() {
     let client_hello = synthetic_pqc_client_hello();
 
     assert!(handler.detect_pqc_handshake(&client_hello, SpaceId::Initial));
-    assert!(handler.should_trigger_mtu_discovery());
-    assert!(!handler.should_trigger_mtu_discovery());
+
+    // ant-quic#270: detection adjusts frame sizing only; it must never raise the path MTU.
 
     assert_eq!(handler.get_min_packet_size(SpaceId::Initial), PQC_MIN_MTU);
     assert_eq!(handler.get_min_packet_size(SpaceId::Handshake), 1500);
@@ -112,7 +114,6 @@ fn test_packet_handler_detects_pqc_handshake_and_adjusts_packet_limits() {
 
     handler.reset();
     assert_eq!(handler.get_min_packet_size(SpaceId::Initial), 1200);
-    assert!(!handler.should_trigger_mtu_discovery());
 }
 
 #[test]
