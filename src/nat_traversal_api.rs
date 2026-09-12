@@ -27,7 +27,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
@@ -314,9 +314,6 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::ack_frame::{
-    ACK_BIDI_REQUEST_MAGIC, AckControlOutcome, ReceiveRejectReason, encode_ack_bidi_response,
-};
 use crate::connection_lifecycle::{ConnectionCloseReason, ConnectionLifecycleState};
 use crate::high_level::default_runtime;
 
@@ -578,12 +575,6 @@ pub struct NatTraversalEndpoint {
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
     relay_server: Option<Arc<MasqueRelayServer>>,
-    /// Endpoint-level ACK-v2 bidi stream sink.
-    ///
-    /// The NAT relay service also accepts bidi streams on peer connections. If
-    /// it wins the accept race for an ACK-v2 stream, it forwards the stream here
-    /// instead of closing it as an invalid relay request.
-    ack_bidi_stream_tx: Arc<ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>>,
     /// Successful candidate pairs discovered via hole punching
     /// Maps peer ID to the remote address that successfully responded
     /// Uses DashMap for fine-grained concurrent access without blocking workers
@@ -798,18 +789,6 @@ fn default_max_concurrent_uni_streams() -> u32 {
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct PeerId(pub [u8; 32]);
-
-/// ACK-v2 bidi stream accepted by a NAT-layer relay handler and forwarded to
-/// the endpoint-level app reader. This bridges the current split accept loops
-/// until bidi streams are owned by a single typed dispatcher.
-pub(crate) struct IncomingAckBidiStream {
-    pub(crate) peer_id: PeerId,
-    pub(crate) conn_stable_id: usize,
-    pub(crate) send: InnerSendStream,
-    pub(crate) recv: InnerRecvStream,
-    pub(crate) prefix: Vec<u8>,
-    pub(crate) accepted_at: Instant,
-}
 
 /// Information about a bootstrap/coordinator node
 #[derive(Debug, Clone)]
@@ -1924,7 +1903,6 @@ impl NatTraversalEndpoint {
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
-            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -2110,8 +2088,6 @@ impl NatTraversalEndpoint {
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
-            let relay_server_clone = endpoint.relay_server.clone();
-            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -2127,8 +2103,6 @@ impl NatTraversalEndpoint {
                     next_connection_generation_clone,
                     local_peer_id,
                     emitted_events_clone,
-                    relay_server_clone,
-                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -2436,7 +2410,6 @@ impl NatTraversalEndpoint {
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_server,
-            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -2622,8 +2595,6 @@ impl NatTraversalEndpoint {
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
-            let relay_server_clone = endpoint.relay_server.clone();
-            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
@@ -2639,8 +2610,6 @@ impl NatTraversalEndpoint {
                     next_connection_generation_clone,
                     local_peer_id,
                     emitted_events_clone,
-                    relay_server_clone,
-                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -3125,14 +3094,6 @@ impl NatTraversalEndpoint {
     /// enabling multi-transport support and shared socket management.
     pub fn transport_registry(&self) -> Option<&Arc<TransportRegistry>> {
         self.transport_registry.as_ref()
-    }
-
-    /// Register the endpoint-level ACK-v2 bidi stream sink.
-    pub(crate) fn set_ack_bidi_stream_sender(
-        &self,
-        tx: mpsc::UnboundedSender<IncomingAckBidiStream>,
-    ) {
-        *self.ack_bidi_stream_tx.write() = Some(tx);
     }
 
     /// Let the endpoint-level reader hand a non-ACK bidi stream back to the
@@ -5338,8 +5299,6 @@ impl NatTraversalEndpoint {
         let next_connection_generation_clone = self.next_connection_generation.clone();
         let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
-        let relay_server_clone = self.relay_server.clone();
-        let ack_bidi_stream_tx_clone = self.ack_bidi_stream_tx.clone();
         let observed_address_tx_clone = self.observed_address_tx.clone();
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
@@ -5355,8 +5314,6 @@ impl NatTraversalEndpoint {
                 next_connection_generation_clone,
                 local_peer_id,
                 emitted_events_clone,
-                relay_server_clone,
-                ack_bidi_stream_tx_clone,
                 observed_address_tx_clone,
                 traversal_event_notify_clone,
                 incoming_notify_clone,
@@ -5378,10 +5335,6 @@ impl NatTraversalEndpoint {
         next_connection_generation: Arc<AtomicU64>,
         local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
-        relay_server: Option<Arc<MasqueRelayServer>>,
-        ack_bidi_stream_tx: Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
         observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
@@ -5395,8 +5348,6 @@ impl NatTraversalEndpoint {
                     let connection_lifecycle = connection_lifecycle.clone();
                     let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
-                    let relay_server = relay_server.clone();
-                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
                     let observed_address_tx = observed_address_tx.clone();
                     let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
@@ -5460,21 +5411,6 @@ impl NatTraversalEndpoint {
                                     traversal_event_notify.notify_waiters();
                                 }
 
-                                if let Some(ref server) = relay_server {
-                                    let conn_clone = connection.clone();
-                                    let server_clone = Arc::clone(server);
-                                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
-                                    tokio::spawn(async move {
-                                        Self::handle_relay_requests(
-                                            peer_id,
-                                            conn_clone,
-                                            server_clone,
-                                            ack_bidi_stream_tx,
-                                        )
-                                        .await;
-                                    });
-                                }
-
                                 Self::spawn_observed_address_watch_task_parts(
                                     observed_address_tx.clone(),
                                     peer_id,
@@ -5500,36 +5436,6 @@ impl NatTraversalEndpoint {
                     break;
                 }
             }
-        }
-    }
-
-    /// Handle relay requests from a connected peer (symmetric P2P)
-    ///
-    /// This listens for bidirectional streams and processes CONNECT-UDP Bind requests.
-    /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
-    fn dispatch_ack_bidi_stream(
-        ack_bidi_stream_tx: &Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
-        stream: IncomingAckBidiStream,
-    ) -> Result<(), IncomingAckBidiStream> {
-        let tx = ack_bidi_stream_tx.read().clone();
-        match tx {
-            Some(tx) => tx.send(stream).map_err(|error| error.0),
-            None => Err(stream),
-        }
-    }
-
-    async fn send_ack_bidi_not_supported(mut send_stream: InnerSendStream) {
-        let bytes = encode_ack_bidi_response(AckControlOutcome::Rejected(
-            ReceiveRejectReason::NotSupported,
-        ));
-        if let Err(error) = send_stream.write_all(&bytes).await {
-            debug!(error = %error, "failed to send ACK-v2 NotSupported response");
-            return;
-        }
-        if let Err(error) = send_stream.finish() {
-            debug!(error = %error, "failed to finish ACK-v2 NotSupported response");
         }
     }
 
@@ -5657,73 +5563,6 @@ impl NatTraversalEndpoint {
                     "Stream from {} is not a CONNECT-UDP request: {}",
                     client_addr, e
                 );
-            }
-        }
-    }
-
-    async fn handle_relay_requests(
-        peer_id: PeerId,
-        connection: InnerConnection,
-        relay_server: Arc<MasqueRelayServer>,
-        ack_bidi_stream_tx: Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
-    ) {
-        let client_addr = connection.remote_address();
-        debug!("Started relay request handler for peer at {}", client_addr);
-
-        loop {
-            // Accept bidirectional streams for relay requests
-            match connection.accept_bi().await {
-                Ok((send_stream, mut recv_stream)) => {
-                    let server = Arc::clone(&relay_server);
-                    let addr = client_addr;
-                    let conn_stable_id = connection.stable_id();
-                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
-                    let accepted_at = Instant::now();
-
-                    tokio::spawn(async move {
-                        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
-                        if let Err(e) = recv_stream.read_exact(&mut prefix).await {
-                            debug!("Failed to read bidi stream prefix from {}: {}", addr, e);
-                            return;
-                        }
-
-                        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
-                            let stream = IncomingAckBidiStream {
-                                peer_id,
-                                conn_stable_id,
-                                send: send_stream,
-                                recv: recv_stream,
-                                prefix,
-                                accepted_at,
-                            };
-                            if let Err(stream) =
-                                Self::dispatch_ack_bidi_stream(&ack_bidi_stream_tx, stream)
-                            {
-                                Self::send_ack_bidi_not_supported(stream.send).await;
-                            }
-                            return;
-                        }
-
-                        Self::handle_relay_bidi_stream_with_prefix(
-                            server,
-                            addr,
-                            send_stream,
-                            recv_stream,
-                            prefix,
-                        )
-                        .await;
-                    });
-                }
-                Err(e) => {
-                    // Connection closed or error
-                    debug!(
-                        "Relay handler stopping for {} - accept_bi error: {}",
-                        client_addr, e
-                    );
-                    break;
-                }
             }
         }
     }
@@ -6388,10 +6227,10 @@ impl NatTraversalEndpoint {
 
         info!("Establishing relay session to {}", relay_addr);
 
-        // Prefer reusing an existing peer connection to the relay.
-        // The relay server's handle_relay_requests is spawned for each ACCEPTED
-        // connection, so using the existing connection ensures a handler is
-        // already listening for bidi streams.
+        // Prefer reusing an existing peer connection to the relay: the
+        // endpoint's reader task demultiplexes relay bidi streams for every
+        // connection the application accepts (#280), so an existing
+        // connection already carries a serving path.
         let existing_conn = self.connections.iter().find_map(|entry| {
             let conn = entry.value();
             if conn.remote_address() == relay_addr && conn.close_reason().is_none() {
@@ -6601,9 +6440,12 @@ impl NatTraversalEndpoint {
 
     /// Accept incoming connections on the endpoint.
     ///
-    /// The pending-accept queue is bounded (`MAX_PENDING_ACCEPTS`); if the
-    /// application does not drain it, the oldest queued connections are
-    /// evicted and will not be returned here.
+    /// The bounded `pending_accepts` queue is the sole accept source (#280):
+    /// every producer (main accept loop, shared-relay accept loop) pushes here
+    /// with generation tagging, so a connection is never returned twice and
+    /// never receives two reader tasks. `ConnectionEstablished` remains an
+    /// observer event only. If the application does not drain the queue, the
+    /// oldest queued connections are evicted and will not be returned here.
     pub async fn accept_connection(&self) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         debug!("Waiting for incoming connection via accept queue...");
         loop {
@@ -6640,50 +6482,6 @@ impl NatTraversalEndpoint {
                     pending.peer_id
                 );
                 return Ok((pending.peer_id, connection));
-            }
-
-            // Drain all pending events (non-blocking, under ParkingMutex) for
-            // relay/legacy paths that may still only signal via event_rx.
-            {
-                let mut event_rx = self.event_rx.lock();
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(NatTraversalEvent::ConnectionEstablished {
-                            peer_id,
-                            remote_address,
-                            side,
-                        }) => {
-                            info!(
-                                "Received ConnectionEstablished event for peer {:?} at {} (side: {:?})",
-                                peer_id, remote_address, side
-                            );
-                            let Some(connection) = self
-                                .connections
-                                .get(&peer_id)
-                                .map(|entry| entry.value().clone())
-                            else {
-                                debug!(
-                                    "Ignoring stale ConnectionEstablished event for peer {:?}: connection no longer in storage",
-                                    peer_id
-                                );
-                                continue;
-                            };
-                            return Ok((peer_id, connection));
-                        }
-                        Ok(event) => {
-                            debug!(
-                                "Ignoring non-connection event while waiting for accept: {:?}",
-                                event
-                            );
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            return Err(NatTraversalError::NetworkError(
-                                "Event channel closed".to_string(),
-                            ));
-                        }
-                    }
-                }
             }
 
             self.incoming_notify.notified().await;

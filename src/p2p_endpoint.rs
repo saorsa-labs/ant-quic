@@ -90,8 +90,8 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
-    ConstrainedEventWithAddr, IncomingAckBidiStream, NatTraversalEndpoint, NatTraversalError,
-    NatTraversalEvent, PeerId, TraversalFailureReason,
+    ConstrainedEventWithAddr, NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
+    TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{
@@ -3296,67 +3296,6 @@ impl P2pEndpoint {
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
             ack_response_drop_injection: Arc::new(AtomicUsize::new(0)),
         };
-
-        let (ack_bidi_tx, mut ack_bidi_rx) = mpsc::unbounded_channel();
-        endpoint.inner.set_ack_bidi_stream_sender(ack_bidi_tx);
-        {
-            let connected_peers = Arc::clone(&endpoint.connected_peers);
-            let peer_activity = Arc::clone(&endpoint.peer_activity);
-            let ack_diagnostics = Arc::clone(&endpoint.ack_diagnostics);
-            let ack_request_dedupe = Arc::clone(&endpoint.ack_request_dedupe);
-            let data_tx = endpoint.data_tx.clone();
-            let data_tx_diagnostics = Arc::clone(&endpoint.data_tx_diagnostics);
-            let data_tx_capacity = endpoint.data_tx_capacity;
-            let event_tx = endpoint.event_tx.clone();
-            let shutdown = endpoint.shutdown.clone();
-            let max_read_bytes = endpoint.config.max_message_size;
-            let ack_response_drop_injection = Arc::clone(&endpoint.ack_response_drop_injection);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        stream = ack_bidi_rx.recv() => {
-                            let Some(IncomingAckBidiStream {
-                                peer_id,
-                                conn_stable_id,
-                                send,
-                                recv,
-                                prefix,
-                                accepted_at,
-                            }) = stream else {
-                                break;
-                            };
-                            if !Self::handle_ack_bidi_stream(
-                                ack_diagnostics.as_ref(),
-                                ack_request_dedupe.as_ref(),
-                                &connected_peers,
-                                &peer_activity,
-                                &data_tx,
-                                data_tx_diagnostics.as_ref(),
-                                data_tx_capacity,
-                                &event_tx,
-                                peer_id,
-                                conn_stable_id,
-                                send,
-                                recv,
-                                prefix,
-                                accepted_at,
-                                max_read_bytes,
-                                &ack_response_drop_injection,
-                            )
-                            .await
-                            {
-                                debug!(
-                                    "ACK-v2 bidi bridge stopping for peer {:?}: consumer gone",
-                                    peer_id
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
 
         // Spawn background pollers for transport and peer-address updates.
         endpoint.spawn_constrained_poller();
@@ -14506,10 +14445,16 @@ mod tests {
     /// partial prefix must not freeze the reader task. After the prefix-read
     /// timeout the reader resets the half-opened stream and continues, so a
     /// subsequent application stream is still delivered to `accept_bi`.
+    ///
+    /// #280: previously `#[ignore]`d as "timing-sensitive" — it was actually
+    /// sampling the two-consumer `accept_bi` race (the redundant
+    /// per-connection relay accept task). With the single-reader demux
+    /// restored it is deterministic and runs everywhere.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
-    #[ignore = "real two-node loopback test; timing-sensitive across CI configs \
-                (release / --no-default-features / beta / windows). Run explicitly: \
-                `cargo test --lib -- --ignored reader_recovers_from_prefix_starvation`"]
     async fn reader_recovers_from_prefix_starvation() {
         async fn build_endpoint() -> P2pEndpoint {
             P2pEndpoint::new(
@@ -15018,19 +14963,16 @@ mod tests {
     ///   connection is installed in BOTH `connected_peers` and the
     ///   nat-traversal winner map before connectivity is reported.
     ///
-    /// Ignored like its neighbour `reader_recovers_from_prefix_starvation`:
-    /// the two-node accept fixture is timing-sensitive across CI configs and,
-    /// in release builds, independently broken by ant-quic#280 (one connect
-    /// yields two accepted generations; the dialer's stream never surfaces) —
-    /// not fixable by settling or serialising.
+    /// #280: previously `#[ignore]`d (PR #279 round 3) because master's
+    /// two-consumer accept race made this fixture bimodal — the "two accepted
+    /// generations" symptom was in fact one connection returned twice plus the
+    /// relay task stealing the dialer's stream. With the single-reader demux
+    /// restored the churn sequence is deterministic.
     // Requires the network-discovery socket path: the fallback
     // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
     // connections (see issue tracked separately).
     #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
-    #[ignore = "real two-node loopback test; timing-sensitive across CI configs \
-                (release / --no-default-features / beta / windows). Run explicitly: \
-                `cargo test --lib -- --ignored churn_disconnect_reconnect_delivers_over_new_connection`"]
     async fn churn_disconnect_reconnect_delivers_over_new_connection() {
         // Deadline/poll values follow the neighbouring loopback fixtures:
         // a 30 s overall connect budget (relay_only_data_plane_end_to_end's
@@ -15149,6 +15091,248 @@ mod tests {
             .expect("post-churn read");
         assert_eq!(post_payload, b"post-churn");
 
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #280 (a): single stream owner. An application stream opened by the
+    /// dialer must be delivered to the acceptor's app-stream queue EXACTLY
+    /// once, with a relay server configured (the default), and exactly one
+    /// reader task must own the connection.
+    ///
+    /// Pre-fix on origin/master this fails deterministically: `accept()`
+    /// returned the same connection twice (legacy `ConnectionEstablished`
+    /// accept path) so two reader tasks were spawned — `reader_handle_count`
+    /// was 2 — and the app stream itself was stolen ~50% of the time by the
+    /// redundant per-connection relay accept task, which parsed the app magic
+    /// as a big-endian relay length and silently dropped the stream.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn app_stream_has_single_owner_with_relay_server_configured() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi");
+        send.write_all(b"single-owner").await.expect("write");
+        send.finish().expect("finish");
+
+        // Delivered exactly once: the first accept yields the stream...
+        let (from, _, mut stream) = tokio::time::timeout(Duration::from_secs(15), b.accept_bi())
+            .await
+            .expect("app stream must reach the accept queue")
+            .expect("app stream handle");
+        assert_eq!(from, a_id);
+        let payload = stream.read_to_end(1024).await.expect("read payload");
+        assert_eq!(payload, b"single-owner");
+        // ...and a second accept finds nothing (no duplicate delivery).
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.accept_bi())
+                .await
+                .is_err(),
+            "the app stream must be delivered exactly once"
+        );
+
+        // Exactly one reader task owns the connection (pre-fix: two).
+        assert_eq!(
+            b.reader_handle_count().await,
+            1,
+            "one accepted connection must have exactly one reader task"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #280 (b): an app-magic stream must reach the app queue even when the
+    /// acceptor's reader starts LATE — with a relay server configured (the
+    /// default).
+    ///
+    /// Pre-fix on origin/master this fails deterministically: the moment the
+    /// NAT layer accepted the connection it spawned the redundant relay task,
+    /// the only `accept_bi` consumer until the application accepted. During
+    /// the deliberate 300 ms head start it consumed the dialer's app stream,
+    /// mis-parsed the app magic (`ANQAppB1` → big-endian length
+    /// 1,096,057,153) and silently dropped it — the accept queue stayed empty
+    /// forever (the x0x#277 "shape B" signature: writes succeed, zero
+    /// received). Post-fix there is no second consumer: the stream waits in
+    /// the connection's accept queue until the reader starts.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn late_reader_still_receives_app_stream_with_relay_configured() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        // Deliberately NO accept loop on b yet: on the pre-fix code the
+        // relay task gets an uncontested window over the connection.
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi");
+        send.write_all(b"late-reader").await.expect("write");
+        send.finish().expect("finish");
+
+        // Give any rogue second consumer an uncontested window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // NOW the application accepts (reader spawns) — the stream must still
+        // be delivered.
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Ok((from, _, mut stream))) =
+                tokio::time::timeout(Duration::from_secs(2), b.accept_bi()).await
+            {
+                assert_eq!(from, a_id);
+                let payload = stream.read_to_end(1024).await.expect("read payload");
+                assert_eq!(payload, b"late-reader");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "app stream was consumed by a rogue accept_bi consumer (dropped silently)"
+            );
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #280 (c): a partial-prefix stream must not leak consumer tasks. The
+    /// reader's `BIDI_PREFIX_READ_TIMEOUT` releases the starved stream; the
+    /// connection keeps exactly one reader and stays fully serviceable.
+    ///
+    /// Pre-fix on origin/master this fails deterministically: the same
+    /// connection was accepted twice (two reader tasks ⇒
+    /// `reader_handle_count` == 2), and every partial-prefix stream
+    /// additionally parked a relay task forever on an unbounded prefix read.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn partial_prefix_stream_does_not_leak_consumer_tasks() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        // Raw stream with a partial (3 of 8 bytes) prefix: the reader must
+        // time the prefix read out and reset the stream instead of parking.
+        let conn = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection")
+            .expect("a is connected to b");
+        let (mut starved_send, _starved_recv) = conn.open_bi().await.expect("raw open_bi");
+        starved_send
+            .write_all(&[0u8; 3])
+            .await
+            .expect("partial prefix write");
+
+        // Wait past BIDI_PREFIX_READ_TIMEOUT so the reader releases the
+        // starved stream (test cfg: 2 s; margin for scheduling).
+        tokio::time::sleep(BIDI_PREFIX_READ_TIMEOUT + Duration::from_millis(500)).await;
+
+        assert_eq!(
+            b.reader_handle_count().await,
+            1,
+            "the starved stream must not grow the reader set (pre-fix: duplicate accept)"
+        );
+
+        // And the same single reader still serves a good app stream.
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi after starvation");
+        send.write_all(b"post-starvation").await.expect("write");
+        send.finish().expect("finish");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Ok((_from, _, mut stream))) =
+                tokio::time::timeout(Duration::from_secs(2), b.accept_bi()).await
+            {
+                let payload = stream.read_to_end(1024).await.expect("read payload");
+                assert_eq!(payload, b"post-starvation");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reader never recovered from the starved partial-prefix stream"
+            );
+        }
+
+        drop(starved_send);
         a.shutdown().await;
         b.shutdown().await;
     }

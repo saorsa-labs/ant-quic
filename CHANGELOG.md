@@ -24,6 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConnectionClosed { reason }` — carrying the disconnect's close reason — instead of a
   misleading `PeerNotFound` for a peer this endpoint recently closed. No wire or API change.
 
+- **One stream consumer per connection: relay accept task removed, single accept source (#280, x0x#277 shape B).**
+  Two unsynchronised `accept_bi()` consumers raced on every accepted connection whenever a relay
+  server existed (the default): the NAT layer spawned `handle_relay_requests` per connection while
+  the endpoint reader task polled the same source. When the relay task won, it read the 8-byte
+  prefix, had no app-magic branch, parsed `ANQAppB1` as a big-endian length (1,096,057,153),
+  tripped "request too large" and silently dropped the stream — writes succeed, the peer's
+  `accept_bi()` never yields. Independently, `accept_connection()` drained a legacy
+  `ConnectionEstablished` path beside the pending-accept queue, so one connection could be
+  returned twice and spawn two reader tasks; `handle_relay_requests`' prefix read also had no
+  timeout (a remote-triggerable task leak per partial-prefix stream). The redundant relay accept
+  task (and its now-dead ACK-bidi bridge plumbing) is deleted — relay serving runs exclusively
+  through the reader's prefix demux (ACK-v2 → app → relay, with `BIDI_PREFIX_READ_TIMEOUT`); the
+  bounded `pending_accepts` queue is the sole accept source; no unbounded prefix read remains.
+  No wire, frame or transport-parameter change. `relay_connect_udp_bind_on_live_node` now drives
+  the supported single-consumer path (the relay node accepts; pre-fix it deliberately avoided
+  `accept()` to dodge the race this change removes).
+
 ## [0.27.50] - 2026-09-07
 
 ### Fixed

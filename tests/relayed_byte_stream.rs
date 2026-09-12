@@ -12,14 +12,16 @@
 //! ANQAckB3 magic prefix) and exchanges a length-prefixed CONNECT-UDP Bind / Response
 //! with `r`'s relay service. The test asserts the response is a success and that `r`
 //! allocated a UDP forwarding socket for the session.
-//!
 //! This exercises a code path not covered elsewhere:
-//! - `handle_relay_requests` accepting bidi streams on an accepted connection
-//!   (`nat_traversal_api.rs` line 5527)
+//! - the reader task's bidi demux forwarding a raw (unrecognised-prefix)
+//!   stream to the relay service via `handle_relay_bidi_stream_from_app_reader`
+//!   (`p2p_endpoint.rs`) — the single stream consumer on an accepted
+//!   connection (#280: the former redundant per-connection relay accept task
+//!   was removed)
 //! - `handle_relay_bidi_stream_with_prefix` parsing the CONNECT-UDP Bind frame
-//!   (`nat_traversal_api.rs` line 5419)
+//!   (`nat_traversal_api.rs`)
 //! - `MasqueRelayServer::handle_connect_request` binding a real UDP socket for
-//!   the session (`masque/relay_server.rs` line 512)
+//!   the session (`masque/relay_server.rs`)
 //! - The length-prefixed CONNECT-UDP Response encoding
 //!
 //! `masque_integration_tests.rs` tests the relay protocol types in isolation using
@@ -92,25 +94,18 @@ fn loopback_addr(node: &Node) -> std::net::SocketAddr {
 /// Two real `Node` instances are bound on loopback. `a` opens a raw QUIC bidi stream
 /// on its connection to `r` (bypassing `Node::open_bi`'s ANQAppB1 prefix) and
 /// exchanges a CONNECT-UDP Bind / Response with `r`'s relay service.
-///
 /// # Determinism guarantee
 ///
-/// `r.accept()` is deliberately **never called**. Without an application-layer accept
-/// loop, `spawn_reader_task` is never spawned on `r` for the connection from `a`. The
-/// only concurrent consumer of bidi streams on that connection is `handle_relay_requests`,
-/// which is spawned automatically by the NAT traversal layer when the connection is
-/// accepted (`nat_traversal_api.rs` line 5346). This makes the test deterministic:
-/// there is no race between `spawn_reader_task` and `handle_relay_requests` for the
-/// CONNECT-UDP Bind stream.
-///
-/// (For comparison: in `node_app_streams.rs` the connected-pair helper does call
-/// `b.accept()`, which spawns both handlers concurrently. ANQAppB1 and ANQAckB3
-/// streams route correctly because each unknown-prefix stream is silently dropped by
-/// the other handler — but a raw CONNECT-UDP stream might be stolen by
-/// `spawn_reader_task` if both are running, making such a test non-deterministic.)
+/// `r` runs a normal application accept loop, so the connection from `a` gets
+/// exactly one reader task — the single `accept_bi` consumer on that
+/// connection (#280). The reader's prefix demux forwards the raw
+/// length-prefixed CONNECT-UDP Bind stream to the relay service; there is no
+/// second consumer to race with. (Pre-#280 this test deliberately never called
+/// `r.accept()` because a redundant NAT-layer relay task raced the reader for
+/// bidi streams; that task no longer exists.)
 #[tokio::test]
 async fn relay_connect_udp_bind_on_live_node() {
-    // r: relay node. No accept loop — handle_relay_requests runs automatically.
+    // r: relay node, with a normal accept loop (single-consumer path, #280).
     let r = Node::bind("127.0.0.1:0".parse().expect("addr"))
         .await
         .expect("relay node");
@@ -118,19 +113,19 @@ async fn relay_connect_udp_bind_on_live_node() {
         .await
         .expect("client node");
 
+    // r drains accepted connections so each gets its single reader task.
+    let r_for_accept = r.clone();
+    tokio::spawn(async move { while r_for_accept.accept().await.is_some() {} });
+
     let r_id = r.peer_id();
     let r_addr = loopback_addr(&r);
 
-    // Connect a → r. The NAT traversal layer on r accepts the incoming connection
-    // and spawns handle_relay_requests in a background task.
+    // Connect a → r. r's accept loop registers the connection and spawns its
+    // single reader task, whose prefix demux serves relay requests.
     timeout(Duration::from_secs(5), a.connect_addr(r_addr))
         .await
         .expect("connect timed out")
         .expect("connect failed");
-
-    // Yield to give r's NAT traversal accept-loop task time to run and spawn
-    // handle_relay_requests before we push the bidi stream into the connection.
-    tokio::task::yield_now().await;
 
     // Retrieve the raw QUIC connection from a's side.
     // After a successful connect_addr(), the connection is stored in a's NAT
