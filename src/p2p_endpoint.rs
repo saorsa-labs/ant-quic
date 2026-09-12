@@ -15023,6 +15023,41 @@ mod tests {
     #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
     async fn churn_disconnect_reconnect_delivers_over_new_connection() {
+        // Deadline/poll values follow the neighbouring loopback fixtures:
+        // a 30 s overall connect budget (relay_only_data_plane_end_to_end's
+        // connect) and 2 s cancel-safe accept attempts inside a 30 s outer
+        // deadline (reader_recovers_from_prefix_starvation's poll shape).
+        // The poll shape matters on loaded 2-vCPU CI runners: a single
+        // sequential 10 s accept expired while the PQC handshake was still
+        // monopolising the core (PR #279 round 2). `accept_bi` resolves from
+        // a queued channel handle, so a cancelled attempt cannot lose an
+        // already-delivered stream.
+        const CONNECT_BUDGET: Duration = Duration::from_secs(30);
+        const ACCEPT_ATTEMPT: Duration = Duration::from_secs(2);
+        const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn accept_app_stream(
+            b: &P2pEndpoint,
+            attempt: Duration,
+            deadline: Duration,
+            what: &str,
+        ) -> (
+            PeerId,
+            crate::high_level::SendStream,
+            crate::high_level::RecvStream,
+        ) {
+            let deadline = Instant::now() + deadline;
+            loop {
+                if let Ok(Ok(stream)) = tokio::time::timeout(attempt, b.accept_bi()).await {
+                    return stream;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: accept_bi never yielded the app stream"
+                );
+            }
+        }
+
         async fn build_endpoint() -> P2pEndpoint {
             P2pEndpoint::new(
                 crate::unified_config::P2pConfig::builder()
@@ -15047,7 +15082,7 @@ mod tests {
         let a_id = a.peer_id();
 
         // Phase 1 — connect and deliver a pre-churn payload.
-        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
             .await
             .expect("connect timeout")
             .expect("connect failed");
@@ -15058,10 +15093,7 @@ mod tests {
             .expect("pre-churn write");
         pre_send.finish().expect("pre-churn finish");
         let (from, _, mut pre_stream) =
-            tokio::time::timeout(Duration::from_secs(10), b.accept_bi())
-                .await
-                .expect("pre-churn accept timeout")
-                .expect("pre-churn app stream");
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "pre-churn").await;
         assert_eq!(from, a_id, "app stream arrives from the connected peer");
         let pre_payload = pre_stream.read_to_end(1024).await.expect("pre-churn read");
         assert_eq!(pre_payload, b"pre-churn");
@@ -15088,7 +15120,7 @@ mod tests {
 
         // Phase 3 — reconnect: the new connection must be installed in both
         // structures, and a write must reach the peer over it.
-        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
             .await
             .expect("reconnect timeout")
             .expect("reconnect failed");
@@ -15100,10 +15132,7 @@ mod tests {
             .expect("post-churn write");
         post_send.finish().expect("post-churn finish");
         let (from, _, mut post_stream) =
-            tokio::time::timeout(Duration::from_secs(10), b.accept_bi())
-                .await
-                .expect("post-churn accept timeout")
-                .expect("post-churn app stream");
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "post-churn").await;
         assert_eq!(from, a_id);
         let post_payload = post_stream
             .read_to_end(1024)

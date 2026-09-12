@@ -7892,9 +7892,16 @@ impl NatTraversalEndpoint {
     /// Every non-closed tracked generation is marked `Closed` under the
     /// lifecycle lock — so a concurrent `repromote_surviving_connection`
     /// cannot resurrect it — and each still-open connection is closed
-    /// synchronously, making its `close_reason()` `Some` immediately. A
-    /// winner-map entry is evicted only when it aliases a swept generation,
-    /// so a replacement registered concurrently with the disconnect survives.
+    /// synchronously, making its `close_reason()` `Some` immediately.
+    /// Winner-map eviction is bounded to swept generations.
+    ///
+    /// Concurrency guarantee (stated exactly): a replacement connection
+    /// racing this sweep is NOT spared — if its registration completes
+    /// before the sweep's lifecycle-lock section runs, its `Live` entry is
+    /// swept and closed too (the disconnect wins; ordering is decided by
+    /// who holds the lifecycle write lock, not by the bounded `remove_if`).
+    /// Only a replacement registering after the lock section releases
+    /// survives untouched.
     ///
     /// Returns the number of generations swept.
     pub(crate) fn close_all_connection_generations(
