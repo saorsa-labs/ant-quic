@@ -15944,6 +15944,122 @@ mod tests {
         b.shutdown().await;
     }
 
+    /// #283: `NatTraversalEndpoint::shutdown` must close every
+    /// lifecycle-tracked generation — Superseded survivors included — BEFORE
+    /// the bounded drain, so the CONNECTION_CLOSE frames flush while the
+    /// socket still exists. Previously only the canonical `connections`
+    /// entries were closed; survivors were closed merely implicitly by the
+    /// post-drain `connection_lifecycle.clear()`, immediately before
+    /// `release_socket_for_shutdown` yanked the socket, so the remote kept
+    /// the peer "connected" (its `is_peer_connected` repromotes any
+    /// still-alive Superseded entry) until the idle timeout — the x0x#510
+    /// restart-class "old owner connection never observed as gone".
+    ///
+    /// Construction: B dials A twice into the SAME initiator family (both
+    /// raw handshakes, registered on B explicitly — B's NAT accept task
+    /// processes one inbound at a time, so inbound-only constructions cannot
+    /// stack generations). The second registration is the newer same-family
+    /// generation and wins the tiebreak DETERMINISTICALLY, demoting the
+    /// first connection to an OPEN Superseded survivor on B. A holds the
+    /// first connection (its accept task registered it, its accept loop
+    /// spawned the reader). B's inner endpoint then shuts down: pre-fix only
+    /// the canonical winner is closed, the survivor stays transport-open and
+    /// A must stay "connected" until its idle timeout; with the fix every
+    /// generation closes before the drain and A observes the disconnect
+    /// within it.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn shutdown_closes_superseded_survivors_remote_observes_disconnect() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let a_for_accept = a.clone();
+        tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
+        let a_addr = localhost_addr(a.local_addr().expect("a bound"));
+        let b_id = b.peer_id();
+
+        // First B → A dial: A's NAT accept task registers it and A's accept
+        // loop adopts it (outer record + reader) — A is connected through it.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c0_probe = c0.clone();
+        b.inner
+            .add_connection_with_outcome(a.peer_id(), c0)
+            .expect("register c0 on B");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.is_connected(&b_id).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "A never adopted the first dial (not connected)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Second B → A dial, same initiator family: newer generation wins
+        // deterministically, demoting c0 to an OPEN Superseded survivor on B.
+        let c1 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        b.inner
+            .add_connection_with_outcome(a.peer_id(), c1.clone())
+            .expect("register c1 on B");
+        assert_eq!(
+            b.inner
+                .get_connection(&a.peer_id())
+                .expect("get_connection ok")
+                .expect("canonical winner")
+                .stable_id(),
+            c1.stable_id(),
+            "the newer same-family dial must be the canonical winner"
+        );
+        assert!(
+            c0_probe.close_reason().is_none(),
+            "the demoted first dial must remain open (Superseded survivor)"
+        );
+
+        // B's inner endpoint shuts down — the path that, pre-fix, closed
+        // only the canonical winner and left the Superseded survivor open.
+        b.inner.shutdown().await.expect("inner shutdown");
+
+        // A must observe the disconnect within the drain window (the bounded
+        // drain is 5 s; the QUIC idle timeout is far longer — pre-fix, A
+        // stays connected until it).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < deadline,
+                "A must observe B's shutdown within the drain window — a                  superseded survivor was never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        a.shutdown().await;
+    }
+
     /// #280 (a): single stream owner. An application stream opened by the
     /// dialer must be delivered to the acceptor's app-stream queue EXACTLY
     /// once, with a relay server configured (the default), and exactly one

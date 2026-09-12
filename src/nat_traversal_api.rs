@@ -8468,6 +8468,35 @@ impl NatTraversalEndpoint {
             }
         }
 
+        // #283: close every lifecycle-tracked generation — Superseded
+        // survivors included — BEFORE the bounded drain. Previously only the
+        // canonical `connections` entries were closed here; survivors were
+        // closed merely implicitly by `connection_lifecycle.clear()` AFTER
+        // wait_idle, immediately before the socket release, so their
+        // CONNECTION_CLOSE frames frequently never transmitted. The REMOTE
+        // then kept the peer "connected" (its `is_peer_connected` falls
+        // through to `repromote_surviving_connection`, which resurrects any
+        // still-alive Superseded entry) until the idle timeout — the x0x#510
+        // restart-class "old owner connection never observed as gone".
+        {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let mut closed = 0usize;
+            for entries in lifecycle.values_mut() {
+                for entry in entries.iter_mut() {
+                    if entry.connection.close_reason().is_none() {
+                        entry
+                            .connection
+                            .close(crate::VarInt::from_u32(0), b"Shutdown");
+                        closed += 1;
+                    }
+                }
+            }
+            drop(lifecycle);
+            if closed > 0 {
+                info!("shutdown: closed {closed} additional lifecycle-tracked connection(s)");
+            }
+        }
+
         // Bounded drain: in simultaneous-shutdown scenarios both sides may
         // close at once, so wait_idle can stall until the idle timeout.
         if let Some(ref endpoint) = self.inner_endpoint {
