@@ -32,8 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close reason) before the tiebreak, and the search additionally requires `is_alive()`;
   (2) `repromote_surviving_connection` repaired the inner winner map without re-registering the
   promoted survivor at the p2p layer, leaving `is_connected()`/`connected_peers()` false while
-  the DashMap served traffic — a promotion hook (installed by `P2pEndpoint::new`) now
-  re-registers the peer; (3) `finalize_direct_connection` returned the outer `connected_peers`
+  the DashMap served traffic — promotions now signal the p2p layer through a channel (a stored
+  callback capturing the endpoint would leak it; round 2) whose consumer re-registers the peer
+  with the survivor's real traversal classification (Direct/Relay tracked per generation); (3) `finalize_direct_connection` returned the outer `connected_peers`
   entry unconditionally in its Rejected branch — a dead entry is now treated as absent, so
   `Ok` always leaves a live routable connection behind it.
 

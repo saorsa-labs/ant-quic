@@ -26,5 +26,5 @@ test-group = "node-app-streams"
 # b_events_parity binary — are serialised into one group so their
 # handshake/CPU spikes never overlap each other.
 [[profile.default.overrides]]
-filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(dead_live_entry_never_wins_simultaneous_open_tiebreaker) or test(lazy_promotion_re_registers_peer_at_p2p_layer) or test(finalize_direct_connection_never_returns_stale_dead_entry) or binary_id(ant-quic::b_events_parity)"
+filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(dead_live_entry_never_wins_simultaneous_open_tiebreaker) or test(lazy_promotion_re_registers_peer_at_p2p_layer) or test(finalize_direct_connection_never_returns_stale_dead_entry) or test(promoted_connection_signal_does_not_leak_endpoint) or test(promotion_reregisters_relayed_survivor_with_real_traversal_method) or test(finalize_rejected_with_unroutable_winner_errors_not_stale_ok) or binary_id(ant-quic::b_events_parity)"
 test-group = "loopback-pair-heavyweights"
