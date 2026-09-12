@@ -15078,6 +15078,7 @@ mod tests {
         tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
         let b_addr = localhost_addr(b.local_addr().expect("b bound"));
         let b_id = b.peer_id();
+        let mut events = a.subscribe();
 
         // First connection, registered at the inner layer only.
         let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
@@ -15180,6 +15181,24 @@ mod tests {
         assert_eq!(
             stats.direct_connections, 0,
             "promoting a hole-punched survivor must not inflate direct_connections"
+        );
+
+        // Exactly ONE PeerConnected for the peer: the finalize's. The
+        // promotion re-registration carries the same addr/method/side and
+        // must not emit a spurious second event.
+        let collected = collect_broadcast_events(&mut events);
+        let peer_connected = collected
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    P2pEvent::PeerConnected { peer_id, .. } if *peer_id == b_id
+                )
+            })
+            .count();
+        assert_eq!(
+            peer_connected, 1,
+            "the promotion re-registration must not emit a spurious PeerConnected"
         );
 
         a.shutdown().await;

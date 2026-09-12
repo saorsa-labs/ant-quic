@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `connected_peers`) could report the peer live while `open_bi()` (backed by the nat-traversal
   winner map) handed out streams on the old, half-dead connection — writes then failed with
   `sending stopped by peer: error 0` or succeeded into a send buffer the teardown discarded,
-  with no error surfaced so replay logic never fired. Disconnect now sweeps every
+  with no error surfaced so application replay logic never fired. Disconnect now sweeps every
   tracked generation for the peer under the lifecycle lock (closing each synchronously, so
   `close_reason()` is `Some` immediately) and `open_bi()` reports
   `ConnectionClosed { reason }` — carrying the disconnect's close reason — instead of a
@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promoted survivor at the p2p layer, leaving `is_connected()`/`connected_peers()` false while
   the DashMap served traffic — promotions now signal the p2p layer through a channel (a stored
   callback capturing the endpoint would leak it; round 2) whose consumer re-registers the peer
-  with the survivor's real traversal classification (Direct/Relay tracked per generation); (3) `finalize_direct_connection` returned the outer `connected_peers`
+  with the survivor's real traversal classification (Direct/HolePunch/Relay tracked per generation); (3) `finalize_direct_connection` returned the outer `connected_peers`
   entry unconditionally in its Rejected branch — a dead entry is now treated as absent, so
   `Ok` always leaves a live routable connection behind it.
 
