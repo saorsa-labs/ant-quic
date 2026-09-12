@@ -25,5 +25,5 @@ test-group = "node-app-streams"
 # round 2), and victims rotate with scheduling. All of them are serialised
 # into one group so their handshake/CPU spikes never overlap each other.
 [[profile.default.overrides]]
-filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(reader_recovers_from_prefix_starvation) or test(app_stream_has_single_owner_with_relay_server_configured) or test(late_reader_still_receives_app_stream_with_relay_configured) or test(partial_prefix_stream_does_not_leak_consumer_tasks) or binary_id(ant-quic::b_events_parity)"
+filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(reader_recovers_from_prefix_starvation) or test(app_stream_has_single_owner_with_relay_server_configured) or test(late_reader_still_receives_app_stream_with_relay_configured) or test(partial_prefix_stream_does_not_leak_consumer_tasks) or test(shutdown_closes_superseded_survivors_remote_observes_disconnect) or binary_id(ant-quic::b_events_parity)"
 test-group = "loopback-pair-heavyweights"
