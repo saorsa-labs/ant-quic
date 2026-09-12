@@ -3376,6 +3376,7 @@ impl P2pEndpoint {
         // #368: give the inner endpoint a reader-liveness probe (we own
         // reader_handles) and start the orphan-connection janitor.
         endpoint.install_reader_liveness_probe();
+        endpoint.install_connection_promoted_hook();
         endpoint.spawn_orphan_connection_janitor();
 
         Ok(endpoint)
@@ -5384,7 +5385,13 @@ impl P2pEndpoint {
             registration,
             crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
         ) {
-            if let Some(existing) = self.connected_peers.read().await.get(&peer_id).cloned() {
+            // #277: the outer entry is only trustworthy while the inner
+            // endpoint still routes a live connection for this peer. A dead
+            // entry must be treated as absent — returning it would hand the
+            // caller a stale PeerConnection with nothing behind it.
+            if self.inner.is_peer_connected(&peer_id)
+                && let Some(existing) = self.connected_peers.read().await.get(&peer_id).cloned()
+            {
                 return Ok(existing);
             }
             let live_connection = self
@@ -8172,6 +8179,37 @@ impl P2pEndpoint {
                         })
                     })
                 })
+            }));
+    }
+
+    /// #277: install the p2p re-registration hook into the inner endpoint.
+    /// When the inner layer lazily promotes a surviving connection back to
+    /// the winner slot (from `get_connection` / `is_peer_connected` reads),
+    /// no p2p registration runs — `connected_peers` would stay empty while
+    /// the winner map serves traffic, so `is_connected()` /
+    /// `connected_peers()` disagree with the inner state (x0x#510). The
+    /// hook re-registers the promoted connection's peer at the p2p layer.
+    fn install_connection_promoted_hook(&self) {
+        let promoted_endpoint = self.clone();
+        self.inner
+            .set_connection_promoted_hook(Arc::new(move |peer_id, connection| {
+                let endpoint = promoted_endpoint.clone();
+                let peer_id = *peer_id;
+                let remote_addr = connection.remote_address();
+                let side = connection.side();
+                tokio::spawn(async move {
+                    endpoint
+                        .register_connected_peer(PeerConnection {
+                            peer_id,
+                            remote_addr: TransportAddr::Udp(remote_addr),
+                            traversal_method: TraversalMethod::Direct,
+                            side,
+                            authenticated: true,
+                            connected_at: Instant::now(),
+                            last_activity: Instant::now(),
+                        })
+                        .await;
+                });
             }));
     }
 
@@ -14574,6 +14612,204 @@ mod tests {
         assert_eq!(accepted.0, a_id, "app stream from the connected peer");
         send_a.finish().ok();
         drop(starved_send);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Regression for #277 (x0x#510): a lazily promoted surviving connection
+    /// must become visible at the p2p layer, not just in the inner winner
+    /// map.
+    ///
+    /// Repromotion runs from lazy read paths (`get_connection` /
+    /// `is_peer_connected`) where no p2p registration happens. Pre-fix, the
+    /// inner winner map served traffic over the promoted survivor while
+    /// `connected_peers` stayed empty — `is_connected()` returned false and
+    /// higher layers suppressed reconnects / reported the peer absent even
+    /// though the DashMap routed fine (the two-structure disagreement of
+    /// x0x#510). Post-fix, the promotion hook re-registers the peer.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn lazy_promotion_re_registers_peer_at_p2p_layer() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two real authenticated connections a -> b; registration is
+        // controlled explicitly (no readers, no p2p outer entry — the exact
+        // x0x#510 state where the promoted side never registered at the p2p
+        // layer).
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1.clone())
+            .expect("register c1");
+        // Precondition: the newer connection is the Live winner, the older is
+        // the open Superseded survivor, and the p2p outer map is empty.
+        assert!(
+            !a.is_connected(&b_id).await,
+            "precondition: no p2p-layer registration yet"
+        );
+
+        // Kill the winner at the transport level and trigger the lazy
+        // winner-map repair read path.
+        c1.close(crate::VarInt::from_u32(0), b"#277-winner-dead");
+        let promoted = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy read must repromote the survivor");
+        assert_eq!(
+            promoted.stable_id(),
+            c0.stable_id(),
+            "the Superseded survivor must be promoted into the winner map"
+        );
+
+        // #277: the promotion must also be visible at the p2p layer. The hook
+        // registers asynchronously, so poll with a deadline.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.is_connected(&b_id).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "promotion must re-register the peer at the p2p layer \
+                 (is_connected must agree with the winner map)"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Regression for #277 (x0x#510): `finalize_direct_connection` must never
+    /// return Ok with a stale outer `PeerConnection` when the inner endpoint
+    /// has no live connection for the peer.
+    ///
+    /// Pre-fix, the Rejected branch returned the `connected_peers` entry
+    /// unconditionally: a dead-but-Live inner entry won the tiebreaker (no
+    /// `is_alive()` gate), the fresh candidate was rejected and closed, and
+    /// the caller got `Ok(PeerConnection)` with no live connection behind it.
+    /// Post-fix the dead entry can never win the tiebreaker, so the fresh
+    /// connection is adopted — and the outer entry is only returned while the
+    /// inner endpoint still routes a live connection.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn finalize_direct_connection_never_returns_stale_dead_entry() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two real authenticated connections a -> b.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // Seed a dead-but-Live entry with the maximum cross-family sort key
+        // (connection_id all-0xFF) so the pre-fix tiebreaker prefers it over
+        // the fresh candidate, then close its transport.
+        let seeded = crate::nat_traversal_api::tracked_connection_with_sort_keys_for_test(
+            c0.clone(),
+            7,
+            0,
+            [0u8; 32],
+            [0xFFu8; 32],
+        );
+        a.inner.seed_lifecycle_entry_for_test(b_id, seeded);
+        c0.close(crate::VarInt::from_u32(0), b"#277-dead-live");
+        assert!(
+            !c0.is_alive(),
+            "precondition: seeded entry is transport-dead"
+        );
+
+        // The stale outer entry the pre-fix Rejected branch used to return.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(b_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+
+        let _peer_conn = a
+            .finalize_direct_connection(c1.clone(), b_addr, None)
+            .await
+            .expect("finalize must not fail while a fresh candidate exists");
+
+        // The contract: a successful finalize must leave a LIVE routable
+        // connection for the peer — never Ok with a stale PeerConnection and
+        // a corpse behind it (pre-fix: candidate rejected, winner map empty).
+        let routed = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("finalize Ok must leave a live routable connection");
+        assert_eq!(
+            routed.stable_id(),
+            c1.stable_id(),
+            "the fresh candidate must be the live winner"
+        );
+        assert!(
+            a.is_connected(&b_id).await,
+            "both structures must agree the peer is connected"
+        );
+
         a.shutdown().await;
         b.shutdown().await;
     }
