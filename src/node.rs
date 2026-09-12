@@ -722,7 +722,7 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
-    /// Same as [`send_with_receive_ack`] but the caller supplies the ACK-v2
+    /// Same as [`Node::send_with_receive_ack`] but the caller supplies the ACK-v2
     /// request id. Repeated calls with the same `(peer_id, request_id, data)`
     /// are duplicate-safe at the receiver — the second arrival is replayed
     /// from the receiver-side ACK dedupe cache and the payload is not

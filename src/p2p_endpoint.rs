@@ -2460,6 +2460,22 @@ async fn do_cleanup_connection(
 
     if !if_unroutable {
         let _ = inner.remove_connection_with_reason(peer_id, close_reason);
+        // #278: `remove_connection_with_reason` tears down only the winner
+        // generation. Surviving (superseded) generations stay open with
+        // `close_reason() == None` and remain promotable, so a concurrent
+        // `get_connection` would repromote one and hand it to `open_bi`/`send`
+        // — streams then open on a connection the caller just disconnected
+        // from: writes fail with `sending stopped by peer: error 0` or
+        // succeed into a send buffer the teardown discards, with no error
+        // surfaced (x0x#277). Sweep every remaining generation so the peer is
+        // unobservable as live before the `connected_peers` removal below.
+        let swept = inner.close_all_connection_generations(peer_id, close_reason);
+        if swept > 0 {
+            info!(
+                "disconnect: closed {} surviving connection generation(s) for peer {:?}",
+                swept, peer_id
+            );
+        }
     }
 
     if let Some(snapshot) = lifecycle_snapshot {
@@ -7116,7 +7132,7 @@ impl P2pEndpoint {
     ///
     /// Generates a fresh request id and delegates to
     /// [`P2pEndpoint::send_with_receive_ack_with_request_id`]. Callers that need
-    /// to issue more than one [`send_with_receive_ack`] for the same logical
+    /// to issue more than one [`P2pEndpoint::send_with_receive_ack`] for the same logical
     /// payload — e.g. application-level request hedging — should use the
     /// `_with_request_id` variant directly and supply the same id to every call
     /// so the receiver dedupes the duplicates instead of delivering them twice.
@@ -7132,10 +7148,10 @@ impl P2pEndpoint {
             .await
     }
 
-    /// Same contract as [`send_with_receive_ack`] but the caller supplies the
+    /// Same contract as [`P2pEndpoint::send_with_receive_ack`] but the caller supplies the
     /// ACK-v2 request id. Two calls with the same `(peer_id, request_id, data)`
     /// are duplicate-safe at the receiver: the second arrival is replayed from
-    /// the receiver-side [`AckRequestDedupeCache`], the cached ACK is returned
+    /// the receiver-side `AckRequestDedupeCache`, the cached ACK is returned
     /// on the wire, and the payload is **not** redelivered to `recv()`.
     ///
     /// Intended for application-level request hedging (x0x X0X-0066): the caller
@@ -7942,9 +7958,13 @@ impl P2pEndpoint {
     ///
     /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
     /// - [`EndpointError::PeerNotFound`] if no live QUIC connection exists for
-    ///   this peer (e.g. the peer is only reachable over a constrained transport
-    ///   such as BLE/LoRa, which cannot carry QUIC byte-streams).
-    /// - [`EndpointError::ConnectionClosed`] if the connection is closing.
+    ///   this peer and none was recently closed by this endpoint (e.g. the
+    ///   peer is only reachable over a constrained transport such as BLE/LoRa,
+    ///   which cannot carry QUIC byte-streams).
+    /// - [`EndpointError::ConnectionClosed`] if the connection is closing, or
+    ///   no live connection remains and this endpoint recently closed one for
+    ///   the peer (e.g. via [`P2pEndpoint::disconnect`]) — carrying that close
+    ///   reason (#278).
     pub async fn open_bi(
         &self,
         peer_id: &PeerId,
@@ -7953,11 +7973,23 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        let connection = self
+        let Some(connection) = self
             .inner
             .get_connection(peer_id)
             .map_err(EndpointError::NatTraversal)?
-            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        else {
+            // #278: no live connection. If this endpoint recently closed one
+            // for this peer (e.g. `disconnect`), surface that close reason as
+            // `ConnectionClosed` so churn-aware callers distinguish "we tore
+            // this down, replay onto a fresh connection" from an unknown
+            // peer. Without this, callers saw `PeerNotFound` (or worse, a
+            // repromoted stale generation) after a disconnect.
+            let reason = self
+                .inner
+                .recent_close_reason_for_peer(peer_id)
+                .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+            return Err(EndpointError::ConnectionClosed { reason });
+        };
 
         if let Some(reason) = close_reason_from_connection(&connection) {
             return Err(EndpointError::ConnectionClosed { reason });
@@ -14836,6 +14868,289 @@ mod tests {
         );
 
         a.shutdown().await;
+    }
+
+    /// Regression for #278 (x0x#277): `disconnect` must tear down EVERY
+    /// tracked generation for the peer, not just the current winner.
+    ///
+    /// A peer with two registered generations — a Live winner plus an open
+    /// Superseded survivor kept for its drain window — is exactly the state
+    /// connection churn produces under simultaneous open. Pre-fix,
+    /// `disconnect` closed only the winner; the survivor stayed open with
+    /// `close_reason() == None`, so the next `get_connection` miss
+    /// REPROMOTED it to Live and re-inserted it into the winner map. `open_bi`
+    /// then handed out streams on the old, half-dead connection: writes
+    /// failed with `sending stopped by peer: error 0` or succeeded into a
+    /// send buffer that the eventual teardown discarded — no error ever
+    /// surfaced to the caller, so application replay logic never fired (the
+    /// two x0x#277 failure shapes). Post-fix, the peer-scope cleanup sweeps
+    /// and synchronously closes both generations, and `open_bi` reports
+    /// `ConnectionClosed` instead of resurrecting the stale one.
+    ///
+    /// Deterministic: two real authenticated QUIC connections registered for
+    /// one peer (candidate replacement marks the older one Superseded while it
+    /// stays open). No reader tasks, no polling, no wall-clock races: the
+    /// repromotion the old code performed is synchronous inside
+    /// `get_connection`.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two distinct, fully-authenticated QUIC connections from a -> b.
+        // `attempt_direct_handshake` performs only the handshake — it does NOT
+        // register the connection or spawn a reader — so lifecycle
+        // registration is controlled explicitly below (zero real-reader
+        // interference).
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // Probe clones share the underlying connection state, so their
+        // close_reason() reports whether the disconnect sweep closed them.
+        let c0_probe = c0.clone();
+        let c1_probe = c1.clone();
+
+        // Register both generations: the newer becomes the Live winner aliased
+        // by the winner map; the older is marked Superseded while remaining
+        // open for its drain window.
+        a.inner
+            .add_connection_with_outcome(b_id, c0)
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1)
+            .expect("register c1");
+
+        // Make the peer observable at the p2p layer, as a live connection
+        // would be, so `disconnect` accepts it.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(b_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+        assert!(a.is_connected(&b_id).await, "precondition: peer connected");
+
+        a.disconnect(&b_id).await.expect("disconnect");
+
+        // Every tracked generation was closed synchronously: close_reason()
+        // must be Some for the Superseded survivor too, not just the winner
+        // the winner-map removal closed.
+        assert!(
+            c0_probe.close_reason().is_some() && c1_probe.close_reason().is_some(),
+            "disconnect must synchronously close every tracked generation"
+        );
+
+        // No stale generation can be resurrected: get_connection must not
+        // repromote the survivor back into the winner map.
+        assert!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .is_none(),
+            "get_connection must never return a closing/closed connection after disconnect"
+        );
+
+        // open_bi must fail with ConnectionClosed carrying the disconnect
+        // reason — never Ok, never a stream on the old connection.
+        let err = a
+            .open_bi(&b_id)
+            .await
+            .expect_err("open_bi after disconnect must fail");
+        assert!(
+            matches!(
+                err,
+                EndpointError::ConnectionClosed {
+                    reason: ConnectionCloseReason::LifecycleCleanup
+                }
+            ),
+            "expected ConnectionClosed(LifecycleCleanup), got {:?}",
+            err
+        );
+
+        assert!(!a.is_connected(&b_id).await, "peer must be disconnected");
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// End-to-end churn regression for #278: a write queued around a
+    /// disconnect → reconnect cycle must either error or be delivered —
+    /// never silently dropped — and the post-reconnect stream must run over
+    /// the NEW connection.
+    ///
+    /// - the pre-churn write is delivered;
+    /// - the write attempted immediately after `disconnect` errors with
+    ///   `ConnectionClosed` (on the old code, `open_bi` could still hand out
+    ///   the stale generation and the payload vanished with its send buffer);
+    /// - after `connect_addr` returns, `is_connected` is true and a write
+    ///   reaches the peer over the new connection — proving the new
+    ///   connection is installed in BOTH `connected_peers` and the
+    ///   nat-traversal winner map before connectivity is reported.
+    ///
+    /// Ignored like its neighbour `reader_recovers_from_prefix_starvation`:
+    /// the two-node accept fixture is timing-sensitive across CI configs and,
+    /// in release builds, independently broken by ant-quic#280 (one connect
+    /// yields two accepted generations; the dialer's stream never surfaces) —
+    /// not fixable by settling or serialising.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    #[ignore = "real two-node loopback test; timing-sensitive across CI configs \
+                (release / --no-default-features / beta / windows). Run explicitly: \
+                `cargo test --lib -- --ignored churn_disconnect_reconnect_delivers_over_new_connection`"]
+    async fn churn_disconnect_reconnect_delivers_over_new_connection() {
+        // Deadline/poll values follow the neighbouring loopback fixtures:
+        // a 30 s overall connect budget (relay_only_data_plane_end_to_end's
+        // connect) and 2 s cancel-safe accept attempts inside a 30 s outer
+        // deadline (reader_recovers_from_prefix_starvation's poll shape).
+        // The poll shape matters on loaded 2-vCPU CI runners: a single
+        // sequential 10 s accept expired while the PQC handshake was still
+        // monopolising the core (PR #279 round 2). `accept_bi` resolves from
+        // a queued channel handle, so a cancelled attempt cannot lose an
+        // already-delivered stream.
+        const CONNECT_BUDGET: Duration = Duration::from_secs(30);
+        const ACCEPT_ATTEMPT: Duration = Duration::from_secs(2);
+        const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn accept_app_stream(
+            b: &P2pEndpoint,
+            attempt: Duration,
+            deadline: Duration,
+            what: &str,
+        ) -> (
+            PeerId,
+            crate::high_level::SendStream,
+            crate::high_level::RecvStream,
+        ) {
+            let deadline = Instant::now() + deadline;
+            loop {
+                if let Ok(Ok(stream)) = tokio::time::timeout(attempt, b.accept_bi()).await {
+                    return stream;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: accept_bi never yielded the app stream"
+                );
+            }
+        }
+
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        // Phase 1 — connect and deliver a pre-churn payload.
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+        let (mut pre_send, _pre_recv) = a.open_bi(&b_id).await.expect("pre-churn open_bi");
+        pre_send
+            .write_all(b"pre-churn")
+            .await
+            .expect("pre-churn write");
+        pre_send.finish().expect("pre-churn finish");
+        let (from, _, mut pre_stream) =
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "pre-churn").await;
+        assert_eq!(from, a_id, "app stream arrives from the connected peer");
+        let pre_payload = pre_stream.read_to_end(1024).await.expect("pre-churn read");
+        assert_eq!(pre_payload, b"pre-churn");
+
+        // Phase 2 — churn: disconnect, then immediately queue a write. It
+        // must ERROR (ConnectionClosed with the disconnect reason); on the
+        // old code it could return Ok onto the stale generation and be
+        // silently discarded.
+        a.disconnect(&b_id).await.expect("disconnect");
+        let churn_err = a
+            .open_bi(&b_id)
+            .await
+            .expect_err("queued write after disconnect must error");
+        assert!(
+            matches!(
+                churn_err,
+                EndpointError::ConnectionClosed {
+                    reason: ConnectionCloseReason::LifecycleCleanup
+                }
+            ),
+            "expected ConnectionClosed(LifecycleCleanup), got {:?}",
+            churn_err
+        );
+
+        // Phase 3 — reconnect: the new connection must be installed in both
+        // structures, and a write must reach the peer over it.
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
+            .await
+            .expect("reconnect timeout")
+            .expect("reconnect failed");
+        assert!(a.is_connected(&b_id).await, "reconnected");
+        let (mut post_send, _post_recv) = a.open_bi(&b_id).await.expect("post-churn open_bi");
+        post_send
+            .write_all(b"post-churn")
+            .await
+            .expect("post-churn write");
+        post_send.finish().expect("post-churn finish");
+        let (from, _, mut post_stream) =
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "post-churn").await;
+        assert_eq!(from, a_id);
+        let post_payload = post_stream
+            .read_to_end(1024)
+            .await
+            .expect("post-churn read");
+        assert_eq!(post_payload, b"post-churn");
+
+        a.shutdown().await;
+        b.shutdown().await;
     }
 
     /// Regression for the secondary (lazy) read path of winner-map self-heal.

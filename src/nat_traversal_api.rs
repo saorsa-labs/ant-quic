@@ -7876,6 +7876,98 @@ impl NatTraversalEndpoint {
         Ok(removed)
     }
 
+    /// #278: peer-scope teardown — close every tracked generation for
+    /// `peer_id`, not just the current winner.
+    ///
+    /// [`Self::remove_connection_with_reason`] removes and closes the winner
+    /// only. Surviving `Superseded` generations (kept open for their drain
+    /// window) remain open with `close_reason() == None`, so the next
+    /// [`Self::get_connection`] miss repromotes one back to `Live` and
+    /// re-inserts it into the winner map. After `disconnect(peer)` returned,
+    /// `open_bi`/`send` could then open streams on an old, half-dead
+    /// connection: writes fail with `sending stopped by peer: error 0` or
+    /// succeed into a send buffer that the eventual teardown discards, with
+    /// no error ever surfacing to the caller (x0x#277 / #278).
+    ///
+    /// Every non-closed tracked generation is marked `Closed` under the
+    /// lifecycle lock — so a concurrent `repromote_surviving_connection`
+    /// cannot resurrect it — and each still-open connection is closed
+    /// synchronously, making its `close_reason()` `Some` immediately.
+    /// Winner-map eviction is bounded to swept generations.
+    ///
+    /// Concurrency guarantee (stated exactly): a replacement connection
+    /// racing this sweep is NOT spared — if its registration completes
+    /// before the sweep's lifecycle-lock section runs, its `Live` entry is
+    /// swept and closed too (the disconnect wins; ordering is decided by
+    /// who holds the lifecycle write lock, not by the bounded `remove_if`).
+    /// Only a replacement registering after the lock section releases
+    /// survives untouched.
+    ///
+    /// Returns the number of generations swept.
+    pub(crate) fn close_all_connection_generations(
+        &self,
+        peer_id: &PeerId,
+        close_reason: ConnectionCloseReason,
+    ) -> usize {
+        let mut swept: Vec<(usize, InnerConnection)> = Vec::new();
+        {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let Some(entries) = lifecycle.get_mut(peer_id) else {
+                return 0;
+            };
+            for entry in entries.iter_mut() {
+                if matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Closing { .. }
+                        | ConnectionLifecycleState::Closed { .. }
+                ) {
+                    continue;
+                }
+                let from_state = entry.state;
+                entry.state = ConnectionLifecycleState::Closed {
+                    reason: close_reason,
+                    closed_at_unix_ms: now_unix_ms(),
+                };
+                Self::log_lifecycle_transition(
+                    peer_id,
+                    entry.generation,
+                    &entry.connection_id,
+                    entry.stable_id(),
+                    from_state.name(),
+                    entry.state.name(),
+                    close_reason,
+                );
+                swept.push((entry.stable_id(), entry.connection.clone()));
+            }
+        }
+
+        // Close outside the lifecycle lock: `close()` takes the connection
+        // state lock and queues CONNECTION_CLOSE on the endpoint driver.
+        // `mark_connection_closed` already pairs lifecycle →
+        // connection-state locking; keeping driver work out of the critical
+        // section preserves that order trivially.
+        for (_, connection) in &swept {
+            if connection.close_reason().is_none()
+                && let Some(code) = close_reason.app_error_code()
+            {
+                connection.close(code, close_reason.reason_bytes());
+            }
+            if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                peers.remove(&connection.remote_address());
+            }
+        }
+
+        if !swept.is_empty() {
+            self.connections.remove_if(peer_id, |_, current| {
+                swept
+                    .iter()
+                    .any(|(stable_id, _)| current.stable_id() == *stable_id)
+            });
+            self.emitted_established_events.remove(peer_id);
+        }
+        swept.len()
+    }
+
     /// Spawn the NAT traversal handler loop for an existing connection referenced by the endpoint.
     ///
     /// # Arguments

@@ -11,7 +11,7 @@
 //! the higher-level [`crate::p2p_endpoint::P2pEndpoint`] and [`crate::Node`]
 //! re-export via accessor methods. The counters are intentionally global
 //! rather than per-endpoint: every concrete UDP send path in ant-quic ends
-//! up funnelled through the same low-level [`crate::high_level::connection`]
+//! up funnelled through the same low-level `crate::high_level::connection`
 //! `drive_transmit` loop, and the actual GSO bundling (when enabled) is a
 //! kernel-side concern rather than an endpoint-scoped one. Surfacing them
 //! globally keeps the instrumentation hook one-line at the call site and
