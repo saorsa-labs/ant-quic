@@ -4524,16 +4524,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
-                // #281 round 3: classify the generation so a later promotion
-                // re-registers this connection with its real traversal method
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
                 // (HolePunch) instead of inflating direct_connections.
-                if let Ok(Some(current)) = self.inner.get_connection(&peer_id) {
-                    self.inner.mark_connection_traversal_method(
-                        &peer_id,
-                        current.stable_id(),
-                        TraversalMethod::HolePunch,
-                    );
-                }
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -4587,15 +4586,29 @@ impl P2pEndpoint {
                             .register_connection_peer_id(remote_address, peer_id);
 
                         // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
-                        // #281 round 3: classify the generation so a later promotion
-                        // re-registers this connection with its real traversal method
-                        // (HolePunch) instead of inflating direct_connections.
-                        if let Ok(Some(current)) = self.inner.get_connection(&peer_id) {
+                        // #281 round 4: classify the generation being finalized —
+                        // the connection this event established, the same handle
+                        // the reader spawns on — so a later promotion re-registers
+                        // it with its real traversal method (HolePunch) instead of
+                        // inflating direct_connections.
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(peer_id)
+                            .await
+                            .or_else(|| self.inner.session_connection(peer_id))
+                        {
                             self.inner.mark_connection_traversal_method(
                                 &peer_id,
-                                current.stable_id(),
+                                conn.stable_id(),
                                 TraversalMethod::HolePunch,
                             );
+
+                            // Spawn background reader task BEFORE storing in connected_peers
+                            // to prevent race where recv() misses early data
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(peer_id, conn).await;
+                            });
                         }
                         let peer_conn = PeerConnection {
                             peer_id,
@@ -4606,20 +4619,6 @@ impl P2pEndpoint {
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
                         };
-
-                        // Spawn background reader task BEFORE storing in connected_peers
-                        // to prevent race where recv() misses early data
-                        if let Some(conn) = self
-                            .inner
-                            .get_connection_by_authenticated_peer(peer_id)
-                            .await
-                            .or_else(|| self.inner.session_connection(peer_id))
-                        {
-                            let endpoint = self.clone();
-                            tokio::spawn(async move {
-                                endpoint.spawn_reader_task(peer_id, conn).await;
-                            });
-                        }
 
                         self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
@@ -4663,16 +4662,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
-                // #281 round 3: classify the generation so a later promotion
-                // re-registers this connection with its real traversal method
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
                 // (HolePunch) instead of inflating direct_connections.
-                if let Ok(Some(current)) = self.inner.get_connection(&peer_id) {
-                    self.inner.mark_connection_traversal_method(
-                        &peer_id,
-                        current.stable_id(),
-                        TraversalMethod::HolePunch,
-                    );
-                }
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -5509,15 +5507,27 @@ impl P2pEndpoint {
                         self.inner
                             .register_connection_peer_id(remote_address, evt_peer);
 
-                        // #281 round 3: classify the generation so a later promotion
-                        // re-registers this connection with its real traversal method
-                        // (HolePunch) instead of inflating direct_connections.
-                        if let Ok(Some(current)) = self.inner.get_connection(&evt_peer) {
+                        // #281 round 4: classify the generation being
+                        // finalized — the connection this event established,
+                        // the same handle the reader spawns on — so a later
+                        // promotion re-registers it with its real traversal
+                        // method (HolePunch) instead of inflating
+                        // direct_connections.
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(evt_peer)
+                            .await
+                            .or_else(|| self.inner.session_connection(evt_peer))
+                        {
                             self.inner.mark_connection_traversal_method(
                                 &evt_peer,
-                                current.stable_id(),
+                                conn.stable_id(),
                                 TraversalMethod::HolePunch,
                             );
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(evt_peer, conn).await;
+                            });
                         }
                         let peer_conn = PeerConnection {
                             peer_id: evt_peer,
@@ -5528,18 +5538,6 @@ impl P2pEndpoint {
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
                         };
-
-                        if let Some(conn) = self
-                            .inner
-                            .get_connection_by_authenticated_peer(evt_peer)
-                            .await
-                            .or_else(|| self.inner.session_connection(evt_peer))
-                        {
-                            let endpoint = self.clone();
-                            tokio::spawn(async move {
-                                endpoint.spawn_reader_task(evt_peer, conn).await;
-                            });
-                        }
 
                         self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
@@ -5561,16 +5559,16 @@ impl P2pEndpoint {
                             self.inner
                                 .register_connection_peer_id(remote_address, peer_id);
 
-                            // #281 round 3: classify the generation so a later promotion
-                            // re-registers this connection with its real traversal method
+                            // #281 round 4: classify the generation being
+                            // finalized — the conn in scope supplying
+                            // remote_addr/side — so a later promotion
+                            // re-registers it with its real traversal method
                             // (HolePunch) instead of inflating direct_connections.
-                            if let Ok(Some(current)) = self.inner.get_connection(&peer_id) {
-                                self.inner.mark_connection_traversal_method(
-                                    &peer_id,
-                                    current.stable_id(),
-                                    TraversalMethod::HolePunch,
-                                );
-                            }
+                            self.inner.mark_connection_traversal_method(
+                                &peer_id,
+                                conn.stable_id(),
+                                TraversalMethod::HolePunch,
+                            );
                             let peer_conn = PeerConnection {
                                 peer_id,
                                 remote_addr: TransportAddr::Udp(remote_address),
@@ -5638,16 +5636,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
-                // #281 round 3: classify the generation so a later promotion
-                // re-registers this connection with its real traversal method
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
                 // (HolePunch) instead of inflating direct_connections.
-                if let Ok(Some(current)) = self.inner.get_connection(&peer_id) {
-                    self.inner.mark_connection_traversal_method(
-                        &peer_id,
-                        current.stable_id(),
-                        TraversalMethod::HolePunch,
-                    );
-                }
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -15044,19 +15041,22 @@ mod tests {
         b.shutdown().await;
     }
 
-    /// #281 round 3: a promoted HOLE-PUNCHED survivor must re-register with
-    /// its real classification. The round-2 fix only classified relay
-    /// generations; every hole-punch finalize site marked its outer record
-    /// HolePunch but left the lifecycle generation Direct, so promoting a
-    /// hole-punched survivor inflated `direct_connections` without
-    /// correcting `holepunched_connections`. All six hole-punch finalize
-    /// sites now classify their generation.
+    /// #281 round 4: a promoted HOLE-PUNCHED survivor must re-register with
+    /// its real classification, and the classification must come from a REAL
+    /// hole-punch finalize — this test never calls
+    /// `mark_connection_traversal_method` itself. It drives the production
+    /// finalize path (`await_hole_punch_outcome`'s existing-connection
+    /// branch) for the first connection, supersedes it with a second
+    /// same-family dial, kills the winner, and lets the lazy promotion
+    /// re-register the survivor: the outer record must read `HolePunch`,
+    /// `holepunched_connections` corrected, `direct_connections` not
+    /// inflated, no spurious `PeerConnected`.
     // Requires the network-discovery socket path: the fallback
     // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
     // connections (see issue tracked separately).
     #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
-    async fn promotion_reregisters_holepunched_survivor_with_real_traversal_method() {
+    async fn promotion_reregisters_holepunched_survivor_with_real_finalize_path() {
         async fn build_endpoint() -> P2pEndpoint {
             P2pEndpoint::new(
                 crate::unified_config::P2pConfig::builder()
@@ -15074,31 +15074,68 @@ mod tests {
 
         let a = build_endpoint().await;
         let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
         let b_addr = localhost_addr(b.local_addr().expect("b bound"));
         let b_id = b.peer_id();
 
+        // First connection, registered at the inner layer only.
         let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
             .await
             .expect("c0 handshake timeout")
             .expect("c0 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+
+        // REAL hole-punch finalize for c0 through the production path: the
+        // existing-connection branch of `await_hole_punch_outcome` classifies
+        // c0's generation (HolePunch), registers the outer record and spawns
+        // its reader.
+        let finalized = a
+            .await_hole_punch_outcome(
+                b_addr,
+                b_id,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .expect("hole-punch finalize");
+        assert_eq!(
+            finalized.traversal_method,
+            TraversalMethod::HolePunch,
+            "the finalize path must record HolePunch"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let method = a
+                .connected_peers
+                .read()
+                .await
+                .get(&b_id)
+                .map(|peer| peer.traversal_method);
+            if method == Some(TraversalMethod::HolePunch) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the real finalize must register the outer record as HolePunch"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Supersede c0 with a second same-family dial: newer generation wins
+        // deterministically, demoting c0 to an OPEN Superseded survivor whose
+        // tracked classification (HolePunch) must survive the supersede.
         let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
             .await
             .expect("c1 handshake timeout")
             .expect("c1 handshake");
-
-        // The survivor generation is classified HolePunch (as the six
-        // hole-punch finalize sites now mark theirs); the newer connection
-        // wins the winner slot and supersedes it.
-        a.inner
-            .add_connection_with_outcome(b_id, c0.clone())
-            .expect("register c0");
-        a.inner
-            .mark_connection_traversal_method(&b_id, c0.stable_id(), TraversalMethod::HolePunch);
         a.inner
             .add_connection_with_outcome(b_id, c1.clone())
             .expect("register c1");
 
-        c1.close(crate::VarInt::from_u32(0), b"#281-r3-winner-dead");
+        // Kill the winner and trigger the lazy promotion read path.
+        c1.close(crate::VarInt::from_u32(0), b"#281-r4-winner-dead");
         let promoted = a
             .inner
             .get_connection(&b_id)
@@ -15106,16 +15143,23 @@ mod tests {
             .expect("lazy read must repromote the hole-punched survivor");
         assert_eq!(promoted.stable_id(), c0.stable_id());
 
+        // The promotion re-registration (asynchronous consumer) must carry
+        // the survivor's real classification. Observe the REWRITE, not the
+        // finalize's original record: capture the finalize registration's
+        // connected_at and wait for it to change.
+        let finalize_connected_at = a
+            .connected_peers
+            .read()
+            .await
+            .get(&b_id)
+            .map(|peer| peer.connected_at);
         let deadline = Instant::now() + Duration::from_secs(10);
         let record = loop {
-            let record = a
-                .connected_peers
-                .read()
-                .await
-                .get(&b_id)
-                .map(|peer| peer.traversal_method);
-            if let Some(method) = record {
-                break method;
+            let entry = a.connected_peers.read().await.get(&b_id).cloned();
+            if let Some(peer) = entry {
+                if Some(peer.connected_at) != finalize_connected_at {
+                    break peer.traversal_method;
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -15131,7 +15175,7 @@ mod tests {
         let stats = a.stats().await;
         assert_eq!(
             stats.holepunched_connections, 1,
-            "the hole-punched survivor must count as hole-punched"
+            "the hole-punched survivor must count as hole-punched (no double count)"
         );
         assert_eq!(
             stats.direct_connections, 0,
