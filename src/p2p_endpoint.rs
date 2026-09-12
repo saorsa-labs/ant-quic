@@ -15017,11 +15017,20 @@ mod tests {
     ///   reaches the peer over the new connection — proving the new
     ///   connection is installed in BOTH `connected_peers` and the
     ///   nat-traversal winner map before connectivity is reported.
+    ///
+    /// Ignored like its neighbour `reader_recovers_from_prefix_starvation`:
+    /// the two-node accept fixture is timing-sensitive across CI configs and,
+    /// in release builds, independently broken by ant-quic#280 (one connect
+    /// yields two accepted generations; the dialer's stream never surfaces) —
+    /// not fixable by settling or serialising.
     // Requires the network-discovery socket path: the fallback
     // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
     // connections (see issue tracked separately).
     #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
+    #[ignore = "real two-node loopback test; timing-sensitive across CI configs \
+                (release / --no-default-features / beta / windows). Run explicitly: \
+                `cargo test --lib -- --ignored churn_disconnect_reconnect_delivers_over_new_connection`"]
     async fn churn_disconnect_reconnect_delivers_over_new_connection() {
         // Deadline/poll values follow the neighbouring loopback fixtures:
         // a 30 s overall connect budget (relay_only_data_plane_end_to_end's
