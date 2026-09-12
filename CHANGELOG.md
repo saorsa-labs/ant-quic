@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+### Fixed
+
+- **`disconnect()` no longer leaves a stale connection observable to `open_bi()` (#278, x0x#277).**
+  Peer-scope cleanup closed only the current winner generation: surviving `Superseded`
+  generations stayed open with `close_reason() == None` and remained promotable, so the next
+  `get_connection()` miss repromoted one back to `Live` and re-inserted it into the winner map.
+  After a `disconnect()` → `connect_addr()` churn cycle, `is_connected()` (backed by
+  `connected_peers`) could report the peer live while `open_bi()` (backed by the nat-traversal
+  winner map) handed out streams on the old, half-dead connection — writes then failed with
+  `sending stopped by peer: error 0` or succeeded into a send buffer the teardown discarded,
+  with no error surfaced so application replay logic never fired. Disconnect now sweeps every
+  tracked generation for the peer under the lifecycle lock (closing each synchronously, so
+  `close_reason()` is `Some` immediately) and `open_bi()` reports
+  `ConnectionClosed { reason }` — carrying the disconnect's close reason — instead of a
+  misleading `PeerNotFound` for a peer this endpoint recently closed. No wire or API change.
+
 ## [0.27.50] - 2026-09-07
 
 ### Fixed

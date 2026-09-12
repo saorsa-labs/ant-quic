@@ -37,8 +37,8 @@
 //!
 //! ant-quic's [`crate::high_level::runtime::UdpSender`] trait defaults
 //! `max_transmit_segments()` to `1`, and the in-tree implementations
-//! ([`crate::high_level::runtime::tokio::TokioRuntime`]'s `UdpSocket` and
-//! [`crate::high_level::runtime::dual_stack::DualStackSocket`]) both use
+//! (`crate::high_level::runtime::tokio::TokioRuntime`'s `UdpSocket` and
+//! `crate::high_level::runtime::dual_stack::DualStackSocket`) both use
 //! `try_send_to(transmit.contents, destination)` rather than
 //! `quinn_udp::UdpSocketState::send`. As a consequence:
 //!
