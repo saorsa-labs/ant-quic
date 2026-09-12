@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relay session never pins the reader (`run_stream_forwarding_loop` shares the peer
   connection), and `spawn_reader_task` now enforces one reader per connection (stable_id).
 
+- **`shutdown()` closes superseded lifecycle survivors before the drain (#283, x0x#510).**
+  `NatTraversalEndpoint::shutdown` closed only the canonical `connections` entries; Superseded
+  survivors were closed merely implicitly by the post-drain `connection_lifecycle.clear()`,
+  immediately before `release_socket_for_shutdown` yanked the socket, so their CONNECTION_CLOSE
+  frames frequently never transmitted. The remote then kept the peer "connected" (its
+  `is_peer_connected` repromotes any still-alive Superseded entry) until the idle timeout — the
+  x0x restart-class "old owner connection never observed as gone". Shutdown now explicitly
+  closes every lifecycle-tracked generation BEFORE the bounded drain, so the close frames flush
+  while the socket still exists and the remote observes the disconnect within the drain window.
+  The remote-side repromotion logic itself is unchanged (possible follow-up).
+
 ## [0.27.50] - 2026-09-07
 
 ### Fixed
