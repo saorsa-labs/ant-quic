@@ -24,6 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConnectionClosed { reason }` — carrying the disconnect's close reason — instead of a
   misleading `PeerNotFound` for a peer this endpoint recently closed. No wire or API change.
 
+- **Simultaneous-open tiebreaker now rejects dead winners; promotions propagate to the p2p layer (#277, x0x#510).**
+  Three two-structure disagreements after connection churn/restart: (1) the Live-entry search in
+  `register_connection_lifecycle_parts` ignored `connection.is_alive()`, so a dead-but-Live
+  entry could win the tiebreaker, reject and close the fresh candidate, and leave the winner map
+  aliasing a corpse — dead Live entries are now retired to `Closed` (preferring the transport
+  close reason) before the tiebreak, and the search additionally requires `is_alive()`;
+  (2) `repromote_surviving_connection` repaired the inner winner map without re-registering the
+  promoted survivor at the p2p layer, leaving `is_connected()`/`connected_peers()` false while
+  the DashMap served traffic — promotions now signal the p2p layer through a channel (a stored
+  callback capturing the endpoint would leak it; round 2) whose consumer re-registers the peer
+  with the survivor's real traversal classification (Direct/HolePunch/Relay tracked per generation); (3) `finalize_direct_connection` returned the outer `connected_peers`
+  entry unconditionally in its Rejected branch — a dead entry is now treated as absent, so
+  `Ok` always leaves a live routable connection behind it.
+
 - **One stream consumer per connection: relay accept task removed, single accept source (#280, x0x#277 shape B).**
   Two unsynchronised `accept_bi()` consumers raced on every accepted connection whenever a relay
   server existed (the default): the NAT layer spawned `handle_relay_requests` per connection while

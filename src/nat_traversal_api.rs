@@ -316,6 +316,7 @@ use tokio::{
 
 use crate::connection_lifecycle::{ConnectionCloseReason, ConnectionLifecycleState};
 use crate::high_level::default_runtime;
+use crate::reachability::TraversalMethod;
 
 use crate::{
     VarInt,
@@ -380,6 +381,10 @@ pub(crate) struct TrackedConnection {
     connection_family_id: [u8; 32],
     connection_id: [u8; 32],
     state: ConnectionLifecycleState,
+    /// P2P-layer classification (Direct / Relay) captured at registration so
+    /// a later promotion re-registers the survivor with its real method
+    /// instead of inflating `direct_connections` (#277 round 2).
+    traversal_method: TraversalMethod,
 }
 
 impl TrackedConnection {
@@ -409,14 +414,47 @@ pub(crate) fn tracked_connection_for_test(
     generation: u64,
     established_at_unix_ms: u64,
 ) -> TrackedConnection {
+    tracked_connection_with_sort_keys_for_test(
+        connection,
+        generation,
+        established_at_unix_ms,
+        [0u8; 32],
+        [0u8; 32],
+        TraversalMethod::Direct,
+    )
+}
+
+/// #277 test helper: like [`tracked_connection_for_test`] but with explicit
+/// canonical sort keys, so a test can construct an entry that
+/// deterministically outranks (or loses to) a freshly registered candidate
+/// regardless of the TLS-exporter-derived keys real connections carry.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn tracked_connection_with_sort_keys_for_test(
+    connection: InnerConnection,
+    generation: u64,
+    established_at_unix_ms: u64,
+    connection_family_id: [u8; 32],
+    connection_id: [u8; 32],
+    traversal_method: TraversalMethod,
+) -> TrackedConnection {
     TrackedConnection {
         connection,
         generation,
         established_at_unix_ms,
-        connection_family_id: [0u8; 32],
-        connection_id: [0u8; 32],
+        connection_family_id,
+        connection_id,
         state: ConnectionLifecycleState::Live,
+        traversal_method,
     }
+}
+
+/// #277: a survivor promoted back into the winner slot, signalled to the
+/// p2p layer for re-registration (identity, transport classification and
+/// the connection handle).
+pub(crate) struct PromotedConnection {
+    pub(crate) peer_id: PeerId,
+    pub(crate) traversal_method: TraversalMethod,
+    pub(crate) connection: InnerConnection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,6 +584,17 @@ pub struct NatTraversalEndpoint {
     /// being promoted to a Live-but-readerless connection that pins every
     /// inbound datagram.
     reader_liveness_probe: ParkingRwLock<Option<Arc<dyn Fn(&PeerId, u64) -> bool + Send + Sync>>>,
+    /// #277: p2p-layer re-registration channel, signalled whenever a
+    /// surviving connection is promoted back to the winner slot. Repromotion
+    /// repairs the inner winner map lazily (from get_connection /
+    /// is_peer_connected reads), but the p2p layer's connected_peers map is
+    /// only written by explicit registration — without this a promoted
+    /// survivor leaves is_connected() false while the winner map serves
+    /// traffic (x0x#510). A channel (not a callback) on purpose: storing a
+    /// closure that captures the endpoint inside the endpoint's own inner
+    /// Arc would leak the whole endpoint (#277 round 2) — the sender keeps
+    /// only the channel alive.
+    connection_promoted_tx: ParkingRwLock<Option<mpsc::UnboundedSender<PromotedConnection>>>,
     /// #368: orphan connections closed by repromotion refusal or the janitor.
     orphan_connections_closed: std::sync::atomic::AtomicU64,
     /// Monotonic local generation counter used for tracked connections.
@@ -1893,6 +1942,7 @@ impl NatTraversalEndpoint {
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
+            connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
@@ -2400,6 +2450,7 @@ impl NatTraversalEndpoint {
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
+            connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::new(AtomicU64::new(1)),
             local_peer_id: Self::generate_local_peer_id(),
@@ -6776,6 +6827,7 @@ impl NatTraversalEndpoint {
             ),
             connection_id: Self::lifecycle_connection_id_for(local_peer_id, peer_id, &connection),
             state: ConnectionLifecycleState::Live,
+            traversal_method: TraversalMethod::Direct,
         };
 
         let mut superseded_generation = None;
@@ -6784,10 +6836,44 @@ impl NatTraversalEndpoint {
         {
             let mut lifecycle = connection_lifecycle.write();
             let entries = lifecycle.entry(peer_id).or_default();
-            if let Some(live_idx) = entries
-                .iter()
-                .position(|entry| matches!(entry.state, ConnectionLifecycleState::Live))
-            {
+            // #277 (x0x#510): a lifecycle-Live entry whose connection is
+            // dead at the transport level must never win the
+            // simultaneous-open tiebreaker — it would reject and close the
+            // fresh candidate while the winner map keeps aliasing a corpse.
+            // Retire non-alive Live entries to Closed first (mirroring
+            // mark_connection_closed: prefer the transport close reason), so
+            // the tiebreaker only ever runs against a live winner and the
+            // unique-Live invariant is preserved.
+            for entry in entries.iter_mut() {
+                if !matches!(entry.state, ConnectionLifecycleState::Live)
+                    || entry.connection.is_alive()
+                {
+                    continue;
+                }
+                let reason = entry
+                    .connection
+                    .close_reason()
+                    .as_ref()
+                    .map(ConnectionCloseReason::from_connection_error)
+                    .unwrap_or(ConnectionCloseReason::ConnectionClosed);
+                let from_state = entry.state;
+                entry.state = ConnectionLifecycleState::Closed {
+                    reason,
+                    closed_at_unix_ms: now_unix_ms(),
+                };
+                Self::log_lifecycle_transition(
+                    &peer_id,
+                    entry.generation,
+                    &entry.connection_id,
+                    entry.stable_id(),
+                    from_state.name(),
+                    entry.state.name(),
+                    reason,
+                );
+            }
+            if let Some(live_idx) = entries.iter().position(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live) && entry.connection.is_alive()
+            }) {
                 let live = entries[live_idx].clone();
                 if Self::candidate_wins(&live, &tracked) {
                     superseded_generation = Some(live.generation);
@@ -7105,6 +7191,36 @@ impl NatTraversalEndpoint {
         *self.reader_liveness_probe.write() = Some(probe);
     }
 
+    /// #277: install the p2p-layer receiver for promoted survivors. Must be
+    /// called once at construction, before any connection churn.
+    pub(crate) fn set_connection_promoted_sender(
+        &self,
+        tx: mpsc::UnboundedSender<PromotedConnection>,
+    ) {
+        *self.connection_promoted_tx.write() = Some(tx);
+    }
+
+    /// #277 round 2: classify a tracked generation's transport (Direct /
+    /// Relay). Relay registrations mark their generation right after
+    /// registering; promotions then re-register the survivor with its real
+    /// method instead of inflating `direct_connections`.
+    pub(crate) fn mark_connection_traversal_method(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        traversal_method: TraversalMethod,
+    ) {
+        let mut lifecycle = self.connection_lifecycle.write();
+        if let Some(entries) = lifecycle.get_mut(peer_id) {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.stable_id() == stable_id)
+            {
+                entry.traversal_method = traversal_method;
+            }
+        }
+    }
+
     /// #368: grace before reader-absence is treated as orphaning — covers
     /// the register → spawn-reader → insert-handle window.
     const ORPHAN_SPAWN_GRACE_MS: u64 = 10_000;
@@ -7286,10 +7402,25 @@ impl NatTraversalEndpoint {
             replacement.state = ConnectionLifecycleState::Live;
         }
         let connection = replacement.connection.clone();
+        let promoted = PromotedConnection {
+            peer_id: *peer_id,
+            traversal_method: replacement.traversal_method,
+            connection: connection.clone(),
+        };
         self.connections.insert(*peer_id, connection.clone());
         self.emitted_established_events.insert(*peer_id);
         drop(lifecycle);
         self.finalize_orphan_closures(peer_id, orphan_closures);
+        // #277: repair the p2p layer's view too — repromotion can run from
+        // lazy read paths (`get_connection` / `is_peer_connected`) where no
+        // p2p registration happens, which would leave `connected_peers`
+        // empty while the winner map serves traffic (x0x#510). Signalled via
+        // channel so the inner endpoint never holds a reference back to the
+        // p2p endpoint (#277 round 2 leak).
+        let promoted_tx = self.connection_promoted_tx.read().clone();
+        if let Some(tx) = promoted_tx {
+            let _ = tx.send(promoted);
+        }
         Some(connection)
     }
 
@@ -13411,6 +13542,7 @@ mod tests {
                 connection_family_id: [0u8; 32],
                 connection_id: [0u8; 32],
                 state,
+                traversal_method: TraversalMethod::Direct,
             }],
         );
     }
@@ -13489,6 +13621,108 @@ mod tests {
         assert!(
             client.connection_lifecycle.read().get(&peer_id).is_none(),
             "the orphan's lifecycle entry is removed"
+        );
+    }
+
+    /// #277 (x0x#510): a lifecycle-Live entry whose connection is dead at
+    /// the transport level must never win the simultaneous-open tiebreaker.
+    ///
+    /// Pre-fix, the Live-entry search in `register_connection_lifecycle_parts`
+    /// ignored `connection.is_alive()`, so a dead-but-Live entry could reject
+    /// and CLOSE the fresh candidate (outcome `Rejected`) while the winner
+    /// kept aliasing a corpse — the fresh handshake was destroyed by the very
+    /// registration that should have adopted it, leaving the peer with no
+    /// usable connection.
+    ///
+    /// Deterministic: the dead entry is seeded with the maximum cross-family
+    /// sort key (`connection_id` all-0xFF), so it outranks any fresh
+    /// candidate on the pre-fix tiebreaker (fresh exporter-derived ids are
+    /// < all-0xFF with probability 1 - 2^-256).
+    #[tokio::test]
+    async fn dead_live_entry_never_wins_simultaneous_open_tiebreaker() {
+        fn test_config() -> NatTraversalConfig {
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("valid bind addr")),
+                ..Default::default()
+            }
+        }
+        let server = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("server endpoint binds");
+        let client = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("client endpoint binds");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound to a local address");
+        async fn handshake(client: &NatTraversalEndpoint, addr: SocketAddr) -> InnerConnection {
+            let connecting = client
+                .get_endpoint()
+                .expect("client endpoint present")
+                .connect(addr, "peer")
+                .expect("initiate client connection");
+            tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+                .await
+                .expect("loopback handshake must not hang")
+                .expect("loopback handshake must succeed")
+        }
+        let dead_conn = handshake(&client, server_addr).await;
+        let fresh_conn = handshake(&client, server_addr).await;
+        let peer_id = PeerId([0xCD; 32]);
+
+        // Transport-dead but lifecycle-Live, with the maximum cross-family
+        // sort key so the pre-fix tiebreaker prefers it over the fresh
+        // candidate.
+        client.connection_lifecycle.write().insert(
+            peer_id,
+            vec![TrackedConnection {
+                connection: dead_conn.clone(),
+                generation: 7,
+                established_at_unix_ms: 0,
+                connection_family_id: [0u8; 32],
+                connection_id: [0xFFu8; 32],
+                state: ConnectionLifecycleState::Live,
+                traversal_method: TraversalMethod::Direct,
+            }],
+        );
+        dead_conn.close(VarInt::from_u32(0), b"#277-dead-live");
+        assert!(
+            !dead_conn.is_alive(),
+            "precondition: seeded entry is transport-dead"
+        );
+
+        let outcome = client
+            .add_connection_with_outcome(peer_id, fresh_conn.clone())
+            .expect("registration succeeds");
+        assert!(
+            matches!(outcome, ConnectionRegistrationOutcome::Live { .. }),
+            "a dead-but-Live entry must never win the tiebreaker; got {:?}",
+            outcome
+        );
+        assert!(
+            fresh_conn.close_reason().is_none(),
+            "the fresh candidate must not be closed by a dead winner"
+        );
+
+        let winner = client
+            .get_connection(&peer_id)
+            .expect("get_connection ok")
+            .expect("a live winner must exist");
+        assert_eq!(
+            winner.stable_id(),
+            fresh_conn.stable_id(),
+            "the winner map must alias the fresh candidate"
+        );
+
+        let dead_snap = client
+            .connection_snapshot_by_stable_id(&peer_id, dead_conn.stable_id())
+            .expect("dead entry retained for diagnostics");
+        assert!(
+            matches!(dead_snap.state, ConnectionLifecycleState::Closed { .. }),
+            "the dead Live entry must be retired to Closed, got {:?}",
+            dead_snap.state
         );
     }
 
@@ -13573,6 +13807,7 @@ mod tests {
                         connection_family_id: [0u8; 32],
                         connection_id: [0u8; 32],
                         state: ConnectionLifecycleState::Live,
+                        traversal_method: TraversalMethod::Direct,
                     },
                     TrackedConnection {
                         connection: conn2.clone(),
@@ -13581,6 +13816,7 @@ mod tests {
                         connection_family_id: [0u8; 32],
                         connection_id: [0u8; 32],
                         state: ConnectionLifecycleState::Live,
+                        traversal_method: TraversalMethod::Direct,
                     },
                 ],
             );
@@ -13859,6 +14095,7 @@ mod tests {
                     state: ConnectionLifecycleState::Superseded {
                         replaced_by_generation: w_generation,
                     },
+                    traversal_method: TraversalMethod::Direct,
                 },
                 TrackedConnection {
                     connection: w_conn.clone(),
@@ -13867,6 +14104,7 @@ mod tests {
                     connection_family_id: [0u8; 32],
                     connection_id: [0u8; 32],
                     state: ConnectionLifecycleState::Live,
+                    traversal_method: TraversalMethod::Direct,
                 },
             ],
         );
@@ -13968,6 +14206,7 @@ mod tests {
                     state: ConnectionLifecycleState::Superseded {
                         replaced_by_generation: 2,
                     },
+                    traversal_method: TraversalMethod::Direct,
                 },
                 TrackedConnection {
                     connection: g2_a_conn.clone(),
@@ -13976,6 +14215,7 @@ mod tests {
                     connection_family_id: [0u8; 32],
                     connection_id: [0u8; 32],
                     state: ConnectionLifecycleState::Live,
+                    traversal_method: TraversalMethod::Direct,
                 },
             ],
         );
@@ -13991,6 +14231,7 @@ mod tests {
                 connection_family_id: [0u8; 32],
                 connection_id: [0u8; 32],
                 state: ConnectionLifecycleState::Live,
+                traversal_method: TraversalMethod::Direct,
             }],
         );
         endpoint.connections.insert(peer_b, g2_b_conn.clone());
