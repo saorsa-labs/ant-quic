@@ -37,9 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task (and its now-dead ACK-bidi bridge plumbing) is deleted — relay serving runs exclusively
   through the reader's prefix demux (ACK-v2 → app → relay, with `BIDI_PREFIX_READ_TIMEOUT`); the
   bounded `pending_accepts` queue is the sole accept source; no unbounded prefix read remains.
-  No wire, frame or transport-parameter change. `relay_connect_udp_bind_on_live_node` now drives
-  the supported single-consumer path (the relay node accepts; pre-fix it deliberately avoided
-  `accept()` to dodge the race this change removes).
+  No wire, frame or transport-parameter change. Contract note: relay serving on a node now
+  requires the application to drive `accept()` (the relay demux lives inside the reader task an
+  accepted connection gets) — a node that never drains `accept()` serves neither relay, ACK-v2
+  nor app streams. `relay_connect_udp_bind_on_live_node` now drives the supported
+  single-consumer path (the relay node accepts; pre-fix it deliberately avoided `accept()` to
+  dodge the race this change removes). Relay streams are served on their own task so a live
+  relay session never pins the reader (`run_stream_forwarding_loop` shares the peer
+  connection), and `spawn_reader_task` now enforces one reader per connection (stable_id).
 
 ## [0.27.50] - 2026-09-07
 

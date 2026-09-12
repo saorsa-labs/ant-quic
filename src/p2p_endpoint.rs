@@ -6140,7 +6140,7 @@ impl P2pEndpoint {
     #[allow(clippy::too_many_arguments)]
     async fn handle_bidi_stream_inline(
         ack_bidi_serialization: &Arc<tokio::sync::Mutex<()>>,
-        inner: &NatTraversalEndpoint,
+        inner: &Arc<NatTraversalEndpoint>,
         ack_diagnostics: &AckDiagnostics,
         ack_request_dedupe: &Arc<AckRequestDedupeCache>,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
@@ -6263,10 +6263,20 @@ impl P2pEndpoint {
             return true;
         }
 
-        if inner
-            .handle_relay_bidi_stream_from_app_reader(connection.clone(), send, recv, prefix)
-            .await
-        {
+        // #280 round 2: serve the relay stream on its OWN task. The relay
+        // session's success path runs `run_stream_forwarding_loop` for the
+        // whole session lifetime, and `establish_relay_session` deliberately
+        // REUSES the peer connection — awaiting that loop inline would pin
+        // the sole accept consumer, so no further app/ACK-v2/gossip stream
+        // from this peer would be accepted while the session lives.
+        if inner.relay_server_present() {
+            let inner = Arc::clone(inner);
+            let relay_connection = connection.clone();
+            tokio::spawn(async move {
+                inner
+                    .handle_relay_bidi_stream_from_app_reader(relay_connection, send, recv, prefix)
+                    .await;
+            });
             return true;
         }
 
@@ -9594,8 +9604,27 @@ impl P2pEndpoint {
         });
         let abort_handle = join_handle.abort_handle();
 
-        // Append — DO NOT pre-empt existing readers. See function doc.
+        // #280 round 2: enforce one reader per CONNECTION (stable_id). Readers
+        // for OTHER generations of the same peer are still tolerated (issue
+        // #166 drain semantics) — only a duplicate for the same connection is
+        // skipped, turning the single-reader invariant from a call-site audit
+        // into an enforced guarantee.
         let mut handles = self.reader_handles.write().await;
+        if handles.get(&peer_id).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|handle| handle.conn_stable_id == conn_stable_id)
+        }) {
+            debug!(
+                peer_id = ?peer_id,
+                conn_stable_id,
+                "reader already registered for this connection; cancelling duplicate spawn"
+            );
+            drop(handles);
+            cancel.cancel();
+            abort_handle.abort();
+            return;
+        }
         handles.entry(peer_id).or_default().push(ReaderTaskHandle {
             generation,
             conn_stable_id,

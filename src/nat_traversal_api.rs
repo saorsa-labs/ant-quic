@@ -3096,6 +3096,14 @@ impl NatTraversalEndpoint {
         self.transport_registry.as_ref()
     }
 
+    /// Whether a relay server is configured on this endpoint (the default).
+    /// Lets the reader's prefix demux decide synchronously whether an
+    /// unrecognised-prefix stream is a relay candidate before handing it to
+    /// the relay service on its own task (#280 round 2).
+    pub(crate) fn relay_server_present(&self) -> bool {
+        self.relay_server.is_some()
+    }
+
     /// Let the endpoint-level reader hand a non-ACK bidi stream back to the
     /// relay service after it has consumed the protocol prefix.
     pub(crate) async fn handle_relay_bidi_stream_from_app_reader(
