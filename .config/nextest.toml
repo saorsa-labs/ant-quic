@@ -22,9 +22,9 @@ test-group = "node-app-streams"
 # teardown interfere under aggregate CI load: on 2-vCPU CI runners the #278
 # regression pair made b_events_parity's simultaneous-open subscription test
 # flake 3/3 (PR #279 round 2), and victims rotate with scheduling. All the
-# heavyweight loopback fixtures — the #277 and #278 regression tests and the
-# b_events_parity binary — are serialised into one group so their
+# heavyweight loopback fixtures — the #277, #278 and #280 regression tests
+# and the b_events_parity binary — are serialised into one group so their
 # handshake/CPU spikes never overlap each other.
 [[profile.default.overrides]]
-filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(dead_live_entry_never_wins_simultaneous_open_tiebreaker) or test(lazy_promotion_re_registers_peer_at_p2p_layer) or test(finalize_direct_connection_never_returns_stale_dead_entry) or test(promoted_connection_signal_does_not_leak_endpoint) or test(promotion_reregisters_relayed_survivor_with_real_traversal_method) or test(finalize_rejected_with_unroutable_winner_errors_not_stale_ok) or binary_id(ant-quic::b_events_parity)"
+filter = "test(p2p_endpoint::tests::churn_disconnect_reconnect_delivers_over_new_connection) or test(p2p_endpoint::tests::disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed) or test(reader_recovers_from_prefix_starvation) or test(app_stream_has_single_owner_with_relay_server_configured) or test(late_reader_still_receives_app_stream_with_relay_configured) or test(partial_prefix_stream_does_not_leak_consumer_tasks) or test(dead_live_entry_never_wins_simultaneous_open_tiebreaker) or test(lazy_promotion_re_registers_peer_at_p2p_layer) or test(finalize_direct_connection_never_returns_stale_dead_entry) or test(promoted_connection_signal_does_not_leak_endpoint) or test(promotion_reregisters_relayed_survivor_with_real_traversal_method) or test(finalize_rejected_with_unroutable_winner_errors_not_stale_ok) or test(promotion_reregisters_holepunched_survivor_with_real_traversal_method) or test(promotion_signal_dropped_after_survivor_death) or binary_id(ant-quic::b_events_parity)"
 test-group = "loopback-pair-heavyweights"

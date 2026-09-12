@@ -88,7 +88,7 @@ async fn send_with_receive_ack_returns_after_remote_pipeline_accepts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn send_with_receive_ack_survives_relay_handler_bidi_accept_competition() {
+async fn send_with_receive_ack_survives_concurrent_relay_bind_streams() {
     let _guard = test_guard().await;
 
     let receiver = make_node(vec![]).await;
