@@ -481,6 +481,58 @@ pub(crate) enum ConnectionRegistrationOutcome {
     Refused,
 }
 
+/// #286 round 2: refuse a connection registration because the endpoint is
+/// shutting down, closing the connection rather than leaking it.
+pub(crate) fn refuse_registration(
+    peer_id: &PeerId,
+    connection: InnerConnection,
+) -> ConnectionRegistrationOutcome {
+    debug!(
+        peer_id = ?peer_id,
+        "refusing late connection registration: endpoint is shutting down"
+    );
+    if connection.close_reason().is_none() {
+        connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+    }
+    ConnectionRegistrationOutcome::Refused
+}
+
+/// #286 round 2 test-only registration gate: lets a test park a registration
+/// between the fast-path shutdown check and the map insert — the worst-case
+/// scheduling the in-lock re-check must survive. Production code never arms
+/// it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct RegistrationGate {
+    pub(crate) parked_count: std::sync::atomic::AtomicUsize,
+    pub(crate) released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static REGISTRATION_GATE: ParkingRwLock<Option<Arc<RegistrationGate>>> = ParkingRwLock::new(None);
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn take_registration_gate_for_pause() -> Option<Arc<RegistrationGate>> {
+    REGISTRATION_GATE.read().clone()
+}
+
+/// Arm the registration gate; returns the gate so the test can observe the
+/// park and release it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn arm_registration_gate_for_test() -> Arc<RegistrationGate> {
+    let gate = Arc::new(RegistrationGate {
+        parked_count: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    *REGISTRATION_GATE.write() = Some(Arc::clone(&gate));
+    gate
+}
+
+/// Disarm the registration gate.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn disarm_registration_gate_for_test() {
+    *REGISTRATION_GATE.write() = None;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReaderExitOutcome {
     Noop,
@@ -2882,7 +2934,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
-                                    relay_shutdown.load(Ordering::Relaxed),
+                                    relay_shutdown.as_ref(),
                                     peer_id,
                                     conn.clone(),
                                 );
@@ -4290,6 +4342,8 @@ impl NatTraversalEndpoint {
                     let event_tx = self.event_tx.clone();
                     let event_callback = self.event_callback.clone();
                     let observed_address_tx = self.observed_address_tx.clone();
+                    let shutdown_flag = Arc::clone(&self.shutdown);
+                    let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
                     let connection_timeout = self
                         .timeout_config
                         .nat_traversal
@@ -4312,6 +4366,8 @@ impl NatTraversalEndpoint {
                                 Arc::clone(&incoming_notify),
                                 event_tx.clone(),
                                 event_callback.clone(),
+                                Arc::clone(&shutdown_flag),
+                                Arc::clone(&sweep_lock_source),
                                 connection_timeout,
                                 target_peer,
                                 addr,
@@ -4399,6 +4455,8 @@ impl NatTraversalEndpoint {
                         let event_tx = self.event_tx.clone();
                         let event_callback = self.event_callback.clone();
                         let observed_address_tx = self.observed_address_tx.clone();
+                        let shutdown_flag = Arc::clone(&self.shutdown);
+                        let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
                         let connection_timeout = self
                             .timeout_config
                             .nat_traversal
@@ -4418,6 +4476,8 @@ impl NatTraversalEndpoint {
                                     Arc::clone(&incoming_notify),
                                     event_tx.clone(),
                                     event_callback.clone(),
+                                    Arc::clone(&shutdown_flag),
+                                    Arc::clone(&sweep_lock_source),
                                     connection_timeout,
                                     initiator_peer,
                                     addr,
@@ -4579,7 +4639,7 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
-        shutting_down: bool,
+        shutting_down: &AtomicBool,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -4753,7 +4813,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
-                                        dial_shutdown.load(Ordering::Relaxed),
+                                        dial_shutdown.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -5475,7 +5535,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
-                                    shutdown.load(Ordering::Relaxed),
+                                    shutdown.as_ref(),
                                     peer_id,
                                     connection.clone(),
                                 );
@@ -6863,7 +6923,7 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
-        shutting_down: bool,
+        shutting_down: &AtomicBool,
         peer_id: PeerId,
         connection: InnerConnection,
     ) -> ConnectionRegistrationOutcome {
@@ -6872,15 +6932,27 @@ impl NatTraversalEndpoint {
         // `connections` map is drained only once, before the sweep), leaving
         // exactly one stale survivor the remote repromotes until its idle
         // timeout. Refuse the late registration and close the connection.
-        if shutting_down {
-            debug!(
-                peer_id = ?peer_id,
-                "refusing late connection registration: endpoint is shutting down"
-            );
-            if connection.close_reason().is_none() {
-                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+        // Fast path: refuse without touching the maps. This is an
+        // optimisation only — the authoritative re-check happens INSIDE the
+        // lifecycle write lock below, because the #286 shutdown sweep holds
+        // that same lock: a task that loaded `false` here can block on the
+        // lock and resume after the sweep. (#286 round 2.)
+        if shutting_down.load(Ordering::Relaxed) {
+            return refuse_registration(&peer_id, connection);
+        }
+        #[cfg(all(test, feature = "network-discovery"))]
+        if let Some(gate) = take_registration_gate_for_pause() {
+            // #286 round 2 test hook: park this registration between the
+            // fast-path check and the map insert, emulating the worst-case
+            // scheduling (flag read early, insert attempted after the
+            // shutdown sweep has already run). The in-lock re-check below
+            // remains the production guard. The park is a cooperative
+            // yield-loop (parts is sync); only the armed test releases it.
+            gate.parked_count.fetch_add(1, Ordering::SeqCst);
+            while !gate.released.load(Ordering::SeqCst) {
+                std::thread::yield_now();
             }
-            return ConnectionRegistrationOutcome::Refused;
+            gate.parked_count.fetch_sub(1, Ordering::SeqCst);
         }
         let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
         let tracked = TrackedConnection {
@@ -6902,6 +6974,16 @@ impl NatTraversalEndpoint {
 
         {
             let mut lifecycle = connection_lifecycle.write();
+            // #286 round 2: authoritative shutdown re-check under the same
+            // write lock the shutdown sweep takes. Linearisation argument:
+            // the flag is stored BEFORE the sweep acquires this lock, so any
+            // registration ordered after the sweep in the lock order MUST
+            // observe `true` here and refuse; any registration ordered before
+            // the sweep is already in the map and gets closed BY the sweep.
+            if shutting_down.load(Ordering::Relaxed) {
+                drop(lifecycle);
+                return refuse_registration(&peer_id, connection);
+            }
             let entries = lifecycle.entry(peer_id).or_default();
             // #277 (x0x#510): a lifecycle-Live entry whose connection is
             // dead at the transport level must never win the
@@ -7106,7 +7188,7 @@ impl NatTraversalEndpoint {
             self.connection_lifecycle.as_ref(),
             self.next_connection_generation.as_ref(),
             self.emitted_established_events.as_ref(),
-            self.shutdown.load(Ordering::Relaxed),
+            self.shutdown.as_ref(),
             peer_id,
             connection,
         ))
@@ -7352,6 +7434,12 @@ impl NatTraversalEndpoint {
         exiting_stable_id: Option<usize>,
     ) -> Option<InnerConnection> {
         let mut lifecycle = self.connection_lifecycle.write();
+        // #286 round 2: never resurrect a survivor once shutdown has begun —
+        // the sweep may already have closed it, and re-promoting mid-shutdown
+        // re-inserts a corpse into the winner map.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
         let entries = lifecycle.get_mut(peer_id)?;
         if let Some(exiting_stable_id) = exiting_stable_id {
             entries.retain(|entry| entry.stable_id() != exiting_stable_id);
@@ -9173,6 +9261,13 @@ impl NatTraversalEndpoint {
                         let observed_address_tx = self.observed_address_tx.clone();
                         let traversal_event_notify = self.traversal_event_notify.clone();
                         let incoming_notify = self.incoming_notify.clone();
+                        // #286 round 2: this detached spawn inserts into the
+                        // winner map directly — linearize the flag re-check
+                        // and the insert under the lifecycle write lock (the
+                        // same lock the shutdown sweep takes) so a preempted
+                        // task cannot insert past the sweep.
+                        let punch_shutdown = self.shutdown.clone();
+                        let punch_lifecycle = self.connection_lifecycle.clone();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
@@ -9198,7 +9293,24 @@ impl NatTraversalEndpoint {
 
                                     // Store the connection
                                     // DashMap provides lock-free .insert()
-                                    connections.insert(peer_id_clone, connection.clone());
+                                    // #286 round 2: refuse when shutting
+                                    // down — close instead of inserting.
+                                    // Re-checked under the lifecycle write
+                                    // lock so the insert is linearized against
+                                    // the shutdown sweep.
+                                    {
+                                        let _sweep_lock = punch_lifecycle.write();
+                                        if punch_shutdown.load(Ordering::Relaxed) {
+                                            debug!(
+                                                peer_id = ?peer_id_clone,
+                                                "refusing hole-punch winner-map insert: endpoint is shutting down"
+                                            );
+                                            connection
+                                                .close(crate::VarInt::from_u32(0), b"Shutdown");
+                                            return;
+                                        }
+                                        connections.insert(peer_id_clone, connection.clone());
+                                    }
 
                                     // Send connection established event (we initiated hole punch = Client side)
                                     let _ =
@@ -10251,7 +10363,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
-                                        dial_shutdown.load(Ordering::Relaxed),
+                                        dial_shutdown.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -10828,6 +10940,8 @@ impl NatTraversalEndpoint {
             Arc::clone(&self.incoming_notify),
             self.event_tx.clone(),
             self.event_callback.clone(),
+            Arc::clone(&self.shutdown),
+            Arc::clone(&self.connection_lifecycle),
             self.timeout_config
                 .nat_traversal
                 .connection_establishment_timeout,
@@ -10847,6 +10961,11 @@ impl NatTraversalEndpoint {
         incoming_notify: Arc<tokio::sync::Notify>,
         event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        // #286 round 2: gate the raw winner-map insert on the shutdown flag,
+        // re-checked under the lifecycle write lock (linearized against the
+        // shutdown sweep).
+        shutdown_flag: Arc<AtomicBool>,
+        sweep_lock_source: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
         connection_timeout: Duration,
         peer_id: PeerId,
         candidate_address: SocketAddr,
@@ -10885,7 +11004,25 @@ impl NatTraversalEndpoint {
         // (ref is dropped when session goes out of scope at end of if block)
 
         // Step 3: Now safe to insert into connections
-        connections.insert(peer_id, connection.clone());
+        // #286 round 2: refuse when shutting down — close instead of
+        // inserting (this path bypasses register_connection_lifecycle_parts,
+        // so the in-lock re-check does not cover it). The flag is re-checked
+        // under the lifecycle write lock so the insert is linearized against
+        // the shutdown sweep.
+        {
+            let _sweep_lock = sweep_lock_source.write();
+            if shutdown_flag.load(Ordering::Relaxed) {
+                debug!(
+                    peer_id = ?peer_id,
+                    "refusing validated-candidate winner-map insert: endpoint is shutting down"
+                );
+                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+                return Err(NatTraversalError::NetworkError(
+                    "endpoint is shutting down".to_string(),
+                ));
+            }
+            connections.insert(peer_id, connection.clone());
+        }
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
         }

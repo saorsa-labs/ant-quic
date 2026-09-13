@@ -5348,10 +5348,18 @@ impl P2pEndpoint {
             .inner
             .add_connection_with_outcome(peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
-        if matches!(
-            registration,
+        // #286 round 2: exhaustive match — the compiler must catch any new
+        // outcome variant instead of silently taking the success path.
+        let registration_refused_or_rejected = match registration {
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => false,
             crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-        ) {
+            | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => true,
+        };
+        if registration_refused_or_rejected {
+            // #286: Refused = the endpoint is shutting down and the inner
+            // layer closed the connection — fall through to the live-winner
+            // lookup, which errors honestly instead of spawning a reader over
+            // a corpse. Rejected keeps its #277 handling below.
             // #277: the outer entry is only trustworthy while the inner
             // endpoint still routes a live connection for this peer. A dead
             // entry must be treated as absent — returning it would hand the
@@ -5897,10 +5905,13 @@ impl P2pEndpoint {
             connection.stable_id(),
             TraversalMethod::Relay,
         );
-        if matches!(
-            registration,
+        // #286 round 2: exhaustive match (Refused handled as failure).
+        let relay_registration_refused_or_rejected = match registration {
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => false,
             crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-        ) {
+            | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => true,
+        };
+        if relay_registration_refused_or_rejected {
             if let Some(existing) = self
                 .connected_peers
                 .read()
@@ -6774,11 +6785,17 @@ impl P2pEndpoint {
                             .map_err(EndpointError::NatTraversal)
                         {
                             Ok(outcome) => {
-                                if matches!(
-                                    outcome,
+                                // #286 round 2: exhaustive match — Refused
+                                // (endpoint shutting down, connection closed
+                                // by the registrar) is a failure, not a
+                                // success whose reader would spawn over a
+                                // corpse.
+                                match outcome {
+                                    crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => {}
                                     crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-                                ) {
-                                    return None;
+                                    | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => {
+                                        return None;
+                                    }
                                 }
                                 registration = Some(outcome);
                                 resolved_peer_id = actual_peer_id;
@@ -16081,25 +16098,26 @@ mod tests {
 
     /// #286: an inbound handshake completing DURING `shutdown()` — after the
     /// #285 lifecycle sweep — must not leave an entry in either map. The
-    /// accept worker is spawned with its join handle dropped, so `shutdown()`
-    /// never waited for it and the registration path had no shutdown check:
-    /// the late entry landed in `connections` (drained only once, before the
-    /// sweep) and `connection_lifecycle`, was closed by nobody, and the
-    /// remote — which registers its own side of the dial, as the real dialer
-    /// flow does — kept the peer "connected" until its idle timeout: the x0x
-    /// 1-in-20 stale `is_connected` after `shutdown()` (x0x#692).
+    /// accept workers' join handles were dropped and the registration path
+    /// had no shutdown check, so a late registration landed in both maps,
+    /// was closed by nobody, and the remote kept the peer "connected" until
+    /// its idle timeout (the x0x 1-in-20 stale `is_connected`, x0x#692).
     ///
-    /// Modelled on the #285 test's harness. The late dial is started first
-    /// (its ClientHello is on the wire), then shutdown begins, so the
-    /// handshake completes squarely after the flag is set and the lifecycle
-    /// sweep has run. Asserts (a) no entry survives in either map after
-    /// shutdown completes, and (b) the remote observes the disconnect within
-    /// the drain window rather than at the idle timeout.
+    /// #286 round 2 — deterministic: the race is driven by the
+    /// registration-gate test hook (`arm_registration_gate_for_test`), which
+    /// parks B's registration of the late dial between its fast-path
+    /// shutdown check and the map insert — the exact worst-case scheduling
+    /// the in-lock re-check must survive (flag read early, insert attempted
+    /// after the sweep). With the registration parked, B's shutdown runs to
+    /// COMPLETION (sweep, drain, socket release), then the gate releases the
+    /// registration. Profile-independent: no sleeps, no handshake timing.
+    /// Asserts (a) no entry survives in either map and (b) the remote
+    /// observes the disconnect within the drain window.
     // Requires the network-discovery socket path: the fallback
     // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
     // connections (see issue tracked separately).
     #[cfg(all(test, feature = "network-discovery"))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_during_inbound_handshake_leaves_no_stale_entry() {
         async fn build_endpoint() -> P2pEndpoint {
             P2pEndpoint::new(
@@ -16146,25 +16164,40 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Start the late A → B dial FIRST (ClientHello in flight), then begin
-        // B's shutdown: the handshake completes after the flag is set and the
-        // lifecycle sweep has run — the #286 window.
+        // Arm the registration gate and start the late A → B dial. B's
+        // accept worker registers the inbound handshake through
+        // register_connection_lifecycle_parts, which parks on the gate AFTER
+        // its fast-path flag check.
+        let gate = crate::nat_traversal_api::arm_registration_gate_for_test();
         let late_dial = {
             let a = a.clone();
             tokio::spawn(async move { a.attempt_direct_handshake(b_addr).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let b_shutdown = {
-            let b = b.clone();
-            tokio::spawn(async move { b.inner.shutdown().await })
-        };
+        let park_deadline = Instant::now() + Duration::from_secs(10);
+        while gate.parked_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < park_deadline,
+                "the late registration never reached the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-        // The dial's fate depends on where the fix cuts it: refused (the
-        // handshake completes and the registration is refused — B closes the
-        // connection) or aborted (the worker dies mid-handshake — the
-        // endpoint abandons the dial). Both close the transport. Register
-        // A's side only when the handshake completed, mirroring the real
-        // dialer flow that registers its own side.
+        // With the registration parked mid-flight, run B's shutdown to
+        // COMPLETION — flag stored, canonical drain, #285 lifecycle sweep,
+        // worker abort+join, bounded drain, socket release.
+        b.inner.shutdown().await.expect("inner shutdown");
+
+        // Release the parked registration: it resumes exactly in the
+        // worst-case window (post-sweep). The in-lock re-check must refuse
+        // it; on the unfixed tree it inserts the stale survivor.
+        gate.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::nat_traversal_api::disarm_registration_gate_for_test();
+
+        // The dial's fate: refused (handshake completed, registration
+        // refused, B closed the connection) or aborted (worker died
+        // mid-handshake). Both close the transport. Register A's side when
+        // the handshake completed, mirroring the real dialer flow.
         let late = tokio::time::timeout(Duration::from_secs(10), late_dial)
             .await
             .expect("late dial task")
@@ -16176,23 +16209,17 @@ mod tests {
         }
 
         // (b) A must observe the disconnect within the drain window (the
-        // bounded drain is 5 s; the QUIC idle timeout is far longer — on the
-        // unfixed code the never-closed late survivor keeps A connected
-        // until it).
+        // QUIC idle timeout is far longer — on the unfixed code the
+        // never-closed late survivor keeps A connected until it).
         let observe_deadline = Instant::now() + Duration::from_secs(15);
         while a.is_connected(&b_id).await {
             assert!(
                 Instant::now() < observe_deadline,
-                "A must observe B's shutdown within the drain window — a                  late-registered handshake survived the shutdown"
+                "A must observe B's shutdown within the drain window — a \
+                 late-registered handshake survived the shutdown"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
-        // Shutdown has completed (A already observed the disconnects).
-        b_shutdown
-            .await
-            .expect("shutdown task")
-            .expect("inner shutdown");
 
         // (a) No entry survives in either map: the connections map is empty,
         // and no lifecycle generation remains promotable.
