@@ -93,8 +93,8 @@ The PeerId is derived by hashing the ML-DSA-65 public key:
 ML-DSA-65 Public Key: 1952 bytes → SHA-256 → PeerId (32 bytes)
 ```
 
-**Rationale:** This provides a compact 32-byte identifier suitable for DHT
-routing and peer addressing while maintaining a single quantum-resistant key
+**Rationale:** This provides a compact 32-byte identifier suitable for any
+consumer-side addressing layer while maintaining a single quantum-resistant key
 pair for both identity and authentication. The SHA-256 hash provides:
 - Uniform 32-byte identifiers regardless of public key size
 - Collision resistance (2^128 security level)

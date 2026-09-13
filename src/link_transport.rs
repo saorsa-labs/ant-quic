@@ -19,8 +19,8 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                      saorsa-core (overlay)                       │
-//! │  DHT routing │ Record storage │ Greedy routing │ Naming         │
+//! │                      saorsa-core (overlay)                      │
+//! │ Overlay routing │ Record storage │ Greedy routing │ Naming      │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!                              ▼
@@ -44,11 +44,11 @@
 //! use futures_util::StreamExt;
 //!
 //! // Define your overlay's protocol identifier
-//! const DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
+//! const OVERLAY_SERVICE_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-overlay/1.0.0");
 //!
 //! async fn run_overlay<T: LinkTransport>(transport: Arc<T>) -> anyhow::Result<()> {
 //!     // Register our protocol so peers know we support it
-//!     transport.register_protocol(DHT_PROTOCOL);
+//!     transport.register_protocol(OVERLAY_SERVICE_PROTOCOL);
 //!
 //!     // Subscribe to transport events for connection lifecycle
 //!     let mut events = transport.subscribe();
@@ -69,7 +69,7 @@
 //!     // Accept incoming connections in a background task
 //!     let transport_clone = transport.clone();
 //!     tokio::spawn(async move {
-//!         let mut incoming = transport_clone.accept(DHT_PROTOCOL);
+//!         let mut incoming = transport_clone.accept(OVERLAY_SERVICE_PROTOCOL);
 //!         while let Some(result) = incoming.next().await {
 //!             match result {
 //!                 Ok(conn) => {
@@ -84,7 +84,7 @@
 //!     // Dial a peer using their PeerId (NAT traversal handled automatically)
 //!     let peers = transport.peer_table();
 //!     if let Some((peer_id, caps)) = peers.first() {
-//!         match transport.dial(*peer_id, DHT_PROTOCOL).await {
+//!         match transport.dial(*peer_id, OVERLAY_SERVICE_PROTOCOL).await {
 //!             Ok(conn) => {
 //!                 // Open a bidirectional stream for request/response
 //!                 let (mut send, mut recv) = conn.open_bi().await?;
@@ -181,7 +181,7 @@ use crate::transport::TransportAddr;
 /// | Range | Protocol Family | Types |
 /// |-------|-----------------|-------|
 /// | 0x00-0x0F | Gossip | Membership, PubSub, Bulk |
-/// | 0x10-0x1F | DHT | Query, Store, Witness, Replication |
+/// | 0x10-0x1F | Overlay services | Query, Store, Witness, Replication |
 /// | 0x20-0x2F | WebRTC | Signal, Media, Data |
 /// | 0xF0-0xFF | Reserved | Future use |
 ///
@@ -192,7 +192,7 @@ use crate::transport::TransportAddr;
 ///
 /// // Check if a byte is a valid stream type
 /// let stream_type = StreamType::from_byte(0x10);
-/// assert_eq!(stream_type, Some(StreamType::DhtQuery));
+/// assert_eq!(stream_type, Some(StreamType::ServiceQuery));
 ///
 /// // Get all gossip types
 /// for st in StreamType::gossip_types() {
@@ -215,19 +215,19 @@ pub enum StreamType {
     GossipBulk = 0x02,
 
     // =========================================================================
-    // DHT Protocols (0x10-0x1F)
+    // Overlay service protocols (0x10-0x1F)
     // =========================================================================
-    /// DHT query operations (GET, FIND_NODE, FIND_VALUE).
-    DhtQuery = 0x10,
+    /// Query operations for overlay services (GET, FIND_NODE, FIND_VALUE).
+    ServiceQuery = 0x10,
 
-    /// DHT store operations (PUT, STORE).
-    DhtStore = 0x11,
+    /// Store operations for overlay services (PUT, STORE).
+    ServiceStore = 0x11,
 
-    /// DHT witness operations (Byzantine fault tolerance).
-    DhtWitness = 0x12,
+    /// Witness operations for overlay services (Byzantine fault tolerance).
+    ServiceWitness = 0x12,
 
-    /// DHT replication operations (background repair).
-    DhtReplication = 0x13,
+    /// Replication operations for overlay services (background repair).
+    ServiceReplication = 0x13,
 
     // =========================================================================
     // WebRTC Protocols (0x20-0x2F)
@@ -258,10 +258,10 @@ impl StreamType {
             0x00 => Some(Self::Membership),
             0x01 => Some(Self::PubSub),
             0x02 => Some(Self::GossipBulk),
-            0x10 => Some(Self::DhtQuery),
-            0x11 => Some(Self::DhtStore),
-            0x12 => Some(Self::DhtWitness),
-            0x13 => Some(Self::DhtReplication),
+            0x10 => Some(Self::ServiceQuery),
+            0x11 => Some(Self::ServiceStore),
+            0x12 => Some(Self::ServiceWitness),
+            0x13 => Some(Self::ServiceReplication),
             0x20 => Some(Self::WebRtcSignal),
             0x21 => Some(Self::WebRtcMedia),
             0x22 => Some(Self::WebRtcData),
@@ -281,7 +281,7 @@ impl StreamType {
     pub const fn family(self) -> StreamTypeFamily {
         match self as u8 {
             0x00..=0x0F => StreamTypeFamily::Gossip,
-            0x10..=0x1F => StreamTypeFamily::Dht,
+            0x10..=0x1F => StreamTypeFamily::OverlayService,
             0x20..=0x2F => StreamTypeFamily::WebRtc,
             _ => StreamTypeFamily::Reserved,
         }
@@ -293,10 +293,10 @@ impl StreamType {
         matches!(self.family(), StreamTypeFamily::Gossip)
     }
 
-    /// Check if this is a DHT protocol type.
+    /// Check if this is an overlay service type.
     #[inline]
-    pub const fn is_dht(self) -> bool {
-        matches!(self.family(), StreamTypeFamily::Dht)
+    pub const fn is_overlay_service(self) -> bool {
+        matches!(self.family(), StreamTypeFamily::OverlayService)
     }
 
     /// Check if this is a WebRTC protocol type.
@@ -310,13 +310,13 @@ impl StreamType {
         &[Self::Membership, Self::PubSub, Self::GossipBulk]
     }
 
-    /// Get all DHT stream types.
-    pub const fn dht_types() -> &'static [StreamType] {
+    /// Get all overlay service stream types.
+    pub const fn service_types() -> &'static [StreamType] {
         &[
-            Self::DhtQuery,
-            Self::DhtStore,
-            Self::DhtWitness,
-            Self::DhtReplication,
+            Self::ServiceQuery,
+            Self::ServiceStore,
+            Self::ServiceWitness,
+            Self::ServiceReplication,
         ]
     }
 
@@ -331,10 +331,10 @@ impl StreamType {
             Self::Membership,
             Self::PubSub,
             Self::GossipBulk,
-            Self::DhtQuery,
-            Self::DhtStore,
-            Self::DhtWitness,
-            Self::DhtReplication,
+            Self::ServiceQuery,
+            Self::ServiceStore,
+            Self::ServiceWitness,
+            Self::ServiceReplication,
             Self::WebRtcSignal,
             Self::WebRtcMedia,
             Self::WebRtcData,
@@ -349,10 +349,10 @@ impl fmt::Display for StreamType {
             Self::Membership => write!(f, "Membership"),
             Self::PubSub => write!(f, "PubSub"),
             Self::GossipBulk => write!(f, "GossipBulk"),
-            Self::DhtQuery => write!(f, "DhtQuery"),
-            Self::DhtStore => write!(f, "DhtStore"),
-            Self::DhtWitness => write!(f, "DhtWitness"),
-            Self::DhtReplication => write!(f, "DhtReplication"),
+            Self::ServiceQuery => write!(f, "ServiceQuery"),
+            Self::ServiceStore => write!(f, "ServiceStore"),
+            Self::ServiceWitness => write!(f, "ServiceWitness"),
+            Self::ServiceReplication => write!(f, "ServiceReplication"),
             Self::WebRtcSignal => write!(f, "WebRtcSignal"),
             Self::WebRtcMedia => write!(f, "WebRtcMedia"),
             Self::WebRtcData => write!(f, "WebRtcData"),
@@ -380,8 +380,8 @@ impl TryFrom<u8> for StreamType {
 pub enum StreamTypeFamily {
     /// Gossip protocols (0x00-0x0F).
     Gossip,
-    /// DHT protocols (0x10-0x1F).
-    Dht,
+    /// Overlay service protocols (0x10-0x1F).
+    OverlayService,
     /// WebRTC protocols (0x20-0x2F).
     WebRtc,
     /// Reserved (0xF0-0xFF).
@@ -393,7 +393,7 @@ impl StreamTypeFamily {
     pub const fn byte_range(self) -> (u8, u8) {
         match self {
             Self::Gossip => (0x00, 0x0F),
-            Self::Dht => (0x10, 0x1F),
+            Self::OverlayService => (0x10, 0x1F),
             Self::WebRtc => (0x20, 0x2F),
             Self::Reserved => (0xF0, 0xFF),
         }
@@ -416,14 +416,14 @@ impl StreamTypeFamily {
 /// ```rust
 /// use ant_quic::link_transport::{StreamFilter, StreamType};
 ///
-/// // Accept only DHT streams
+/// // Accept only overlay service streams
 /// let filter = StreamFilter::new()
-///     .with_types(StreamType::dht_types());
+///     .with_types(StreamType::service_types());
 ///
-/// // Accept gossip and DHT
+/// // Accept gossip and overlay services
 /// let filter = StreamFilter::new()
 ///     .with_type(StreamType::Membership)
-///     .with_type(StreamType::DhtQuery);
+///     .with_type(StreamType::ServiceQuery);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct StreamFilter {
@@ -451,9 +451,9 @@ impl StreamFilter {
         Self::new().with_types(StreamType::gossip_types())
     }
 
-    /// Create a filter for DHT streams only.
-    pub fn dht_only() -> Self {
-        Self::new().with_types(StreamType::dht_types())
+    /// Create a filter for overlay service streams only.
+    pub fn overlay_service_only() -> Self {
+        Self::new().with_types(StreamType::service_types())
     }
 
     /// Create a filter for WebRTC streams only.
@@ -506,7 +506,7 @@ impl StreamFilter {
 /// use ant_quic::link_transport::ProtocolId;
 ///
 /// // From a static string (padded/truncated to 16 bytes)
-/// const DHT: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
+/// const OVERLAY_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-overlay/1.0.0");
 ///
 /// // From bytes
 /// let proto = ProtocolId::new([0x73, 0x61, 0x6f, 0x72, 0x73, 0x61, 0x2d, 0x64,
@@ -1118,7 +1118,7 @@ pub trait LinkConn: Send + Sync {
     ///
     /// # Example
     /// ```rust,ignore
-    /// let (mut send, mut recv) = conn.open_bi_typed(StreamType::DhtQuery).await?;
+    /// let (mut send, mut recv) = conn.open_bi_typed(StreamType::ServiceQuery).await?;
     /// send.write_all(b"query request").await?;
     /// send.finish()?;
     /// let response = recv.read_to_end(4096).await?;
@@ -1154,11 +1154,11 @@ pub trait LinkConn: Send + Sync {
     ///
     /// # Example
     /// ```rust,ignore
-    /// let filter = StreamFilter::dht_only();
+    /// let filter = StreamFilter::overlay_service_only();
     /// let mut incoming = conn.accept_bi_typed(filter);
     /// while let Some(result) = incoming.next().await {
     ///     let (stream_type, send, recv) = result?;
-    ///     // Handle DHT request/response
+    ///     // Handle overlay-service request/response
     /// }
     /// ```
     fn accept_bi_typed(
@@ -1449,8 +1449,8 @@ mod tests {
 
     #[test]
     fn test_protocol_id_from_string() {
-        let proto = ProtocolId::from("saorsa-dht/1.0");
-        assert_eq!(&proto.0[..14], b"saorsa-dht/1.0");
+        let proto = ProtocolId::from("saorsa-overlay");
+        assert_eq!(&proto.0[..14], b"saorsa-overlay");
         assert_eq!(proto.0[14], 0);
         assert_eq!(proto.0[15], 0);
     }
@@ -1513,12 +1513,12 @@ mod tests {
     #[test]
     fn test_capabilities_supports_protocol() {
         let mut caps = Capabilities::default();
-        let dht = ProtocolId::from("dht/1.0");
+        let overlay_proto = ProtocolId::from("overlay/1.0");
         let gossip = ProtocolId::from("gossip/1.0");
 
-        caps.protocols.push(dht);
+        caps.protocols.push(overlay_proto);
 
-        assert!(caps.supports_protocol(&dht));
+        assert!(caps.supports_protocol(&overlay_proto));
         assert!(!caps.supports_protocol(&gossip));
     }
 
@@ -1531,10 +1531,10 @@ mod tests {
         assert_eq!(StreamType::Membership.as_byte(), 0x00);
         assert_eq!(StreamType::PubSub.as_byte(), 0x01);
         assert_eq!(StreamType::GossipBulk.as_byte(), 0x02);
-        assert_eq!(StreamType::DhtQuery.as_byte(), 0x10);
-        assert_eq!(StreamType::DhtStore.as_byte(), 0x11);
-        assert_eq!(StreamType::DhtWitness.as_byte(), 0x12);
-        assert_eq!(StreamType::DhtReplication.as_byte(), 0x13);
+        assert_eq!(StreamType::ServiceQuery.as_byte(), 0x10);
+        assert_eq!(StreamType::ServiceStore.as_byte(), 0x11);
+        assert_eq!(StreamType::ServiceWitness.as_byte(), 0x12);
+        assert_eq!(StreamType::ServiceReplication.as_byte(), 0x13);
         assert_eq!(StreamType::WebRtcSignal.as_byte(), 0x20);
         assert_eq!(StreamType::WebRtcMedia.as_byte(), 0x21);
         assert_eq!(StreamType::WebRtcData.as_byte(), 0x22);
@@ -1544,7 +1544,7 @@ mod tests {
     #[test]
     fn test_stream_type_from_byte() {
         assert_eq!(StreamType::from_byte(0x00), Some(StreamType::Membership));
-        assert_eq!(StreamType::from_byte(0x10), Some(StreamType::DhtQuery));
+        assert_eq!(StreamType::from_byte(0x10), Some(StreamType::ServiceQuery));
         assert_eq!(StreamType::from_byte(0x20), Some(StreamType::WebRtcSignal));
         assert_eq!(StreamType::from_byte(0xF0), Some(StreamType::Reserved));
         assert_eq!(StreamType::from_byte(0x99), None); // Unassigned
@@ -1557,10 +1557,10 @@ mod tests {
         assert!(StreamType::PubSub.is_gossip());
         assert!(StreamType::GossipBulk.is_gossip());
 
-        assert!(StreamType::DhtQuery.is_dht());
-        assert!(StreamType::DhtStore.is_dht());
-        assert!(StreamType::DhtWitness.is_dht());
-        assert!(StreamType::DhtReplication.is_dht());
+        assert!(StreamType::ServiceQuery.is_overlay_service());
+        assert!(StreamType::ServiceStore.is_overlay_service());
+        assert!(StreamType::ServiceWitness.is_overlay_service());
+        assert!(StreamType::ServiceReplication.is_overlay_service());
 
         assert!(StreamType::WebRtcSignal.is_webrtc());
         assert!(StreamType::WebRtcMedia.is_webrtc());
@@ -1573,9 +1573,9 @@ mod tests {
         assert!(StreamTypeFamily::Gossip.contains(0x0F));
         assert!(!StreamTypeFamily::Gossip.contains(0x10));
 
-        assert!(StreamTypeFamily::Dht.contains(0x10));
-        assert!(StreamTypeFamily::Dht.contains(0x1F));
-        assert!(!StreamTypeFamily::Dht.contains(0x20));
+        assert!(StreamTypeFamily::OverlayService.contains(0x10));
+        assert!(StreamTypeFamily::OverlayService.contains(0x1F));
+        assert!(!StreamTypeFamily::OverlayService.contains(0x20));
 
         assert!(StreamTypeFamily::WebRtc.contains(0x20));
         assert!(StreamTypeFamily::WebRtc.contains(0x2F));
@@ -1586,10 +1586,10 @@ mod tests {
     fn test_stream_filter_accepts() {
         let filter = StreamFilter::new()
             .with_type(StreamType::Membership)
-            .with_type(StreamType::DhtQuery);
+            .with_type(StreamType::ServiceQuery);
 
         assert!(filter.accepts(StreamType::Membership));
-        assert!(filter.accepts(StreamType::DhtQuery));
+        assert!(filter.accepts(StreamType::ServiceQuery));
         assert!(!filter.accepts(StreamType::PubSub));
         assert!(!filter.accepts(StreamType::WebRtcMedia));
     }
@@ -1599,7 +1599,7 @@ mod tests {
         let filter = StreamFilter::new();
         assert!(filter.accepts_all());
         assert!(filter.accepts(StreamType::Membership));
-        assert!(filter.accepts(StreamType::DhtQuery));
+        assert!(filter.accepts(StreamType::ServiceQuery));
         assert!(filter.accepts(StreamType::WebRtcMedia));
     }
 
@@ -1609,23 +1609,23 @@ mod tests {
         assert!(gossip.accepts(StreamType::Membership));
         assert!(gossip.accepts(StreamType::PubSub));
         assert!(gossip.accepts(StreamType::GossipBulk));
-        assert!(!gossip.accepts(StreamType::DhtQuery));
+        assert!(!gossip.accepts(StreamType::ServiceQuery));
 
-        let dht = StreamFilter::dht_only();
-        assert!(dht.accepts(StreamType::DhtQuery));
-        assert!(dht.accepts(StreamType::DhtStore));
-        assert!(!dht.accepts(StreamType::Membership));
+        let service_filter = StreamFilter::overlay_service_only();
+        assert!(service_filter.accepts(StreamType::ServiceQuery));
+        assert!(service_filter.accepts(StreamType::ServiceStore));
+        assert!(!service_filter.accepts(StreamType::Membership));
 
         let webrtc = StreamFilter::webrtc_only();
         assert!(webrtc.accepts(StreamType::WebRtcSignal));
         assert!(webrtc.accepts(StreamType::WebRtcMedia));
-        assert!(!webrtc.accepts(StreamType::DhtQuery));
+        assert!(!webrtc.accepts(StreamType::ServiceQuery));
     }
 
     #[test]
     fn test_stream_type_display() {
         assert_eq!(format!("{}", StreamType::Membership), "Membership");
-        assert_eq!(format!("{}", StreamType::DhtQuery), "DhtQuery");
+        assert_eq!(format!("{}", StreamType::ServiceQuery), "ServiceQuery");
         assert_eq!(format!("{}", StreamType::WebRtcMedia), "WebRtcMedia");
     }
 
@@ -1691,11 +1691,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_handler_returns_response() {
-            let handler = TestHandler::new(vec![StreamType::DhtQuery]);
+            let handler = TestHandler::new(vec![StreamType::ServiceQuery]);
             let peer = PeerId::from([0u8; 32]);
 
             let result = handler
-                .handle_stream(peer, StreamType::DhtQuery, Bytes::from_static(b"test"))
+                .handle_stream(peer, StreamType::ServiceQuery, Bytes::from_static(b"test"))
                 .await;
 
             assert!(result.is_ok());
@@ -1755,8 +1755,8 @@ mod tests {
 
         #[test]
         fn test_boxed_handler() {
-            let handler: BoxedHandler = TestHandler::new(vec![StreamType::DhtStore]).boxed();
-            assert_eq!(handler.stream_types(), &[StreamType::DhtStore]);
+            let handler: BoxedHandler = TestHandler::new(vec![StreamType::ServiceStore]).boxed();
+            assert_eq!(handler.stream_types(), &[StreamType::ServiceStore]);
             assert_eq!(handler.name(), "TestHandler");
         }
 
@@ -1803,9 +1803,9 @@ mod tests {
 
         #[test]
         fn test_no_handler_error() {
-            let err = LinkError::NoHandler(StreamType::DhtQuery);
+            let err = LinkError::NoHandler(StreamType::ServiceQuery);
             let msg = err.to_string();
-            assert!(msg.contains("DhtQuery"), "Error message: {}", msg);
+            assert!(msg.contains("ServiceQuery"), "Error message: {}", msg);
         }
 
         #[test]

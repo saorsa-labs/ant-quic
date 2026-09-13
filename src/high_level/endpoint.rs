@@ -1079,7 +1079,7 @@ impl State {
         }
 
         // Forward peer address updates from ADD_ADDRESS frames to the
-        // NatTraversalEndpoint so it can update the DHT routing table.
+        // NatTraversalEndpoint so consuming overlays can update their own address books.
         let address_updates: Vec<(SocketAddr, SocketAddr)> =
             self.inner.drain_peer_address_updates().collect();
         for (peer_addr, advertised_addr) in address_updates {

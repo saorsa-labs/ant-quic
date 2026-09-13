@@ -83,7 +83,7 @@ pub(crate) enum EndpointEventInner {
     #[allow(dead_code)]
     NatCandidateValidated { address: SocketAddr, challenge: u64 },
     /// A peer advertised a new reachable address via ADD_ADDRESS.
-    /// The endpoint should propagate this so the DHT routing table is updated.
+    /// The endpoint should propagate this so consuming overlays can update their own address books.
     PeerAddressAdvertised {
         /// The peer's current connection address
         peer_addr: SocketAddr,

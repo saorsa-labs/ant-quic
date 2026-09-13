@@ -967,10 +967,10 @@ impl ProgressiveHandshake {
 
 ## 7. Network Layer and Routing
 
-### 7.1 Routing Table Design
+### 7.1 Route Table Design
 
 ```rust
-pub struct RoutingTable {
+pub struct RouteTable {
     /// Known routes to peers
     routes: HashMap<PeerId, Route>,
     
@@ -1007,7 +1007,7 @@ pub struct RouteMetrics {
 ### 7.2 Route Selection
 
 ```rust
-impl RoutingTable {
+impl RouteTable {
     pub fn select_route(&self, dest: &PeerId, requirements: &RouteRequirements) -> Option<SelectedRoute> {
         let route = self.routes.get(dest)?;
         
@@ -1115,8 +1115,8 @@ pub struct GatewayNode {
     /// Protocol engines per transport class
     engines: HashMap<TransportType, Arc<dyn ProtocolEngine>>,
     
-    /// Unified routing table
-    routing: Arc<RwLock<RoutingTable>>,
+    /// Unified route table
+    routing: Arc<RwLock<RouteTable>>,
     
     /// Message relay queue
     relay_queue: mpsc::Sender<RelayRequest>,
@@ -1576,7 +1576,7 @@ impl Message {
 ### Phase 5: Network Layer (5-6 weeks)
 
 **Goals**:
-- Routing table design
+- Route table design
 - Route announcements
 - Gateway logic
 - Multi-transport peer discovery
