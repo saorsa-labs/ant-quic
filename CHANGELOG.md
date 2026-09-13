@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.52] - 2026-09-13
+
 ### Fixed
 
 - **`shutdown()` now aborts and joins the accept workers and refuses late handshake registrations (#286, x0x#692).**
