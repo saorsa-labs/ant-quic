@@ -16079,6 +16079,141 @@ mod tests {
         a.shutdown().await;
     }
 
+    /// #286: an inbound handshake completing DURING `shutdown()` — after the
+    /// #285 lifecycle sweep — must not leave an entry in either map. The
+    /// accept worker is spawned with its join handle dropped, so `shutdown()`
+    /// never waited for it and the registration path had no shutdown check:
+    /// the late entry landed in `connections` (drained only once, before the
+    /// sweep) and `connection_lifecycle`, was closed by nobody, and the
+    /// remote — which registers its own side of the dial, as the real dialer
+    /// flow does — kept the peer "connected" until its idle timeout: the x0x
+    /// 1-in-20 stale `is_connected` after `shutdown()` (x0x#692).
+    ///
+    /// Modelled on the #285 test's harness. The late dial is started first
+    /// (its ClientHello is on the wire), then shutdown begins, so the
+    /// handshake completes squarely after the flag is set and the lifecycle
+    /// sweep has run. Asserts (a) no entry survives in either map after
+    /// shutdown completes, and (b) the remote observes the disconnect within
+    /// the drain window rather than at the idle timeout.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn shutdown_during_inbound_handshake_leaves_no_stale_entry() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let a_for_accept = a.clone();
+        tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let a_addr = localhost_addr(a.local_addr().expect("a bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        // Family 1 (B → A dial, registered on B; A adopts it through its
+        // accept path): A holds a live connection to B whose fate the test
+        // observes, and B's accept worker is running.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        b.inner
+            .add_connection_with_outcome(a_id, c0)
+            .expect("register c0 on B");
+
+        // Precondition: A is connected to B through family 1.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < deadline,
+                "precondition: A must be connected to B"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Start the late A → B dial FIRST (ClientHello in flight), then begin
+        // B's shutdown: the handshake completes after the flag is set and the
+        // lifecycle sweep has run — the #286 window.
+        let late_dial = {
+            let a = a.clone();
+            tokio::spawn(async move { a.attempt_direct_handshake(b_addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let b_shutdown = {
+            let b = b.clone();
+            tokio::spawn(async move { b.inner.shutdown().await })
+        };
+
+        // The dial's fate depends on where the fix cuts it: refused (the
+        // handshake completes and the registration is refused — B closes the
+        // connection) or aborted (the worker dies mid-handshake — the
+        // endpoint abandons the dial). Both close the transport. Register
+        // A's side only when the handshake completed, mirroring the real
+        // dialer flow that registers its own side.
+        let late = tokio::time::timeout(Duration::from_secs(10), late_dial)
+            .await
+            .expect("late dial task")
+            .expect("late dial join");
+        if let Ok(late_conn) = late {
+            a.inner
+                .add_connection_with_outcome(b_id, late_conn)
+                .expect("register A's side of the late dial");
+        }
+
+        // (b) A must observe the disconnect within the drain window (the
+        // bounded drain is 5 s; the QUIC idle timeout is far longer — on the
+        // unfixed code the never-closed late survivor keeps A connected
+        // until it).
+        let observe_deadline = Instant::now() + Duration::from_secs(15);
+        while a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < observe_deadline,
+                "A must observe B's shutdown within the drain window — a                  late-registered handshake survived the shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Shutdown has completed (A already observed the disconnects).
+        b_shutdown
+            .await
+            .expect("shutdown task")
+            .expect("inner shutdown");
+
+        // (a) No entry survives in either map: the connections map is empty,
+        // and no lifecycle generation remains promotable.
+        assert!(
+            b.inner
+                .list_connections()
+                .expect("list_connections")
+                .is_empty(),
+            "no connection may remain in the winner map after shutdown"
+        );
+        assert!(
+            b.inner
+                .get_connection(&a_id)
+                .expect("get_connection")
+                .is_none(),
+            "no lifecycle generation may remain promotable after shutdown"
+        );
+
+        a.shutdown().await;
+    }
+
     /// #280 (a): single stream owner. An application stream opened by the
     /// dialer must be delivered to the acceptor's app-stream queue EXACTLY
     /// once, with a relay server configured (the default), and exactly one
