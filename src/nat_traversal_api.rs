@@ -475,6 +475,10 @@ pub(crate) enum ConnectionRegistrationOutcome {
     Rejected {
         winner_generation: u64,
     },
+    /// #286: the endpoint is shutting down — the registration was refused
+    /// and the connection has been closed by the registrar. Nothing was
+    /// entered into either map.
+    Refused,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -621,6 +625,11 @@ pub struct NatTraversalEndpoint {
     shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
     /// Whether the shared relay endpoint already has an accept loop attached.
     relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
+    /// #286: join handles of the background accept workers (the connection
+    /// accept loops and the shared-relay accept loop). `shutdown` aborts and
+    /// joins them inside the bounded drain so no worker can register a
+    /// late-completing handshake after the lifecycle sweep.
+    accept_worker_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
     relay_server: Option<Arc<MasqueRelayServer>>,
@@ -1952,6 +1961,7 @@ impl NatTraversalEndpoint {
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -2143,7 +2153,7 @@ impl NatTraversalEndpoint {
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
-            tokio::spawn(async move {
+            let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
                     endpoint_clone,
                     shutdown_clone,
@@ -2160,6 +2170,12 @@ impl NatTraversalEndpoint {
                 )
                 .await;
             });
+            // #286: keep the accept worker's handle so shutdown can abort and
+            // join it inside the bounded drain.
+            endpoint
+                .accept_worker_handles
+                .lock()
+                .push(accept_worker_handle);
 
             info!("Started accepting connections (symmetric P2P node)");
         }
@@ -2460,6 +2476,7 @@ impl NatTraversalEndpoint {
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -2651,7 +2668,7 @@ impl NatTraversalEndpoint {
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
-            tokio::spawn(async move {
+            let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
                     endpoint_clone,
                     shutdown_clone,
@@ -2668,6 +2685,12 @@ impl NatTraversalEndpoint {
                 )
                 .await;
             });
+            // #286: keep the accept worker's handle so shutdown can abort and
+            // join it inside the bounded drain.
+            endpoint
+                .accept_worker_handles
+                .lock()
+                .push(accept_worker_handle);
 
             info!("Started accepting connections (symmetric P2P node)");
         }
@@ -2827,7 +2850,8 @@ impl NatTraversalEndpoint {
             let incoming_notify = self.incoming_notify.clone();
             let pending_accepts = self.pending_accepts.clone();
             let relay_event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
+            let relay_shutdown = self.shutdown.clone();
+            let relay_worker_handle = tokio::spawn(async move {
                 loop {
                     match relay_endpoint.accept().await {
                         Some(incoming) => match incoming.await {
@@ -2858,6 +2882,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
+                                    relay_shutdown.load(Ordering::Relaxed),
                                     peer_id,
                                     conn.clone(),
                                 );
@@ -2872,6 +2897,11 @@ impl NatTraversalEndpoint {
                                             "Rejected relayed connection for peer {:?}; live generation {} kept",
                                             peer_id, winner_generation
                                         );
+                                        continue;
+                                    }
+                                    ConnectionRegistrationOutcome::Refused => {
+                                        // Late registration during shutdown;
+                                        // the connection is already closed.
                                         continue;
                                     }
                                 };
@@ -2920,6 +2950,10 @@ impl NatTraversalEndpoint {
                     }
                 }
             });
+
+            // #286: keep the relay accept worker's handle so shutdown can
+            // abort and join it inside the bounded drain.
+            self.accept_worker_handles.lock().push(relay_worker_handle);
         }
 
         // Step 4: Store relay public address for re-advertisement to future peers
@@ -4545,6 +4579,7 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
+        shutting_down: bool,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -4559,12 +4594,16 @@ impl NatTraversalEndpoint {
             connection_lifecycle,
             next_connection_generation,
             emitted_established_events,
+            shutting_down,
             peer_id,
             connection.clone(),
         );
 
         match outcome {
             ConnectionRegistrationOutcome::Live { .. } => Ok((peer_id, connection)),
+            ConnectionRegistrationOutcome::Refused => Err(NatTraversalError::NetworkError(
+                "endpoint is shutting down".to_string(),
+            )),
             ConnectionRegistrationOutcome::Rejected { .. } => {
                 let existing = connections
                     .get(&peer_id)
@@ -4701,6 +4740,7 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
                     let traversal_event_notify = self.traversal_event_notify.clone();
+                    let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
@@ -4713,6 +4753,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
+                                        dial_shutdown.load(Ordering::Relaxed),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -5363,7 +5404,7 @@ impl NatTraversalEndpoint {
         let incoming_notify_clone = self.incoming_notify.clone();
         let pending_accepts_clone = self.pending_accepts.clone();
 
-        tokio::spawn(async move {
+        let accept_worker_handle = tokio::spawn(async move {
             Self::accept_connections(
                 endpoint_clone,
                 shutdown_clone,
@@ -5380,6 +5421,9 @@ impl NatTraversalEndpoint {
             )
             .await;
         });
+        // #286: keep the accept worker's handle so shutdown can abort and
+        // join it inside the bounded drain.
+        self.accept_worker_handles.lock().push(accept_worker_handle);
 
         Ok(())
     }
@@ -5411,6 +5455,7 @@ impl NatTraversalEndpoint {
                     let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
                     let pending_accepts = pending_accepts.clone();
+                    let shutdown = shutdown.clone();
                     tokio::spawn(async move {
                         match connecting.await {
                             Ok(connection) => {
@@ -5430,6 +5475,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
+                                    shutdown.load(Ordering::Relaxed),
                                     peer_id,
                                     connection.clone(),
                                 );
@@ -5445,6 +5491,11 @@ impl NatTraversalEndpoint {
                                             "Rejected inbound connection for peer {:?}; live generation {} kept",
                                             peer_id, winner_generation
                                         );
+                                        return;
+                                    }
+                                    ConnectionRegistrationOutcome::Refused => {
+                                        // Late registration during shutdown;
+                                        // the connection is already closed.
                                         return;
                                     }
                                 };
@@ -6812,9 +6863,25 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
+        shutting_down: bool,
         peer_id: PeerId,
         connection: InnerConnection,
     ) -> ConnectionRegistrationOutcome {
+        // #286: a handshake completing after the shutdown lifecycle sweep
+        // would land in both maps and never be closed (the canonical
+        // `connections` map is drained only once, before the sweep), leaving
+        // exactly one stale survivor the remote repromotes until its idle
+        // timeout. Refuse the late registration and close the connection.
+        if shutting_down {
+            debug!(
+                peer_id = ?peer_id,
+                "refusing late connection registration: endpoint is shutting down"
+            );
+            if connection.close_reason().is_none() {
+                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+            }
+            return ConnectionRegistrationOutcome::Refused;
+        }
         let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
         let tracked = TrackedConnection {
             connection: connection.clone(),
@@ -7039,6 +7106,7 @@ impl NatTraversalEndpoint {
             self.connection_lifecycle.as_ref(),
             self.next_connection_generation.as_ref(),
             self.emitted_established_events.as_ref(),
+            self.shutdown.load(Ordering::Relaxed),
             peer_id,
             connection,
         ))
@@ -8494,6 +8562,34 @@ impl NatTraversalEndpoint {
             drop(lifecycle);
             if closed > 0 {
                 info!("shutdown: closed {closed} additional lifecycle-tracked connection(s)");
+            }
+        }
+
+        // #286: abort and join the accept workers BEFORE the bounded drain,
+        // so no worker can register a handshake that completes after the
+        // lifecycle sweep above (the flag is checked at registration, but the
+        // join also guarantees the worker is gone before the socket is
+        // released). Aborted mid-handshake dials are dropped by the endpoint
+        // driver, which closes them. The join is bounded by the same drain
+        // budget — no unbounded await.
+        {
+            let handles = {
+                let mut workers = self.accept_worker_handles.lock();
+                std::mem::take(&mut *workers)
+            };
+            if !handles.is_empty() {
+                debug!(
+                    "shutdown: aborting and joining {} accept worker(s)",
+                    handles.len()
+                );
+                for handle in &handles {
+                    handle.abort();
+                }
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_DRAIN_TIMEOUT,
+                    futures_util::future::join_all(handles),
+                )
+                .await;
             }
         }
 
@@ -10139,6 +10235,7 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
+                    let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
@@ -10154,6 +10251,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
+                                        dial_shutdown.load(Ordering::Relaxed),
                                         connection,
                                     ) {
                                         Ok(result) => result,

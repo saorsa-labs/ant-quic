@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`shutdown()` now aborts and joins the accept workers and refuses late handshake registrations (#286, x0x#692).**
+  The connection accept workers were spawned with their join handles dropped, so `shutdown()` never waited
+  for them, and the registration path had no shutdown check: an inbound handshake completing after the #285
+  lifecycle sweep landed in both `connections` (drained only once, before the sweep) and
+  `connection_lifecycle`, was closed by nobody, and the remote — which registers its own side of the dial —
+  kept the peer "connected" until its idle timeout. Observed downstream as a stale `is_connected` roughly
+  1 run in 20 after `shutdown()` (x0x#692). `shutdown()` now keeps the workers' join handles, aborts and
+  joins them inside the bounded drain before the socket release, and the registration path refuses (and
+  closes) any late registration while the endpoint is shutting down. No wire change.
+
 ## [0.27.51] - 2026-09-12
 
 ### Fixed
@@ -180,10 +192,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a check-then-act that per-stream concurrency could race into double delivery.
   Cross-stream ordering was never guaranteed (each stream is one self-contained
   message); per-stream `data_tx` ordering is unchanged.
-
-## [Unreleased]
-
-### Fixed
 
 - **Stream-scoped read errors no longer kill the connection reader (#255 fix A).** A peer
   resetting one stream mid-message (the fork's Drop⇒RESET abandonment class, `0xA17C0244` —
