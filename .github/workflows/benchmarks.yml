@@ -11,6 +11,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "benches/**"
+      - ".github/workflows/benchmarks.yml"
+      - "scripts/ci/criterion_report.py"
+      - "scripts/ci/test_criterion_report.py"
   pull_request:
     branches: [master, main]
     paths:
@@ -18,6 +21,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "benches/**"
+      - ".github/workflows/benchmarks.yml"
+      - "scripts/ci/criterion_report.py"
+      - "scripts/ci/test_criterion_report.py"
   workflow_dispatch:
     inputs:
       baseline:
@@ -57,37 +63,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-criterion
-        run: cargo install cargo-criterion --locked || true
+      - name: Create fresh benchmark output
+        run: |
+          # Keep Criterion samples outside rust-cache's compiler target cleanup.
+          criterion_home=$(mktemp -d "$RUNNER_TEMP/ant-quic-criterion.XXXXXXXX")
+          echo "CRITERION_HOME=$criterion_home" >> "$GITHUB_ENV"
+
+      - name: Validate benchmark reporting helpers
+        run: python3 -m unittest discover -s scripts/ci -p 'test_criterion_report.py'
 
       - name: Run NAT traversal benchmarks
-        run: cargo bench --bench nat_traversal_performance -- --save-baseline current-nat || true
+        run: cargo bench --bench nat_traversal_performance -- --save-baseline current-nat
 
       - name: Run connection management benchmarks
-        run: cargo bench --bench connection_management -- --save-baseline current-conn || true
+        run: cargo bench --bench connection_management -- --save-baseline current-conn
 
       - name: Generate benchmark report
-        run: |
-          echo "# Benchmark Results" > benchmark-report.md
-          echo "## NAT Traversal" >> benchmark-report.md
-          cat target/criterion/nat_traversal_performance/*/base/estimates.json >> benchmark-report.md 2>/dev/null || echo "No results" >> benchmark-report.md
-
-          # Create benchmark results JSON
-          echo '{"timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "commit": "'${{ github.sha }}'", "results": []}' > benchmark-results.json
-          if [ -d "target/criterion/nat_traversal_performance" ]; then
-            find target/criterion/nat_traversal_performance -name "estimates.json" -exec cat {} \; | jq -s '.' > temp-results.json 2>/dev/null || echo "[]" > temp-results.json
-            jq --argjson results "$(cat temp-results.json)" '.results = $results' benchmark-results.json > benchmark-results-final.json
-            mv benchmark-results-final.json benchmark-results.json
-          fi
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v5
-        with:
-          name: benchmark-results-${{ github.sha }}
-          path: |
-            benchmark-results.json
-            benchmark-report.md
-            target/criterion/
+        run: python3 scripts/ci/criterion_report.py collect --root "$CRITERION_HOME"
 
       - name: Download baseline benchmarks
         if: github.event_name == 'pull_request'
@@ -104,31 +96,39 @@ jobs:
         if: github.event_name == 'pull_request' && success()
         id: compare
         run: |
-          if [ -d "baseline-benchmarks" ]; then
-            python3 .github/scripts/compare-benchmarks.py \
-              baseline-benchmarks/*/benchmark-results.json \
-              benchmark-results.json \
-              > comparison-report.md 2>/dev/null || echo "Comparison script not available" > comparison-report.md
-
-            if grep -q "REGRESSION" comparison-report.md; then
-              echo "regression_found=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No baseline benchmarks found for comparison" > comparison-report.md
+          python3 scripts/ci/criterion_report.py compare \
+            --root "$CRITERION_HOME" --baseline-download baseline-benchmarks \
+            --comparator .github/scripts/compare-benchmarks.py
+          if grep -q "REGRESSION" "$CRITERION_HOME/comparison-report.md"; then
+            echo "regression_found=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Upload benchmark results
+        if: always() && env.CRITERION_HOME != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: ${{ env.CRITERION_HOME }}/
+          if-no-files-found: error
+
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && env.CRITERION_HOME != ''
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
+            const path = require('path');
+            const reportPath = path.join(process.env.CRITERION_HOME, 'comparison-report.md');
+            const resultsPath = path.join(process.env.CRITERION_HOME, 'benchmark-report.md');
             let comment = '## Benchmark Results\n\n';
 
-            if (fs.existsSync('comparison-report.md')) {
-              comment += fs.readFileSync('comparison-report.md', 'utf8');
+            if (fs.existsSync(reportPath)) {
+              comment += fs.readFileSync(reportPath, 'utf8');
+            } else if (fs.existsSync(resultsPath)) {
+              comment += fs.readFileSync(resultsPath, 'utf8');
+              comment += '\nComparison unavailable; inspect the failed workflow step.\n';
             } else {
-              comment += fs.readFileSync('benchmark-report.md', 'utf8');
+              comment += 'Benchmark run incomplete; comparison unavailable.\n';
             }
 
             const { data: comments } = await github.rest.issues.listComments({
@@ -162,7 +162,7 @@ jobs:
         if: steps.compare.outputs.regression_found == 'true'
         run: |
           echo "Performance regression detected!"
-          cat comparison-report.md
+          cat "$CRITERION_HOME/comparison-report.md"
           exit 1
 
   profile:
