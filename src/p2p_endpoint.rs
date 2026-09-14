@@ -561,6 +561,26 @@ where
     None
 }
 
+fn direct_stage_timeout(
+    configured_timeout: Duration,
+    overall_timeout: Duration,
+    custom_strategy_supplied: bool,
+    address_only: bool,
+    relay_reserve: Option<Duration>,
+) -> Duration {
+    if custom_strategy_supplied || !address_only {
+        return configured_timeout.min(overall_timeout);
+    }
+
+    let minimum_direct = configured_timeout.min(overall_timeout);
+    let maximum_relay_reserve = overall_timeout.saturating_sub(minimum_direct);
+    overall_timeout.saturating_sub(
+        relay_reserve
+            .unwrap_or(Duration::ZERO)
+            .min(maximum_relay_reserve),
+    )
+}
+
 fn cached_peer_avg_rtt(peer: &CachedPeer) -> Option<Duration> {
     (peer.stats.avg_rtt_ms > 0).then(|| Duration::from_millis(u64::from(peer.stats.avg_rtt_ms)))
 }
@@ -4951,13 +4971,16 @@ impl P2pEndpoint {
             );
         }
 
+        let address_only = peer_id.is_none();
+        let relay_reserve = (config.relay_enabled && !config.relay_addrs.is_empty())
+            .then_some(config.relay_timeout);
         let mut strategy = ConnectionStrategy::new(config);
-        let overall_deadline = tokio::time::Instant::now()
-            + self
-                .config
-                .timeouts
-                .nat_traversal
-                .connection_establishment_timeout;
+        let connection_establishment_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+        let overall_deadline = tokio::time::Instant::now() + connection_establishment_timeout;
 
         info!(
             "Starting fallback connection: IPv4={:?}, IPv6={:?} (PeerId: {:?})",
@@ -5001,7 +5024,19 @@ impl P2pEndpoint {
                     }
 
                     let he_config = HappyEyeballsConfig::default();
-                    let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+                    // Address-only dials cannot use hole punching because they do not
+                    // carry an authenticated target PeerId. Give their direct stage
+                    // the authoritative overall establishment budget, reserving time
+                    // only when a relay path is actually available. This keeps the
+                    // dial bounded while avoiding an early RTT-derived terminal abort
+                    // under scheduler contention (issue #292).
+                    let direct_timeout = direct_stage_timeout(
+                        strategy.ipv4_timeout().max(strategy.ipv6_timeout()),
+                        overall_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        custom_strategy_supplied,
+                        address_only,
+                        relay_reserve,
+                    );
                     let handshake_timeout = self
                         .config
                         .timeouts
@@ -10980,6 +11015,95 @@ mod tests {
         assert_eq!(
             cache.replay(peer_id, request_id, b"different payload"),
             Some(AckRequestDedupeReplay::Conflict)
+        );
+    }
+
+    #[test]
+    fn address_only_direct_budget_uses_available_overall_deadline() {
+        let configured = Duration::from_millis(2_082);
+        let overall = Duration::from_secs(30);
+
+        assert_eq!(
+            direct_stage_timeout(configured, overall, false, true, None),
+            overall,
+            "without a usable fallback, direct dialing owns the bounded overall budget"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                true,
+                Some(Duration::from_secs(10)),
+            ),
+            Duration::from_secs(20),
+            "a usable relay keeps its reserved slice"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                true,
+                Some(Duration::from_secs(30)),
+            ),
+            configured,
+            "an oversized relay reserve must not starve a viable direct route"
+        );
+        assert_eq!(
+            direct_stage_timeout(configured, overall, true, true, None),
+            configured,
+            "an explicit strategy remains authoritative"
+        );
+        assert_eq!(
+            direct_stage_timeout(configured, overall, false, false, None),
+            configured,
+            "peer-oriented dialing retains its adaptive fallback allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_only_direct_budget_allows_slow_race_but_keeps_overall_cap() {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().expect("loopback addr");
+        let configured = Duration::from_millis(20);
+        let overall = Duration::from_millis(300);
+        let effective = direct_stage_timeout(configured, overall, false, true, None);
+
+        let completed = timeout(
+            effective,
+            happy_eyeballs::race_connect(
+                &[addr],
+                &HappyEyeballsConfig::default(),
+                move |candidate| async move {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Ok::<SocketAddr, EndpointError>(candidate)
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            completed
+                .expect("race stays within overall deadline")
+                .expect("dial succeeds"),
+            (addr, addr),
+            "a delayed dial must survive the shorter adaptive cutoff"
+        );
+
+        let capped = timeout(
+            effective,
+            happy_eyeballs::race_connect(
+                &[addr],
+                &HappyEyeballsConfig::default(),
+                move |candidate| async move {
+                    tokio::time::sleep(overall + Duration::from_millis(100)).await;
+                    Ok::<SocketAddr, EndpointError>(candidate)
+                },
+            ),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "the direct race must still terminate at the configured overall deadline"
         );
     }
 
