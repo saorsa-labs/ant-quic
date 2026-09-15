@@ -319,14 +319,14 @@ where
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AttemptResult<C>>();
-    let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(sorted.len());
+    let mut attempts = AttemptTasks::with_capacity(sorted.len());
     let mut errors: Vec<(SocketAddr, String)> = Vec::new();
     let mut next_index: usize = 0;
     let total = sorted.len();
     let mut in_flight: usize = 0;
 
     // Spawn the first attempt immediately
-    handles.push(spawn_attempt(
+    attempts.push(spawn_attempt(
         sorted[next_index],
         next_index + 1,
         &connect_fn,
@@ -347,7 +347,6 @@ where
                     match result {
                         Some(AttemptResult::Success(conn, addr)) => {
                             info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                            abort_all(&handles);
                             return Ok((conn, addr));
                         }
                         Some(AttemptResult::Failure(addr, err)) => {
@@ -357,7 +356,7 @@ where
 
                             // On failure, start next attempt immediately (RFC 8305 Section 5)
                             if next_index < total {
-                                handles.push(spawn_attempt(
+                                attempts.push(spawn_attempt(
                                     sorted[next_index],
                                     next_index + 1,
                                     &connect_fn,
@@ -382,7 +381,7 @@ where
                             attempt = next_index + 1,
                             "Starting parallel attempt after delay"
                         );
-                        handles.push(spawn_attempt(
+                        attempts.push(spawn_attempt(
                             sorted[next_index],
                             next_index + 1,
                             &connect_fn,
@@ -402,7 +401,6 @@ where
             match rx.recv().await {
                 Some(AttemptResult::Success(conn, addr)) => {
                     info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                    abort_all(&handles);
                     return Ok((conn, addr));
                 }
                 Some(AttemptResult::Failure(addr, err)) => {
@@ -421,10 +419,24 @@ where
     Err(HappyEyeballsError::AllAttemptsFailed { errors })
 }
 
-/// Abort all spawned task handles.
-fn abort_all(handles: &[JoinHandle<()>]) {
-    for handle in handles {
-        handle.abort();
+/// Owns every attempt so cancellation of the race also cancels its child tasks.
+struct AttemptTasks(Vec<JoinHandle<()>>);
+
+impl AttemptTasks {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.0.push(handle);
+    }
+}
+
+impl Drop for AttemptTasks {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
     }
 }
 
@@ -435,6 +447,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropWitness {
+        count: Arc<AtomicUsize>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.dropped.notify_one();
+        }
+    }
 
     /// Parse a v4 socket address from a string.
     fn v4(s: &str) -> SocketAddr {
@@ -795,6 +819,90 @@ mod tests {
         // Only one task should have completed (the fast successful one).
         // The others should have been aborted.
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_race_cancels_entered_attempt() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drop_event = Arc::new(tokio::sync::Notify::new());
+        let entered_for_attempt = Arc::clone(&entered);
+        let dropped_for_attempt = Arc::clone(&dropped);
+        let drop_event_for_attempt = Arc::clone(&drop_event);
+        let addrs = vec![v6("[::1]:80")];
+
+        let race = tokio::spawn(async move {
+            race_connect(&addrs, &HappyEyeballsConfig::default(), move |_| {
+                let entered = Arc::clone(&entered_for_attempt);
+                let dropped = Arc::clone(&dropped_for_attempt);
+                let drop_event = Arc::clone(&drop_event_for_attempt);
+                async move {
+                    let _witness = DropWitness {
+                        count: dropped,
+                        dropped: drop_event,
+                    };
+                    entered.notify_one();
+                    std::future::pending::<Result<String, String>>().await
+                }
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        race.abort();
+        let _ = race.await;
+
+        tokio::time::timeout(Duration::from_secs(1), drop_event.notified())
+            .await
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timing_out_race_cancels_entered_attempt() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drop_event = Arc::new(tokio::sync::Notify::new());
+        let entered_for_attempt = Arc::clone(&entered);
+        let dropped_for_attempt = Arc::clone(&dropped);
+        let drop_event_for_attempt = Arc::clone(&drop_event);
+        let addrs = vec![v6("[::1]:80")];
+
+        let mut race = Box::pin(async {
+            race_connect(&addrs, &HappyEyeballsConfig::default(), move |_| {
+                let entered = Arc::clone(&entered_for_attempt);
+                let dropped = Arc::clone(&dropped_for_attempt);
+                let drop_event = Arc::clone(&drop_event_for_attempt);
+                async move {
+                    let _witness = DropWitness {
+                        count: dropped,
+                        dropped: drop_event,
+                    };
+                    entered.notify_one();
+                    std::future::pending::<Result<String, String>>().await
+                }
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                () = entered.notified() => {}
+                result = &mut race => panic!("race ended before attempt entered: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(50), &mut race).await;
+
+        assert!(result.is_err());
+        drop(race);
+        tokio::time::timeout(Duration::from_secs(1), drop_event.notified())
+            .await
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     #[test]
