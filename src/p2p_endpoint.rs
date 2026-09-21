@@ -16451,12 +16451,13 @@ mod tests {
     ///
     /// #286 round 2 — deterministic: the race is driven by the
     /// registration-gate test hook (`arm_registration_gate_for_test`), which
-    /// parks B's registration of the late dial between its fast-path
+    /// parks only B's registration of the late dial between its fast-path
     /// shutdown check and the map insert — the exact worst-case scheduling
     /// the in-lock re-check must survive (flag read early, insert attempted
-    /// after the sweep). With the registration parked, B's shutdown runs to
-    /// COMPLETION (sweep, drain, socket release), then the gate releases the
-    /// registration. Profile-independent: no sleeps, no handshake timing.
+    /// after the sweep). The test observes B's completed lifecycle sweep,
+    /// then releases the registration before shutdown joins the worker.
+    /// An unrelated C → D registration must complete while B remains parked,
+    /// proving the hook cannot capture concurrent tests or endpoints.
     /// Asserts (a) no entry survives in either map and (b) the remote
     /// observes the disconnect within the drain window.
     // Requires the network-discovery socket path: the fallback
@@ -16482,12 +16483,16 @@ mod tests {
 
         let a = build_endpoint().await;
         let b = build_endpoint().await;
+        let c = build_endpoint().await;
+        let d = build_endpoint().await;
         let a_for_accept = a.clone();
         tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
         let b_addr = localhost_addr(b.local_addr().expect("b bound"));
         let a_addr = localhost_addr(a.local_addr().expect("a bound"));
         let b_id = b.peer_id();
         let a_id = a.peer_id();
+        let d_id = d.peer_id();
+        let d_addr = localhost_addr(d.local_addr().expect("d bound"));
 
         // Family 1 (B → A dial, registered on B; A adopts it through its
         // accept path): A holds a live connection to B whose fate the test
@@ -16514,31 +16519,60 @@ mod tests {
         // accept worker registers the inbound handshake through
         // register_connection_lifecycle_parts, which parks on the gate AFTER
         // its fast-path flag check.
-        let gate = crate::nat_traversal_api::arm_registration_gate_for_test();
+        let gate = b.inner.arm_registration_gate_for_test();
         let late_dial = {
             let a = a.clone();
             tokio::spawn(async move { a.attempt_direct_handshake(b_addr).await })
         };
-        let park_deadline = Instant::now() + Duration::from_secs(10);
-        while gate.parked_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(
-                Instant::now() < park_deadline,
-                "the late registration never reached the gate"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+            .await
+            .expect("the late registration never reached the gate");
 
-        // With the registration parked mid-flight, run B's shutdown to
-        // COMPLETION — flag stored, canonical drain, #285 lifecycle sweep,
-        // worker abort+join, bounded drain, socket release.
-        b.inner.shutdown().await.expect("inner shutdown");
+        // The gate is endpoint-scoped: an unrelated C → D handshake and
+        // registration completes while B remains parked. A process-global
+        // gate deadlocks here and the outer timeout fails deterministically.
+        let unrelated = tokio::spawn(async move {
+            let connection = c.attempt_direct_handshake(d_addr).await.map_err(|error| {
+                crate::nat_traversal_api::NatTraversalError::NetworkError(format!(
+                    "unrelated control handshake failed: {error}"
+                ))
+            })?;
+            c.inner.add_connection_with_outcome(d_id, connection)?;
+            Ok::<P2pEndpoint, crate::nat_traversal_api::NatTraversalError>(c)
+        });
+        let c = tokio::time::timeout(Duration::from_secs(10), unrelated)
+            .await
+            .expect("unrelated registration was captured by B's gate")
+            .expect("unrelated registration task")
+            .expect("unrelated registration");
+        assert_eq!(
+            gate.parked_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only B's selected registration may be parked"
+        );
+
+        // Start B's shutdown and wait for its explicit post-lifecycle-sweep
+        // anchor. Shutdown cannot join the parked accept worker until the
+        // gate is released, so awaiting full shutdown here would deadlock.
+        let b_for_shutdown = b.clone();
+        let shutdown = tokio::spawn(async move { b_for_shutdown.inner.shutdown().await });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            b.inner.wait_for_shutdown_lifecycle_sweep_for_test(),
+        )
+        .await
+        .expect("shutdown did not complete its lifecycle sweep");
 
         // Release the parked registration: it resumes exactly in the
         // worst-case window (post-sweep). The in-lock re-check must refuse
         // it; on the unfixed tree it inserts the stale survivor.
-        gate.released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        crate::nat_traversal_api::disarm_registration_gate_for_test();
+        gate.release();
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(15), shutdown)
+            .await
+            .expect("B shutdown timeout")
+            .expect("B shutdown task")
+            .expect("B inner shutdown");
 
         // The dial's fate: refused (handshake completed, registration
         // refused, B closed the connection) or aborted (worker died
@@ -16585,6 +16619,8 @@ mod tests {
         );
 
         a.shutdown().await;
+        c.shutdown().await;
+        d.shutdown().await;
     }
 
     /// #280 (a): single stream owner. An application stream opened by the

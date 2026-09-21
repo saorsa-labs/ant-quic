@@ -22,6 +22,10 @@ use crate::coordinator_control::{
     remove_inbound_offer, remove_pending_request, take_live_rejection,
     wire_and_monotonic_expiry_after,
 };
+#[cfg(any(not(wasm_browser), all(test, feature = "network-discovery")))]
+use std::sync::Weak;
+#[cfg(not(wasm_browser))]
+use std::time::Instant;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -29,8 +33,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-#[cfg(not(wasm_browser))]
-use std::{sync::Weak, time::Instant};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
 use crate::transport::TransportRegistry;
@@ -514,33 +516,117 @@ pub(crate) fn refuse_registration(
 #[cfg(all(test, feature = "network-discovery"))]
 pub(crate) struct RegistrationGate {
     pub(crate) parked_count: std::sync::atomic::AtomicUsize,
-    pub(crate) released: std::sync::atomic::AtomicBool,
+    target_shutdown: usize,
+    released: std::sync::Mutex<bool>,
+    release_notify: std::sync::Condvar,
+    parked_notify: tokio::sync::Notify,
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
-static REGISTRATION_GATE: ParkingRwLock<Option<Arc<RegistrationGate>>> = ParkingRwLock::new(None);
+impl RegistrationGate {
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.release_notify.notify_all();
+    }
+
+    pub(crate) async fn wait_until_parked(&self) {
+        loop {
+            let parked = self.parked_notify.notified();
+            if self.parked_count.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            parked.await;
+        }
+    }
+
+    fn wait_for_release(&self) {
+        self.wait_for_release_with_timeout(Duration::from_secs(30));
+    }
+
+    fn wait_for_release_with_timeout(&self, timeout: Duration) {
+        self.parked_count.fetch_add(1, Ordering::SeqCst);
+        self.parked_notify.notify_waiters();
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (released, wait_result) = self
+            .release_notify
+            .wait_timeout_while(released, timeout, |released| !*released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_released = *released;
+        let timed_out = wait_result.timed_out();
+        drop(released);
+        self.parked_count.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            was_released && !timed_out,
+            "registration gate was not released within the test deadline"
+        );
+    }
+}
 
 #[cfg(all(test, feature = "network-discovery"))]
-fn take_registration_gate_for_pause() -> Option<Arc<RegistrationGate>> {
-    REGISTRATION_GATE.read().clone()
+pub(crate) struct RegistrationGateGuard {
+    gate: Arc<RegistrationGate>,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl std::ops::Deref for RegistrationGateGuard {
+    type Target = RegistrationGate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl Drop for RegistrationGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut armed = REGISTRATION_GATES.write();
+        if armed
+            .get(&self.gate.target_shutdown)
+            .and_then(Weak::upgrade)
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+        {
+            armed.remove(&self.gate.target_shutdown);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static REGISTRATION_GATES: std::sync::LazyLock<
+    ParkingRwLock<HashMap<usize, Weak<RegistrationGate>>>,
+> = std::sync::LazyLock::new(|| ParkingRwLock::new(HashMap::new()));
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn take_registration_gate_for_pause(shutting_down: &AtomicBool) -> Option<Arc<RegistrationGate>> {
+    let target_shutdown = std::ptr::from_ref(shutting_down) as usize;
+    REGISTRATION_GATES
+        .read()
+        .get(&target_shutdown)
+        .and_then(Weak::upgrade)
 }
 
 /// Arm the registration gate; returns the gate so the test can observe the
 /// park and release it.
 #[cfg(all(test, feature = "network-discovery"))]
-pub(crate) fn arm_registration_gate_for_test() -> Arc<RegistrationGate> {
+fn arm_registration_gate_for_test(shutting_down: &Arc<AtomicBool>) -> RegistrationGateGuard {
     let gate = Arc::new(RegistrationGate {
         parked_count: std::sync::atomic::AtomicUsize::new(0),
-        released: std::sync::atomic::AtomicBool::new(false),
+        target_shutdown: Arc::as_ptr(shutting_down) as usize,
+        released: std::sync::Mutex::new(false),
+        release_notify: std::sync::Condvar::new(),
+        parked_notify: tokio::sync::Notify::new(),
     });
-    *REGISTRATION_GATE.write() = Some(Arc::clone(&gate));
-    gate
-}
-
-/// Disarm the registration gate.
-#[cfg(all(test, feature = "network-discovery"))]
-pub(crate) fn disarm_registration_gate_for_test() {
-    *REGISTRATION_GATE.write() = None;
+    REGISTRATION_GATES
+        .write()
+        .insert(gate.target_shutdown, Arc::downgrade(&gate));
+    RegistrationGateGuard { gate }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -746,6 +832,10 @@ pub struct NatTraversalEndpoint {
     listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
     #[cfg(test)]
     force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, feature = "network-discovery"))]
+    shutdown_lifecycle_swept: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, feature = "network-discovery"))]
+    shutdown_lifecycle_swept_notify: tokio::sync::Notify,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
     constrained_engine: Arc<ParkingMutex<ConstrainedEngine>>,
@@ -2116,6 +2206,10 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "network-discovery"))]
+            shutdown_lifecycle_swept: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "network-discovery"))]
+            shutdown_lifecycle_swept_notify: tokio::sync::Notify::new(),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -2642,6 +2736,10 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "network-discovery"))]
+            shutdown_lifecycle_swept: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "network-discovery"))]
+            shutdown_lifecycle_swept_notify: tokio::sync::Notify::new(),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -7036,18 +7134,15 @@ impl NatTraversalEndpoint {
             return refuse_registration(&peer_id, connection);
         }
         #[cfg(all(test, feature = "network-discovery"))]
-        if let Some(gate) = take_registration_gate_for_pause() {
+        if let Some(gate) = take_registration_gate_for_pause(shutting_down) {
             // #286 round 2 test hook: park this registration between the
             // fast-path check and the map insert, emulating the worst-case
             // scheduling (flag read early, insert attempted after the
             // shutdown sweep has already run). The in-lock re-check below
-            // remains the production guard. The park is a cooperative
-            // yield-loop (parts is sync); only the armed test releases it.
-            gate.parked_count.fetch_add(1, Ordering::SeqCst);
-            while !gate.released.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            gate.parked_count.fetch_sub(1, Ordering::SeqCst);
+            // remains the production guard. The endpoint-scoped test gate
+            // uses a bounded condition-variable wait because this function
+            // is synchronous; unrelated endpoints continue registering.
+            gate.wait_for_release();
         }
         let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
         let tracked = TrackedConnection {
@@ -8701,6 +8796,22 @@ impl NatTraversalEndpoint {
     }
 
     /// Shutdown the endpoint
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_registration_gate_for_test(&self) -> RegistrationGateGuard {
+        arm_registration_gate_for_test(&self.shutdown)
+    }
+
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) async fn wait_for_shutdown_lifecycle_sweep_for_test(&self) {
+        loop {
+            let swept = self.shutdown_lifecycle_swept_notify.notified();
+            if self.shutdown_lifecycle_swept.load(Ordering::SeqCst) {
+                return;
+            }
+            swept.await;
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
         let _shutdown_guard = self.shutdown_lock.lock().await;
         let mut shutdown_error = None;
@@ -8748,6 +8859,12 @@ impl NatTraversalEndpoint {
             if closed > 0 {
                 info!("shutdown: closed {closed} additional lifecycle-tracked connection(s)");
             }
+        }
+
+        #[cfg(all(test, feature = "network-discovery"))]
+        {
+            self.shutdown_lifecycle_swept.store(true, Ordering::SeqCst);
+            self.shutdown_lifecycle_swept_notify.notify_waiters();
         }
 
         // #286: abort and join the accept workers BEFORE the bounded drain,
@@ -11594,6 +11711,50 @@ impl crate::TokenStore for DefaultTokenStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "network-discovery")]
+    #[test]
+    fn registration_gate_timeout_cleanup_is_isolated() {
+        let shutdown_a = Arc::new(AtomicBool::new(false));
+        let shutdown_b = Arc::new(AtomicBool::new(false));
+        let guard_a = arm_registration_gate_for_test(&shutdown_a);
+        let guard_b = arm_registration_gate_for_test(&shutdown_b);
+        let gate_a = take_registration_gate_for_pause(&shutdown_a).expect("A gate armed");
+
+        // Exercise cleanup with a pre-existing poison and a deterministic
+        // zero-duration timeout. The timeout panic unwinds through guard A;
+        // its Drop must remain infallible and remove only A's registry entry.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = gate_a.released.lock().expect("initial A gate lock");
+            panic!("poison A's release mutex");
+        }));
+        assert!(poisoned.is_err(), "poison control must unwind");
+        let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard_a = guard_a;
+            gate_a.wait_for_release_with_timeout(Duration::ZERO);
+        }));
+        assert!(timed_out.is_err(), "zero-duration gate wait must time out");
+        assert!(
+            take_registration_gate_for_pause(&shutdown_a).is_none(),
+            "unwound guard A must remove its registry entry"
+        );
+
+        let gate_b = take_registration_gate_for_pause(&shutdown_b).expect("B gate remains armed");
+        assert_eq!(gate_b.parked_count.load(Ordering::SeqCst), 0);
+        assert!(
+            !*gate_b
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "A's cleanup must not release B"
+        );
+        drop(gate_b);
+        drop(guard_b);
+        assert!(
+            take_registration_gate_for_pause(&shutdown_b).is_none(),
+            "guard B must remove its own registry entry"
+        );
+    }
 
     #[test]
     fn test_nat_traversal_config_default() {

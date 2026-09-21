@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature_mode: [minimal, all]
+        feature_mode: [minimal, all, default-release]
     steps:
       - name: Check out selected ref
         uses: actions/checkout@v5
@@ -64,6 +64,7 @@ jobs:
           case "$FEATURE_MODE" in
             all) printf 'args=--all-features\n' >> "$GITHUB_OUTPUT" ;;
             minimal) printf 'args=--no-default-features\n' >> "$GITHUB_OUTPUT" ;;
+            default-release) printf 'args=--release\n' >> "$GITHUB_OUTPUT" ;;
             *) echo "unsupported feature mode" >&2; exit 2 ;;
           esac
 
@@ -89,6 +90,7 @@ jobs:
         shell: bash
         env:
           FEATURE_ARGS: ${{ steps.features.outputs.args }}
+          FEATURE_MODE: ${{ matrix.feature_mode }}
         run: |
           set -Eeuo pipefail
           read -r -a feature_args <<< "$FEATURE_ARGS"
@@ -104,6 +106,18 @@ jobs:
             p2p_endpoint::tests::shutdown_releases_udp_socket_for_tight_loop_rebind_with_live_connection
             nat_traversal_api::tests::test_poll_advances_synchronization_without_waiting_for_fixed_timeout
           )
+          # These fixtures require network-discovery/platform-verifier. The
+          # inbound-handshake fixture also drives an unrelated endpoint while
+          # its target is parked, so endpoint isolation is exercised even when
+          # this selector is run by itself.
+          if [[ "$FEATURE_MODE" != minimal ]]; then
+            selectors+=(
+              nat_traversal_api::tests::registration_gate_timeout_cleanup_is_isolated
+              p2p_endpoint::tests::shutdown_during_inbound_handshake_leaves_no_stale_entry
+              p2p_endpoint::tests::test_mdns_auto_connect_succeeds_without_overriding_authenticated_identity
+              p2p_endpoint::tests::test_mdns_discovered_peer_coexists_with_static_known_peer_dedup
+            )
+          fi
 
           : > shutdown-regression-logs/results.txt
           for index in "${!selectors[@]}"; do
