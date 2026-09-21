@@ -16423,6 +16423,13 @@ mod tests {
             "the demoted first dial must remain open (Superseded survivor)"
         );
 
+        // These assertion-only B-side handles retain QUIC endpoint/socket
+        // custody beyond the lifecycle-map owners. Release them before strict
+        // shutdown so the resource-release proof measures production custody,
+        // while A's remote view below still proves every generation closed.
+        drop(c0_probe);
+        drop(c1);
+
         // B's inner endpoint shuts down — the path that, pre-fix, closed
         // only the canonical winner and left the Superseded survivor open.
         b.inner.shutdown().await.expect("inner shutdown");
