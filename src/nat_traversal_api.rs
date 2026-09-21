@@ -29,11 +29,21 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+#[cfg(not(wasm_browser))]
+use std::{sync::Weak, time::Instant};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
 use crate::transport::TransportRegistry;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
+
+#[cfg(not(wasm_browser))]
+pub(crate) const SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX: &str = "shutdown socket release timeout:";
+#[cfg(not(wasm_browser))]
+pub(crate) const SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX: &str =
+    "shutdown socket release probe failed:";
+pub(crate) const SHUTDOWN_LISTENER_TIMEOUT_PREFIX: &str =
+    "shutdown listener termination unconfirmed:";
 
 /// Creates a bind address that allows the OS to select a random available port
 ///
@@ -720,6 +730,21 @@ pub struct NatTraversalEndpoint {
     /// Task handles for transport listener tasks
     /// Used for cleanup on shutdown
     transport_listener_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Serializes shutdown so concurrent callers cannot race socket replacement
+    /// or report completion while another caller still owns release custody.
+    shutdown_lock: TokioMutex<()>,
+    /// Original sockets awaiting final descriptor release. Records survive a
+    /// failed shutdown attempt so a later call retries the same addresses.
+    #[cfg(not(wasm_browser))]
+    pending_socket_releases: ParkingMutex<Vec<PendingSocketRelease>>,
+    #[cfg(test)]
+    socket_release_timeout: ParkingMutex<Option<Duration>>,
+    #[cfg(test)]
+    socket_release_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
+    #[cfg(test)]
+    force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
     constrained_engine: Arc<ParkingMutex<ConstrainedEngine>>,
@@ -730,6 +755,53 @@ pub struct NatTraversalEndpoint {
     /// P2pEndpoint polls this to receive data from constrained transports
     /// Uses TokioMutex (not ParkingMutex) because MutexGuard is held across .await
     constrained_event_rx: TokioMutex<mpsc::UnboundedReceiver<ConstrainedEventWithAddr>>,
+}
+
+#[cfg(not(wasm_browser))]
+#[derive(Clone)]
+struct PendingSocketRelease {
+    address: SocketAddr,
+    socket: Weak<dyn crate::high_level::runtime::AsyncUdpSocket>,
+}
+
+#[cfg(all(test, not(wasm_browser)))]
+#[derive(Debug)]
+struct FailingLocalAddrsSocket {
+    inner: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
+}
+
+#[cfg(all(test, not(wasm_browser)))]
+impl crate::high_level::runtime::AsyncUdpSocket for FailingLocalAddrsSocket {
+    fn create_sender(&self) -> std::pin::Pin<Box<dyn crate::high_level::runtime::UdpSender>> {
+        self.inner.create_sender()
+    }
+
+    fn poll_recv(
+        &self,
+        context: &mut std::task::Context<'_>,
+        buffers: &mut [std::io::IoSliceMut<'_>],
+        metadata: &mut [quinn_udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(context, buffers, metadata)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+        Err(std::io::Error::other(
+            "injected released-socket address enumeration failure",
+        ))
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
 }
 
 /// Configuration for NAT traversal behavior
@@ -2032,6 +2104,17 @@ impl NatTraversalEndpoint {
             )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
+            shutdown_lock: TokioMutex::new(()),
+            #[cfg(not(wasm_browser))]
+            pending_socket_releases: ParkingMutex::new(Vec::new()),
+            #[cfg(test)]
+            socket_release_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            socket_release_wait_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            listener_shutdown_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -2547,6 +2630,17 @@ impl NatTraversalEndpoint {
             )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
+            shutdown_lock: TokioMutex::new(()),
+            #[cfg(not(wasm_browser))]
+            pending_socket_releases: ParkingMutex::new(Vec::new()),
+            #[cfg(test)]
+            socket_release_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            socket_release_wait_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            listener_shutdown_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -8607,6 +8701,8 @@ impl NatTraversalEndpoint {
 
     /// Shutdown the endpoint
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let mut shutdown_error = None;
         // Set shutdown flag and wake any task parked in accept_connection()
         // or transport listener loops
         self.shutdown.store(true, Ordering::Relaxed);
@@ -8700,15 +8796,40 @@ impl NatTraversalEndpoint {
 
             #[cfg(not(wasm_browser))]
             match endpoint.release_socket_for_shutdown() {
-                Ok(released) => Self::await_socket_fd_release(released).await,
+                Ok(released) => {
+                    let mut pending = self.pending_socket_releases.lock();
+                    for released_socket in &released {
+                        for address in &released_socket.addresses {
+                            pending.push(PendingSocketRelease {
+                                address: *address,
+                                socket: Arc::downgrade(&released_socket.socket),
+                            });
+                        }
+                    }
+                    drop(pending);
+                    drop(released);
+                }
                 Err(error) => {
                     warn!(%error, "failed to release endpoint UDP socket during shutdown");
+                    shutdown_error.get_or_insert_with(|| {
+                        NatTraversalError::NetworkError(format!(
+                            "failed to release endpoint UDP socket: {error}"
+                        ))
+                    });
                 }
+            }
+
+            #[cfg(not(wasm_browser))]
+            if let Err(error) = self.settle_released_sockets().await {
+                warn!(%error, "UDP socket release did not settle during shutdown");
+                shutdown_error.get_or_insert(error);
             }
         }
 
-        // Wait for transport listener tasks to complete
-        let handles = {
+        // Wait for transport listener tasks to complete. A graceful timeout
+        // becomes an abort-and-join phase; any task whose termination still
+        // cannot be confirmed remains registered for the next shutdown call.
+        let mut handles = {
             let mut listener_handles = self.transport_listener_handles.lock();
             std::mem::take(&mut *listener_handles)
         };
@@ -8718,64 +8839,217 @@ impl NatTraversalEndpoint {
                 "Waiting for {} transport listener tasks to complete",
                 handles.len()
             );
-            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
-                for handle in handles {
-                    if let Err(e) = handle.await {
-                        warn!("Transport listener task failed during shutdown: {e}");
+            #[cfg(test)]
+            let listener_timeout = self
+                .listener_shutdown_timeout
+                .lock()
+                .unwrap_or(SHUTDOWN_DRAIN_TIMEOUT);
+            #[cfg(not(test))]
+            let listener_timeout = SHUTDOWN_DRAIN_TIMEOUT;
+
+            if tokio::time::timeout(
+                listener_timeout,
+                futures_util::future::join_all(handles.iter_mut()),
+            )
+            .await
+            .is_err()
+            {
+                for handle in &handles {
+                    if !handle.is_finished() {
+                        handle.abort();
                     }
                 }
-            })
-            .await
-            {
-                Ok(()) => debug!("All transport listener tasks completed"),
-                Err(_) => warn!("Transport listener tasks timed out during shutdown, proceeding"),
+
+                #[cfg(test)]
+                let force_confirmation_timeout = self
+                    .force_listener_confirmation_timeout
+                    .swap(false, Ordering::Relaxed);
+                #[cfg(not(test))]
+                let force_confirmation_timeout = false;
+                if force_confirmation_timeout {
+                    let remaining = handles.len();
+                    self.transport_listener_handles.lock().extend(handles);
+                    shutdown_error.get_or_insert_with(|| {
+                        NatTraversalError::NetworkError(format!(
+                            "{SHUTDOWN_LISTENER_TIMEOUT_PREFIX} {remaining} task(s)"
+                        ))
+                    });
+                } else {
+                    let unfinished: Vec<_> = handles
+                        .iter_mut()
+                        .filter(|handle| !handle.is_finished())
+                        .collect();
+                    let _ = tokio::time::timeout(
+                        listener_timeout,
+                        futures_util::future::join_all(unfinished),
+                    )
+                    .await;
+                    handles.retain(|handle| !handle.is_finished());
+                    if !handles.is_empty() {
+                        let remaining = handles.len();
+                        self.transport_listener_handles.lock().extend(handles);
+                        shutdown_error.get_or_insert_with(|| {
+                            NatTraversalError::NetworkError(format!(
+                                "{SHUTDOWN_LISTENER_TIMEOUT_PREFIX} {remaining} task(s)"
+                            ))
+                        });
+                    }
+                }
             }
+        }
+
+        if let Some(error) = shutdown_error {
+            return Err(error);
         }
 
         info!("NAT traversal endpoint shutdown completed");
         Ok(())
     }
 
-    /// Wait until every socket extracted by `release_socket_for_shutdown` has
-    /// dropped its last strong reference, closing the underlying OS file
-    /// descriptor before shutdown returns (issue #199).
-    ///
-    /// The endpoint swaps in an ephemeral replacement synchronously, but live
-    /// connection driver tasks keep `Arc` clones of the original socket (and
-    /// senders built from it) alive until they finish draining — briefly after
-    /// `wait_idle` completes. Awaiting the reference drain makes an immediate
-    /// same-fixed-port rebind succeed in a tight stop/start loop. Bounded so a
-    /// leaked socket clone can only delay, never hang, shutdown.
+    /// Settle every original socket retained from the first shutdown attempt.
+    /// Weak-owner disappearance is necessary but insufficient because an Arc's
+    /// inner destructor may still be running. A successful OS bind probe is the
+    /// completion proof for each actual address. Failed records remain pending
+    /// so a later shutdown retries the originals rather than the replacement.
     #[cfg(not(wasm_browser))]
-    async fn await_socket_fd_release(
-        released: Vec<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>>,
-    ) {
-        /// How often to poll for lingering socket references during shutdown.
+    async fn settle_released_sockets(&self) -> Result<(), NatTraversalError> {
         const SOCKET_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-        /// Bounded wait for connection driver tasks to release the fixed-port
-        /// socket; a leaked clone delays rebind but must not hang shutdown.
-        const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+        const DEFAULT_SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
-        if released.is_empty() {
-            return;
+        let records = self.pending_socket_releases.lock().clone();
+        if records.is_empty() {
+            return Ok(());
         }
-        let watchers: Vec<_> = released.iter().map(Arc::downgrade).collect();
-        drop(released);
 
-        let wait = async {
+        #[cfg(test)]
+        self.socket_release_wait_started.notify_one();
+        #[cfg(test)]
+        let release_timeout = self
+            .socket_release_timeout
+            .lock()
+            .unwrap_or(DEFAULT_SOCKET_RELEASE_TIMEOUT);
+        #[cfg(not(test))]
+        let release_timeout = DEFAULT_SOCKET_RELEASE_TIMEOUT;
+        let deadline = Instant::now() + release_timeout;
+
+        for record in &records {
             loop {
-                if watchers.iter().all(|weak| weak.upgrade().is_none()) {
-                    return;
+                if record.socket.upgrade().is_none() {
+                    match std::net::UdpSocket::bind(record.address) {
+                        Ok(probe) => {
+                            drop(probe);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                        Err(error) => {
+                            return Err(NatTraversalError::NetworkError(format!(
+                                "{SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX} {}: {error}",
+                                record.address
+                            )));
+                        }
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    let mut addresses: Vec<_> = records.iter().map(|item| item.address).collect();
+                    addresses.sort_unstable();
+                    addresses.dedup();
+                    return Err(NatTraversalError::NetworkError(format!(
+                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}"
+                    )));
                 }
                 sleep(SOCKET_RELEASE_POLL_INTERVAL).await;
             }
-        };
-        if timeout(SOCKET_RELEASE_TIMEOUT, wait).await.is_err() {
-            warn!(
-                "timed out waiting for UDP socket references to drop; \
-                 fixed port may remain briefly unavailable for rebind"
-            );
         }
+
+        self.pending_socket_releases.lock().clear();
+        Ok(())
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn clone_socket_for_shutdown_test(
+        &self,
+    ) -> std::io::Result<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>> {
+        self.inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?
+            .clone_socket_for_shutdown_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_socket_release_timeout_for_test(&self, duration: Duration) {
+        *self.socket_release_timeout.lock() = Some(duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_listener_shutdown_timeout_for_test(&self, duration: Duration) {
+        *self.listener_shutdown_timeout.lock() = Some(duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_listener_confirmation_timeout_for_test(&self) {
+        self.force_listener_confirmation_timeout
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_release_wait_notify_for_test(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.socket_release_wait_started)
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn shutdown_socket_address_for_test(&self) -> std::io::Result<SocketAddr> {
+        self.inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?
+            .local_addr()
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn install_failing_local_addrs_socket_for_test(&self) -> std::io::Result<()> {
+        let endpoint = self
+            .inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?;
+        let socket = endpoint.clone_socket_for_shutdown_test()?;
+        endpoint.rebind_abstract(Arc::new(FailingLocalAddrsSocket { inner: socket }))
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn pending_socket_release_count_for_test(&self) -> usize {
+        self.pending_socket_releases.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_listener_count_for_test(&self) -> usize {
+        self.transport_listener_handles.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_stubborn_transport_listener_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(done_tx));
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        self.transport_listener_handles.lock().push(handle);
+        (ready_rx, done_rx)
     }
 
     /// Discover address candidates for a peer

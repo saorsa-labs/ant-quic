@@ -236,8 +236,6 @@ const BIDI_PREFIX_READ_TIMEOUT: Duration = if cfg!(test) {
 // window. This compile-time assertion keeps that invariant locked.
 const _: () = assert!(APP_BIDI_STREAM_MAGIC.len() == ACK_BIDI_REQUEST_MAGIC.len());
 
-use crate::SHUTDOWN_DRAIN_TIMEOUT;
-
 /// Free-slot fraction (of capacity) at or below which a data-channel
 /// saturation event is recorded.
 ///
@@ -8851,6 +8849,18 @@ impl P2pEndpoint {
 
     /// Shutdown the endpoint gracefully
     pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            warn!(%error, "P2P endpoint shutdown did not fully release its resources");
+        }
+    }
+
+    /// Shutdown the endpoint and report whether its original UDP sockets are
+    /// available for immediate reuse.
+    ///
+    /// Each inner phase is independently bounded. The complete cleanup future
+    /// is deliberately not wrapped in an outer timeout, because cancelling it
+    /// could skip listener cleanup and lose retry custody of released sockets.
+    pub async fn try_shutdown(&self) -> Result<(), EndpointError> {
         info!("Shutting down P2P endpoint");
         self.shutdown.cancel();
 
@@ -8879,12 +8889,8 @@ impl P2pEndpoint {
             let _ = self.disconnect(&peer_id).await;
         }
 
-        // Bounded timeout prevents blocking when the remote peer is unresponsive.
-        match timeout(SHUTDOWN_DRAIN_TIMEOUT, self.inner.shutdown()).await {
-            Err(_) => warn!("Inner endpoint shutdown timed out, proceeding"),
-            Ok(Err(e)) => warn!("Inner endpoint shutdown error: {e}"),
-            Ok(Ok(())) => {}
-        }
+        self.inner.shutdown().await?;
+        Ok(())
     }
 
     /// Check if endpoint is running
@@ -12384,6 +12390,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_shutdown_retains_original_socket_release_across_retry() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        endpoint
+            .inner
+            .set_socket_release_timeout_for_test(Duration::from_millis(25));
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::from_millis(25));
+        let (listener_ready, listener_done) = endpoint
+            .inner
+            .install_stubborn_transport_listener_for_test();
+        listener_ready.await.expect("listener probe starts");
+
+        let error = endpoint
+            .try_shutdown()
+            .await
+            .expect_err("held original socket must prevent release completion");
+        assert!(
+            matches!(
+                &error,
+                EndpointError::NatTraversal(NatTraversalError::NetworkError(message))
+                    if message.starts_with(
+                        crate::nat_traversal_api::SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX
+                    )
+            ),
+            "unexpected shutdown error: {error}"
+        );
+        listener_done
+            .await
+            .expect("listener cleanup must complete before the error returns");
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 0);
+        assert!(endpoint.inner.pending_socket_release_count_for_test() > 0);
+        assert!(
+            std::net::UdpSocket::bind(held_addr).is_err(),
+            "the held original socket must still own its actual address"
+        );
+
+        drop(held_socket);
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("retry settles the retained original release record");
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "successful retry must make the original address immediately available: {rebound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_enumeration_failure_never_commits_the_socket_swap() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let original_addr = endpoint
+            .inner
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        endpoint
+            .inner
+            .install_failing_local_addrs_socket_for_test()
+            .expect("install address-enumeration fault socket");
+
+        for attempt in 0..2 {
+            let error = endpoint
+                .try_shutdown()
+                .await
+                .expect_err("address enumeration failure must remain retryable");
+            assert!(
+                matches!(
+                    &error,
+                    EndpointError::NatTraversal(NatTraversalError::NetworkError(_))
+                ),
+                "attempt {attempt}: unexpected error: {error}"
+            );
+            assert_eq!(
+                endpoint
+                    .inner
+                    .shutdown_socket_address_for_test()
+                    .expect("unswapped socket address"),
+                original_addr,
+                "failed address capture must happen before the one-time socket swap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_listener_cleanup_is_retained_for_retry() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::ZERO);
+        endpoint
+            .inner
+            .force_listener_confirmation_timeout_for_test();
+        let (listener_ready, listener_done) = endpoint
+            .inner
+            .install_stubborn_transport_listener_for_test();
+        listener_ready.await.expect("stubborn listener starts");
+
+        let error = endpoint
+            .try_shutdown()
+            .await
+            .expect_err("unconfirmed listener termination must be reported");
+        assert!(
+            matches!(
+                &error,
+                EndpointError::NatTraversal(NatTraversalError::NetworkError(message))
+                    if message.starts_with(
+                        crate::nat_traversal_api::SHUTDOWN_LISTENER_TIMEOUT_PREFIX
+                    )
+            ),
+            "unexpected listener shutdown error: {error}"
+        );
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 1);
+
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::from_secs(2));
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("retry confirms the retained aborted listener");
+        listener_done
+            .await
+            .expect("aborted listener future is terminal before retry returns");
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn try_shutdown_waits_for_explicit_original_socket_release_barrier() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        let release_wait = endpoint.inner.socket_release_wait_notify_for_test();
+        let shutdown_endpoint = endpoint.clone();
+        let shutdown = tokio::spawn(async move { shutdown_endpoint.try_shutdown().await });
+
+        tokio::time::timeout(Duration::from_secs(2), release_wait.notified())
+            .await
+            .expect("shutdown reaches socket settlement");
+        assert!(
+            !shutdown.is_finished(),
+            "held socket must keep shutdown pending"
+        );
+        drop(held_socket);
+
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown completes after explicit release")
+            .expect("shutdown task joins")
+            .expect("socket settlement succeeds");
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "successful shutdown must make the actual address immediately available: {rebound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_try_shutdown_is_serialized_and_reuses_one_replacement() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        let release_wait = endpoint.inner.socket_release_wait_notify_for_test();
+        let first = endpoint.clone();
+        let second = endpoint.clone();
+        let first_shutdown = tokio::spawn(async move { first.try_shutdown().await });
+        let second_shutdown = tokio::spawn(async move { second.try_shutdown().await });
+
+        tokio::time::timeout(Duration::from_secs(2), release_wait.notified())
+            .await
+            .expect("one serialized caller reaches socket settlement");
+        drop(held_socket);
+        for shutdown in [first_shutdown, second_shutdown] {
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .expect("serialized shutdown completes")
+                .expect("shutdown task joins")
+                .expect("serialized shutdown succeeds");
+        }
+
+        let replacement_addr = endpoint
+            .inner
+            .shutdown_socket_address_for_test()
+            .expect("replacement address");
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("repeated shutdown remains successful");
+        assert_eq!(
+            endpoint
+                .inner
+                .shutdown_socket_address_for_test()
+                .expect("stable replacement address"),
+            replacement_addr,
+            "serialized/repeated shutdown must not grow a chain of replacements"
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_releases_udp_socket_for_same_process_rebind() {
         let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
         let local_addr = endpoint.local_addr().expect("endpoint local addr");
@@ -12441,7 +12657,10 @@ mod tests {
             // socket, so probe the address it actually holds.
             let held_addr = endpoint.local_addr().expect("endpoint local addr");
 
-            endpoint.shutdown().await;
+            endpoint
+                .try_shutdown()
+                .await
+                .expect("live-connection shutdown releases its fixed socket");
 
             let rebound = std::net::UdpSocket::bind(held_addr);
             assert!(
@@ -12481,7 +12700,10 @@ mod tests {
             .expect("connect should succeed");
             drop(connection);
 
-            endpoint.shutdown().await;
+            endpoint
+                .try_shutdown()
+                .await
+                .expect("live-connection shutdown releases its fixed socket");
 
             let rebound = std::net::UdpSocket::bind(held_addr);
             assert!(

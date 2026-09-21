@@ -1057,7 +1057,17 @@ impl Node {
     ///
     /// This closes all connections and releases resources.
     pub async fn shutdown(self) {
-        self.inner.shutdown().await;
+        if let Err(error) = self.try_shutdown().await {
+            tracing::warn!(%error, "node shutdown did not fully release its resources");
+        }
+    }
+
+    /// Gracefully shut down the node and report resource-release failures.
+    ///
+    /// Callers that restart on the same fixed port should use this method and
+    /// proceed only after it returns successfully.
+    pub async fn try_shutdown(self) -> Result<(), EndpointError> {
+        self.inner.try_shutdown().await
     }
 
     /// Check if the node is still running

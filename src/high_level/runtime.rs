@@ -68,6 +68,14 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
+    /// Return every OS address owned by this socket abstraction.
+    ///
+    /// Most implementations own one descriptor. Dual-stack wrappers override
+    /// this so shutdown can verify both their IPv4 and IPv6 descriptors.
+    fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.local_addr().map(|address| vec![address])
+    }
+
     /// Maximum number of datagrams that might be described by a single [`RecvMeta`]
     fn max_receive_segments(&self) -> usize {
         1

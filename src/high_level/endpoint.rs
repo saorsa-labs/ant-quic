@@ -484,7 +484,7 @@ impl Endpoint {
     /// the OS file descriptor stays open until the last clone drops (issue
     /// #199). Returns an empty `Vec` when the socket was already released.
     #[cfg(not(wasm_browser))]
-    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<Vec<Arc<dyn AsyncUdpSocket>>> {
+    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<Vec<ReleasedUdpSocket>> {
         let (old_addr, runtime) = {
             let state = self
                 .inner
@@ -523,15 +523,48 @@ impl Endpoint {
         if state.socket_released_for_shutdown {
             return Ok(Vec::new());
         }
+        // Capture every address from the same locked state that is about to be
+        // swapped. Any failure returns before the irreversible mutation.
+        let socket_addresses = state.socket.local_addrs()?;
+        let previous_addresses = state
+            .prev_socket
+            .as_ref()
+            .map(|socket| socket.local_addrs())
+            .transpose()?;
+        let previous_addresses = match (state.prev_socket.is_some(), previous_addresses) {
+            (true, Some(addresses)) => Some(addresses),
+            (false, None) => None,
+            _ => {
+                return Err(io::Error::other(
+                    "previous UDP socket address custody was not captured",
+                ));
+            }
+        };
         let mut released = Vec::with_capacity(2);
-        released.push(mem::replace(&mut state.socket, replacement));
-        if let Some(prev_socket) = state.prev_socket.take() {
-            released.push(prev_socket);
+        released.push(ReleasedUdpSocket {
+            socket: mem::replace(&mut state.socket, replacement),
+            addresses: socket_addresses,
+        });
+        if let (Some(prev_socket), Some(addresses)) = (state.prev_socket.take(), previous_addresses)
+        {
+            released.push(ReleasedUdpSocket {
+                socket: prev_socket,
+                addresses,
+            });
         }
         state.ipv6 = replacement_addr.is_ipv6();
         state.socket_released_for_shutdown = true;
 
         Ok(released)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_socket_for_shutdown_test(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        self.inner
+            .state
+            .lock()
+            .map(|state| Arc::clone(&state.socket))
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))
     }
 
     /// Get the number of connections that are currently open
@@ -620,6 +653,12 @@ impl Endpoint {
             .await;
         }
     }
+}
+
+#[cfg(not(wasm_browser))]
+pub(crate) struct ReleasedUdpSocket {
+    pub(crate) socket: Arc<dyn AsyncUdpSocket>,
+    pub(crate) addresses: Vec<SocketAddr>,
 }
 
 /// Statistics on [Endpoint] activity
