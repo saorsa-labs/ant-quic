@@ -1,0 +1,175 @@
+name: Shutdown regressions
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/shutdown-regressions.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shutdown-regressions-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  focused:
+    name: Focused shutdown tests (${{ matrix.feature_mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        feature_mode: [minimal, all]
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-tests
+          key: features
+          save-if: 'false'
+
+      - name: Configure feature mode
+        id: features
+        env:
+          FEATURE_MODE: ${{ matrix.feature_mode }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case "$FEATURE_MODE" in
+            all) printf 'args=--all-features\n' >> "$GITHUB_OUTPUT" ;;
+            minimal) printf 'args=--no-default-features\n' >> "$GITHUB_OUTPUT" ;;
+            *) echo "unsupported feature mode" >&2; exit 2 ;;
+          esac
+
+      - name: Capture checkout custody
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p shutdown-regression-logs
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          {
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'sha=%s\n' "$GITHUB_SHA"
+            printf 'tree=%s\n' "$(git rev-parse HEAD^{tree})"
+            if [[ -f Cargo.lock ]]; then
+              printf 'cargo_lock_sha256=%s\n' "$(sha256sum Cargo.lock | awk '{print $1}')"
+            else
+              printf 'cargo_lock_sha256=ABSENT\n'
+            fi
+          } | tee shutdown-regression-logs/custody-before.txt
+
+      - name: Run exact shutdown selectors
+        id: focused-tests
+        shell: bash
+        env:
+          FEATURE_ARGS: ${{ steps.features.outputs.args }}
+        run: |
+          set -Eeuo pipefail
+          read -r -a feature_args <<< "$FEATURE_ARGS"
+          selectors=(
+            p2p_endpoint::tests::try_shutdown_retains_original_socket_release_across_retry
+            p2p_endpoint::tests::address_enumeration_failure_never_commits_the_socket_swap
+            p2p_endpoint::tests::unconfirmed_listener_cleanup_is_retained_for_retry
+            p2p_endpoint::tests::try_shutdown_waits_for_explicit_original_socket_release_barrier
+            p2p_endpoint::tests::concurrent_try_shutdown_is_serialized_and_reuses_one_replacement
+            p2p_endpoint::tests::shutdown_releases_udp_socket_for_same_process_rebind
+            p2p_endpoint::tests::shutdown_releases_multiple_fixed_udp_sockets_and_is_idempotent
+            p2p_endpoint::tests::shutdown_releases_udp_socket_for_tight_loop_same_port_rebind
+            p2p_endpoint::tests::shutdown_releases_udp_socket_for_tight_loop_rebind_with_live_connection
+            nat_traversal_api::tests::test_poll_advances_synchronization_without_waiting_for_fixed_timeout
+          )
+
+          : > shutdown-regression-logs/results.txt
+          for index in "${!selectors[@]}"; do
+            selector="${selectors[$index]}"
+            list_log="shutdown-regression-logs/${index}-list.log"
+            run_log="shutdown-regression-logs/${index}-run.log"
+            echo "LIST $selector"
+            set +e
+            cargo test --locked --lib "${feature_args[@]}" "$selector" -- --exact --list --test-threads=1 >"$list_log" 2>&1
+            list_exit=$?
+            set -e
+            cat "$list_log"
+            printf '%s list_native_exit=%s\n' "$selector" "$list_exit" | tee -a shutdown-regression-logs/results.txt
+            if [[ "$list_exit" -ne 0 ]]; then
+              echo "list command failed for $selector" >&2
+              exit "$list_exit"
+            fi
+            matches="$(python3 -c 'import sys; selector=sys.argv[2]; print(sum(line.strip() == selector + ": test" for line in open(sys.argv[1], encoding="utf-8")))' "$list_log" "$selector")"
+            if [[ "$matches" != 1 ]]; then
+              echo "expected exactly one list match for $selector, got $matches" >&2
+              exit 1
+            fi
+
+            echo "RUN $selector"
+            set +e
+            cargo test --locked --lib "${feature_args[@]}" "$selector" -- --exact --nocapture --test-threads=1 >"$run_log" 2>&1
+            native_exit=$?
+            set -e
+            cat "$run_log"
+            printf '%s matches=%s native_exit=%s\n' "$selector" "$matches" "$native_exit" | tee -a shutdown-regression-logs/results.txt
+            if [[ "$native_exit" -ne 0 ]]; then
+              exit "$native_exit"
+            fi
+            summary="$(python3 -c 'import re,sys; text=open(sys.argv[1], encoding="utf-8", errors="replace").read(); text=re.sub(chr(27)+r"\[[0-?]*[ -/]*[@-~]", "", text); rows=re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text); print("passed=%s failed=%s ignored=%s" % rows[0]) if len(rows)==1 else sys.exit("expected one test summary, got %d" % len(rows))' "$run_log")"
+            echo "$summary" | tee -a shutdown-regression-logs/results.txt
+            if [[ "$summary" != 'passed=1 failed=0 ignored=0' ]]; then
+              echo "selector did not execute exactly one passing test: $selector" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify checkout custody after tests
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          {
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'sha=%s\n' "$GITHUB_SHA"
+            printf 'tree=%s\n' "$(git rev-parse HEAD^{tree})"
+            if [[ -f Cargo.lock ]]; then
+              printf 'cargo_lock_sha256=%s\n' "$(sha256sum Cargo.lock | awk '{print $1}')"
+            else
+              printf 'cargo_lock_sha256=ABSENT\n'
+            fi
+          } | tee shutdown-regression-logs/custody-after.txt
+          diff -u shutdown-regression-logs/custody-before.txt shutdown-regression-logs/custody-after.txt
+          git diff --exit-code
+          git diff --cached --exit-code
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+
+      - name: Upload focused logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shutdown-regression-logs-${{ matrix.feature_mode }}
+          path: shutdown-regression-logs/
+          if-no-files-found: error

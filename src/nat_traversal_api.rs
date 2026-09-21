@@ -687,10 +687,11 @@ pub struct NatTraversalEndpoint {
     shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
     /// Whether the shared relay endpoint already has an accept loop attached.
     relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
-    /// #286: join handles of the background accept workers (the connection
-    /// accept loops and the shared-relay accept loop). `shutdown` aborts and
-    /// joins them inside the bounded drain so no worker can register a
-    /// late-completing handshake after the lifecycle sweep.
+    /// #286: join handles of background connection workers (accept loops,
+    /// shared-relay accept, and outgoing hole-punch attempts). `shutdown`
+    /// aborts and joins them inside the bounded drain so no worker can retain
+    /// the original socket or register a late-completing handshake after the
+    /// lifecycle sweep.
     accept_worker_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
@@ -9545,7 +9546,19 @@ impl NatTraversalEndpoint {
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
-                        tokio::spawn(async move {
+                        // Register the outgoing attempt under the same worker
+                        // lock shutdown drains. Re-check the shutdown flag
+                        // while holding that lock: either this handle is
+                        // published before shutdown takes the registry, or no
+                        // task is spawned after shutdown has begun.
+                        let mut workers = self.accept_worker_handles.lock();
+                        if self.shutdown.load(Ordering::Relaxed) {
+                            return Err(NatTraversalError::NetworkError(
+                                "endpoint is shutting down".to_string(),
+                            ));
+                        }
+                        workers.retain(|handle| !handle.is_finished());
+                        let handle = tokio::spawn(async move {
                             match connecting.await {
                                 Ok(connection) => {
                                     // Check if another task already inserted a connection for this peer
@@ -9615,6 +9628,7 @@ impl NatTraversalEndpoint {
                                 }
                             }
                         });
+                        workers.push(handle);
                     }
 
                     Ok(())
@@ -12536,6 +12550,7 @@ mod tests {
             },
         );
 
+        let workers_before_poll = endpoint.accept_worker_handles.lock().len();
         let events = endpoint
             .poll(std::time::Instant::now())
             .expect("poll should succeed");
@@ -12561,6 +12576,11 @@ mod tests {
             NatTraversalEvent::HolePunchingStarted { peer_id: event_peer, .. }
                 if *event_peer == peer_id
         )));
+        assert_eq!(
+            endpoint.accept_worker_handles.lock().len(),
+            workers_before_poll + 1,
+            "the outgoing hole-punch attempt must be registered for shutdown cleanup"
+        );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
