@@ -444,6 +444,27 @@ mod tests {
     }
 
     #[test]
+    fn queued_connection_generations_survive_replacement() {
+        let mut buffer = BoundedPendingBuffer::new(1024, 4, Duration::from_secs(30));
+        let peer = PeerId([0x76; 32]);
+        buffer
+            .push_with_generation(&peer, 41, b"old".to_vec())
+            .expect("old frame");
+        buffer
+            .push_with_generation(&peer, 42, b"new".to_vec())
+            .expect("new frame");
+        assert_eq!(
+            buffer.pop_any_with_generation(),
+            Some((peer, 41, b"old".to_vec()))
+        );
+        assert_eq!(
+            buffer.pop_any_with_generation(),
+            Some((peer, 42, b"new".to_vec()))
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
     fn test_pending_buffer_rejects_too_large_message() {
         let mut buffer = BoundedPendingBuffer::new(
             1000, // Max 1000 bytes per peer

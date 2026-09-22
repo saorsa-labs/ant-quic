@@ -709,6 +709,44 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Send bytes only on the authenticated QUIC connection with `generation`.
+    ///
+    /// The generation is in the same process-local namespace as
+    /// [`Self::recv_with_generation`] and [`Self::current_connection_generation`].
+    /// If that connection was replaced before stream admission, the bytes are
+    /// rejected; they are never retried on the replacement connection.
+    pub async fn send_on_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), NodeError> {
+        self.inner
+            .send_on_generation(peer_id, generation, data)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
+    /// Pin the send to `generation` and evaluate `admit` after stream
+    /// allocation, immediately before writing on that same connection.
+    /// The callback is not called for a stale generation; refusal sends no
+    /// bytes and the operation never reconnects or selects another transport.
+    pub async fn send_on_generation_with_admission<B, F>(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        admit: F,
+    ) -> Result<(), NodeError>
+    where
+        B: AsRef<[u8]> + Send,
+        F: FnOnce(u64) -> Result<B, EndpointError> + Send,
+    {
+        self.inner
+            .send_on_generation_with_admission(peer_id, generation, admit)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Send data and wait until the remote receive pipeline accepts it.
     pub async fn send_with_receive_ack(
         &self,

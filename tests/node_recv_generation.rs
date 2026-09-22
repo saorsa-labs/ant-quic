@@ -2,7 +2,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ant_quic::{Node, NodeConfig, bootstrap_cache::BootstrapCacheConfig};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -51,6 +58,9 @@ async fn recv_generation_survives_queued_reconnect_and_recv_stays_compatible() {
     let old = receiver
         .current_connection_generation(&sender_id)
         .expect("old generation");
+    let sender_old = sender
+        .current_connection_generation(&receiver_id)
+        .expect("sender old generation");
     assert_ne!(old, u64::MAX);
     // Endpoint instances allocate from the same process-wide namespace.
     assert_ne!(
@@ -84,6 +94,49 @@ async fn recv_generation_survives_queued_reconnect_and_recv_stays_compatible() {
         let current = receiver
             .current_connection_generation(&sender_id)
             .expect("current generation");
+        let sender_current = sender
+            .current_connection_generation(&receiver_id)
+            .expect("sender current generation");
+        assert_ne!(sender_current, sender_old);
+        assert!(
+            sender
+                .send_on_generation(&receiver_id, sender_old, b"stale")
+                .await
+                .is_err(),
+            "old connection-scoped bytes must not cross reconnect"
+        );
+        sender
+            .send_on_generation(&receiver_id, sender_current, b"pinned")
+            .await
+            .expect("current pinned send");
+        let stale_admissions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&stale_admissions);
+        assert!(
+            sender
+                .send_on_generation_with_admission(&receiver_id, sender_old, move |_| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    Ok(b"stale guarded".to_vec())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(stale_admissions.load(Ordering::Relaxed), 0);
+        sender
+            .send_on_generation_with_admission(&receiver_id, sender_current, |actual| {
+                assert_eq!(actual, sender_current);
+                Ok(b"guarded".to_vec())
+            })
+            .await
+            .expect("current guarded send");
+        let refusal: Result<Vec<u8>, ant_quic::EndpointError> = Err(
+            ant_quic::EndpointError::Connection("policy refused".to_owned()),
+        );
+        assert!(
+            sender
+                .send_on_generation_with_admission(&receiver_id, sender_current, |_| refusal)
+                .await
+                .is_err()
+        );
         assert!(current > previous);
         previous = current;
         if cycle == 0 {
@@ -102,6 +155,20 @@ async fn recv_generation_survives_queued_reconnect_and_recv_stays_compatible() {
                 .expect("ack recv timeout")
                 .expect("ack recv"),
             (sender_id, current, b"new ack".to_vec())
+        );
+        assert_eq!(
+            timeout(DEADLINE, receiver.recv_with_generation())
+                .await
+                .expect("pinned recv timeout")
+                .expect("pinned recv"),
+            (sender_id, current, b"pinned".to_vec())
+        );
+        assert_eq!(
+            timeout(DEADLINE, receiver.recv_with_generation())
+                .await
+                .expect("guarded recv timeout")
+                .expect("guarded recv"),
+            (sender_id, current, b"guarded".to_vec())
         );
     }
     sender

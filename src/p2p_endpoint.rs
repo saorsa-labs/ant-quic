@@ -2214,6 +2214,36 @@ fn close_reason_from_connection(
         .map(ConnectionCloseReason::from_connection_error)
 }
 
+fn send_generation_matches(
+    snapshot: Option<crate::nat_traversal_api::ConnectionLifecycleSnapshot>,
+    generation: u64,
+) -> bool {
+    generation != UNAUTHENTICATED_GENERATION
+        && snapshot.is_some_and(|entry| {
+            entry.generation == generation
+                && matches!(
+                    entry.state,
+                    crate::connection_lifecycle::ConnectionLifecycleState::Live
+                )
+        })
+}
+
+fn admit_pinned_send<B, F>(
+    snapshot: Option<crate::nat_traversal_api::ConnectionLifecycleSnapshot>,
+    generation: u64,
+    admit: F,
+) -> Result<B, EndpointError>
+where
+    F: FnOnce(u64) -> Result<B, EndpointError>,
+{
+    if !send_generation_matches(snapshot, generation) {
+        return Err(EndpointError::Connection(
+            "authenticated connection generation changed before write".to_owned(),
+        ));
+    }
+    admit(generation)
+}
+
 fn endpoint_error_from_connection_error(error: crate::ConnectionError) -> EndpointError {
     EndpointError::ConnectionClosed {
         reason: ConnectionCloseReason::from_connection_error(&error),
@@ -7163,6 +7193,106 @@ impl P2pEndpoint {
         result
     }
 
+    /// Send only on the authenticated QUIC connection with `generation`.
+    ///
+    /// Unlike [`Self::send`], this never switches to another connection or a
+    /// constrained transport. The connection is selected and checked before
+    /// opening a stream, then held for the entire write. Callers can safely
+    /// encode connection-scoped bytes before calling this method: a reconnect
+    /// between encoding and this check returns an error without sending them.
+    pub async fn send_on_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), EndpointError> {
+        self.send_on_generation_with_admission(peer_id, generation, |_| Ok(data))
+            .await
+    }
+
+    /// Send on one pinned generation after admitting bytes at the stream seam.
+    ///
+    /// `admit` runs exactly once only after `open_uni()` completes and the
+    /// connection is still live at the requested generation. It may inspect
+    /// current application policy and return connection-scoped bytes or refuse
+    /// the send. A refusal writes no bytes; neither this path nor its legacy
+    /// projection retries on a replacement connection or constrained engine.
+    pub async fn send_on_generation_with_admission<B, F>(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        admit: F,
+    ) -> Result<(), EndpointError>
+    where
+        B: AsRef<[u8]> + Send,
+        F: FnOnce(u64) -> Result<B, EndpointError> + Send,
+    {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if !send_generation_matches(snapshot, generation) {
+            return Err(EndpointError::Connection(
+                "authenticated connection generation changed before send".to_owned(),
+            ));
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+
+        let mut stream = connection
+            .open_uni()
+            .await
+            .map_err(endpoint_error_from_connection_error)?;
+        // Stream credit can stall behind peer backpressure. Recheck after
+        // that wait, before admitting any connection-scoped bytes.
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+        let data = admit_pinned_send(snapshot, generation, admit)?;
+        // An admission callback can be nontrivial; reject a generation swap
+        // during that synchronous work before handing bytes to the stream.
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if !send_generation_matches(snapshot, generation) {
+            return Err(EndpointError::Connection(
+                "authenticated connection generation changed after admission".to_owned(),
+            ));
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+        stream
+            .write_all(data.as_ref())
+            .await
+            .map_err(endpoint_error_from_write_error)?;
+        stream.finish().map_err(|error| {
+            close_reason_from_connection(&connection)
+                .map(|reason| EndpointError::ConnectionClosed { reason })
+                .unwrap_or_else(|| EndpointError::Connection(error.to_string()))
+        })?;
+        note_peer_activity(
+            &self.connected_peers,
+            &self.peer_activity,
+            *peer_id,
+            PeerActivityKind::Sent,
+            Instant::now(),
+        )
+        .await;
+        Ok(())
+    }
+
     /// Send data and wait until the remote ant-quic receive pipeline accepts it.
     ///
     /// This is a stronger guarantee than [`P2pEndpoint::send`]: success means the
@@ -10635,6 +10765,86 @@ mod tests {
     use crate::coordinator_control::RejectionReason;
     #[cfg(all(test, feature = "network-discovery"))]
     use crate::nat_traversal_api::tracked_connection_for_test;
+
+    #[test]
+    fn guarded_send_accepts_only_the_requested_live_generation() {
+        use crate::connection_lifecycle::ConnectionLifecycleState;
+        use crate::nat_traversal_api::ConnectionLifecycleSnapshot;
+
+        let live = ConnectionLifecycleSnapshot {
+            generation: 42,
+            stable_id: 7,
+            connection_id: [0; 32],
+            state: ConnectionLifecycleState::Live,
+            established_at_unix_ms: 0,
+        };
+        assert!(send_generation_matches(Some(live), 42));
+        assert!(!send_generation_matches(Some(live), 41));
+        assert!(!send_generation_matches(
+            Some(live),
+            UNAUTHENTICATED_GENERATION
+        ));
+        assert!(!send_generation_matches(None, 42));
+        let superseded = ConnectionLifecycleSnapshot {
+            state: ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 43,
+            },
+            ..live
+        };
+        assert!(!send_generation_matches(Some(superseded), 42));
+    }
+
+    #[test]
+    fn pinned_send_admission_refuses_stale_generation_and_propagates_policy_refusal() {
+        use crate::connection_lifecycle::ConnectionLifecycleState;
+        use crate::nat_traversal_api::ConnectionLifecycleSnapshot;
+        use std::cell::Cell;
+
+        let live = ConnectionLifecycleSnapshot {
+            generation: 42,
+            stable_id: 7,
+            connection_id: [0; 32],
+            state: ConnectionLifecycleState::Live,
+            established_at_unix_ms: 0,
+        };
+        let calls = Cell::new(0);
+        for snapshot in [
+            None,
+            Some(ConnectionLifecycleSnapshot {
+                generation: 43,
+                ..live
+            }),
+            Some(ConnectionLifecycleSnapshot {
+                state: ConnectionLifecycleState::Superseded {
+                    replaced_by_generation: 43,
+                },
+                ..live
+            }),
+        ] {
+            let result = admit_pinned_send(snapshot, 42, |_| {
+                calls.set(calls.get() + 1);
+                Ok(b"must not send".to_vec())
+            });
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.get(), 0, "stale connections must not call admission");
+
+        let admitted = admit_pinned_send(Some(live), 42, |actual| {
+            calls.set(calls.get() + 1);
+            assert_eq!(actual, 42);
+            Ok(b"admitted".to_vec())
+        })
+        .expect("live generation admits");
+        assert_eq!(admitted, b"admitted");
+        assert_eq!(calls.get(), 1);
+
+        let refused: Result<Vec<u8>, EndpointError> = admit_pinned_send(Some(live), 42, |_| {
+            Err(EndpointError::Connection("policy refused".to_owned()))
+        });
+        assert!(
+            matches!(refused, Err(EndpointError::Connection(reason)) if reason == "policy refused")
+        );
+    }
 
     #[cfg(feature = "network-discovery")]
     #[tokio::test]
