@@ -27,7 +27,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
@@ -329,11 +329,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::ack_frame::{
-    ACK_BIDI_REQUEST_MAGIC, AckControlOutcome, ReceiveRejectReason, encode_ack_bidi_response,
-};
 use crate::connection_lifecycle::{ConnectionCloseReason, ConnectionLifecycleState};
 use crate::high_level::default_runtime;
+use crate::reachability::TraversalMethod;
 
 use crate::{
     VarInt,
@@ -398,6 +396,10 @@ pub(crate) struct TrackedConnection {
     connection_family_id: [u8; 32],
     connection_id: [u8; 32],
     state: ConnectionLifecycleState,
+    /// P2P-layer classification (Direct / Relay) captured at registration so
+    /// a later promotion re-registers the survivor with its real method
+    /// instead of inflating `direct_connections` (#277 round 2).
+    traversal_method: TraversalMethod,
 }
 
 impl TrackedConnection {
@@ -427,14 +429,47 @@ pub(crate) fn tracked_connection_for_test(
     generation: u64,
     established_at_unix_ms: u64,
 ) -> TrackedConnection {
+    tracked_connection_with_sort_keys_for_test(
+        connection,
+        generation,
+        established_at_unix_ms,
+        [0u8; 32],
+        [0u8; 32],
+        TraversalMethod::Direct,
+    )
+}
+
+/// #277 test helper: like [`tracked_connection_for_test`] but with explicit
+/// canonical sort keys, so a test can construct an entry that
+/// deterministically outranks (or loses to) a freshly registered candidate
+/// regardless of the TLS-exporter-derived keys real connections carry.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn tracked_connection_with_sort_keys_for_test(
+    connection: InnerConnection,
+    generation: u64,
+    established_at_unix_ms: u64,
+    connection_family_id: [u8; 32],
+    connection_id: [u8; 32],
+    traversal_method: TraversalMethod,
+) -> TrackedConnection {
     TrackedConnection {
         connection,
         generation,
         established_at_unix_ms,
-        connection_family_id: [0u8; 32],
-        connection_id: [0u8; 32],
+        connection_family_id,
+        connection_id,
         state: ConnectionLifecycleState::Live,
+        traversal_method,
     }
+}
+
+/// #277: a survivor promoted back into the winner slot, signalled to the
+/// p2p layer for re-registration (identity, transport classification and
+/// the connection handle).
+pub(crate) struct PromotedConnection {
+    pub(crate) peer_id: PeerId,
+    pub(crate) traversal_method: TraversalMethod,
+    pub(crate) connection: InnerConnection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +490,62 @@ pub(crate) enum ConnectionRegistrationOutcome {
     Rejected {
         winner_generation: u64,
     },
+    /// #286: the endpoint is shutting down — the registration was refused
+    /// and the connection has been closed by the registrar. Nothing was
+    /// entered into either map.
+    Refused,
+}
+
+/// #286 round 2: refuse a connection registration because the endpoint is
+/// shutting down, closing the connection rather than leaking it.
+pub(crate) fn refuse_registration(
+    peer_id: &PeerId,
+    connection: InnerConnection,
+) -> ConnectionRegistrationOutcome {
+    debug!(
+        peer_id = ?peer_id,
+        "refusing late connection registration: endpoint is shutting down"
+    );
+    if connection.close_reason().is_none() {
+        connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+    }
+    ConnectionRegistrationOutcome::Refused
+}
+
+/// #286 round 2 test-only registration gate: lets a test park a registration
+/// between the fast-path shutdown check and the map insert — the worst-case
+/// scheduling the in-lock re-check must survive. Production code never arms
+/// it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct RegistrationGate {
+    pub(crate) parked_count: std::sync::atomic::AtomicUsize,
+    pub(crate) released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static REGISTRATION_GATE: ParkingRwLock<Option<Arc<RegistrationGate>>> = ParkingRwLock::new(None);
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn take_registration_gate_for_pause() -> Option<Arc<RegistrationGate>> {
+    REGISTRATION_GATE.read().clone()
+}
+
+/// Arm the registration gate; returns the gate so the test can observe the
+/// park and release it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn arm_registration_gate_for_test() -> Arc<RegistrationGate> {
+    let gate = Arc::new(RegistrationGate {
+        parked_count: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    *REGISTRATION_GATE.write() = Some(Arc::clone(&gate));
+    gate
+}
+
+/// Disarm the registration gate.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) fn disarm_registration_gate_for_test() {
+    *REGISTRATION_GATE.write() = None;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -564,6 +655,17 @@ pub struct NatTraversalEndpoint {
     /// being promoted to a Live-but-readerless connection that pins every
     /// inbound datagram.
     reader_liveness_probe: ParkingRwLock<Option<Arc<dyn Fn(&PeerId, u64) -> bool + Send + Sync>>>,
+    /// #277: p2p-layer re-registration channel, signalled whenever a
+    /// surviving connection is promoted back to the winner slot. Repromotion
+    /// repairs the inner winner map lazily (from get_connection /
+    /// is_peer_connected reads), but the p2p layer's connected_peers map is
+    /// only written by explicit registration — without this a promoted
+    /// survivor leaves is_connected() false while the winner map serves
+    /// traffic (x0x#510). A channel (not a callback) on purpose: storing a
+    /// closure that captures the endpoint inside the endpoint's own inner
+    /// Arc would leak the whole endpoint (#277 round 2) — the sender keeps
+    /// only the channel alive.
+    connection_promoted_tx: ParkingRwLock<Option<mpsc::UnboundedSender<PromotedConnection>>>,
     /// #368: orphan connections closed by repromotion refusal or the janitor.
     orphan_connections_closed: std::sync::atomic::AtomicU64,
     /// Monotonic local generation counter used for tracked connections.
@@ -590,15 +692,14 @@ pub struct NatTraversalEndpoint {
     shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
     /// Whether the shared relay endpoint already has an accept loop attached.
     relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
+    /// #286: join handles of the background accept workers (the connection
+    /// accept loops and the shared-relay accept loop). `shutdown` aborts and
+    /// joins them inside the bounded drain so no worker can register a
+    /// late-completing handshake after the lifecycle sweep.
+    accept_worker_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
     relay_server: Option<Arc<MasqueRelayServer>>,
-    /// Endpoint-level ACK-v2 bidi stream sink.
-    ///
-    /// The NAT relay service also accepts bidi streams on peer connections. If
-    /// it wins the accept race for an ACK-v2 stream, it forwards the stream here
-    /// instead of closing it as an invalid relay request.
-    ack_bidi_stream_tx: Arc<ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>>,
     /// Successful candidate pairs discovered via hole punching
     /// Maps peer ID to the remote address that successfully responded
     /// Uses DashMap for fine-grained concurrent access without blocking workers
@@ -813,19 +914,6 @@ fn default_max_concurrent_uni_streams() -> u32 {
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct PeerId(pub [u8; 32]);
-
-/// ACK-v2 bidi stream accepted by a NAT-layer relay handler and forwarded to
-/// the endpoint-level app reader. This bridges the current split accept loops
-/// until bidi streams are owned by a single typed dispatcher.
-pub(crate) struct IncomingAckBidiStream {
-    pub(crate) peer_id: PeerId,
-    pub(crate) conn_stable_id: usize,
-    pub(crate) generation: u64,
-    pub(crate) send: InnerSendStream,
-    pub(crate) recv: InnerRecvStream,
-    pub(crate) prefix: Vec<u8>,
-    pub(crate) accepted_at: Instant,
-}
 
 /// Information about a bootstrap/coordinator node
 #[derive(Debug, Clone)]
@@ -1930,6 +2018,7 @@ impl NatTraversalEndpoint {
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
+            connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -1939,8 +2028,8 @@ impl NatTraversalEndpoint {
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
-            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -2126,14 +2215,12 @@ impl NatTraversalEndpoint {
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
-            let relay_server_clone = endpoint.relay_server.clone();
-            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
-            tokio::spawn(async move {
+            let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
                     endpoint_clone,
                     shutdown_clone,
@@ -2143,8 +2230,6 @@ impl NatTraversalEndpoint {
                     next_connection_generation_clone,
                     local_peer_id,
                     emitted_events_clone,
-                    relay_server_clone,
-                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -2152,6 +2237,12 @@ impl NatTraversalEndpoint {
                 )
                 .await;
             });
+            // #286: keep the accept worker's handle so shutdown can abort and
+            // join it inside the bounded drain.
+            endpoint
+                .accept_worker_handles
+                .lock()
+                .push(accept_worker_handle);
 
             info!("Started accepting connections (symmetric P2P node)");
         }
@@ -2442,6 +2533,7 @@ impl NatTraversalEndpoint {
             connections: Arc::new(dashmap::DashMap::new()),
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
+            connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -2451,8 +2543,8 @@ impl NatTraversalEndpoint {
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
-            ack_bidi_stream_tx: Arc::new(ParkingRwLock::new(None)),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
@@ -2638,14 +2730,12 @@ impl NatTraversalEndpoint {
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
             let local_peer_id = endpoint.local_peer_id;
             let emitted_events_clone = emitted_established_events.clone();
-            let relay_server_clone = endpoint.relay_server.clone();
-            let ack_bidi_stream_tx_clone = endpoint.ack_bidi_stream_tx.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
 
-            tokio::spawn(async move {
+            let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
                     endpoint_clone,
                     shutdown_clone,
@@ -2655,8 +2745,6 @@ impl NatTraversalEndpoint {
                     next_connection_generation_clone,
                     local_peer_id,
                     emitted_events_clone,
-                    relay_server_clone,
-                    ack_bidi_stream_tx_clone,
                     observed_address_tx_clone,
                     traversal_event_notify_clone,
                     incoming_notify_clone,
@@ -2664,6 +2752,12 @@ impl NatTraversalEndpoint {
                 )
                 .await;
             });
+            // #286: keep the accept worker's handle so shutdown can abort and
+            // join it inside the bounded drain.
+            endpoint
+                .accept_worker_handles
+                .lock()
+                .push(accept_worker_handle);
 
             info!("Started accepting connections (symmetric P2P node)");
         }
@@ -2823,7 +2917,8 @@ impl NatTraversalEndpoint {
             let incoming_notify = self.incoming_notify.clone();
             let pending_accepts = self.pending_accepts.clone();
             let relay_event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
+            let relay_shutdown = self.shutdown.clone();
+            let relay_worker_handle = tokio::spawn(async move {
                 loop {
                     match relay_endpoint.accept().await {
                         Some(incoming) => match incoming.await {
@@ -2854,6 +2949,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
+                                    relay_shutdown.as_ref(),
                                     peer_id,
                                     conn.clone(),
                                 );
@@ -2868,6 +2964,11 @@ impl NatTraversalEndpoint {
                                             "Rejected relayed connection for peer {:?}; live generation {} kept",
                                             peer_id, winner_generation
                                         );
+                                        continue;
+                                    }
+                                    ConnectionRegistrationOutcome::Refused => {
+                                        // Late registration during shutdown;
+                                        // the connection is already closed.
                                         continue;
                                     }
                                 };
@@ -2916,6 +3017,10 @@ impl NatTraversalEndpoint {
                     }
                 }
             });
+
+            // #286: keep the relay accept worker's handle so shutdown can
+            // abort and join it inside the bounded drain.
+            self.accept_worker_handles.lock().push(relay_worker_handle);
         }
 
         // Step 4: Store relay public address for re-advertisement to future peers
@@ -3143,12 +3248,12 @@ impl NatTraversalEndpoint {
         self.transport_registry.as_ref()
     }
 
-    /// Register the endpoint-level ACK-v2 bidi stream sink.
-    pub(crate) fn set_ack_bidi_stream_sender(
-        &self,
-        tx: mpsc::UnboundedSender<IncomingAckBidiStream>,
-    ) {
-        *self.ack_bidi_stream_tx.write() = Some(tx);
+    /// Whether a relay server is configured on this endpoint (the default).
+    /// Lets the reader's prefix demux decide synchronously whether an
+    /// unrecognised-prefix stream is a relay candidate before handing it to
+    /// the relay service on its own task (#280 round 2).
+    pub(crate) fn relay_server_present(&self) -> bool {
+        self.relay_server.is_some()
     }
 
     /// Let the endpoint-level reader hand a non-ACK bidi stream back to the
@@ -4252,6 +4357,8 @@ impl NatTraversalEndpoint {
                     let event_tx = self.event_tx.clone();
                     let event_callback = self.event_callback.clone();
                     let observed_address_tx = self.observed_address_tx.clone();
+                    let shutdown_flag = Arc::clone(&self.shutdown);
+                    let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
                     let connection_timeout = self
                         .timeout_config
                         .nat_traversal
@@ -4274,6 +4381,8 @@ impl NatTraversalEndpoint {
                                 Arc::clone(&incoming_notify),
                                 event_tx.clone(),
                                 event_callback.clone(),
+                                Arc::clone(&shutdown_flag),
+                                Arc::clone(&sweep_lock_source),
                                 connection_timeout,
                                 target_peer,
                                 addr,
@@ -4361,6 +4470,8 @@ impl NatTraversalEndpoint {
                         let event_tx = self.event_tx.clone();
                         let event_callback = self.event_callback.clone();
                         let observed_address_tx = self.observed_address_tx.clone();
+                        let shutdown_flag = Arc::clone(&self.shutdown);
+                        let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
                         let connection_timeout = self
                             .timeout_config
                             .nat_traversal
@@ -4380,6 +4491,8 @@ impl NatTraversalEndpoint {
                                     Arc::clone(&incoming_notify),
                                     event_tx.clone(),
                                     event_callback.clone(),
+                                    Arc::clone(&shutdown_flag),
+                                    Arc::clone(&sweep_lock_source),
                                     connection_timeout,
                                     initiator_peer,
                                     addr,
@@ -4541,6 +4654,7 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
+        shutting_down: &AtomicBool,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -4555,12 +4669,16 @@ impl NatTraversalEndpoint {
             connection_lifecycle,
             next_connection_generation,
             emitted_established_events,
+            shutting_down,
             peer_id,
             connection.clone(),
         );
 
         match outcome {
             ConnectionRegistrationOutcome::Live { .. } => Ok((peer_id, connection)),
+            ConnectionRegistrationOutcome::Refused => Err(NatTraversalError::NetworkError(
+                "endpoint is shutting down".to_string(),
+            )),
             ConnectionRegistrationOutcome::Rejected { .. } => {
                 let existing = connections
                     .get(&peer_id)
@@ -4697,6 +4815,7 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let envelope = envelope.clone();
                     let traversal_event_notify = self.traversal_event_notify.clone();
+                    let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
@@ -4709,6 +4828,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
+                                        dial_shutdown.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -5354,14 +5474,12 @@ impl NatTraversalEndpoint {
         let next_connection_generation_clone = self.next_connection_generation.clone();
         let local_peer_id = self.local_peer_id;
         let emitted_events_clone = self.emitted_established_events.clone();
-        let relay_server_clone = self.relay_server.clone();
-        let ack_bidi_stream_tx_clone = self.ack_bidi_stream_tx.clone();
         let observed_address_tx_clone = self.observed_address_tx.clone();
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
         let pending_accepts_clone = self.pending_accepts.clone();
 
-        tokio::spawn(async move {
+        let accept_worker_handle = tokio::spawn(async move {
             Self::accept_connections(
                 endpoint_clone,
                 shutdown_clone,
@@ -5371,8 +5489,6 @@ impl NatTraversalEndpoint {
                 next_connection_generation_clone,
                 local_peer_id,
                 emitted_events_clone,
-                relay_server_clone,
-                ack_bidi_stream_tx_clone,
                 observed_address_tx_clone,
                 traversal_event_notify_clone,
                 incoming_notify_clone,
@@ -5380,6 +5496,9 @@ impl NatTraversalEndpoint {
             )
             .await;
         });
+        // #286: keep the accept worker's handle so shutdown can abort and
+        // join it inside the bounded drain.
+        self.accept_worker_handles.lock().push(accept_worker_handle);
 
         Ok(())
     }
@@ -5394,10 +5513,6 @@ impl NatTraversalEndpoint {
         next_connection_generation: Arc<AtomicU64>,
         local_peer_id: PeerId,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
-        relay_server: Option<Arc<MasqueRelayServer>>,
-        ack_bidi_stream_tx: Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
         observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
@@ -5411,12 +5526,11 @@ impl NatTraversalEndpoint {
                     let connection_lifecycle = connection_lifecycle.clone();
                     let next_connection_generation = next_connection_generation.clone();
                     let emitted_events = emitted_events.clone();
-                    let relay_server = relay_server.clone();
-                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
                     let observed_address_tx = observed_address_tx.clone();
                     let traversal_event_notify = traversal_event_notify.clone();
                     let incoming_notify = incoming_notify.clone();
                     let pending_accepts = pending_accepts.clone();
+                    let shutdown = shutdown.clone();
                     tokio::spawn(async move {
                         match connecting.await {
                             Ok(connection) => {
@@ -5436,6 +5550,7 @@ impl NatTraversalEndpoint {
                                     connection_lifecycle.as_ref(),
                                     next_connection_generation.as_ref(),
                                     emitted_events.as_ref(),
+                                    shutdown.as_ref(),
                                     peer_id,
                                     connection.clone(),
                                 );
@@ -5451,6 +5566,11 @@ impl NatTraversalEndpoint {
                                             "Rejected inbound connection for peer {:?}; live generation {} kept",
                                             peer_id, winner_generation
                                         );
+                                        return;
+                                    }
+                                    ConnectionRegistrationOutcome::Refused => {
+                                        // Late registration during shutdown;
+                                        // the connection is already closed.
                                         return;
                                     }
                                 };
@@ -5474,22 +5594,6 @@ impl NatTraversalEndpoint {
                                             side: Side::Server,
                                         });
                                     traversal_event_notify.notify_waiters();
-                                }
-
-                                if let Some(ref server) = relay_server {
-                                    let conn_clone = connection.clone();
-                                    let server_clone = Arc::clone(server);
-                                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
-                                    tokio::spawn(async move {
-                                        Self::handle_relay_requests(
-                                            peer_id,
-                                            generation,
-                                            conn_clone,
-                                            server_clone,
-                                            ack_bidi_stream_tx,
-                                        )
-                                        .await;
-                                    });
                                 }
 
                                 Self::spawn_observed_address_watch_task_parts(
@@ -5517,36 +5621,6 @@ impl NatTraversalEndpoint {
                     break;
                 }
             }
-        }
-    }
-
-    /// Handle relay requests from a connected peer (symmetric P2P)
-    ///
-    /// This listens for bidirectional streams and processes CONNECT-UDP Bind requests.
-    /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
-    fn dispatch_ack_bidi_stream(
-        ack_bidi_stream_tx: &Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
-        stream: IncomingAckBidiStream,
-    ) -> Result<(), IncomingAckBidiStream> {
-        let tx = ack_bidi_stream_tx.read().clone();
-        match tx {
-            Some(tx) => tx.send(stream).map_err(|error| error.0),
-            None => Err(stream),
-        }
-    }
-
-    async fn send_ack_bidi_not_supported(mut send_stream: InnerSendStream) {
-        let bytes = encode_ack_bidi_response(AckControlOutcome::Rejected(
-            ReceiveRejectReason::NotSupported,
-        ));
-        if let Err(error) = send_stream.write_all(&bytes).await {
-            debug!(error = %error, "failed to send ACK-v2 NotSupported response");
-            return;
-        }
-        if let Err(error) = send_stream.finish() {
-            debug!(error = %error, "failed to finish ACK-v2 NotSupported response");
         }
     }
 
@@ -5674,75 +5748,6 @@ impl NatTraversalEndpoint {
                     "Stream from {} is not a CONNECT-UDP request: {}",
                     client_addr, e
                 );
-            }
-        }
-    }
-
-    async fn handle_relay_requests(
-        peer_id: PeerId,
-        generation: u64,
-        connection: InnerConnection,
-        relay_server: Arc<MasqueRelayServer>,
-        ack_bidi_stream_tx: Arc<
-            ParkingRwLock<Option<mpsc::UnboundedSender<IncomingAckBidiStream>>>,
-        >,
-    ) {
-        let client_addr = connection.remote_address();
-        debug!("Started relay request handler for peer at {}", client_addr);
-
-        loop {
-            // Accept bidirectional streams for relay requests
-            match connection.accept_bi().await {
-                Ok((send_stream, mut recv_stream)) => {
-                    let server = Arc::clone(&relay_server);
-                    let addr = client_addr;
-                    let conn_stable_id = connection.stable_id();
-                    let ack_bidi_stream_tx = ack_bidi_stream_tx.clone();
-                    let accepted_at = Instant::now();
-
-                    tokio::spawn(async move {
-                        let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
-                        if let Err(e) = recv_stream.read_exact(&mut prefix).await {
-                            debug!("Failed to read bidi stream prefix from {}: {}", addr, e);
-                            return;
-                        }
-
-                        if prefix.as_slice() == &ACK_BIDI_REQUEST_MAGIC[..] {
-                            let stream = IncomingAckBidiStream {
-                                peer_id,
-                                generation,
-                                conn_stable_id,
-                                send: send_stream,
-                                recv: recv_stream,
-                                prefix,
-                                accepted_at,
-                            };
-                            if let Err(stream) =
-                                Self::dispatch_ack_bidi_stream(&ack_bidi_stream_tx, stream)
-                            {
-                                Self::send_ack_bidi_not_supported(stream.send).await;
-                            }
-                            return;
-                        }
-
-                        Self::handle_relay_bidi_stream_with_prefix(
-                            server,
-                            addr,
-                            send_stream,
-                            recv_stream,
-                            prefix,
-                        )
-                        .await;
-                    });
-                }
-                Err(e) => {
-                    // Connection closed or error
-                    debug!(
-                        "Relay handler stopping for {} - accept_bi error: {}",
-                        client_addr, e
-                    );
-                    break;
-                }
             }
         }
     }
@@ -6407,10 +6412,10 @@ impl NatTraversalEndpoint {
 
         info!("Establishing relay session to {}", relay_addr);
 
-        // Prefer reusing an existing peer connection to the relay.
-        // The relay server's handle_relay_requests is spawned for each ACCEPTED
-        // connection, so using the existing connection ensures a handler is
-        // already listening for bidi streams.
+        // Prefer reusing an existing peer connection to the relay: the
+        // endpoint's reader task demultiplexes relay bidi streams for every
+        // connection the application accepts (#280), so an existing
+        // connection already carries a serving path.
         let existing_conn = self.connections.iter().find_map(|entry| {
             let conn = entry.value();
             if conn.remote_address() == relay_addr && conn.close_reason().is_none() {
@@ -6620,9 +6625,12 @@ impl NatTraversalEndpoint {
 
     /// Accept incoming connections on the endpoint.
     ///
-    /// The pending-accept queue is bounded (`MAX_PENDING_ACCEPTS`); if the
-    /// application does not drain it, the oldest queued connections are
-    /// evicted and will not be returned here.
+    /// The bounded `pending_accepts` queue is the sole accept source (#280):
+    /// every producer (main accept loop, shared-relay accept loop) pushes here
+    /// with generation tagging, so a connection is never returned twice and
+    /// never receives two reader tasks. `ConnectionEstablished` remains an
+    /// observer event only. If the application does not drain the queue, the
+    /// oldest queued connections are evicted and will not be returned here.
     pub async fn accept_connection(&self) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         debug!("Waiting for incoming connection via accept queue...");
         loop {
@@ -6659,50 +6667,6 @@ impl NatTraversalEndpoint {
                     pending.peer_id
                 );
                 return Ok((pending.peer_id, connection));
-            }
-
-            // Drain all pending events (non-blocking, under ParkingMutex) for
-            // relay/legacy paths that may still only signal via event_rx.
-            {
-                let mut event_rx = self.event_rx.lock();
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(NatTraversalEvent::ConnectionEstablished {
-                            peer_id,
-                            remote_address,
-                            side,
-                        }) => {
-                            info!(
-                                "Received ConnectionEstablished event for peer {:?} at {} (side: {:?})",
-                                peer_id, remote_address, side
-                            );
-                            let Some(connection) = self
-                                .connections
-                                .get(&peer_id)
-                                .map(|entry| entry.value().clone())
-                            else {
-                                debug!(
-                                    "Ignoring stale ConnectionEstablished event for peer {:?}: connection no longer in storage",
-                                    peer_id
-                                );
-                                continue;
-                            };
-                            return Ok((peer_id, connection));
-                        }
-                        Ok(event) => {
-                            debug!(
-                                "Ignoring non-connection event while waiting for accept: {:?}",
-                                event
-                            );
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            return Err(NatTraversalError::NetworkError(
-                                "Event channel closed".to_string(),
-                            ));
-                        }
-                    }
-                }
             }
 
             self.incoming_notify.notified().await;
@@ -6974,9 +6938,37 @@ impl NatTraversalEndpoint {
         connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
+        shutting_down: &AtomicBool,
         peer_id: PeerId,
         connection: InnerConnection,
     ) -> ConnectionRegistrationOutcome {
+        // #286: a handshake completing after the shutdown lifecycle sweep
+        // would land in both maps and never be closed (the canonical
+        // `connections` map is drained only once, before the sweep), leaving
+        // exactly one stale survivor the remote repromotes until its idle
+        // timeout. Refuse the late registration and close the connection.
+        // Fast path: refuse without touching the maps. This is an
+        // optimisation only — the authoritative re-check happens INSIDE the
+        // lifecycle write lock below, because the #286 shutdown sweep holds
+        // that same lock: a task that loaded `false` here can block on the
+        // lock and resume after the sweep. (#286 round 2.)
+        if shutting_down.load(Ordering::Relaxed) {
+            return refuse_registration(&peer_id, connection);
+        }
+        #[cfg(all(test, feature = "network-discovery"))]
+        if let Some(gate) = take_registration_gate_for_pause() {
+            // #286 round 2 test hook: park this registration between the
+            // fast-path check and the map insert, emulating the worst-case
+            // scheduling (flag read early, insert attempted after the
+            // shutdown sweep has already run). The in-lock re-check below
+            // remains the production guard. The park is a cooperative
+            // yield-loop (parts is sync); only the armed test releases it.
+            gate.parked_count.fetch_add(1, Ordering::SeqCst);
+            while !gate.released.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            gate.parked_count.fetch_sub(1, Ordering::SeqCst);
+        }
         let Some(generation) = allocate_connection_generation(next_connection_generation) else {
             // Exhaustion is terminal for allocation: never wrap or issue the stale sentinel.
             connection.close(VarInt::from_u32(0), b"connection generation exhausted");
@@ -6996,6 +6988,7 @@ impl NatTraversalEndpoint {
             ),
             connection_id: Self::lifecycle_connection_id_for(local_peer_id, peer_id, &connection),
             state: ConnectionLifecycleState::Live,
+            traversal_method: TraversalMethod::Direct,
         };
 
         let mut superseded_generation = None;
@@ -7003,11 +6996,55 @@ impl NatTraversalEndpoint {
 
         {
             let mut lifecycle = connection_lifecycle.write();
+            // #286 round 2: authoritative shutdown re-check under the same
+            // write lock the shutdown sweep takes. Linearisation argument:
+            // the flag is stored BEFORE the sweep acquires this lock, so any
+            // registration ordered after the sweep in the lock order MUST
+            // observe `true` here and refuse; any registration ordered before
+            // the sweep is already in the map and gets closed BY the sweep.
+            if shutting_down.load(Ordering::Relaxed) {
+                drop(lifecycle);
+                return refuse_registration(&peer_id, connection);
+            }
             let entries = lifecycle.entry(peer_id).or_default();
-            if let Some(live_idx) = entries
-                .iter()
-                .position(|entry| matches!(entry.state, ConnectionLifecycleState::Live))
-            {
+            // #277 (x0x#510): a lifecycle-Live entry whose connection is
+            // dead at the transport level must never win the
+            // simultaneous-open tiebreaker — it would reject and close the
+            // fresh candidate while the winner map keeps aliasing a corpse.
+            // Retire non-alive Live entries to Closed first (mirroring
+            // mark_connection_closed: prefer the transport close reason), so
+            // the tiebreaker only ever runs against a live winner and the
+            // unique-Live invariant is preserved.
+            for entry in entries.iter_mut() {
+                if !matches!(entry.state, ConnectionLifecycleState::Live)
+                    || entry.connection.is_alive()
+                {
+                    continue;
+                }
+                let reason = entry
+                    .connection
+                    .close_reason()
+                    .as_ref()
+                    .map(ConnectionCloseReason::from_connection_error)
+                    .unwrap_or(ConnectionCloseReason::ConnectionClosed);
+                let from_state = entry.state;
+                entry.state = ConnectionLifecycleState::Closed {
+                    reason,
+                    closed_at_unix_ms: now_unix_ms(),
+                };
+                Self::log_lifecycle_transition(
+                    &peer_id,
+                    entry.generation,
+                    &entry.connection_id,
+                    entry.stable_id(),
+                    from_state.name(),
+                    entry.state.name(),
+                    reason,
+                );
+            }
+            if let Some(live_idx) = entries.iter().position(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live) && entry.connection.is_alive()
+            }) {
                 let live = entries[live_idx].clone();
                 if Self::candidate_wins(&live, &tracked) {
                     superseded_generation = Some(live.generation);
@@ -7193,6 +7230,7 @@ impl NatTraversalEndpoint {
             self.connection_lifecycle.as_ref(),
             self.next_connection_generation.as_ref(),
             self.emitted_established_events.as_ref(),
+            self.shutdown.as_ref(),
             peer_id,
             connection,
         ))
@@ -7345,6 +7383,36 @@ impl NatTraversalEndpoint {
         *self.reader_liveness_probe.write() = Some(probe);
     }
 
+    /// #277: install the p2p-layer receiver for promoted survivors. Must be
+    /// called once at construction, before any connection churn.
+    pub(crate) fn set_connection_promoted_sender(
+        &self,
+        tx: mpsc::UnboundedSender<PromotedConnection>,
+    ) {
+        *self.connection_promoted_tx.write() = Some(tx);
+    }
+
+    /// #277 round 2: classify a tracked generation's transport (Direct /
+    /// Relay). Relay registrations mark their generation right after
+    /// registering; promotions then re-register the survivor with its real
+    /// method instead of inflating `direct_connections`.
+    pub(crate) fn mark_connection_traversal_method(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        traversal_method: TraversalMethod,
+    ) {
+        let mut lifecycle = self.connection_lifecycle.write();
+        if let Some(entries) = lifecycle.get_mut(peer_id) {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.stable_id() == stable_id)
+            {
+                entry.traversal_method = traversal_method;
+            }
+        }
+    }
+
     /// #368: grace before reader-absence is treated as orphaning — covers
     /// the register → spawn-reader → insert-handle window.
     const ORPHAN_SPAWN_GRACE_MS: u64 = 10_000;
@@ -7408,6 +7476,12 @@ impl NatTraversalEndpoint {
         exiting_stable_id: Option<usize>,
     ) -> Option<InnerConnection> {
         let mut lifecycle = self.connection_lifecycle.write();
+        // #286 round 2: never resurrect a survivor once shutdown has begun —
+        // the sweep may already have closed it, and re-promoting mid-shutdown
+        // re-inserts a corpse into the winner map.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
         let entries = lifecycle.get_mut(peer_id)?;
         if let Some(exiting_stable_id) = exiting_stable_id {
             entries.retain(|entry| entry.stable_id() != exiting_stable_id);
@@ -7526,10 +7600,25 @@ impl NatTraversalEndpoint {
             replacement.state = ConnectionLifecycleState::Live;
         }
         let connection = replacement.connection.clone();
+        let promoted = PromotedConnection {
+            peer_id: *peer_id,
+            traversal_method: replacement.traversal_method,
+            connection: connection.clone(),
+        };
         self.connections.insert(*peer_id, connection.clone());
         self.emitted_established_events.insert(*peer_id);
         drop(lifecycle);
         self.finalize_orphan_closures(peer_id, orphan_closures);
+        // #277: repair the p2p layer's view too — repromotion can run from
+        // lazy read paths (`get_connection` / `is_peer_connected`) where no
+        // p2p registration happens, which would leave `connected_peers`
+        // empty while the winner map serves traffic (x0x#510). Signalled via
+        // channel so the inner endpoint never holds a reference back to the
+        // p2p endpoint (#277 round 2 leak).
+        let promoted_tx = self.connection_promoted_tx.read().clone();
+        if let Some(tx) = promoted_tx {
+            let _ = tx.send(promoted);
+        }
         Some(connection)
     }
 
@@ -7920,6 +8009,98 @@ impl NatTraversalEndpoint {
             }
         }
         Ok(removed)
+    }
+
+    /// #278: peer-scope teardown — close every tracked generation for
+    /// `peer_id`, not just the current winner.
+    ///
+    /// [`Self::remove_connection_with_reason`] removes and closes the winner
+    /// only. Surviving `Superseded` generations (kept open for their drain
+    /// window) remain open with `close_reason() == None`, so the next
+    /// [`Self::get_connection`] miss repromotes one back to `Live` and
+    /// re-inserts it into the winner map. After `disconnect(peer)` returned,
+    /// `open_bi`/`send` could then open streams on an old, half-dead
+    /// connection: writes fail with `sending stopped by peer: error 0` or
+    /// succeed into a send buffer that the eventual teardown discards, with
+    /// no error ever surfacing to the caller (x0x#277 / #278).
+    ///
+    /// Every non-closed tracked generation is marked `Closed` under the
+    /// lifecycle lock — so a concurrent `repromote_surviving_connection`
+    /// cannot resurrect it — and each still-open connection is closed
+    /// synchronously, making its `close_reason()` `Some` immediately.
+    /// Winner-map eviction is bounded to swept generations.
+    ///
+    /// Concurrency guarantee (stated exactly): a replacement connection
+    /// racing this sweep is NOT spared — if its registration completes
+    /// before the sweep's lifecycle-lock section runs, its `Live` entry is
+    /// swept and closed too (the disconnect wins; ordering is decided by
+    /// who holds the lifecycle write lock, not by the bounded `remove_if`).
+    /// Only a replacement registering after the lock section releases
+    /// survives untouched.
+    ///
+    /// Returns the number of generations swept.
+    pub(crate) fn close_all_connection_generations(
+        &self,
+        peer_id: &PeerId,
+        close_reason: ConnectionCloseReason,
+    ) -> usize {
+        let mut swept: Vec<(usize, InnerConnection)> = Vec::new();
+        {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let Some(entries) = lifecycle.get_mut(peer_id) else {
+                return 0;
+            };
+            for entry in entries.iter_mut() {
+                if matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Closing { .. }
+                        | ConnectionLifecycleState::Closed { .. }
+                ) {
+                    continue;
+                }
+                let from_state = entry.state;
+                entry.state = ConnectionLifecycleState::Closed {
+                    reason: close_reason,
+                    closed_at_unix_ms: now_unix_ms(),
+                };
+                Self::log_lifecycle_transition(
+                    peer_id,
+                    entry.generation,
+                    &entry.connection_id,
+                    entry.stable_id(),
+                    from_state.name(),
+                    entry.state.name(),
+                    close_reason,
+                );
+                swept.push((entry.stable_id(), entry.connection.clone()));
+            }
+        }
+
+        // Close outside the lifecycle lock: `close()` takes the connection
+        // state lock and queues CONNECTION_CLOSE on the endpoint driver.
+        // `mark_connection_closed` already pairs lifecycle →
+        // connection-state locking; keeping driver work out of the critical
+        // section preserves that order trivially.
+        for (_, connection) in &swept {
+            if connection.close_reason().is_none()
+                && let Some(code) = close_reason.app_error_code()
+            {
+                connection.close(code, close_reason.reason_bytes());
+            }
+            if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                peers.remove(&connection.remote_address());
+            }
+        }
+
+        if !swept.is_empty() {
+            self.connections.remove_if(peer_id, |_, current| {
+                swept
+                    .iter()
+                    .any(|(stable_id, _)| current.stable_id() == *stable_id)
+            });
+            self.emitted_established_events.remove(peer_id);
+        }
+        swept.len()
     }
 
     /// Spawn the NAT traversal handler loop for an existing connection referenced by the endpoint.
@@ -8482,6 +8663,63 @@ impl NatTraversalEndpoint {
             if let Some((_, connection)) = self.connections.remove(&peer_id) {
                 info!("Closing connection to peer {:?}", peer_id);
                 connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+            }
+        }
+
+        // #283: close every lifecycle-tracked generation — Superseded
+        // survivors included — BEFORE the bounded drain. Previously only the
+        // canonical `connections` entries were closed here; survivors were
+        // closed merely implicitly by `connection_lifecycle.clear()` AFTER
+        // wait_idle, immediately before the socket release, so their
+        // CONNECTION_CLOSE frames frequently never transmitted. The REMOTE
+        // then kept the peer "connected" (its `is_peer_connected` falls
+        // through to `repromote_surviving_connection`, which resurrects any
+        // still-alive Superseded entry) until the idle timeout — the x0x#510
+        // restart-class "old owner connection never observed as gone".
+        {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let mut closed = 0usize;
+            for entries in lifecycle.values_mut() {
+                for entry in entries.iter_mut() {
+                    if entry.connection.close_reason().is_none() {
+                        entry
+                            .connection
+                            .close(crate::VarInt::from_u32(0), b"Shutdown");
+                        closed += 1;
+                    }
+                }
+            }
+            drop(lifecycle);
+            if closed > 0 {
+                info!("shutdown: closed {closed} additional lifecycle-tracked connection(s)");
+            }
+        }
+
+        // #286: abort and join the accept workers BEFORE the bounded drain,
+        // so no worker can register a handshake that completes after the
+        // lifecycle sweep above (the flag is checked at registration, but the
+        // join also guarantees the worker is gone before the socket is
+        // released). Aborted mid-handshake dials are dropped by the endpoint
+        // driver, which closes them. The join is bounded by the same drain
+        // budget — no unbounded await.
+        {
+            let handles = {
+                let mut workers = self.accept_worker_handles.lock();
+                std::mem::take(&mut *workers)
+            };
+            if !handles.is_empty() {
+                debug!(
+                    "shutdown: aborting and joining {} accept worker(s)",
+                    handles.len()
+                );
+                for handle in &handles {
+                    handle.abort();
+                }
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_DRAIN_TIMEOUT,
+                    futures_util::future::join_all(handles),
+                )
+                .await;
             }
         }
 
@@ -9065,6 +9303,13 @@ impl NatTraversalEndpoint {
                         let observed_address_tx = self.observed_address_tx.clone();
                         let traversal_event_notify = self.traversal_event_notify.clone();
                         let incoming_notify = self.incoming_notify.clone();
+                        // #286 round 2: this detached spawn inserts into the
+                        // winner map directly — linearize the flag re-check
+                        // and the insert under the lifecycle write lock (the
+                        // same lock the shutdown sweep takes) so a preempted
+                        // task cannot insert past the sweep.
+                        let punch_shutdown = self.shutdown.clone();
+                        let punch_lifecycle = self.connection_lifecycle.clone();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
@@ -9090,7 +9335,24 @@ impl NatTraversalEndpoint {
 
                                     // Store the connection
                                     // DashMap provides lock-free .insert()
-                                    connections.insert(peer_id_clone, connection.clone());
+                                    // #286 round 2: refuse when shutting
+                                    // down — close instead of inserting.
+                                    // Re-checked under the lifecycle write
+                                    // lock so the insert is linearized against
+                                    // the shutdown sweep.
+                                    {
+                                        let _sweep_lock = punch_lifecycle.write();
+                                        if punch_shutdown.load(Ordering::Relaxed) {
+                                            debug!(
+                                                peer_id = ?peer_id_clone,
+                                                "refusing hole-punch winner-map insert: endpoint is shutting down"
+                                            );
+                                            connection
+                                                .close(crate::VarInt::from_u32(0), b"Shutdown");
+                                            return;
+                                        }
+                                        connections.insert(peer_id_clone, connection.clone());
+                                    }
 
                                     // Send connection established event (we initiated hole punch = Client side)
                                     let _ =
@@ -10127,6 +10389,7 @@ impl NatTraversalEndpoint {
                     let low_level_endpoint = endpoint.clone();
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
+                    let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     tokio::spawn(async move {
@@ -10142,6 +10405,7 @@ impl NatTraversalEndpoint {
                                         connection_lifecycle.as_ref(),
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
+                                        dial_shutdown.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -10718,6 +10982,8 @@ impl NatTraversalEndpoint {
             Arc::clone(&self.incoming_notify),
             self.event_tx.clone(),
             self.event_callback.clone(),
+            Arc::clone(&self.shutdown),
+            Arc::clone(&self.connection_lifecycle),
             self.timeout_config
                 .nat_traversal
                 .connection_establishment_timeout,
@@ -10737,6 +11003,11 @@ impl NatTraversalEndpoint {
         incoming_notify: Arc<tokio::sync::Notify>,
         event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        // #286 round 2: gate the raw winner-map insert on the shutdown flag,
+        // re-checked under the lifecycle write lock (linearized against the
+        // shutdown sweep).
+        shutdown_flag: Arc<AtomicBool>,
+        sweep_lock_source: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
         connection_timeout: Duration,
         peer_id: PeerId,
         candidate_address: SocketAddr,
@@ -10775,7 +11046,25 @@ impl NatTraversalEndpoint {
         // (ref is dropped when session goes out of scope at end of if block)
 
         // Step 3: Now safe to insert into connections
-        connections.insert(peer_id, connection.clone());
+        // #286 round 2: refuse when shutting down — close instead of
+        // inserting (this path bypasses register_connection_lifecycle_parts,
+        // so the in-lock re-check does not cover it). The flag is re-checked
+        // under the lifecycle write lock so the insert is linearized against
+        // the shutdown sweep.
+        {
+            let _sweep_lock = sweep_lock_source.write();
+            if shutdown_flag.load(Ordering::Relaxed) {
+                debug!(
+                    peer_id = ?peer_id,
+                    "refusing validated-candidate winner-map insert: endpoint is shutting down"
+                );
+                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+                return Err(NatTraversalError::NetworkError(
+                    "endpoint is shutting down".to_string(),
+                ));
+            }
+            connections.insert(peer_id, connection.clone());
+        }
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
         }
@@ -13537,6 +13826,7 @@ mod tests {
                 &client.connection_lifecycle,
                 &client.next_connection_generation,
                 &client.emitted_established_events,
+                &AtomicBool::new(false),
                 peer,
                 connection.clone(),
             )
@@ -13600,6 +13890,7 @@ mod tests {
                 connection_family_id: [0u8; 32],
                 connection_id: [0u8; 32],
                 state,
+                traversal_method: TraversalMethod::Direct,
             }],
         );
     }
@@ -13678,6 +13969,108 @@ mod tests {
         assert!(
             client.connection_lifecycle.read().get(&peer_id).is_none(),
             "the orphan's lifecycle entry is removed"
+        );
+    }
+
+    /// #277 (x0x#510): a lifecycle-Live entry whose connection is dead at
+    /// the transport level must never win the simultaneous-open tiebreaker.
+    ///
+    /// Pre-fix, the Live-entry search in `register_connection_lifecycle_parts`
+    /// ignored `connection.is_alive()`, so a dead-but-Live entry could reject
+    /// and CLOSE the fresh candidate (outcome `Rejected`) while the winner
+    /// kept aliasing a corpse — the fresh handshake was destroyed by the very
+    /// registration that should have adopted it, leaving the peer with no
+    /// usable connection.
+    ///
+    /// Deterministic: the dead entry is seeded with the maximum cross-family
+    /// sort key (`connection_id` all-0xFF), so it outranks any fresh
+    /// candidate on the pre-fix tiebreaker (fresh exporter-derived ids are
+    /// < all-0xFF with probability 1 - 2^-256).
+    #[tokio::test]
+    async fn dead_live_entry_never_wins_simultaneous_open_tiebreaker() {
+        fn test_config() -> NatTraversalConfig {
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("valid bind addr")),
+                ..Default::default()
+            }
+        }
+        let server = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("server endpoint binds");
+        let client = NatTraversalEndpoint::new(test_config(), None, None)
+            .await
+            .expect("client endpoint binds");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound to a local address");
+        async fn handshake(client: &NatTraversalEndpoint, addr: SocketAddr) -> InnerConnection {
+            let connecting = client
+                .get_endpoint()
+                .expect("client endpoint present")
+                .connect(addr, "peer")
+                .expect("initiate client connection");
+            tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+                .await
+                .expect("loopback handshake must not hang")
+                .expect("loopback handshake must succeed")
+        }
+        let dead_conn = handshake(&client, server_addr).await;
+        let fresh_conn = handshake(&client, server_addr).await;
+        let peer_id = PeerId([0xCD; 32]);
+
+        // Transport-dead but lifecycle-Live, with the maximum cross-family
+        // sort key so the pre-fix tiebreaker prefers it over the fresh
+        // candidate.
+        client.connection_lifecycle.write().insert(
+            peer_id,
+            vec![TrackedConnection {
+                connection: dead_conn.clone(),
+                generation: 7,
+                established_at_unix_ms: 0,
+                connection_family_id: [0u8; 32],
+                connection_id: [0xFFu8; 32],
+                state: ConnectionLifecycleState::Live,
+                traversal_method: TraversalMethod::Direct,
+            }],
+        );
+        dead_conn.close(VarInt::from_u32(0), b"#277-dead-live");
+        assert!(
+            !dead_conn.is_alive(),
+            "precondition: seeded entry is transport-dead"
+        );
+
+        let outcome = client
+            .add_connection_with_outcome(peer_id, fresh_conn.clone())
+            .expect("registration succeeds");
+        assert!(
+            matches!(outcome, ConnectionRegistrationOutcome::Live { .. }),
+            "a dead-but-Live entry must never win the tiebreaker; got {:?}",
+            outcome
+        );
+        assert!(
+            fresh_conn.close_reason().is_none(),
+            "the fresh candidate must not be closed by a dead winner"
+        );
+
+        let winner = client
+            .get_connection(&peer_id)
+            .expect("get_connection ok")
+            .expect("a live winner must exist");
+        assert_eq!(
+            winner.stable_id(),
+            fresh_conn.stable_id(),
+            "the winner map must alias the fresh candidate"
+        );
+
+        let dead_snap = client
+            .connection_snapshot_by_stable_id(&peer_id, dead_conn.stable_id())
+            .expect("dead entry retained for diagnostics");
+        assert!(
+            matches!(dead_snap.state, ConnectionLifecycleState::Closed { .. }),
+            "the dead Live entry must be retired to Closed, got {:?}",
+            dead_snap.state
         );
     }
 
@@ -13762,6 +14155,7 @@ mod tests {
                         connection_family_id: [0u8; 32],
                         connection_id: [0u8; 32],
                         state: ConnectionLifecycleState::Live,
+                        traversal_method: TraversalMethod::Direct,
                     },
                     TrackedConnection {
                         connection: conn2.clone(),
@@ -13770,6 +14164,7 @@ mod tests {
                         connection_family_id: [0u8; 32],
                         connection_id: [0u8; 32],
                         state: ConnectionLifecycleState::Live,
+                        traversal_method: TraversalMethod::Direct,
                     },
                 ],
             );
@@ -14048,6 +14443,7 @@ mod tests {
                     state: ConnectionLifecycleState::Superseded {
                         replaced_by_generation: w_generation,
                     },
+                    traversal_method: TraversalMethod::Direct,
                 },
                 TrackedConnection {
                     connection: w_conn.clone(),
@@ -14056,6 +14452,7 @@ mod tests {
                     connection_family_id: [0u8; 32],
                     connection_id: [0u8; 32],
                     state: ConnectionLifecycleState::Live,
+                    traversal_method: TraversalMethod::Direct,
                 },
             ],
         );
@@ -14157,6 +14554,7 @@ mod tests {
                     state: ConnectionLifecycleState::Superseded {
                         replaced_by_generation: 2,
                     },
+                    traversal_method: TraversalMethod::Direct,
                 },
                 TrackedConnection {
                     connection: g2_a_conn.clone(),
@@ -14165,6 +14563,7 @@ mod tests {
                     connection_family_id: [0u8; 32],
                     connection_id: [0u8; 32],
                     state: ConnectionLifecycleState::Live,
+                    traversal_method: TraversalMethod::Direct,
                 },
             ],
         );
@@ -14180,6 +14579,7 @@ mod tests {
                 connection_family_id: [0u8; 32],
                 connection_id: [0u8; 32],
                 state: ConnectionLifecycleState::Live,
+                traversal_method: TraversalMethod::Direct,
             }],
         );
         endpoint.connections.insert(peer_b, g2_b_conn.clone());

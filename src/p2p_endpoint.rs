@@ -49,6 +49,8 @@
 //! }
 //! ```
 
+mod socket_binding;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -89,8 +91,8 @@ use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_run
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::UNAUTHENTICATED_GENERATION;
 use crate::nat_traversal_api::{
-    ConstrainedEventWithAddr, IncomingAckBidiStream, NatTraversalEndpoint, NatTraversalError,
-    NatTraversalEvent, PeerId, TraversalFailureReason,
+    ConstrainedEventWithAddr, NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
+    TraversalFailureReason,
 };
 use crate::peer_directory::{PeerDirectorySnapshot, PeerDiscoverySource};
 use crate::port_mapping::{
@@ -2459,6 +2461,22 @@ async fn do_cleanup_connection(
 
     if !if_unroutable {
         let _ = inner.remove_connection_with_reason(peer_id, close_reason);
+        // #278: `remove_connection_with_reason` tears down only the winner
+        // generation. Surviving (superseded) generations stay open with
+        // `close_reason() == None` and remain promotable, so a concurrent
+        // `get_connection` would repromote one and hand it to `open_bi`/`send`
+        // — streams then open on a connection the caller just disconnected
+        // from: writes fail with `sending stopped by peer: error 0` or
+        // succeed into a send buffer the teardown discards, with no error
+        // surfaced (x0x#277). Sweep every remaining generation so the peer is
+        // unobservable as live before the `connected_peers` removal below.
+        let swept = inner.close_all_connection_generations(peer_id, close_reason);
+        if swept > 0 {
+            info!(
+                "disconnect: closed {} surviving connection generation(s) for peer {:?}",
+                swept, peer_id
+            );
+        }
     }
 
     if let Some(snapshot) = lifecycle_snapshot {
@@ -3081,27 +3099,27 @@ impl P2pEndpoint {
 
         use crate::high_level::runtime::AsyncUdpSocket;
 
-        // Socket strategy: try dual-socket (separate IPv4 + IPv6) first for maximum
-        // platform compatibility. Fall back to single-socket dual-stack, then IPv4 only.
-        let requested_port = config
+        // An explicit interface must be bound exactly. Wildcard and default
+        // configurations retain the dual-socket compatibility fallback ladder.
+        let requested_addr = config
             .bind_addr
             .as_ref()
-            .and_then(|addr| addr.as_socket_addr())
-            .map(|addr| addr.port())
-            .unwrap_or(0);
+            .and_then(|addr| addr.as_socket_addr());
 
         // Track DualStackSocket for local_addrs() API
         let mut _dual_stack_ref: Option<
             std::sync::Arc<crate::high_level::runtime::dual_stack::DualStackSocket>,
         > = None;
 
-        // Try dual-socket first (separate IPv4 + IPv6 sockets)
-        let mut inner = match crate::transport::UdpTransport::bind_dual_stack_for_endpoint(
-            requested_port,
+        let sockets = socket_binding::bind(
+            requested_addr,
+            crate::transport::UdpTransport::bind_dual_stack_for_endpoint,
+            crate::transport::UdpTransport::bind_for_quinn,
         )
         .await
-        {
-            Ok((_transport, dual_socket)) => {
+        .map_err(|e| EndpointError::Config(format!("Failed to bind UDP socket: {e}")))?;
+        let mut inner = match sockets {
+            socket_binding::BoundSocket::Dual((_transport, dual_socket)) => {
                 let (v4_addr, v6_addr) = dual_socket.local_addrs();
                 info!(
                     "Bound dual-socket: IPv4={}, IPv6={} (true dual-stack, separate sockets)",
@@ -3145,44 +3163,7 @@ impl P2pEndpoint {
                 .await
                 .map_err(|e| EndpointError::Config(e.to_string()))?
             }
-            Err(e) => {
-                // Fall back to single-socket approach
-                info!("Dual-socket failed ({e}), falling back to single-socket");
-
-                let dual_stack_default: std::net::SocketAddr = std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                    requested_port,
-                );
-                let ipv4_fallback: std::net::SocketAddr = std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    requested_port,
-                );
-                let bind_addr = config
-                    .bind_addr
-                    .as_ref()
-                    .and_then(|addr| addr.as_socket_addr())
-                    .unwrap_or(dual_stack_default);
-
-                let (_transport, quinn_socket) =
-                    match crate::transport::UdpTransport::bind_for_quinn(bind_addr).await {
-                        Ok(result) => result,
-                        Err(e2) if bind_addr == dual_stack_default => {
-                            info!("Single-socket dual-stack failed ({e2}), falling back to IPv4");
-                            crate::transport::UdpTransport::bind_for_quinn(ipv4_fallback)
-                                .await
-                                .map_err(|e3| {
-                                    EndpointError::Config(format!(
-                                        "All socket binds failed (dual: {e}, v6: {e2}, v4: {e3})"
-                                    ))
-                                })?
-                        }
-                        Err(e2) => {
-                            return Err(EndpointError::Config(format!(
-                                "Failed to bind UDP socket: {e2}"
-                            )));
-                        }
-                    };
-
+            socket_binding::BoundSocket::Single((_transport, quinn_socket)) => {
                 let actual_bind_addr = quinn_socket.local_addr().map_err(|e2| {
                     EndpointError::Config(format!("Failed to get local address: {e2}"))
                 })?;
@@ -3317,69 +3298,6 @@ impl P2pEndpoint {
             ack_response_drop_injection: Arc::new(AtomicUsize::new(0)),
         };
 
-        let (ack_bidi_tx, mut ack_bidi_rx) = mpsc::unbounded_channel();
-        endpoint.inner.set_ack_bidi_stream_sender(ack_bidi_tx);
-        {
-            let connected_peers = Arc::clone(&endpoint.connected_peers);
-            let peer_activity = Arc::clone(&endpoint.peer_activity);
-            let ack_diagnostics = Arc::clone(&endpoint.ack_diagnostics);
-            let ack_request_dedupe = Arc::clone(&endpoint.ack_request_dedupe);
-            let data_tx = endpoint.data_tx.clone();
-            let data_tx_diagnostics = Arc::clone(&endpoint.data_tx_diagnostics);
-            let data_tx_capacity = endpoint.data_tx_capacity;
-            let event_tx = endpoint.event_tx.clone();
-            let shutdown = endpoint.shutdown.clone();
-            let max_read_bytes = endpoint.config.max_message_size;
-            let ack_response_drop_injection = Arc::clone(&endpoint.ack_response_drop_injection);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        stream = ack_bidi_rx.recv() => {
-                            let Some(IncomingAckBidiStream {
-                                peer_id,
-                                conn_stable_id,
-                                generation,
-                                send,
-                                recv,
-                                prefix,
-                                accepted_at,
-                            }) = stream else {
-                                break;
-                            };
-                            if !Self::handle_ack_bidi_stream(
-                                ack_diagnostics.as_ref(),
-                                ack_request_dedupe.as_ref(),
-                                &connected_peers,
-                                &peer_activity,
-                                &data_tx,
-                                data_tx_diagnostics.as_ref(),
-                                data_tx_capacity,
-                                &event_tx,
-                                peer_id,
-                                conn_stable_id,
-                                generation,
-                                send,
-                                recv,
-                                prefix,
-                                accepted_at,
-                                max_read_bytes,
-                                &ack_response_drop_injection,
-                            )
-                            .await
-                            {
-                                debug!(
-                                    "ACK-v2 bidi bridge stopping for peer {:?}: consumer gone",
-                                    peer_id
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
         // Spawn background pollers for transport and peer-address updates.
         endpoint.spawn_constrained_poller();
         endpoint.spawn_peer_address_update_poller();
@@ -3398,6 +3316,7 @@ impl P2pEndpoint {
         // #368: give the inner endpoint a reader-liveness probe (we own
         // reader_handles) and start the orphan-connection janitor.
         endpoint.install_reader_liveness_probe();
+        endpoint.spawn_connection_promoted_consumer();
         endpoint.spawn_orphan_connection_janitor();
 
         Ok(endpoint)
@@ -4606,6 +4525,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
+                // (HolePunch) instead of inflating direct_connections.
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -4659,6 +4587,30 @@ impl P2pEndpoint {
                             .register_connection_peer_id(remote_address, peer_id);
 
                         // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
+                        // #281 round 4: classify the generation being finalized —
+                        // the connection this event established, the same handle
+                        // the reader spawns on — so a later promotion re-registers
+                        // it with its real traversal method (HolePunch) instead of
+                        // inflating direct_connections.
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(peer_id)
+                            .await
+                            .or_else(|| self.inner.session_connection(peer_id))
+                        {
+                            self.inner.mark_connection_traversal_method(
+                                &peer_id,
+                                conn.stable_id(),
+                                TraversalMethod::HolePunch,
+                            );
+
+                            // Spawn background reader task BEFORE storing in connected_peers
+                            // to prevent race where recv() misses early data
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(peer_id, conn).await;
+                            });
+                        }
                         let peer_conn = PeerConnection {
                             peer_id,
                             remote_addr: TransportAddr::Udp(remote_address),
@@ -4668,20 +4620,6 @@ impl P2pEndpoint {
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
                         };
-
-                        // Spawn background reader task BEFORE storing in connected_peers
-                        // to prevent race where recv() misses early data
-                        if let Some(conn) = self
-                            .inner
-                            .get_connection_by_authenticated_peer(peer_id)
-                            .await
-                            .or_else(|| self.inner.session_connection(peer_id))
-                        {
-                            let endpoint = self.clone();
-                            tokio::spawn(async move {
-                                endpoint.spawn_reader_task(peer_id, conn).await;
-                            });
-                        }
 
                         self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
@@ -4725,6 +4663,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
+                // (HolePunch) instead of inflating direct_connections.
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -5402,11 +5349,25 @@ impl P2pEndpoint {
             .inner
             .add_connection_with_outcome(peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
-        if matches!(
-            registration,
+        // #286 round 2: exhaustive match — the compiler must catch any new
+        // outcome variant instead of silently taking the success path.
+        let registration_refused_or_rejected = match registration {
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => false,
             crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-        ) {
-            if let Some(existing) = self.connected_peers.read().await.get(&peer_id).cloned() {
+            | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => true,
+        };
+        if registration_refused_or_rejected {
+            // #286: Refused = the endpoint is shutting down and the inner
+            // layer closed the connection — fall through to the live-winner
+            // lookup, which errors honestly instead of spawning a reader over
+            // a corpse. Rejected keeps its #277 handling below.
+            // #277: the outer entry is only trustworthy while the inner
+            // endpoint still routes a live connection for this peer. A dead
+            // entry must be treated as absent — returning it would hand the
+            // caller a stale PeerConnection with nothing behind it.
+            if self.inner.is_peer_connected(&peer_id)
+                && let Some(existing) = self.connected_peers.read().await.get(&peer_id).cloned()
+            {
                 return Ok(existing);
             }
             let live_connection = self
@@ -5555,6 +5516,28 @@ impl P2pEndpoint {
                         self.inner
                             .register_connection_peer_id(remote_address, evt_peer);
 
+                        // #281 round 4: classify the generation being
+                        // finalized — the connection this event established,
+                        // the same handle the reader spawns on — so a later
+                        // promotion re-registers it with its real traversal
+                        // method (HolePunch) instead of inflating
+                        // direct_connections.
+                        if let Some(conn) = self
+                            .inner
+                            .get_connection_by_authenticated_peer(evt_peer)
+                            .await
+                            .or_else(|| self.inner.session_connection(evt_peer))
+                        {
+                            self.inner.mark_connection_traversal_method(
+                                &evt_peer,
+                                conn.stable_id(),
+                                TraversalMethod::HolePunch,
+                            );
+                            let endpoint = self.clone();
+                            tokio::spawn(async move {
+                                endpoint.spawn_reader_task(evt_peer, conn).await;
+                            });
+                        }
                         let peer_conn = PeerConnection {
                             peer_id: evt_peer,
                             remote_addr: TransportAddr::Udp(remote_address),
@@ -5564,18 +5547,6 @@ impl P2pEndpoint {
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
                         };
-
-                        if let Some(conn) = self
-                            .inner
-                            .get_connection_by_authenticated_peer(evt_peer)
-                            .await
-                            .or_else(|| self.inner.session_connection(evt_peer))
-                        {
-                            let endpoint = self.clone();
-                            tokio::spawn(async move {
-                                endpoint.spawn_reader_task(evt_peer, conn).await;
-                            });
-                        }
 
                         self.observe_peer_reachability(&peer_conn);
                         self.register_connected_peer(peer_conn.clone()).await;
@@ -5597,6 +5568,16 @@ impl P2pEndpoint {
                             self.inner
                                 .register_connection_peer_id(remote_address, peer_id);
 
+                            // #281 round 4: classify the generation being
+                            // finalized — the conn in scope supplying
+                            // remote_addr/side — so a later promotion
+                            // re-registers it with its real traversal method
+                            // (HolePunch) instead of inflating direct_connections.
+                            self.inner.mark_connection_traversal_method(
+                                &peer_id,
+                                conn.stable_id(),
+                                TraversalMethod::HolePunch,
+                            );
                             let peer_conn = PeerConnection {
                                 peer_id,
                                 remote_addr: TransportAddr::Udp(remote_address),
@@ -5664,6 +5645,15 @@ impl P2pEndpoint {
                 self.inner
                     .register_connection_peer_id(remote_address, peer_id);
 
+                // #281 round 4: classify the generation being finalized —
+                // the conn in scope supplying remote_addr/side — so a later
+                // promotion re-registers it with its real traversal method
+                // (HolePunch) instead of inflating direct_connections.
+                self.inner.mark_connection_traversal_method(
+                    &peer_id,
+                    conn.stable_id(),
+                    TraversalMethod::HolePunch,
+                );
                 let peer_conn = PeerConnection {
                     peer_id,
                     remote_addr: TransportAddr::Udp(remote_address),
@@ -5908,10 +5898,21 @@ impl P2pEndpoint {
             .inner
             .add_connection_with_outcome(relay_peer_id, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
-        if matches!(
-            registration,
+        // #277 round 2: classify the generation as Relay so a later promotion
+        // re-registers the survivor with its real traversal method instead of
+        // inflating `direct_connections`.
+        self.inner.mark_connection_traversal_method(
+            &relay_peer_id,
+            connection.stable_id(),
+            TraversalMethod::Relay,
+        );
+        // #286 round 2: exhaustive match (Refused handled as failure).
+        let relay_registration_refused_or_rejected = match registration {
+            crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => false,
             crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-        ) {
+            | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => true,
+        };
+        if relay_registration_refused_or_rejected {
             if let Some(existing) = self
                 .connected_peers
                 .read()
@@ -6223,7 +6224,7 @@ impl P2pEndpoint {
     #[allow(clippy::too_many_arguments)]
     async fn handle_bidi_stream_inline(
         ack_bidi_serialization: &Arc<tokio::sync::Mutex<()>>,
-        inner: &NatTraversalEndpoint,
+        inner: &Arc<NatTraversalEndpoint>,
         ack_diagnostics: &AckDiagnostics,
         ack_request_dedupe: &Arc<AckRequestDedupeCache>,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
@@ -6348,10 +6349,20 @@ impl P2pEndpoint {
             return true;
         }
 
-        if inner
-            .handle_relay_bidi_stream_from_app_reader(connection.clone(), send, recv, prefix)
-            .await
-        {
+        // #280 round 2: serve the relay stream on its OWN task. The relay
+        // session's success path runs `run_stream_forwarding_loop` for the
+        // whole session lifetime, and `establish_relay_session` deliberately
+        // REUSES the peer connection — awaiting that loop inline would pin
+        // the sole accept consumer, so no further app/ACK-v2/gossip stream
+        // from this peer would be accepted while the session lives.
+        if inner.relay_server_present() {
+            let inner = Arc::clone(inner);
+            let relay_connection = connection.clone();
+            tokio::spawn(async move {
+                inner
+                    .handle_relay_bidi_stream_from_app_reader(relay_connection, send, recv, prefix)
+                    .await;
+            });
             return true;
         }
 
@@ -6780,11 +6791,17 @@ impl P2pEndpoint {
                             .map_err(EndpointError::NatTraversal)
                         {
                             Ok(outcome) => {
-                                if matches!(
-                                    outcome,
+                                // #286 round 2: exhaustive match — Refused
+                                // (endpoint shutting down, connection closed
+                                // by the registrar) is a failure, not a
+                                // success whose reader would spawn over a
+                                // corpse.
+                                match outcome {
+                                    crate::nat_traversal_api::ConnectionRegistrationOutcome::Live { .. } => {}
                                     crate::nat_traversal_api::ConnectionRegistrationOutcome::Rejected { .. }
-                                ) {
-                                    return None;
+                                    | crate::nat_traversal_api::ConnectionRegistrationOutcome::Refused => {
+                                        return None;
+                                    }
                                 }
                                 registration = Some(outcome);
                                 resolved_peer_id = actual_peer_id;
@@ -7159,8 +7176,7 @@ impl P2pEndpoint {
     ///
     /// Generates a fresh request id and delegates to
     /// [`P2pEndpoint::send_with_receive_ack_with_request_id`]. Callers that need
-    /// to issue more than one [`Self::send_with_receive_ack`] for the same logical
-    /// payload — e.g. application-level request hedging — should use the
+    /// to issue more than one [`P2pEndpoint::send_with_receive_ack`] for the same logical
     /// `_with_request_id` variant directly and supply the same id to every call
     /// so the receiver dedupes the duplicates instead of delivering them twice.
     pub async fn send_with_receive_ack(
@@ -7175,7 +7191,7 @@ impl P2pEndpoint {
             .await
     }
 
-    /// Same contract as [`Self::send_with_receive_ack`] but the caller supplies the
+    /// Same contract as [`P2pEndpoint::send_with_receive_ack`] but the caller supplies the
     /// ACK-v2 request id. Two calls with the same `(peer_id, request_id, data)`
     /// are duplicate-safe at the receiver: the second arrival is replayed from
     /// the receiver-side `AckRequestDedupeCache`, the cached ACK is returned
@@ -8012,9 +8028,13 @@ impl P2pEndpoint {
     ///
     /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
     /// - [`EndpointError::PeerNotFound`] if no live QUIC connection exists for
-    ///   this peer (e.g. the peer is only reachable over a constrained transport
-    ///   such as BLE/LoRa, which cannot carry QUIC byte-streams).
-    /// - [`EndpointError::ConnectionClosed`] if the connection is closing.
+    ///   this peer and none was recently closed by this endpoint (e.g. the
+    ///   peer is only reachable over a constrained transport such as BLE/LoRa,
+    ///   which cannot carry QUIC byte-streams).
+    /// - [`EndpointError::ConnectionClosed`] if the connection is closing, or
+    ///   no live connection remains and this endpoint recently closed one for
+    ///   the peer (e.g. via [`P2pEndpoint::disconnect`]) — carrying that close
+    ///   reason (#278).
     pub async fn open_bi(
         &self,
         peer_id: &PeerId,
@@ -8023,11 +8043,23 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        let connection = self
+        let Some(connection) = self
             .inner
             .get_connection(peer_id)
             .map_err(EndpointError::NatTraversal)?
-            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        else {
+            // #278: no live connection. If this endpoint recently closed one
+            // for this peer (e.g. `disconnect`), surface that close reason as
+            // `ConnectionClosed` so churn-aware callers distinguish "we tore
+            // this down, replay onto a fresh connection" from an unknown
+            // peer. Without this, callers saw `PeerNotFound` (or worse, a
+            // repromoted stale generation) after a disconnect.
+            let reason = self
+                .inner
+                .recent_close_reason_for_peer(peer_id)
+                .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+            return Err(EndpointError::ConnectionClosed { reason });
+        };
 
         if let Some(reason) = close_reason_from_connection(&connection) {
             return Err(EndpointError::ConnectionClosed { reason });
@@ -8211,6 +8243,77 @@ impl P2pEndpoint {
                     })
                 })
             }));
+    }
+
+    /// #277: wire the p2p re-registration consumer for promoted survivors.
+    /// When the inner layer lazily promotes a surviving connection back to
+    /// the winner slot (from `get_connection` / `is_peer_connected` reads),
+    /// no p2p registration runs — `connected_peers` would stay empty while
+    /// the winner map serves traffic, so `is_connected()` /
+    /// `connected_peers()` disagree with the inner state (x0x#510).
+    ///
+    /// #277 round 2: the inner endpoint is signalled through a channel, not a
+    /// callback — storing a closure that captures `self` inside the
+    /// endpoint's own inner Arc leaked the whole endpoint (strong cycle,
+    /// never freed after shutdown+drop). The consumer task holds the endpoint
+    /// only until the shutdown token fires, matching the lifecycle of the
+    /// other endpoint-owned background tasks.
+    fn spawn_connection_promoted_consumer(&self) {
+        let (promoted_tx, mut promoted_rx) = mpsc::unbounded_channel();
+        self.inner.set_connection_promoted_sender(promoted_tx);
+        let endpoint = self.clone();
+        let shutdown = self.shutdown_token();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    promoted = promoted_rx.recv() => {
+                        let Some(promoted) = promoted else {
+                            break;
+                        };
+                        // #281 round 3: the signal is asynchronous — a
+                        // disconnect sweep, #368 janitor closure or a
+                        // supersede may have landed between the promotion
+                        // and this consumer. Re-check before storing, else
+                        // the record would resurrect a dead
+                        // `connected_peers` entry for a peer the endpoint
+                        // has already torn down or replaced: the survivor
+                        // must still be open AND still be the peer's
+                        // current winner (a newer winner's own registration
+                        // has already recorded it).
+                        let promoted_stable_id = promoted.connection.stable_id();
+                        let still_current = promoted.connection.close_reason().is_none()
+                            && match endpoint.inner.get_connection(&promoted.peer_id) {
+                                Ok(Some(current)) => {
+                                    current.stable_id() == promoted_stable_id
+                                }
+                                _ => false,
+                            };
+                        if !still_current {
+                            debug!(
+                                peer_id = ?promoted.peer_id,
+                                promoted_stable_id,
+                                "dropping stale promotion signal: survivor closed or replaced"
+                            );
+                            continue;
+                        }
+                        endpoint
+                            .register_connected_peer(PeerConnection {
+                                peer_id: promoted.peer_id,
+                                remote_addr: TransportAddr::Udp(
+                                    promoted.connection.remote_address(),
+                                ),
+                                traversal_method: promoted.traversal_method,
+                                side: promoted.connection.side(),
+                                authenticated: true,
+                                connected_at: Instant::now(),
+                                last_activity: Instant::now(),
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
     }
 
     /// #368 backstop janitor: every 5 s, close open tracked connections
@@ -9699,8 +9802,27 @@ impl P2pEndpoint {
         });
         let abort_handle = join_handle.abort_handle();
 
-        // Append — DO NOT pre-empt existing readers. See function doc.
+        // #280 round 2: enforce one reader per CONNECTION (stable_id). Readers
+        // for OTHER generations of the same peer are still tolerated (issue
+        // #166 drain semantics) — only a duplicate for the same connection is
+        // skipped, turning the single-reader invariant from a call-site audit
+        // into an enforced guarantee.
         let mut handles = self.reader_handles.write().await;
+        if handles.get(&peer_id).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|handle| handle.conn_stable_id == conn_stable_id)
+        }) {
+            debug!(
+                peer_id = ?peer_id,
+                conn_stable_id,
+                "reader already registered for this connection; cancelling duplicate spawn"
+            );
+            drop(handles);
+            cancel.cancel();
+            abort_handle.abort();
+            return;
+        }
         handles.entry(peer_id).or_default().push(ReaderTaskHandle {
             generation,
             conn_stable_id,
@@ -12086,6 +12208,92 @@ mod tests {
 
         let err = EndpointError::PeerNotFound(PeerId([0u8; 32]));
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    fn explicit_bind_test_config(addr: SocketAddr, cache: &std::path::Path) -> P2pConfig {
+        P2pConfig::builder()
+            .bind_addr(addr)
+            .mdns_enabled(false)
+            .nat(crate::NatConfig {
+                enable_relay_fallback: false,
+                ..Default::default()
+            })
+            .port_mapping_enabled(false)
+            .bootstrap_cache(
+                BootstrapCacheConfig::builder()
+                    .cache_dir(cache)
+                    .persist(false)
+                    .build(),
+            )
+            .build()
+            .expect("isolated explicit-bind config")
+    }
+
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn explicit_bind_endpoint_reports_requested_ip_and_allocated_port() {
+        for ip in [
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let cache = tempfile::tempdir().expect("private cache directory");
+            let requested = SocketAddr::new(ip, 0);
+            let endpoint = timeout(
+                Duration::from_secs(10),
+                P2pEndpoint::new(explicit_bind_test_config(requested, cache.path())),
+            )
+            .await
+            .expect("endpoint creation deadline")
+            .expect("loopback endpoint binds");
+            let actual = endpoint.local_addr().expect("bound socket address");
+            // An independent OS bind proves the reported nonzero port belongs
+            // to a live socket, rather than merely echoing the requested hint.
+            let conflict = std::net::UdpSocket::bind(actual).err().map(|e| e.kind());
+            endpoint.shutdown().await;
+            drop(endpoint);
+            assert_eq!(actual.ip(), requested.ip(), "explicit IP must be preserved");
+            assert_ne!(actual.port(), 0, "report the OS-allocated port");
+            assert_eq!(conflict, Some(std::io::ErrorKind::AddrInUse));
+        }
+    }
+
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn explicit_bind_endpoint_rejects_occupied_address_without_widening() {
+        for ip in [
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let cache = tempfile::tempdir().expect("private cache directory");
+            let sentinel = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+                .expect("own the occupied loopback socket");
+            let requested = sentinel.local_addr().expect("sentinel address");
+            let result = timeout(
+                Duration::from_secs(10),
+                P2pEndpoint::new(explicit_bind_test_config(requested, cache.path())),
+            )
+            .await
+            .expect("occupied bind deadline");
+            let rejected_at_bind = match result {
+                Err(EndpointError::Config(message)) => {
+                    message.starts_with("Failed to bind UDP socket:")
+                }
+                Ok(endpoint) => {
+                    endpoint.shutdown().await;
+                    false
+                }
+                Err(_) => false,
+            };
+            assert!(
+                rejected_at_bind,
+                "occupied explicit address must fail at the socket bind"
+            );
+            assert_eq!(
+                sentinel.local_addr().expect("sentinel remains owned"),
+                requested
+            );
+        }
     }
 
     #[tokio::test]
@@ -14545,10 +14753,16 @@ mod tests {
     /// partial prefix must not freeze the reader task. After the prefix-read
     /// timeout the reader resets the half-opened stream and continues, so a
     /// subsequent application stream is still delivered to `accept_bi`.
+    ///
+    /// #280: previously `#[ignore]`d as "timing-sensitive" — it was actually
+    /// sampling the two-consumer `accept_bi` race (the redundant
+    /// per-connection relay accept task). With the single-reader demux
+    /// restored it is deterministic and runs everywhere.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
     #[tokio::test]
-    #[ignore = "real two-node loopback test; timing-sensitive across CI configs \
-                (release / --no-default-features / beta / windows). Run explicitly: \
-                `cargo test --lib -- --ignored reader_recovers_from_prefix_starvation`"]
     async fn reader_recovers_from_prefix_starvation() {
         async fn build_endpoint() -> P2pEndpoint {
             P2pEndpoint::new(
@@ -14613,6 +14827,702 @@ mod tests {
         assert_eq!(accepted.0, a_id, "app stream from the connected peer");
         send_a.finish().ok();
         drop(starved_send);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Regression for #277 (x0x#510): a lazily promoted surviving connection
+    /// must become visible at the p2p layer, not just in the inner winner
+    /// map.
+    ///
+    /// Repromotion runs from lazy read paths (`get_connection` /
+    /// `is_peer_connected`) where no p2p registration happens. Pre-fix, the
+    /// inner winner map served traffic over the promoted survivor while
+    /// `connected_peers` stayed empty — `is_connected()` returned false and
+    /// higher layers suppressed reconnects / reported the peer absent even
+    /// though the DashMap routed fine (the two-structure disagreement of
+    /// x0x#510). Post-fix, the promotion hook re-registers the peer.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn lazy_promotion_re_registers_peer_at_p2p_layer() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two real authenticated connections a -> b; registration is
+        // controlled explicitly (no readers, no p2p outer entry — the exact
+        // x0x#510 state where the promoted side never registered at the p2p
+        // layer).
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1.clone())
+            .expect("register c1");
+        // Precondition: the newer connection is the Live winner, the older is
+        // the open Superseded survivor, and the p2p outer map is empty.
+        assert!(
+            !a.is_connected(&b_id).await,
+            "precondition: no p2p-layer registration yet"
+        );
+
+        // Kill the winner at the transport level and trigger the lazy
+        // winner-map repair read path.
+        c1.close(crate::VarInt::from_u32(0), b"#277-winner-dead");
+        let promoted = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy read must repromote the survivor");
+        assert_eq!(
+            promoted.stable_id(),
+            c0.stable_id(),
+            "the Superseded survivor must be promoted into the winner map"
+        );
+
+        // #277: the promotion must also be visible at the p2p layer. The hook
+        // registers asynchronously, so poll with a deadline.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.is_connected(&b_id).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "promotion must re-register the peer at the p2p layer \
+                 (is_connected must agree with the winner map)"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Regression for #277 (x0x#510): `finalize_direct_connection` must never
+    /// return Ok with a stale outer `PeerConnection` when the inner endpoint
+    /// has no live connection for the peer.
+    ///
+    /// Pre-fix, the Rejected branch returned the `connected_peers` entry
+    /// unconditionally: a dead-but-Live inner entry won the tiebreaker (no
+    /// `is_alive()` gate), the fresh candidate was rejected and closed, and
+    /// the caller got `Ok(PeerConnection)` with no live connection behind it.
+    /// Post-fix the dead entry can never win the tiebreaker, so the fresh
+    /// connection is adopted — and the outer entry is only returned while the
+    /// inner endpoint still routes a live connection.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn finalize_direct_connection_never_returns_stale_dead_entry() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two real authenticated connections a -> b.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // Seed a dead-but-Live entry with the maximum cross-family sort key
+        // (connection_id all-0xFF) so the pre-fix tiebreaker prefers it over
+        // the fresh candidate, then close its transport.
+        let seeded = crate::nat_traversal_api::tracked_connection_with_sort_keys_for_test(
+            c0.clone(),
+            7,
+            0,
+            [0u8; 32],
+            [0xFFu8; 32],
+            TraversalMethod::Direct,
+        );
+        a.inner.seed_lifecycle_entry_for_test(b_id, seeded);
+        c0.close(crate::VarInt::from_u32(0), b"#277-dead-live");
+        assert!(
+            !c0.is_alive(),
+            "precondition: seeded entry is transport-dead"
+        );
+
+        // The stale outer entry the pre-fix Rejected branch used to return.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(b_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+
+        let _peer_conn = a
+            .finalize_direct_connection(c1.clone(), b_addr, None)
+            .await
+            .expect("finalize must not fail while a fresh candidate exists");
+
+        // The contract: a successful finalize must leave a LIVE routable
+        // connection for the peer — never Ok with a stale PeerConnection and
+        // a corpse behind it (pre-fix: candidate rejected, winner map empty).
+        let routed = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("finalize Ok must leave a live routable connection");
+        assert_eq!(
+            routed.stable_id(),
+            c1.stable_id(),
+            "the fresh candidate must be the live winner"
+        );
+        assert!(
+            a.is_connected(&b_id).await,
+            "both structures must agree the peer is connected"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #277 round 2 (leak): the endpoint must be freed after `shutdown()` +
+    /// drop. The original promotion hook captured `self.clone()` into a
+    /// closure stored inside the endpoint's own inner Arc — a strong cycle
+    /// that kept the endpoint (and everything it owns) alive forever; the
+    /// probe showed master freeing the inner endpoint 0.1 s after
+    /// shutdown+drop while the hook-carrying branch still held a strong ref
+    /// after 5 s. The promotion signal is now a channel; the consumer task
+    /// terminates on the shutdown token like every other endpoint task.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn promoted_connection_signal_does_not_leak_endpoint() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let endpoint = build_endpoint().await;
+        // The observable half of the cycle is the INNER endpoint: the round-1
+        // hook stored a closure capturing a full P2pEndpoint clone inside
+        // `inner` itself, so inner → hook → endpoint-clone → inner Arc never
+        // freed (master frees inner ~0.1 s after shutdown+drop).
+        let inner_weak = std::sync::Arc::downgrade(&endpoint.inner);
+        endpoint.shutdown().await;
+        drop(endpoint);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while inner_weak.upgrade().is_some() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            inner_weak.upgrade().is_none(),
+            "inner endpoint must be freed after shutdown + drop (promotion-signal cycle)"
+        );
+    }
+
+    /// #277 round 2 (traversal method): a promoted survivor must
+    /// re-register with its REAL traversal classification. The original hook
+    /// always registered `Direct`, so promoting a relayed (or hole-punched)
+    /// survivor inflated `direct_connections` without decrementing
+    /// `relayed_connections` and emitted a misleading PeerConnected.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn promotion_reregisters_relayed_survivor_with_real_traversal_method() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // The survivor generation is classified Relay (as try_relay_connection
+        // marks its relayed generations); the newer connection wins the
+        // winner slot and supersedes it.
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+        a.inner
+            .mark_connection_traversal_method(&b_id, c0.stable_id(), TraversalMethod::Relay);
+        a.inner
+            .add_connection_with_outcome(b_id, c1.clone())
+            .expect("register c1");
+
+        // Kill the winner and trigger the lazy promotion read path.
+        c1.close(crate::VarInt::from_u32(0), b"#277-r2-winner-dead");
+        let promoted = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy read must repromote the relayed survivor");
+        assert_eq!(promoted.stable_id(), c0.stable_id());
+
+        // The re-registration must carry the survivor's real method (the
+        // consumer runs asynchronously — poll).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            let record = a
+                .connected_peers
+                .read()
+                .await
+                .get(&b_id)
+                .map(|peer| peer.traversal_method);
+            if let Some(method) = record {
+                break method;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "promotion must re-register the survivor at the p2p layer"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            record,
+            TraversalMethod::Relay,
+            "a promoted relayed survivor must re-register as Relay, not Direct"
+        );
+        let stats = a.stats().await;
+        assert_eq!(
+            stats.relayed_connections, 1,
+            "the relayed survivor must count as relayed"
+        );
+        assert_eq!(
+            stats.direct_connections, 0,
+            "promoting a relayed survivor must not inflate direct_connections"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #281 round 4: a promoted HOLE-PUNCHED survivor must re-register with
+    /// its real classification, and the classification must come from a REAL
+    /// hole-punch finalize — this test never calls
+    /// `mark_connection_traversal_method` itself. It drives the production
+    /// finalize path (`await_hole_punch_outcome`'s existing-connection
+    /// branch) for the first connection, supersedes it with a second
+    /// same-family dial, kills the winner, and lets the lazy promotion
+    /// re-register the survivor: the outer record must read `HolePunch`,
+    /// `holepunched_connections` corrected, `direct_connections` not
+    /// inflated, no spurious `PeerConnected`.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn promotion_reregisters_holepunched_survivor_with_real_finalize_path() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let mut events = a.subscribe();
+
+        // First connection, registered at the inner layer only.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+
+        // REAL hole-punch finalize for c0 through the production path: the
+        // existing-connection branch of `await_hole_punch_outcome` classifies
+        // c0's generation (HolePunch), registers the outer record and spawns
+        // its reader.
+        let finalized = a
+            .await_hole_punch_outcome(
+                b_addr,
+                b_id,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .expect("hole-punch finalize");
+        assert_eq!(
+            finalized.traversal_method,
+            TraversalMethod::HolePunch,
+            "the finalize path must record HolePunch"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let method = a
+                .connected_peers
+                .read()
+                .await
+                .get(&b_id)
+                .map(|peer| peer.traversal_method);
+            if method == Some(TraversalMethod::HolePunch) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the real finalize must register the outer record as HolePunch"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Supersede c0 with a second same-family dial: newer generation wins
+        // deterministically, demoting c0 to an OPEN Superseded survivor whose
+        // tracked classification (HolePunch) must survive the supersede.
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c1.clone())
+            .expect("register c1");
+
+        // Kill the winner and trigger the lazy promotion read path.
+        c1.close(crate::VarInt::from_u32(0), b"#281-r4-winner-dead");
+        let promoted = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy read must repromote the hole-punched survivor");
+        assert_eq!(promoted.stable_id(), c0.stable_id());
+
+        // The promotion re-registration (asynchronous consumer) must carry
+        // the survivor's real classification. Observe the REWRITE, not the
+        // finalize's original record: capture the finalize registration's
+        // connected_at and wait for it to change.
+        let finalize_connected_at = a
+            .connected_peers
+            .read()
+            .await
+            .get(&b_id)
+            .map(|peer| peer.connected_at);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            let entry = a.connected_peers.read().await.get(&b_id).cloned();
+            if let Some(peer) = entry {
+                if Some(peer.connected_at) != finalize_connected_at {
+                    break peer.traversal_method;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "promotion must re-register the survivor at the p2p layer"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            record,
+            TraversalMethod::HolePunch,
+            "a promoted hole-punched survivor must re-register as HolePunch, not Direct"
+        );
+        let stats = a.stats().await;
+        assert_eq!(
+            stats.holepunched_connections, 1,
+            "the hole-punched survivor must count as hole-punched (no double count)"
+        );
+        assert_eq!(
+            stats.direct_connections, 0,
+            "promoting a hole-punched survivor must not inflate direct_connections"
+        );
+
+        // Exactly ONE PeerConnected for the peer: the finalize's. The
+        // promotion re-registration carries the same addr/method/side and
+        // must not emit a spurious second event.
+        let collected = collect_broadcast_events(&mut events);
+        let peer_connected = collected
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    P2pEvent::PeerConnected { peer_id, .. } if *peer_id == b_id
+                )
+            })
+            .count();
+        assert_eq!(
+            peer_connected, 1,
+            "the promotion re-registration must not emit a spurious PeerConnected"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #281 round 3: a promotion signal whose survivor dies (or is replaced)
+    /// between the send and the consumer must NOT resurrect a
+    /// `connected_peers` entry. The consumer re-checks liveness and
+    /// winner-currency (`stable_id`) before `store_connected_peer`.
+    ///
+    /// Deterministic on the current-thread test runtime: the lazy
+    /// `get_connection` promotion and the survivor's close are both
+    /// synchronous, so the consumer task — parked on the channel — cannot
+    /// run until the test first awaits; by then the survivor is closed and
+    /// the guard must drop the signal.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn promotion_signal_dropped_after_survivor_death() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        a.inner
+            .add_connection_with_outcome(b_id, c0.clone())
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1.clone())
+            .expect("register c1");
+
+        // Kill the winner, then trigger the lazy promotion — the signal is
+        // queued but the consumer cannot run yet (current-thread runtime,
+        // no await between these synchronous calls).
+        c1.close(crate::VarInt::from_u32(0), b"#281-r3-winner-dead");
+        let promoted = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection ok")
+            .expect("lazy read must repromote the survivor");
+        assert_eq!(promoted.stable_id(), c0.stable_id());
+
+        // The survivor dies BEFORE the consumer processes the signal.
+        c0.close(crate::VarInt::from_u32(0), b"#281-r3-survivor-dead");
+
+        // Now yield: the consumer wakes and must drop the stale signal —
+        // no connected_peers entry may appear for the dead peer.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                a.connected_peers.read().await.get(&b_id).is_none(),
+                "a promotion signal for a dead survivor must not resurrect a \
+                 connected_peers entry"
+            );
+            assert!(!a.is_connected(&b_id).await);
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #277 round 2 (isolating the finalize staleness gate): with hunks 1-2
+    /// intact, the Rejected branch's `is_peer_connected` gate is the ONLY
+    /// difference between returning the stale outer entry and erroring. The
+    /// composite test passes with hunk 3 alone reverted, so this isolates it.
+    ///
+    /// Construction: the outranking winner is alive at registration (so the
+    /// fresh candidate is legitimately Rejected — the fix-1 retirement does
+    /// not apply), but it lives ONLY in the lifecycle Vec — aged past the
+    /// spawn grace with no reader — so the gate's `is_peer_connected` call
+    /// refuses to repromote it (NoReader closure) and reports the peer
+    /// unroutable. Gated: `Err`. Gate reverted: `Ok(stale PeerConnection)`.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn finalize_rejected_with_unroutable_winner_errors_not_stale_ok() {
+        // The seeded winner is deliberately orphaned (aged past every grace,
+        // readerless) so the gate's repromotion refuses it. The orphan
+        // janitor would reap exactly such entries on its immediate first
+        // sweep — disable it for this test process (nextest runs each test
+        // in its own process, so the env var stays isolated).
+        unsafe { std::env::set_var("ANT_QUIC_TEST_DISABLE_368_JANITOR", "1") };
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // An ALIVE, outranking winner that exists only in the lifecycle Vec:
+        // aged past every grace (established_at = 0) and readerless (no
+        // reader task spawned, so the p2p reader-liveness probe reports
+        // none), with the maximum cross-family sort key so it beats any
+        // fresh candidate.
+        let seeded = crate::nat_traversal_api::tracked_connection_with_sort_keys_for_test(
+            c0.clone(),
+            7,
+            0,
+            [0u8; 32],
+            [0xFFu8; 32],
+            TraversalMethod::Direct,
+        );
+        a.inner.seed_lifecycle_entry_for_test(b_id, seeded);
+        assert!(c0.is_alive(), "precondition: seeded winner is alive");
+
+        // The stale outer entry the ungated Rejected branch would return.
+        // Seeded directly into the map: `register_connected_peer` would run
+        // the lazy `get_connection` read, whose repromotion refuses and
+        // REMOVES the readerless seeded winner before finalize reaches it.
+        a.connected_peers.write().await.insert(
+            b_id,
+            PeerConnection {
+                peer_id: b_id,
+                remote_addr: TransportAddr::Udp("127.0.0.1:9".parse().expect("stale addr")),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Client,
+                authenticated: true,
+                connected_at: Instant::now(),
+                last_activity: Instant::now(),
+            },
+        );
+
+        // Registration: the alive outranking winner legitimately Rejects the
+        // fresh candidate. The gate must then observe the peer as unroutable
+        // (readerless aged winner refused at repromotion) and error instead
+        // of returning the stale outer entry.
+        let result = a.finalize_direct_connection(c1, b_addr, None).await;
+        assert!(
+            result.is_err(),
+            "finalize must not return Ok with the stale PeerConnection when \
+             the inner endpoint cannot route the peer; got {:?}",
+            result
+        );
+
         a.shutdown().await;
         b.shutdown().await;
     }
@@ -14907,6 +15817,789 @@ mod tests {
         );
 
         a.shutdown().await;
+    }
+
+    /// Regression for #278 (x0x#277): `disconnect` must tear down EVERY
+    /// tracked generation for the peer, not just the current winner.
+    ///
+    /// A peer with two registered generations — a Live winner plus an open
+    /// Superseded survivor kept for its drain window — is exactly the state
+    /// connection churn produces under simultaneous open. Pre-fix,
+    /// `disconnect` closed only the winner; the survivor stayed open with
+    /// `close_reason() == None`, so the next `get_connection` miss
+    /// REPROMOTED it to Live and re-inserted it into the winner map. `open_bi`
+    /// then handed out streams on the old, half-dead connection: writes
+    /// failed with `sending stopped by peer: error 0` or succeeded into a
+    /// send buffer that the eventual teardown discarded — no error ever
+    /// surfaced to the caller, so application replay logic never fired (the
+    /// two x0x#277 failure shapes). Post-fix, the peer-scope cleanup sweeps
+    /// and synchronously closes both generations, and `open_bi` reports
+    /// `ConnectionClosed` instead of resurrecting the stale one.
+    ///
+    /// Deterministic: two real authenticated QUIC connections registered for
+    /// one peer (candidate replacement marks the older one Superseded while it
+    /// stays open). No reader tasks, no polling, no wall-clock races: the
+    /// repromotion the old code performed is synchronous inside
+    /// `get_connection`.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn disconnect_sweeps_surviving_generation_open_bi_reports_connection_closed() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        // Two distinct, fully-authenticated QUIC connections from a -> b.
+        // `attempt_direct_handshake` performs only the handshake — it does NOT
+        // register the connection or spawn a reader — so lifecycle
+        // registration is controlled explicitly below (zero real-reader
+        // interference).
+        let c0 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c1 = tokio::time::timeout(Duration::from_secs(10), a.attempt_direct_handshake(b_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+
+        // Probe clones share the underlying connection state, so their
+        // close_reason() reports whether the disconnect sweep closed them.
+        let c0_probe = c0.clone();
+        let c1_probe = c1.clone();
+
+        // Register both generations: the newer becomes the Live winner aliased
+        // by the winner map; the older is marked Superseded while remaining
+        // open for its drain window.
+        a.inner
+            .add_connection_with_outcome(b_id, c0)
+            .expect("register c0");
+        a.inner
+            .add_connection_with_outcome(b_id, c1)
+            .expect("register c1");
+
+        // Make the peer observable at the p2p layer, as a live connection
+        // would be, so `disconnect` accepts it.
+        a.register_connected_peer(PeerConnection {
+            peer_id: b_id,
+            remote_addr: TransportAddr::Udp(b_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        })
+        .await;
+        assert!(a.is_connected(&b_id).await, "precondition: peer connected");
+
+        a.disconnect(&b_id).await.expect("disconnect");
+
+        // Every tracked generation was closed synchronously: close_reason()
+        // must be Some for the Superseded survivor too, not just the winner
+        // the winner-map removal closed.
+        assert!(
+            c0_probe.close_reason().is_some() && c1_probe.close_reason().is_some(),
+            "disconnect must synchronously close every tracked generation"
+        );
+
+        // No stale generation can be resurrected: get_connection must not
+        // repromote the survivor back into the winner map.
+        assert!(
+            a.inner
+                .get_connection(&b_id)
+                .expect("get_connection ok")
+                .is_none(),
+            "get_connection must never return a closing/closed connection after disconnect"
+        );
+
+        // open_bi must fail with ConnectionClosed carrying the disconnect
+        // reason — never Ok, never a stream on the old connection.
+        let err = a
+            .open_bi(&b_id)
+            .await
+            .expect_err("open_bi after disconnect must fail");
+        assert!(
+            matches!(
+                err,
+                EndpointError::ConnectionClosed {
+                    reason: ConnectionCloseReason::LifecycleCleanup
+                }
+            ),
+            "expected ConnectionClosed(LifecycleCleanup), got {:?}",
+            err
+        );
+
+        assert!(!a.is_connected(&b_id).await, "peer must be disconnected");
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// End-to-end churn regression for #278: a write queued around a
+    /// disconnect → reconnect cycle must either error or be delivered —
+    /// never silently dropped — and the post-reconnect stream must run over
+    /// the NEW connection.
+    ///
+    /// - the pre-churn write is delivered;
+    /// - the write attempted immediately after `disconnect` errors with
+    ///   `ConnectionClosed` (on the old code, `open_bi` could still hand out
+    ///   the stale generation and the payload vanished with its send buffer);
+    /// - after `connect_addr` returns, `is_connected` is true and a write
+    ///   reaches the peer over the new connection — proving the new
+    ///   connection is installed in BOTH `connected_peers` and the
+    ///   nat-traversal winner map before connectivity is reported.
+    ///
+    /// #280: previously `#[ignore]`d (PR #279 round 3) because master's
+    /// two-consumer accept race made this fixture bimodal — the "two accepted
+    /// generations" symptom was in fact one connection returned twice plus the
+    /// relay task stealing the dialer's stream. With the single-reader demux
+    /// restored the churn sequence is deterministic.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn churn_disconnect_reconnect_delivers_over_new_connection() {
+        // Deadline/poll values follow the neighbouring loopback fixtures:
+        // a 30 s overall connect budget (relay_only_data_plane_end_to_end's
+        // connect) and 2 s cancel-safe accept attempts inside a 30 s outer
+        // deadline (reader_recovers_from_prefix_starvation's poll shape).
+        // The poll shape matters on loaded 2-vCPU CI runners: a single
+        // sequential 10 s accept expired while the PQC handshake was still
+        // monopolising the core (PR #279 round 2). `accept_bi` resolves from
+        // a queued channel handle, so a cancelled attempt cannot lose an
+        // already-delivered stream.
+        const CONNECT_BUDGET: Duration = Duration::from_secs(30);
+        const ACCEPT_ATTEMPT: Duration = Duration::from_secs(2);
+        const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn accept_app_stream(
+            b: &P2pEndpoint,
+            attempt: Duration,
+            deadline: Duration,
+            what: &str,
+        ) -> (
+            PeerId,
+            crate::high_level::SendStream,
+            crate::high_level::RecvStream,
+        ) {
+            let deadline = Instant::now() + deadline;
+            loop {
+                if let Ok(Ok(stream)) = tokio::time::timeout(attempt, b.accept_bi()).await {
+                    return stream;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: accept_bi never yielded the app stream"
+                );
+            }
+        }
+
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        // Phase 1 — connect and deliver a pre-churn payload.
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+        let (mut pre_send, _pre_recv) = a.open_bi(&b_id).await.expect("pre-churn open_bi");
+        pre_send
+            .write_all(b"pre-churn")
+            .await
+            .expect("pre-churn write");
+        pre_send.finish().expect("pre-churn finish");
+        let (from, _, mut pre_stream) =
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "pre-churn").await;
+        assert_eq!(from, a_id, "app stream arrives from the connected peer");
+        let pre_payload = pre_stream.read_to_end(1024).await.expect("pre-churn read");
+        assert_eq!(pre_payload, b"pre-churn");
+
+        // Phase 2 — churn: disconnect, then immediately queue a write. It
+        // must ERROR (ConnectionClosed with the disconnect reason); on the
+        // old code it could return Ok onto the stale generation and be
+        // silently discarded.
+        a.disconnect(&b_id).await.expect("disconnect");
+        let churn_err = a
+            .open_bi(&b_id)
+            .await
+            .expect_err("queued write after disconnect must error");
+        assert!(
+            matches!(
+                churn_err,
+                EndpointError::ConnectionClosed {
+                    reason: ConnectionCloseReason::LifecycleCleanup
+                }
+            ),
+            "expected ConnectionClosed(LifecycleCleanup), got {:?}",
+            churn_err
+        );
+
+        // Phase 3 — reconnect: the new connection must be installed in both
+        // structures, and a write must reach the peer over it.
+        tokio::time::timeout(CONNECT_BUDGET, a.connect_addr(b_addr))
+            .await
+            .expect("reconnect timeout")
+            .expect("reconnect failed");
+        assert!(a.is_connected(&b_id).await, "reconnected");
+        let (mut post_send, _post_recv) = a.open_bi(&b_id).await.expect("post-churn open_bi");
+        post_send
+            .write_all(b"post-churn")
+            .await
+            .expect("post-churn write");
+        post_send.finish().expect("post-churn finish");
+        let (from, _, mut post_stream) =
+            accept_app_stream(&b, ACCEPT_ATTEMPT, ACCEPT_DEADLINE, "post-churn").await;
+        assert_eq!(from, a_id);
+        let post_payload = post_stream
+            .read_to_end(1024)
+            .await
+            .expect("post-churn read");
+        assert_eq!(post_payload, b"post-churn");
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #283: `NatTraversalEndpoint::shutdown` must close every
+    /// lifecycle-tracked generation — Superseded survivors included — BEFORE
+    /// the bounded drain, so the CONNECTION_CLOSE frames flush while the
+    /// socket still exists. Previously only the canonical `connections`
+    /// entries were closed; survivors were closed merely implicitly by the
+    /// post-drain `connection_lifecycle.clear()`, immediately before
+    /// `release_socket_for_shutdown` yanked the socket, so the remote kept
+    /// the peer "connected" (its `is_peer_connected` repromotes any
+    /// still-alive Superseded entry) until the idle timeout — the x0x#510
+    /// restart-class "old owner connection never observed as gone".
+    ///
+    /// Construction: B dials A twice into the SAME initiator family (both
+    /// raw handshakes, registered on B explicitly — B's NAT accept task
+    /// processes one inbound at a time, so inbound-only constructions cannot
+    /// stack generations). The second registration is the newer same-family
+    /// generation and wins the tiebreak DETERMINISTICALLY, demoting the
+    /// first connection to an OPEN Superseded survivor on B. A holds the
+    /// first connection (its accept task registered it, its accept loop
+    /// spawned the reader). B's inner endpoint then shuts down: pre-fix only
+    /// the canonical winner is closed, the survivor stays transport-open and
+    /// A must stay "connected" until its idle timeout; with the fix every
+    /// generation closes before the drain and A observes the disconnect
+    /// within it.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn shutdown_closes_superseded_survivors_remote_observes_disconnect() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let a_for_accept = a.clone();
+        tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
+        let a_addr = localhost_addr(a.local_addr().expect("a bound"));
+        let b_id = b.peer_id();
+
+        // First B → A dial: A's NAT accept task registers it and A's accept
+        // loop adopts it (outer record + reader) — A is connected through it.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        let c0_probe = c0.clone();
+        b.inner
+            .add_connection_with_outcome(a.peer_id(), c0)
+            .expect("register c0 on B");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.is_connected(&b_id).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "A never adopted the first dial (not connected)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Second B → A dial, same initiator family: newer generation wins
+        // deterministically, demoting c0 to an OPEN Superseded survivor on B.
+        let c1 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c1 handshake timeout")
+            .expect("c1 handshake");
+        b.inner
+            .add_connection_with_outcome(a.peer_id(), c1.clone())
+            .expect("register c1 on B");
+        assert_eq!(
+            b.inner
+                .get_connection(&a.peer_id())
+                .expect("get_connection ok")
+                .expect("canonical winner")
+                .stable_id(),
+            c1.stable_id(),
+            "the newer same-family dial must be the canonical winner"
+        );
+        assert!(
+            c0_probe.close_reason().is_none(),
+            "the demoted first dial must remain open (Superseded survivor)"
+        );
+
+        // B's inner endpoint shuts down — the path that, pre-fix, closed
+        // only the canonical winner and left the Superseded survivor open.
+        b.inner.shutdown().await.expect("inner shutdown");
+
+        // A must observe the disconnect within the drain window (the bounded
+        // drain is 5 s; the QUIC idle timeout is far longer — pre-fix, A
+        // stays connected until it).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < deadline,
+                "A must observe B's shutdown within the drain window — a                  superseded survivor was never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        a.shutdown().await;
+    }
+
+    /// #286: an inbound handshake completing DURING `shutdown()` — after the
+    /// #285 lifecycle sweep — must not leave an entry in either map. The
+    /// accept workers' join handles were dropped and the registration path
+    /// had no shutdown check, so a late registration landed in both maps,
+    /// was closed by nobody, and the remote kept the peer "connected" until
+    /// its idle timeout (the x0x 1-in-20 stale `is_connected`, x0x#692).
+    ///
+    /// #286 round 2 — deterministic: the race is driven by the
+    /// registration-gate test hook (`arm_registration_gate_for_test`), which
+    /// parks B's registration of the late dial between its fast-path
+    /// shutdown check and the map insert — the exact worst-case scheduling
+    /// the in-lock re-check must survive (flag read early, insert attempted
+    /// after the sweep). With the registration parked, B's shutdown runs to
+    /// COMPLETION (sweep, drain, socket release), then the gate releases the
+    /// registration. Profile-independent: no sleeps, no handshake timing.
+    /// Asserts (a) no entry survives in either map and (b) the remote
+    /// observes the disconnect within the drain window.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_during_inbound_handshake_leaves_no_stale_entry() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let a_for_accept = a.clone();
+        tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let a_addr = localhost_addr(a.local_addr().expect("a bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        // Family 1 (B → A dial, registered on B; A adopts it through its
+        // accept path): A holds a live connection to B whose fate the test
+        // observes, and B's accept worker is running.
+        let c0 = tokio::time::timeout(Duration::from_secs(10), b.attempt_direct_handshake(a_addr))
+            .await
+            .expect("c0 handshake timeout")
+            .expect("c0 handshake");
+        b.inner
+            .add_connection_with_outcome(a_id, c0)
+            .expect("register c0 on B");
+
+        // Precondition: A is connected to B through family 1.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < deadline,
+                "precondition: A must be connected to B"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Arm the registration gate and start the late A → B dial. B's
+        // accept worker registers the inbound handshake through
+        // register_connection_lifecycle_parts, which parks on the gate AFTER
+        // its fast-path flag check.
+        let gate = crate::nat_traversal_api::arm_registration_gate_for_test();
+        let late_dial = {
+            let a = a.clone();
+            tokio::spawn(async move { a.attempt_direct_handshake(b_addr).await })
+        };
+        let park_deadline = Instant::now() + Duration::from_secs(10);
+        while gate.parked_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < park_deadline,
+                "the late registration never reached the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // With the registration parked mid-flight, run B's shutdown to
+        // COMPLETION — flag stored, canonical drain, #285 lifecycle sweep,
+        // worker abort+join, bounded drain, socket release.
+        b.inner.shutdown().await.expect("inner shutdown");
+
+        // Release the parked registration: it resumes exactly in the
+        // worst-case window (post-sweep). The in-lock re-check must refuse
+        // it; on the unfixed tree it inserts the stale survivor.
+        gate.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::nat_traversal_api::disarm_registration_gate_for_test();
+
+        // The dial's fate: refused (handshake completed, registration
+        // refused, B closed the connection) or aborted (worker died
+        // mid-handshake). Both close the transport. Register A's side when
+        // the handshake completed, mirroring the real dialer flow.
+        let late = tokio::time::timeout(Duration::from_secs(10), late_dial)
+            .await
+            .expect("late dial task")
+            .expect("late dial join");
+        if let Ok(late_conn) = late {
+            a.inner
+                .add_connection_with_outcome(b_id, late_conn)
+                .expect("register A's side of the late dial");
+        }
+
+        // (b) A must observe the disconnect within the drain window (the
+        // QUIC idle timeout is far longer — on the unfixed code the
+        // never-closed late survivor keeps A connected until it).
+        let observe_deadline = Instant::now() + Duration::from_secs(15);
+        while a.is_connected(&b_id).await {
+            assert!(
+                Instant::now() < observe_deadline,
+                "A must observe B's shutdown within the drain window — a \
+                 late-registered handshake survived the shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // (a) No entry survives in either map: the connections map is empty,
+        // and no lifecycle generation remains promotable.
+        assert!(
+            b.inner
+                .list_connections()
+                .expect("list_connections")
+                .is_empty(),
+            "no connection may remain in the winner map after shutdown"
+        );
+        assert!(
+            b.inner
+                .get_connection(&a_id)
+                .expect("get_connection")
+                .is_none(),
+            "no lifecycle generation may remain promotable after shutdown"
+        );
+
+        a.shutdown().await;
+    }
+
+    /// #280 (a): single stream owner. An application stream opened by the
+    /// dialer must be delivered to the acceptor's app-stream queue EXACTLY
+    /// once, with a relay server configured (the default), and exactly one
+    /// reader task must own the connection.
+    ///
+    /// Pre-fix on origin/master this fails deterministically: `accept()`
+    /// returned the same connection twice (legacy `ConnectionEstablished`
+    /// accept path) so two reader tasks were spawned — `reader_handle_count`
+    /// was 2 — and the app stream itself was stolen ~50% of the time by the
+    /// redundant per-connection relay accept task, which parsed the app magic
+    /// as a big-endian relay length and silently dropped the stream.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn app_stream_has_single_owner_with_relay_server_configured() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi");
+        send.write_all(b"single-owner").await.expect("write");
+        send.finish().expect("finish");
+
+        // Delivered exactly once: the first accept yields the stream...
+        let (from, _, mut stream) = tokio::time::timeout(Duration::from_secs(15), b.accept_bi())
+            .await
+            .expect("app stream must reach the accept queue")
+            .expect("app stream handle");
+        assert_eq!(from, a_id);
+        let payload = stream.read_to_end(1024).await.expect("read payload");
+        assert_eq!(payload, b"single-owner");
+        // ...and a second accept finds nothing (no duplicate delivery).
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.accept_bi())
+                .await
+                .is_err(),
+            "the app stream must be delivered exactly once"
+        );
+
+        // Exactly one reader task owns the connection (pre-fix: two).
+        assert_eq!(
+            b.reader_handle_count().await,
+            1,
+            "one accepted connection must have exactly one reader task"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #280 (b): an app-magic stream must reach the app queue even when the
+    /// acceptor's reader starts LATE — with a relay server configured (the
+    /// default).
+    ///
+    /// Pre-fix on origin/master this fails deterministically: the moment the
+    /// NAT layer accepted the connection it spawned the redundant relay task,
+    /// the only `accept_bi` consumer until the application accepted. During
+    /// the deliberate 300 ms head start it consumed the dialer's app stream,
+    /// mis-parsed the app magic (`ANQAppB1` → big-endian length
+    /// 1,096,057,153) and silently dropped it — the accept queue stayed empty
+    /// forever (the x0x#277 "shape B" signature: writes succeed, zero
+    /// received). Post-fix there is no second consumer: the stream waits in
+    /// the connection's accept queue until the reader starts.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn late_reader_still_receives_app_stream_with_relay_configured() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        // Deliberately NO accept loop on b yet: on the pre-fix code the
+        // relay task gets an uncontested window over the connection.
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+        let a_id = a.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi");
+        send.write_all(b"late-reader").await.expect("write");
+        send.finish().expect("finish");
+
+        // Give any rogue second consumer an uncontested window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // NOW the application accepts (reader spawns) — the stream must still
+        // be delivered.
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Ok((from, _, mut stream))) =
+                tokio::time::timeout(Duration::from_secs(2), b.accept_bi()).await
+            {
+                assert_eq!(from, a_id);
+                let payload = stream.read_to_end(1024).await.expect("read payload");
+                assert_eq!(payload, b"late-reader");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "app stream was consumed by a rogue accept_bi consumer (dropped silently)"
+            );
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #280 (c): a partial-prefix stream must not leak consumer tasks. The
+    /// reader's `BIDI_PREFIX_READ_TIMEOUT` releases the starved stream; the
+    /// connection keeps exactly one reader and stays fully serviceable.
+    ///
+    /// Pre-fix on origin/master this fails deterministically: the same
+    /// connection was accepted twice (two reader tasks ⇒
+    /// `reader_handle_count` == 2), and every partial-prefix stream
+    /// additionally parked a relay task forever on an unbounded prefix read.
+    // Requires the network-discovery socket path: the fallback
+    // `create_dual_stack_sockets` (no-default-features) cannot accept loopback
+    // connections (see issue tracked separately).
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn partial_prefix_stream_does_not_leak_consumer_tasks() {
+        async fn build_endpoint() -> P2pEndpoint {
+            P2pEndpoint::new(
+                crate::unified_config::P2pConfig::builder()
+                    .bind_addr(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                    .port_mapping_enabled(false)
+                    .build()
+                    .expect("test config"),
+            )
+            .await
+            .expect("endpoint binds")
+        }
+
+        let a = build_endpoint().await;
+        let b = build_endpoint().await;
+        let b_for_accept = b.clone();
+        tokio::spawn(async move { while b_for_accept.accept().await.is_some() {} });
+        let b_addr = localhost_addr(b.local_addr().expect("b bound"));
+        let b_id = b.peer_id();
+
+        tokio::time::timeout(Duration::from_secs(30), a.connect_addr(b_addr))
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+        // Raw stream with a partial (3 of 8 bytes) prefix: the reader must
+        // time the prefix read out and reset the stream instead of parking.
+        let conn = a
+            .inner
+            .get_connection(&b_id)
+            .expect("get_connection")
+            .expect("a is connected to b");
+        let (mut starved_send, _starved_recv) = conn.open_bi().await.expect("raw open_bi");
+        starved_send
+            .write_all(&[0u8; 3])
+            .await
+            .expect("partial prefix write");
+
+        // Wait past BIDI_PREFIX_READ_TIMEOUT so the reader releases the
+        // starved stream (test cfg: 2 s; margin for scheduling).
+        tokio::time::sleep(BIDI_PREFIX_READ_TIMEOUT + Duration::from_millis(500)).await;
+
+        assert_eq!(
+            b.reader_handle_count().await,
+            1,
+            "the starved stream must not grow the reader set (pre-fix: duplicate accept)"
+        );
+
+        // And the same single reader still serves a good app stream.
+        let (mut send, _recv) = a.open_bi(&b_id).await.expect("open_bi after starvation");
+        send.write_all(b"post-starvation").await.expect("write");
+        send.finish().expect("finish");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Ok((_from, _, mut stream))) =
+                tokio::time::timeout(Duration::from_secs(2), b.accept_bi()).await
+            {
+                let payload = stream.read_to_end(1024).await.expect("read payload");
+                assert_eq!(payload, b"post-starvation");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reader never recovered from the starved partial-prefix stream"
+            );
+        }
+
+        drop(starved_send);
+        a.shutdown().await;
+        b.shutdown().await;
     }
 
     /// Regression for the secondary (lazy) read path of winner-map self-heal.

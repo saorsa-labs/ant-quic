@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.52] - 2026-09-13
+
+### Fixed
+
+- **`shutdown()` now aborts and joins the accept workers and refuses late handshake registrations (#286, x0x#692).**
+  The connection accept workers were spawned with their join handles dropped, so `shutdown()` never waited
+  for them, and the registration path had no shutdown check: an inbound handshake completing after the #285
+  lifecycle sweep landed in both `connections` (drained only once, before the sweep) and
+  `connection_lifecycle`, was closed by nobody, and the remote — which registers its own side of the dial —
+  kept the peer "connected" until its idle timeout. Observed downstream as a stale `is_connected` roughly
+  1 run in 20 after `shutdown()` (x0x#692). `shutdown()` now keeps the workers' join handles, aborts and
+  joins them inside the bounded drain before the socket release, and every registration path refuses
+  (and closes) late registrations while the endpoint is shutting down — with the shutdown flag
+  re-checked INSIDE the lifecycle write lock (the same lock the #285 sweep holds) so an insert cannot
+  land past the sweep regardless of scheduling; the hole-punch and validated-candidate winner-map
+  inserts and survivor repromotion are gated the same way. No wire change.
+
+## [0.27.51] - 2026-09-12
+
+### Fixed
+
+- **`disconnect()` no longer leaves a stale connection observable to `open_bi()` (#278, x0x#277).**
+  Peer-scope cleanup closed only the current winner generation: surviving `Superseded`
+  generations stayed open with `close_reason() == None` and remained promotable, so the next
+  `get_connection()` miss repromoted one back to `Live` and re-inserted it into the winner map.
+  After a `disconnect()` → `connect_addr()` churn cycle, `is_connected()` (backed by
+  `connected_peers`) could report the peer live while `open_bi()` (backed by the nat-traversal
+  winner map) handed out streams on the old, half-dead connection — writes then failed with
+  `sending stopped by peer: error 0` or succeeded into a send buffer the teardown discarded,
+  with no error surfaced so application replay logic never fired. Disconnect now sweeps every
+  tracked generation for the peer under the lifecycle lock (closing each synchronously, so
+  `close_reason()` is `Some` immediately) and `open_bi()` reports
+  `ConnectionClosed { reason }` — carrying the disconnect's close reason — instead of a
+  misleading `PeerNotFound` for a peer this endpoint recently closed. No wire or API change.
+
+- **Simultaneous-open tiebreaker now rejects dead winners; promotions propagate to the p2p layer (#277, x0x#510).**
+  Three two-structure disagreements after connection churn/restart: (1) the Live-entry search in
+  `register_connection_lifecycle_parts` ignored `connection.is_alive()`, so a dead-but-Live
+  entry could win the tiebreaker, reject and close the fresh candidate, and leave the winner map
+  aliasing a corpse — dead Live entries are now retired to `Closed` (preferring the transport
+  close reason) before the tiebreak, and the search additionally requires `is_alive()`;
+  (2) `repromote_surviving_connection` repaired the inner winner map without re-registering the
+  promoted survivor at the p2p layer, leaving `is_connected()`/`connected_peers()` false while
+  the DashMap served traffic — promotions now signal the p2p layer through a channel (a stored
+  callback capturing the endpoint would leak it; round 2) whose consumer re-registers the peer
+  with the survivor's real traversal classification (Direct/HolePunch/Relay tracked per generation); (3) `finalize_direct_connection` returned the outer `connected_peers`
+  entry unconditionally in its Rejected branch — a dead entry is now treated as absent, so
+  `Ok` always leaves a live routable connection behind it.
+
+- **One stream consumer per connection: relay accept task removed, single accept source (#280, x0x#277 shape B).**
+  Two unsynchronised `accept_bi()` consumers raced on every accepted connection whenever a relay
+  server existed (the default): the NAT layer spawned `handle_relay_requests` per connection while
+  the endpoint reader task polled the same source. When the relay task won, it read the 8-byte
+  prefix, had no app-magic branch, parsed `ANQAppB1` as a big-endian length (1,096,057,153),
+  tripped "request too large" and silently dropped the stream — writes succeed, the peer's
+  `accept_bi()` never yields. Independently, `accept_connection()` drained a legacy
+  `ConnectionEstablished` path beside the pending-accept queue, so one connection could be
+  returned twice and spawn two reader tasks; `handle_relay_requests`' prefix read also had no
+  timeout (a remote-triggerable task leak per partial-prefix stream). The redundant relay accept
+  task (and its now-dead ACK-bidi bridge plumbing) is deleted — relay serving runs exclusively
+  through the reader's prefix demux (ACK-v2 → app → relay, with `BIDI_PREFIX_READ_TIMEOUT`); the
+  bounded `pending_accepts` queue is the sole accept source; no unbounded prefix read remains.
+  No wire, frame or transport-parameter change. Contract note: relay serving on a node now
+  requires the application to drive `accept()` (the relay demux lives inside the reader task an
+  accepted connection gets) — a node that never drains `accept()` serves neither relay, ACK-v2
+  nor app streams. `relay_connect_udp_bind_on_live_node` now drives the supported
+  single-consumer path (the relay node accepts; pre-fix it deliberately avoided `accept()` to
+  dodge the race this change removes). Relay streams are served on their own task so a live
+  relay session never pins the reader (`run_stream_forwarding_loop` shares the peer
+  connection), and `spawn_reader_task` now enforces one reader per connection (stable_id).
+
+- **`shutdown()` closes superseded lifecycle survivors before the drain (#283, x0x#510).**
+  `NatTraversalEndpoint::shutdown` closed only the canonical `connections` entries; Superseded
+  survivors were closed merely implicitly by the post-drain `connection_lifecycle.clear()`,
+  immediately before `release_socket_for_shutdown` yanked the socket, so their CONNECTION_CLOSE
+  frames frequently never transmitted. The remote then kept the peer "connected" (its
+  `is_peer_connected` repromotes any still-alive Superseded entry) until the idle timeout — the
+  x0x restart-class "old owner connection never observed as gone". Shutdown now explicitly
+  closes every lifecycle-tracked generation BEFORE the bounded drain, so the close frames flush
+  while the socket still exists and the remote observes the disconnect within the drain window.
+  The remote-side repromotion logic itself is unchanged (possible follow-up).
+
+## [0.27.50] - 2026-09-07
+
+### Fixed
+
+- **Honor explicit `P2pConfig.bind_addr` without collapsing to a wildcard (#274).** The preferred
+  dual-stack binder previously extracted only the port from non-wildcard bind requests, so
+  `127.0.0.1:0` (and other explicit IPs) could return a wildcard IPv6 socket and advertise an
+  unusable address to consumers. Explicit IPs now go through the single-address binder with the
+  complete requested socket address; the actual bound family/address/port (including port-zero
+  allocation) is returned, and an explicit bind failure is propagated without widening.
+  `None` and wildcard requests keep the existing dual-stack and fallback behavior. Merged as
+  #274 (`d78b78f5ce6d3a8d060a7a1f6644d2d87753c463`); crates.io 0.27.49 still has the old bind
+  behavior and cannot be republished.
+
+## [0.27.49] - 2026-09-06
+
 ### Fixed
 
 - **RFC 9000 §14 compliance: PQC handshakes no longer rely on IP fragmentation (#270, x0x#505).**
@@ -23,9 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path MTU. PQ handshake volume continues to flow as multiple ≤MTU datagrams of split CRYPTO
   frames; the server's first flight was ~95% padding, not key material. Regression tests drive
   a full PQC handshake through the low-level state machines and assert every transmit fits
-  1200 bytes (fails on the pre-fix code with three 4096-byte datagrams).
-
-
+  1200 bytes (fails on the pre-fix code with three 4096-byte datagrams). Merged as #271
+  (`c3ca46adef666e83750ec4bae160deb8c5b61094`), including PATH_RESPONSE token echo and
+  PATH_CHALLENGE finalize/encrypt repairs before merge.
 
 ## [0.27.48] - 2026-09-02
 
@@ -99,10 +197,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a check-then-act that per-stream concurrency could race into double delivery.
   Cross-stream ordering was never guaranteed (each stream is one self-contained
   message); per-stream `data_tx` ordering is unchanged.
-
-## [Unreleased]
-
-### Fixed
 
 - **Stream-scoped read errors no longer kill the connection reader (#255 fix A).** A peer
   resetting one stream mid-message (the fork's Drop⇒RESET abandonment class, `0xA17C0244` —
