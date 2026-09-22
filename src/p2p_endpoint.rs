@@ -16558,22 +16558,28 @@ mod tests {
             "only B's selected registration may be parked"
         );
 
-        // Start B's shutdown and wait for its explicit post-lifecycle-sweep
-        // anchor. Shutdown cannot join the parked accept worker until the
-        // gate is released, so awaiting full shutdown here would deadlock.
+        // Start B's shutdown and hold it immediately after the lifecycle
+        // sweep, before any production drain or socket-release deadline.
         let b_for_shutdown = b.clone();
         let shutdown = tokio::spawn(async move { b_for_shutdown.inner.shutdown().await });
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            b.inner.wait_for_shutdown_lifecycle_sweep_for_test(),
-        )
-        .await
-        .expect("shutdown did not complete its lifecycle sweep");
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_shutdown_paused())
+            .await
+            .expect("shutdown did not pause after its lifecycle sweep");
 
         // Release the parked registration: it resumes exactly in the
         // worst-case window (post-sweep). The in-lock re-check must refuse
         // it; on the unfixed tree it inserts the stale survivor.
         gate.release();
+        let registrar_outcome =
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_for_registrar_outcome())
+                .await
+                .expect("parked registrar did not finish");
+        assert_eq!(
+            registrar_outcome,
+            crate::nat_traversal_api::GatedRegistrarOutcome::RefusedAndDropped,
+            "a post-sweep registrar must be refused and drop its task-local connection"
+        );
+        gate.release_shutdown();
         drop(gate);
         tokio::time::timeout(Duration::from_secs(15), shutdown)
             .await
