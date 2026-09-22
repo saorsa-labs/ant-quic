@@ -77,6 +77,9 @@ jobs:
       - name: Run library tests
         run: cargo test --lib --all-features -- --test-threads=2
 
+      - name: Run receive-generation queued reconnect tests
+        run: cargo test --test node_recv_generation --all-features -- --test-threads=1
+
       - name: Run integration tests
         run: |
           cargo test --test quick --all-features -- --test-threads=2 --skip auto_binding --skip binding_stream --skip kem_group_is_restricted_with_provider

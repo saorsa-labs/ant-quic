@@ -47,6 +47,21 @@ pub(crate) const SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX: &str =
 pub(crate) const SHUTDOWN_LISTENER_TIMEOUT_PREFIX: &str =
     "shutdown listener termination unconfirmed:";
 
+/// Reserved receive provenance for data without a proven live connection.
+pub(crate) const UNAUTHENTICATED_GENERATION: u64 = u64::MAX;
+
+// Shared by every endpoint in this process, including endpoints created after shutdown.
+static CONNECTION_GENERATIONS: std::sync::LazyLock<Arc<AtomicU64>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(1)));
+
+fn allocate_connection_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            (next < UNAUTHENTICATED_GENERATION).then(|| next + 1)
+        })
+        .ok()
+}
+
 /// Creates a bind address that allows the OS to select a random available port
 ///
 /// This provides protocol obfuscation by preventing port fingerprinting, which improves
@@ -2231,7 +2246,7 @@ impl NatTraversalEndpoint {
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
-            next_connection_generation: Arc::new(AtomicU64::new(1)),
+            next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -2757,7 +2772,7 @@ impl NatTraversalEndpoint {
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
-            next_connection_generation: Arc::new(AtomicU64::new(1)),
+            next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -7216,7 +7231,14 @@ impl NatTraversalEndpoint {
             // is synchronous; unrelated endpoints continue registering.
             gate.wait_for_release();
         }
-        let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
+        let Some(generation) = allocate_connection_generation(next_connection_generation) else {
+            // Exhaustion is terminal for allocation: never wrap or issue the stale sentinel.
+            connection.close(VarInt::from_u32(0), b"connection generation exhausted");
+            tracing::error!("connection generation namespace exhausted");
+            return ConnectionRegistrationOutcome::Rejected {
+                winner_generation: UNAUTHENTICATED_GENERATION,
+            };
+        };
         let tracked = TrackedConnection {
             connection: connection.clone(),
             generation,
@@ -7372,6 +7394,19 @@ impl NatTraversalEndpoint {
             })
     }
 
+    pub(crate) fn current_connection_generation(&self, peer_id: &PeerId) -> Option<u64> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)?
+            .iter()
+            .filter(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live)
+                    && entry.connection.close_reason().is_none()
+            })
+            .map(|entry| entry.generation)
+            .max()
+    }
+
     pub(crate) fn connection_snapshot_by_stable_id(
         &self,
         peer_id: &PeerId,
@@ -7380,7 +7415,14 @@ impl NatTraversalEndpoint {
         self.connection_lifecycle
             .read()
             .get(peer_id)
-            .and_then(|entries| entries.iter().find(|entry| entry.stable_id() == stable_id))
+            .and_then(|entries| {
+                // Retired registrations can share a reused underlying stable_id.
+                // Reader setup must bind to the newest registration of that handle.
+                entries
+                    .iter()
+                    .filter(|entry| entry.stable_id() == stable_id)
+                    .max_by_key(|entry| entry.generation)
+            })
             .map(|entry| ConnectionLifecycleSnapshot {
                 generation: entry.generation,
                 stable_id: entry.stable_id(),
@@ -14284,6 +14326,77 @@ mod tests {
             .expect("loopback handshake must not hang")
             .expect("loopback handshake must succeed");
         (server, client, conn)
+    }
+
+    #[test]
+    fn receive_generation_allocation_is_monotonic_and_never_wraps() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(allocate_connection_generation(&counter), Some(1));
+        assert_eq!(allocate_connection_generation(&counter), Some(2));
+        let exhausted = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_connection_generation(&exhausted),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(allocate_connection_generation(&exhausted), None);
+        assert_eq!(allocate_connection_generation(&exhausted), None);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn receive_generation_reused_stable_id_uses_new_registration() {
+        let (_server, client, connection) = loopback_quic_connection().await;
+        let peer = PeerId([0x51; 32]);
+        let register = || {
+            NatTraversalEndpoint::register_connection_lifecycle_parts(
+                client.local_peer_id,
+                &client.connections,
+                &client.connection_lifecycle,
+                &client.next_connection_generation,
+                &client.emitted_established_events,
+                &AtomicBool::new(false),
+                peer,
+                connection.clone(),
+            )
+        };
+        let first = register();
+        let ConnectionRegistrationOutcome::Live {
+            generation: old, ..
+        } = first
+        else {
+            assert!(matches!(first, ConnectionRegistrationOutcome::Live { .. }));
+            return;
+        };
+        // Model allocator pointer/stable_id reuse after retirement without relying
+        // on a platform allocator to recycle a real connection allocation.
+        client.connection_lifecycle.write().get_mut(&peer).unwrap()[0].state =
+            ConnectionLifecycleState::Closed {
+                reason: ConnectionCloseReason::LocallyClosed,
+                closed_at_unix_ms: now_unix_ms(),
+            };
+        let replacement = register();
+        assert!(matches!(
+            replacement,
+            ConnectionRegistrationOutcome::Live { .. }
+        ));
+        let ConnectionRegistrationOutcome::Live {
+            generation: new, ..
+        } = replacement
+        else {
+            return;
+        };
+        assert!(new > old);
+        assert_eq!(
+            client
+                .connection_snapshot_by_stable_id(&peer, connection.stable_id())
+                .map(|snapshot| snapshot.generation),
+            Some(new)
+        );
+        assert_eq!(client.current_connection_generation(&peer), Some(new));
+        assert!(Arc::ptr_eq(
+            &client.next_connection_generation,
+            &CONNECTION_GENERATIONS
+        ));
     }
 
     /// Seed a single tracked generation for `peer_id` directly into the

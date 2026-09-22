@@ -709,6 +709,44 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Send bytes only on the authenticated QUIC connection with `generation`.
+    ///
+    /// The generation is in the same process-local namespace as
+    /// [`Self::recv_with_generation`] and [`Self::current_connection_generation`].
+    /// If that connection was replaced before stream admission, the bytes are
+    /// rejected; they are never retried on the replacement connection.
+    pub async fn send_on_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), NodeError> {
+        self.inner
+            .send_on_generation(peer_id, generation, data)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
+    /// Pin the send to `generation` and evaluate `admit` after stream
+    /// allocation, immediately before writing on that same connection.
+    /// The callback is not called for a stale generation; refusal sends no
+    /// bytes and the operation never reconnects or selects another transport.
+    pub async fn send_on_generation_with_admission<B, F>(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        admit: F,
+    ) -> Result<(), NodeError>
+    where
+        B: AsRef<[u8]> + Send,
+        F: FnOnce(u64) -> Result<B, EndpointError> + Send,
+    {
+        self.inner
+            .send_on_generation_with_admission(peer_id, generation, admit)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Send data and wait until the remote receive pipeline accepts it.
     pub async fn send_with_receive_ack(
         &self,
@@ -788,6 +826,26 @@ impl Node {
     /// Receive data from any peer
     pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), NodeError> {
         self.inner.recv().await.map_err(NodeError::Endpoint)
+    }
+
+    /// Receive data with the process-local generation of the connection that read it.
+    ///
+    /// Shares a queue with [`Self::recv`]. A reconnect does not change the stamp
+    /// on queued bytes. `u64::MAX` denotes stale pre-authentication data or data
+    /// without proven QUIC lifecycle provenance and must not authorize a session.
+    pub async fn recv_with_generation(&self) -> Result<(PeerId, u64, Vec<u8>), NodeError> {
+        self.inner
+            .recv_with_generation()
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
+    /// Generation of the currently live, open QUIC connection for `peer`, if any.
+    ///
+    /// Generations share the namespace returned by [`Self::recv_with_generation`].
+    /// This snapshot must not be used to stamp previously received data.
+    pub fn current_connection_generation(&self, peer: &PeerId) -> Option<u64> {
+        self.inner.current_connection_generation(peer)
     }
 
     // === Application byte-streams ============================================
