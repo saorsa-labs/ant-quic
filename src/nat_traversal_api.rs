@@ -9049,16 +9049,23 @@ impl NatTraversalEndpoint {
         #[cfg(not(test))]
         let release_timeout = DEFAULT_SOCKET_RELEASE_TIMEOUT;
         let deadline = Instant::now() + release_timeout;
+        let mut observations: Vec<_> = records
+            .iter()
+            .map(|record| (record.address, "not_yet_observed"))
+            .collect();
 
-        for record in &records {
+        for (index, record) in records.iter().enumerate() {
             loop {
                 if record.socket.upgrade().is_none() {
                     match std::net::UdpSocket::bind(record.address) {
                         Ok(probe) => {
+                            observations[index].1 = "released_and_probe_bound";
                             drop(probe);
                             break;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                            observations[index].1 = "weak_gone_but_address_in_use";
+                        }
                         Err(error) => {
                             return Err(NatTraversalError::NetworkError(format!(
                                 "{SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX} {}: {error}",
@@ -9066,14 +9073,18 @@ impl NatTraversalEndpoint {
                             )));
                         }
                     }
+                } else {
+                    observations[index].1 = "weak_socket_owner_still_live";
                 }
 
                 if Instant::now() >= deadline {
                     let mut addresses: Vec<_> = records.iter().map(|item| item.address).collect();
                     addresses.sort_unstable();
                     addresses.dedup();
+                    observations.sort_unstable_by_key(|(address, _)| *address);
                     return Err(NatTraversalError::NetworkError(format!(
-                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}"
+                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}; \
+                         last_observations={observations:?}"
                     )));
                 }
                 sleep(SOCKET_RELEASE_POLL_INTERVAL).await;
