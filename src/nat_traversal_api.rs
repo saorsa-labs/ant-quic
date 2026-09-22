@@ -520,6 +520,19 @@ pub(crate) struct RegistrationGate {
     released: std::sync::Mutex<bool>,
     release_notify: std::sync::Condvar,
     parked_notify: tokio::sync::Notify,
+    registrar_outcome: std::sync::atomic::AtomicU8,
+    registrar_outcome_notify: tokio::sync::Notify,
+    shutdown_paused: AtomicBool,
+    shutdown_paused_notify: tokio::sync::Notify,
+    shutdown_released: AtomicBool,
+    shutdown_release_notify: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedRegistrarOutcome {
+    RefusedAndDropped,
+    LiveInserted,
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
@@ -540,6 +553,53 @@ impl RegistrationGate {
                 return;
             }
             parked.await;
+        }
+    }
+
+    pub(crate) async fn wait_until_shutdown_paused(&self) {
+        loop {
+            let paused = self.shutdown_paused_notify.notified();
+            if self.shutdown_paused.load(Ordering::SeqCst) {
+                return;
+            }
+            paused.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_registrar_outcome(&self) -> GatedRegistrarOutcome {
+        loop {
+            let changed = self.registrar_outcome_notify.notified();
+            match self.registrar_outcome.load(Ordering::SeqCst) {
+                1 => return GatedRegistrarOutcome::RefusedAndDropped,
+                2 => return GatedRegistrarOutcome::LiveInserted,
+                _ => changed.await,
+            }
+        }
+    }
+
+    pub(crate) fn release_shutdown(&self) {
+        self.shutdown_released.store(true, Ordering::SeqCst);
+        self.shutdown_release_notify.notify_waiters();
+    }
+
+    fn record_registrar_outcome(&self, outcome: GatedRegistrarOutcome) {
+        let encoded = match outcome {
+            GatedRegistrarOutcome::RefusedAndDropped => 1,
+            GatedRegistrarOutcome::LiveInserted => 2,
+        };
+        self.registrar_outcome.store(encoded, Ordering::SeqCst);
+        self.registrar_outcome_notify.notify_waiters();
+    }
+
+    async fn pause_shutdown_after_sweep(&self) {
+        self.shutdown_paused.store(true, Ordering::SeqCst);
+        self.shutdown_paused_notify.notify_waiters();
+        loop {
+            let released = self.shutdown_release_notify.notified();
+            if self.shutdown_released.load(Ordering::SeqCst) {
+                return;
+            }
+            released.await;
         }
     }
 
@@ -587,6 +647,7 @@ impl std::ops::Deref for RegistrationGateGuard {
 impl Drop for RegistrationGateGuard {
     fn drop(&mut self) {
         self.gate.release();
+        self.gate.release_shutdown();
         let mut armed = REGISTRATION_GATES.write();
         if armed
             .get(&self.gate.target_shutdown)
@@ -622,6 +683,12 @@ fn arm_registration_gate_for_test(shutting_down: &Arc<AtomicBool>) -> Registrati
         released: std::sync::Mutex::new(false),
         release_notify: std::sync::Condvar::new(),
         parked_notify: tokio::sync::Notify::new(),
+        registrar_outcome: std::sync::atomic::AtomicU8::new(0),
+        registrar_outcome_notify: tokio::sync::Notify::new(),
+        shutdown_paused: AtomicBool::new(false),
+        shutdown_paused_notify: tokio::sync::Notify::new(),
+        shutdown_released: AtomicBool::new(false),
+        shutdown_release_notify: tokio::sync::Notify::new(),
     });
     REGISTRATION_GATES
         .write()
@@ -832,10 +899,6 @@ pub struct NatTraversalEndpoint {
     listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
     #[cfg(test)]
     force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
-    #[cfg(all(test, feature = "network-discovery"))]
-    shutdown_lifecycle_swept: std::sync::atomic::AtomicBool,
-    #[cfg(all(test, feature = "network-discovery"))]
-    shutdown_lifecycle_swept_notify: tokio::sync::Notify,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
     constrained_engine: Arc<ParkingMutex<ConstrainedEngine>>,
@@ -2206,10 +2269,6 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, feature = "network-discovery"))]
-            shutdown_lifecycle_swept: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, feature = "network-discovery"))]
-            shutdown_lifecycle_swept_notify: tokio::sync::Notify::new(),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -2736,10 +2795,6 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, feature = "network-discovery"))]
-            shutdown_lifecycle_swept: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, feature = "network-discovery"))]
-            shutdown_lifecycle_swept_notify: tokio::sync::Notify::new(),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -5710,6 +5765,8 @@ impl NatTraversalEndpoint {
                     let pending_accepts = pending_accepts.clone();
                     let shutdown = shutdown.clone();
                     tokio::spawn(async move {
+                        #[cfg(all(test, feature = "network-discovery"))]
+                        let registration_gate = take_registration_gate_for_pause(shutdown.as_ref());
                         match connecting.await {
                             Ok(connection) => {
                                 info!("Accepted connection from {}", connection.remote_address());
@@ -5735,6 +5792,12 @@ impl NatTraversalEndpoint {
 
                                 let generation = match outcome {
                                     ConnectionRegistrationOutcome::Live { generation, .. } => {
+                                        #[cfg(all(test, feature = "network-discovery"))]
+                                        if let Some(gate) = &registration_gate {
+                                            gate.record_registrar_outcome(
+                                                GatedRegistrarOutcome::LiveInserted,
+                                            );
+                                        }
                                         generation
                                     }
                                     ConnectionRegistrationOutcome::Rejected {
@@ -5749,6 +5812,15 @@ impl NatTraversalEndpoint {
                                     ConnectionRegistrationOutcome::Refused => {
                                         // Late registration during shutdown;
                                         // the connection is already closed.
+                                        #[cfg(all(test, feature = "network-discovery"))]
+                                        {
+                                            drop(connection);
+                                            if let Some(gate) = &registration_gate {
+                                                gate.record_registrar_outcome(
+                                                    GatedRegistrarOutcome::RefusedAndDropped,
+                                                );
+                                            }
+                                        }
                                         return;
                                     }
                                 };
@@ -8801,17 +8873,6 @@ impl NatTraversalEndpoint {
         arm_registration_gate_for_test(&self.shutdown)
     }
 
-    #[cfg(all(test, feature = "network-discovery"))]
-    pub(crate) async fn wait_for_shutdown_lifecycle_sweep_for_test(&self) {
-        loop {
-            let swept = self.shutdown_lifecycle_swept_notify.notified();
-            if self.shutdown_lifecycle_swept.load(Ordering::SeqCst) {
-                return;
-            }
-            swept.await;
-        }
-    }
-
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
         let _shutdown_guard = self.shutdown_lock.lock().await;
         let mut shutdown_error = None;
@@ -8863,8 +8924,9 @@ impl NatTraversalEndpoint {
 
         #[cfg(all(test, feature = "network-discovery"))]
         {
-            self.shutdown_lifecycle_swept.store(true, Ordering::SeqCst);
-            self.shutdown_lifecycle_swept_notify.notify_waiters();
+            if let Some(gate) = take_registration_gate_for_pause(self.shutdown.as_ref()) {
+                gate.pause_shutdown_after_sweep().await;
+            }
         }
 
         // #286: abort and join the accept workers BEFORE the bounded drain,
@@ -9049,16 +9111,23 @@ impl NatTraversalEndpoint {
         #[cfg(not(test))]
         let release_timeout = DEFAULT_SOCKET_RELEASE_TIMEOUT;
         let deadline = Instant::now() + release_timeout;
+        let mut observations: Vec<_> = records
+            .iter()
+            .map(|record| (record.address, "not_yet_observed"))
+            .collect();
 
-        for record in &records {
+        for (index, record) in records.iter().enumerate() {
             loop {
                 if record.socket.upgrade().is_none() {
                     match std::net::UdpSocket::bind(record.address) {
                         Ok(probe) => {
+                            observations[index].1 = "released_and_probe_bound";
                             drop(probe);
                             break;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                            observations[index].1 = "weak_gone_but_address_in_use";
+                        }
                         Err(error) => {
                             return Err(NatTraversalError::NetworkError(format!(
                                 "{SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX} {}: {error}",
@@ -9066,14 +9135,18 @@ impl NatTraversalEndpoint {
                             )));
                         }
                     }
+                } else {
+                    observations[index].1 = "weak_socket_owner_still_live";
                 }
 
                 if Instant::now() >= deadline {
                     let mut addresses: Vec<_> = records.iter().map(|item| item.address).collect();
                     addresses.sort_unstable();
                     addresses.dedup();
+                    observations.sort_unstable_by_key(|(address, _)| *address);
                     return Err(NatTraversalError::NetworkError(format!(
-                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}"
+                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}; \
+                         last_observations={observations:?}"
                     )));
                 }
                 sleep(SOCKET_RELEASE_POLL_INTERVAL).await;
