@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.27.53] - 2026-09-21
+
+### Fixed
+
+- Give address-only direct dialing the remaining connection budget while reserving
+  bounded time for relay fallback; cancel losing Happy Eyeballs attempts.
+- Retain and join outgoing hole-punch handshake workers during shutdown, and
+  serialize shutdown callers through confirmed listener and UDP socket release.
+  Failed release records remain available for a retry instead of being discarded.
+- Update Rustls to 0.23.45 for its security fixes.
+
+### Added
+
+- `P2pEndpoint::try_shutdown` and `Node::try_shutdown` return transport cleanup
+  failures to embedders. Existing unit-returning shutdown wrappers remain available.
+
 ## [0.27.52] - 2026-09-13
 
 ### Fixed
