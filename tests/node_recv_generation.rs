@@ -156,19 +156,29 @@ async fn recv_generation_survives_queued_reconnect_and_recv_stays_compatible() {
                 .expect("ack recv"),
             (sender_id, current, b"new ack".to_vec())
         );
-        assert_eq!(
-            timeout(DEADLINE, receiver.recv_with_generation())
+        // These are independent uni streams: QUIC does not promise their
+        // delivery order even though the sends completed in sequence.
+        let mut received = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (peer, generation, bytes) = timeout(DEADLINE, receiver.recv_with_generation())
                 .await
-                .expect("pinned recv timeout")
-                .expect("pinned recv"),
-            (sender_id, current, b"pinned".to_vec())
+                .expect("pinned/guarded recv timeout")
+                .expect("pinned/guarded recv");
+            assert_eq!(peer, sender_id);
+            assert_eq!(generation, current);
+            received.push(bytes);
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            [b"guarded".to_vec(), b"pinned".to_vec()],
+            "both current-generation frames must arrive exactly once"
         );
-        assert_eq!(
-            timeout(DEADLINE, receiver.recv_with_generation())
+        assert!(
+            timeout(Duration::from_millis(250), receiver.recv_with_generation())
                 .await
-                .expect("guarded recv timeout")
-                .expect("guarded recv"),
-            (sender_id, current, b"guarded".to_vec())
+                .is_err(),
+            "stale or refused sends must not enqueue additional bytes"
         );
     }
     sender
