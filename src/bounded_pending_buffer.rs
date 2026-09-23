@@ -19,6 +19,7 @@ use crate::nat_traversal_api::PeerId;
 #[derive(Debug)]
 struct PendingEntry {
     data: Vec<u8>,
+    generation: u64,
     created_at: Instant,
 }
 
@@ -70,6 +71,20 @@ impl BoundedPendingBuffer {
 
     /// Push data for a peer, dropping oldest if limits exceeded
     pub fn push(&mut self, peer_id: &PeerId, data: Vec<u8>) -> Result<(), PendingBufferError> {
+        self.push_with_generation(
+            peer_id,
+            crate::nat_traversal_api::UNAUTHENTICATED_GENERATION,
+            data,
+        )
+    }
+
+    /// Buffer provenance at insertion, before any authentication or reconnect can finish.
+    pub(crate) fn push_with_generation(
+        &mut self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: Vec<u8>,
+    ) -> Result<(), PendingBufferError> {
         let data_len = data.len();
 
         // Reject single messages larger than limit
@@ -97,6 +112,7 @@ impl BoundedPendingBuffer {
         // Add new entry
         peer_data.entries.push_back(PendingEntry {
             data,
+            generation,
             created_at: Instant::now(),
         });
         peer_data.total_bytes += data_len;
@@ -106,6 +122,10 @@ impl BoundedPendingBuffer {
 
     /// Pop the oldest pending data for a peer
     pub fn pop(&mut self, peer_id: &PeerId) -> Option<Vec<u8>> {
+        self.pop_with_generation(peer_id).map(|(_, data)| data)
+    }
+
+    fn pop_with_generation(&mut self, peer_id: &PeerId) -> Option<(u64, Vec<u8>)> {
         let peer_data = self.data.get_mut(peer_id)?;
         let entry = peer_data.entries.pop_front()?;
         peer_data.total_bytes = peer_data.total_bytes.saturating_sub(entry.data.len());
@@ -115,7 +135,7 @@ impl BoundedPendingBuffer {
             self.data.remove(peer_id);
         }
 
-        Some(entry.data)
+        Some((entry.generation, entry.data))
     }
 
     /// Pop oldest data from any peer (returns peer_id and data)
@@ -124,6 +144,13 @@ impl BoundedPendingBuffer {
         let peer_id = *self.data.keys().next()?;
         let data = self.pop(&peer_id)?;
         Some((peer_id, data))
+    }
+
+    /// Pop data without losing the connection generation captured at insertion.
+    pub(crate) fn pop_any_with_generation(&mut self) -> Option<(PeerId, u64, Vec<u8>)> {
+        let peer_id = *self.data.keys().next()?;
+        let (generation, data) = self.pop_with_generation(&peer_id)?;
+        Some((peer_id, generation, data))
     }
 
     /// Peek at the oldest entry without removing
@@ -414,6 +441,27 @@ mod tests {
         // Buffer should be empty now
         assert!(buffer.is_empty());
         assert!(buffer.pop_any().is_none());
+    }
+
+    #[test]
+    fn queued_connection_generations_survive_replacement() {
+        let mut buffer = BoundedPendingBuffer::new(1024, 4, Duration::from_secs(30));
+        let peer = PeerId([0x76; 32]);
+        buffer
+            .push_with_generation(&peer, 41, b"old".to_vec())
+            .expect("old frame");
+        buffer
+            .push_with_generation(&peer, 42, b"new".to_vec())
+            .expect("new frame");
+        assert_eq!(
+            buffer.pop_any_with_generation(),
+            Some((peer, 41, b"old".to_vec()))
+        );
+        assert_eq!(
+            buffer.pop_any_with_generation(),
+            Some((peer, 42, b"new".to_vec()))
+        );
+        assert!(buffer.is_empty());
     }
 
     #[test]

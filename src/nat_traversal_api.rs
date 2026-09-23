@@ -22,6 +22,10 @@ use crate::coordinator_control::{
     remove_inbound_offer, remove_pending_request, take_live_rejection,
     wire_and_monotonic_expiry_after,
 };
+#[cfg(any(not(wasm_browser), all(test, feature = "network-discovery")))]
+use std::sync::Weak;
+#[cfg(not(wasm_browser))]
+use std::time::Instant;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -34,6 +38,29 @@ use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
 use crate::transport::TransportRegistry;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
+
+#[cfg(not(wasm_browser))]
+pub(crate) const SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX: &str = "shutdown socket release timeout:";
+#[cfg(not(wasm_browser))]
+pub(crate) const SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX: &str =
+    "shutdown socket release probe failed:";
+pub(crate) const SHUTDOWN_LISTENER_TIMEOUT_PREFIX: &str =
+    "shutdown listener termination unconfirmed:";
+
+/// Reserved receive provenance for data without a proven live connection.
+pub(crate) const UNAUTHENTICATED_GENERATION: u64 = u64::MAX;
+
+// Shared by every endpoint in this process, including endpoints created after shutdown.
+static CONNECTION_GENERATIONS: std::sync::LazyLock<Arc<AtomicU64>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(1)));
+
+fn allocate_connection_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            (next < UNAUTHENTICATED_GENERATION).then(|| next + 1)
+        })
+        .ok()
+}
 
 /// Creates a bind address that allows the OS to select a random available port
 ///
@@ -504,33 +531,184 @@ pub(crate) fn refuse_registration(
 #[cfg(all(test, feature = "network-discovery"))]
 pub(crate) struct RegistrationGate {
     pub(crate) parked_count: std::sync::atomic::AtomicUsize,
-    pub(crate) released: std::sync::atomic::AtomicBool,
+    target_shutdown: usize,
+    released: std::sync::Mutex<bool>,
+    release_notify: std::sync::Condvar,
+    parked_notify: tokio::sync::Notify,
+    registrar_outcome: std::sync::atomic::AtomicU8,
+    registrar_outcome_notify: tokio::sync::Notify,
+    shutdown_paused: AtomicBool,
+    shutdown_paused_notify: tokio::sync::Notify,
+    shutdown_released: AtomicBool,
+    shutdown_release_notify: tokio::sync::Notify,
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
-static REGISTRATION_GATE: ParkingRwLock<Option<Arc<RegistrationGate>>> = ParkingRwLock::new(None);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedRegistrarOutcome {
+    RefusedAndDropped,
+    LiveInserted,
+}
 
 #[cfg(all(test, feature = "network-discovery"))]
-fn take_registration_gate_for_pause() -> Option<Arc<RegistrationGate>> {
-    REGISTRATION_GATE.read().clone()
+impl RegistrationGate {
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.release_notify.notify_all();
+    }
+
+    pub(crate) async fn wait_until_parked(&self) {
+        loop {
+            let parked = self.parked_notify.notified();
+            if self.parked_count.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            parked.await;
+        }
+    }
+
+    pub(crate) async fn wait_until_shutdown_paused(&self) {
+        loop {
+            let paused = self.shutdown_paused_notify.notified();
+            if self.shutdown_paused.load(Ordering::SeqCst) {
+                return;
+            }
+            paused.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_registrar_outcome(&self) -> GatedRegistrarOutcome {
+        loop {
+            let changed = self.registrar_outcome_notify.notified();
+            match self.registrar_outcome.load(Ordering::SeqCst) {
+                1 => return GatedRegistrarOutcome::RefusedAndDropped,
+                2 => return GatedRegistrarOutcome::LiveInserted,
+                _ => changed.await,
+            }
+        }
+    }
+
+    pub(crate) fn release_shutdown(&self) {
+        self.shutdown_released.store(true, Ordering::SeqCst);
+        self.shutdown_release_notify.notify_waiters();
+    }
+
+    fn record_registrar_outcome(&self, outcome: GatedRegistrarOutcome) {
+        let encoded = match outcome {
+            GatedRegistrarOutcome::RefusedAndDropped => 1,
+            GatedRegistrarOutcome::LiveInserted => 2,
+        };
+        self.registrar_outcome.store(encoded, Ordering::SeqCst);
+        self.registrar_outcome_notify.notify_waiters();
+    }
+
+    async fn pause_shutdown_after_sweep(&self) {
+        self.shutdown_paused.store(true, Ordering::SeqCst);
+        self.shutdown_paused_notify.notify_waiters();
+        loop {
+            let released = self.shutdown_release_notify.notified();
+            if self.shutdown_released.load(Ordering::SeqCst) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    fn wait_for_release(&self) {
+        self.wait_for_release_with_timeout(Duration::from_secs(30));
+    }
+
+    fn wait_for_release_with_timeout(&self, timeout: Duration) {
+        self.parked_count.fetch_add(1, Ordering::SeqCst);
+        self.parked_notify.notify_waiters();
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (released, wait_result) = self
+            .release_notify
+            .wait_timeout_while(released, timeout, |released| !*released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_released = *released;
+        let timed_out = wait_result.timed_out();
+        drop(released);
+        self.parked_count.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            was_released && !timed_out,
+            "registration gate was not released within the test deadline"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct RegistrationGateGuard {
+    gate: Arc<RegistrationGate>,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl std::ops::Deref for RegistrationGateGuard {
+    type Target = RegistrationGate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl Drop for RegistrationGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        self.gate.release_shutdown();
+        let mut armed = REGISTRATION_GATES.write();
+        if armed
+            .get(&self.gate.target_shutdown)
+            .and_then(Weak::upgrade)
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+        {
+            armed.remove(&self.gate.target_shutdown);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static REGISTRATION_GATES: std::sync::LazyLock<
+    ParkingRwLock<HashMap<usize, Weak<RegistrationGate>>>,
+> = std::sync::LazyLock::new(|| ParkingRwLock::new(HashMap::new()));
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn take_registration_gate_for_pause(shutting_down: &AtomicBool) -> Option<Arc<RegistrationGate>> {
+    let target_shutdown = std::ptr::from_ref(shutting_down) as usize;
+    REGISTRATION_GATES
+        .read()
+        .get(&target_shutdown)
+        .and_then(Weak::upgrade)
 }
 
 /// Arm the registration gate; returns the gate so the test can observe the
 /// park and release it.
 #[cfg(all(test, feature = "network-discovery"))]
-pub(crate) fn arm_registration_gate_for_test() -> Arc<RegistrationGate> {
+fn arm_registration_gate_for_test(shutting_down: &Arc<AtomicBool>) -> RegistrationGateGuard {
     let gate = Arc::new(RegistrationGate {
         parked_count: std::sync::atomic::AtomicUsize::new(0),
-        released: std::sync::atomic::AtomicBool::new(false),
+        target_shutdown: Arc::as_ptr(shutting_down) as usize,
+        released: std::sync::Mutex::new(false),
+        release_notify: std::sync::Condvar::new(),
+        parked_notify: tokio::sync::Notify::new(),
+        registrar_outcome: std::sync::atomic::AtomicU8::new(0),
+        registrar_outcome_notify: tokio::sync::Notify::new(),
+        shutdown_paused: AtomicBool::new(false),
+        shutdown_paused_notify: tokio::sync::Notify::new(),
+        shutdown_released: AtomicBool::new(false),
+        shutdown_release_notify: tokio::sync::Notify::new(),
     });
-    *REGISTRATION_GATE.write() = Some(Arc::clone(&gate));
-    gate
-}
-
-/// Disarm the registration gate.
-#[cfg(all(test, feature = "network-discovery"))]
-pub(crate) fn disarm_registration_gate_for_test() {
-    *REGISTRATION_GATE.write() = None;
+    REGISTRATION_GATES
+        .write()
+        .insert(gate.target_shutdown, Arc::downgrade(&gate));
+    RegistrationGateGuard { gate }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -677,10 +855,11 @@ pub struct NatTraversalEndpoint {
     shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
     /// Whether the shared relay endpoint already has an accept loop attached.
     relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
-    /// #286: join handles of the background accept workers (the connection
-    /// accept loops and the shared-relay accept loop). `shutdown` aborts and
-    /// joins them inside the bounded drain so no worker can register a
-    /// late-completing handshake after the lifecycle sweep.
+    /// #286: join handles of background connection workers (accept loops,
+    /// shared-relay accept, and outgoing hole-punch attempts). `shutdown`
+    /// aborts and joins them inside the bounded drain so no worker can retain
+    /// the original socket or register a late-completing handshake after the
+    /// lifecycle sweep.
     accept_worker_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// MASQUE relay server - every node provides relay services (symmetric P2P)
     /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets
@@ -720,6 +899,21 @@ pub struct NatTraversalEndpoint {
     /// Task handles for transport listener tasks
     /// Used for cleanup on shutdown
     transport_listener_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Serializes shutdown so concurrent callers cannot race socket replacement
+    /// or report completion while another caller still owns release custody.
+    shutdown_lock: TokioMutex<()>,
+    /// Original sockets awaiting final descriptor release. Records survive a
+    /// failed shutdown attempt so a later call retries the same addresses.
+    #[cfg(not(wasm_browser))]
+    pending_socket_releases: ParkingMutex<Vec<PendingSocketRelease>>,
+    #[cfg(test)]
+    socket_release_timeout: ParkingMutex<Option<Duration>>,
+    #[cfg(test)]
+    socket_release_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
+    #[cfg(test)]
+    force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
     constrained_engine: Arc<ParkingMutex<ConstrainedEngine>>,
@@ -730,6 +924,53 @@ pub struct NatTraversalEndpoint {
     /// P2pEndpoint polls this to receive data from constrained transports
     /// Uses TokioMutex (not ParkingMutex) because MutexGuard is held across .await
     constrained_event_rx: TokioMutex<mpsc::UnboundedReceiver<ConstrainedEventWithAddr>>,
+}
+
+#[cfg(not(wasm_browser))]
+#[derive(Clone)]
+struct PendingSocketRelease {
+    address: SocketAddr,
+    socket: Weak<dyn crate::high_level::runtime::AsyncUdpSocket>,
+}
+
+#[cfg(all(test, not(wasm_browser)))]
+#[derive(Debug)]
+struct FailingLocalAddrsSocket {
+    inner: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
+}
+
+#[cfg(all(test, not(wasm_browser)))]
+impl crate::high_level::runtime::AsyncUdpSocket for FailingLocalAddrsSocket {
+    fn create_sender(&self) -> std::pin::Pin<Box<dyn crate::high_level::runtime::UdpSender>> {
+        self.inner.create_sender()
+    }
+
+    fn poll_recv(
+        &self,
+        context: &mut std::task::Context<'_>,
+        buffers: &mut [std::io::IoSliceMut<'_>],
+        metadata: &mut [quinn_udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(context, buffers, metadata)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+        Err(std::io::Error::other(
+            "injected released-socket address enumeration failure",
+        ))
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
 }
 
 /// Configuration for NAT traversal behavior
@@ -2005,7 +2246,7 @@ impl NatTraversalEndpoint {
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
-            next_connection_generation: Arc::new(AtomicU64::new(1)),
+            next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -2032,6 +2273,17 @@ impl NatTraversalEndpoint {
             )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
+            shutdown_lock: TokioMutex::new(()),
+            #[cfg(not(wasm_browser))]
+            pending_socket_releases: ParkingMutex::new(Vec::new()),
+            #[cfg(test)]
+            socket_release_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            socket_release_wait_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            listener_shutdown_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -2520,7 +2772,7 @@ impl NatTraversalEndpoint {
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
-            next_connection_generation: Arc::new(AtomicU64::new(1)),
+            next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -2547,6 +2799,17 @@ impl NatTraversalEndpoint {
             )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
+            shutdown_lock: TokioMutex::new(()),
+            #[cfg(not(wasm_browser))]
+            pending_socket_releases: ParkingMutex::new(Vec::new()),
+            #[cfg(test)]
+            socket_release_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            socket_release_wait_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            listener_shutdown_timeout: ParkingMutex::new(None),
+            #[cfg(test)]
+            force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -5517,6 +5780,8 @@ impl NatTraversalEndpoint {
                     let pending_accepts = pending_accepts.clone();
                     let shutdown = shutdown.clone();
                     tokio::spawn(async move {
+                        #[cfg(all(test, feature = "network-discovery"))]
+                        let registration_gate = take_registration_gate_for_pause(shutdown.as_ref());
                         match connecting.await {
                             Ok(connection) => {
                                 info!("Accepted connection from {}", connection.remote_address());
@@ -5542,6 +5807,12 @@ impl NatTraversalEndpoint {
 
                                 let generation = match outcome {
                                     ConnectionRegistrationOutcome::Live { generation, .. } => {
+                                        #[cfg(all(test, feature = "network-discovery"))]
+                                        if let Some(gate) = &registration_gate {
+                                            gate.record_registrar_outcome(
+                                                GatedRegistrarOutcome::LiveInserted,
+                                            );
+                                        }
                                         generation
                                     }
                                     ConnectionRegistrationOutcome::Rejected {
@@ -5556,6 +5827,15 @@ impl NatTraversalEndpoint {
                                     ConnectionRegistrationOutcome::Refused => {
                                         // Late registration during shutdown;
                                         // the connection is already closed.
+                                        #[cfg(all(test, feature = "network-discovery"))]
+                                        {
+                                            drop(connection);
+                                            if let Some(gate) = &registration_gate {
+                                                gate.record_registrar_outcome(
+                                                    GatedRegistrarOutcome::RefusedAndDropped,
+                                                );
+                                            }
+                                        }
                                         return;
                                     }
                                 };
@@ -6941,20 +7221,24 @@ impl NatTraversalEndpoint {
             return refuse_registration(&peer_id, connection);
         }
         #[cfg(all(test, feature = "network-discovery"))]
-        if let Some(gate) = take_registration_gate_for_pause() {
+        if let Some(gate) = take_registration_gate_for_pause(shutting_down) {
             // #286 round 2 test hook: park this registration between the
             // fast-path check and the map insert, emulating the worst-case
             // scheduling (flag read early, insert attempted after the
             // shutdown sweep has already run). The in-lock re-check below
-            // remains the production guard. The park is a cooperative
-            // yield-loop (parts is sync); only the armed test releases it.
-            gate.parked_count.fetch_add(1, Ordering::SeqCst);
-            while !gate.released.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            gate.parked_count.fetch_sub(1, Ordering::SeqCst);
+            // remains the production guard. The endpoint-scoped test gate
+            // uses a bounded condition-variable wait because this function
+            // is synchronous; unrelated endpoints continue registering.
+            gate.wait_for_release();
         }
-        let generation = next_connection_generation.fetch_add(1, Ordering::Relaxed);
+        let Some(generation) = allocate_connection_generation(next_connection_generation) else {
+            // Exhaustion is terminal for allocation: never wrap or issue the stale sentinel.
+            connection.close(VarInt::from_u32(0), b"connection generation exhausted");
+            tracing::error!("connection generation namespace exhausted");
+            return ConnectionRegistrationOutcome::Rejected {
+                winner_generation: UNAUTHENTICATED_GENERATION,
+            };
+        };
         let tracked = TrackedConnection {
             connection: connection.clone(),
             generation,
@@ -7110,6 +7394,19 @@ impl NatTraversalEndpoint {
             })
     }
 
+    pub(crate) fn current_connection_generation(&self, peer_id: &PeerId) -> Option<u64> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)?
+            .iter()
+            .filter(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live)
+                    && entry.connection.close_reason().is_none()
+            })
+            .map(|entry| entry.generation)
+            .max()
+    }
+
     pub(crate) fn connection_snapshot_by_stable_id(
         &self,
         peer_id: &PeerId,
@@ -7118,7 +7415,14 @@ impl NatTraversalEndpoint {
         self.connection_lifecycle
             .read()
             .get(peer_id)
-            .and_then(|entries| entries.iter().find(|entry| entry.stable_id() == stable_id))
+            .and_then(|entries| {
+                // Retired registrations can share a reused underlying stable_id.
+                // Reader setup must bind to the newest registration of that handle.
+                entries
+                    .iter()
+                    .filter(|entry| entry.stable_id() == stable_id)
+                    .max_by_key(|entry| entry.generation)
+            })
             .map(|entry| ConnectionLifecycleSnapshot {
                 generation: entry.generation,
                 stable_id: entry.stable_id(),
@@ -8606,7 +8910,14 @@ impl NatTraversalEndpoint {
     }
 
     /// Shutdown the endpoint
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_registration_gate_for_test(&self) -> RegistrationGateGuard {
+        arm_registration_gate_for_test(&self.shutdown)
+    }
+
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let mut shutdown_error = None;
         // Set shutdown flag and wake any task parked in accept_connection()
         // or transport listener loops
         self.shutdown.store(true, Ordering::Relaxed);
@@ -8650,6 +8961,13 @@ impl NatTraversalEndpoint {
             drop(lifecycle);
             if closed > 0 {
                 info!("shutdown: closed {closed} additional lifecycle-tracked connection(s)");
+            }
+        }
+
+        #[cfg(all(test, feature = "network-discovery"))]
+        {
+            if let Some(gate) = take_registration_gate_for_pause(self.shutdown.as_ref()) {
+                gate.pause_shutdown_after_sweep().await;
             }
         }
 
@@ -8700,15 +9018,40 @@ impl NatTraversalEndpoint {
 
             #[cfg(not(wasm_browser))]
             match endpoint.release_socket_for_shutdown() {
-                Ok(released) => Self::await_socket_fd_release(released).await,
+                Ok(released) => {
+                    let mut pending = self.pending_socket_releases.lock();
+                    for released_socket in &released {
+                        for address in &released_socket.addresses {
+                            pending.push(PendingSocketRelease {
+                                address: *address,
+                                socket: Arc::downgrade(&released_socket.socket),
+                            });
+                        }
+                    }
+                    drop(pending);
+                    drop(released);
+                }
                 Err(error) => {
                     warn!(%error, "failed to release endpoint UDP socket during shutdown");
+                    shutdown_error.get_or_insert_with(|| {
+                        NatTraversalError::NetworkError(format!(
+                            "failed to release endpoint UDP socket: {error}"
+                        ))
+                    });
                 }
+            }
+
+            #[cfg(not(wasm_browser))]
+            if let Err(error) = self.settle_released_sockets().await {
+                warn!(%error, "UDP socket release did not settle during shutdown");
+                shutdown_error.get_or_insert(error);
             }
         }
 
-        // Wait for transport listener tasks to complete
-        let handles = {
+        // Wait for transport listener tasks to complete. A graceful timeout
+        // becomes an abort-and-join phase; any task whose termination still
+        // cannot be confirmed remains registered for the next shutdown call.
+        let mut handles = {
             let mut listener_handles = self.transport_listener_handles.lock();
             std::mem::take(&mut *listener_handles)
         };
@@ -8718,64 +9061,228 @@ impl NatTraversalEndpoint {
                 "Waiting for {} transport listener tasks to complete",
                 handles.len()
             );
-            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
-                for handle in handles {
-                    if let Err(e) = handle.await {
-                        warn!("Transport listener task failed during shutdown: {e}");
+            #[cfg(test)]
+            let listener_timeout = self
+                .listener_shutdown_timeout
+                .lock()
+                .unwrap_or(SHUTDOWN_DRAIN_TIMEOUT);
+            #[cfg(not(test))]
+            let listener_timeout = SHUTDOWN_DRAIN_TIMEOUT;
+
+            if tokio::time::timeout(
+                listener_timeout,
+                futures_util::future::join_all(handles.iter_mut()),
+            )
+            .await
+            .is_err()
+            {
+                for handle in &handles {
+                    if !handle.is_finished() {
+                        handle.abort();
                     }
                 }
-            })
-            .await
-            {
-                Ok(()) => debug!("All transport listener tasks completed"),
-                Err(_) => warn!("Transport listener tasks timed out during shutdown, proceeding"),
+
+                #[cfg(test)]
+                let force_confirmation_timeout = self
+                    .force_listener_confirmation_timeout
+                    .swap(false, Ordering::Relaxed);
+                #[cfg(not(test))]
+                let force_confirmation_timeout = false;
+                if force_confirmation_timeout {
+                    let remaining = handles.len();
+                    self.transport_listener_handles.lock().extend(handles);
+                    shutdown_error.get_or_insert_with(|| {
+                        NatTraversalError::NetworkError(format!(
+                            "{SHUTDOWN_LISTENER_TIMEOUT_PREFIX} {remaining} task(s)"
+                        ))
+                    });
+                } else {
+                    let unfinished: Vec<_> = handles
+                        .iter_mut()
+                        .filter(|handle| !handle.is_finished())
+                        .collect();
+                    let _ = tokio::time::timeout(
+                        listener_timeout,
+                        futures_util::future::join_all(unfinished),
+                    )
+                    .await;
+                    handles.retain(|handle| !handle.is_finished());
+                    if !handles.is_empty() {
+                        let remaining = handles.len();
+                        self.transport_listener_handles.lock().extend(handles);
+                        shutdown_error.get_or_insert_with(|| {
+                            NatTraversalError::NetworkError(format!(
+                                "{SHUTDOWN_LISTENER_TIMEOUT_PREFIX} {remaining} task(s)"
+                            ))
+                        });
+                    }
+                }
             }
+        }
+
+        if let Some(error) = shutdown_error {
+            return Err(error);
         }
 
         info!("NAT traversal endpoint shutdown completed");
         Ok(())
     }
 
-    /// Wait until every socket extracted by `release_socket_for_shutdown` has
-    /// dropped its last strong reference, closing the underlying OS file
-    /// descriptor before shutdown returns (issue #199).
-    ///
-    /// The endpoint swaps in an ephemeral replacement synchronously, but live
-    /// connection driver tasks keep `Arc` clones of the original socket (and
-    /// senders built from it) alive until they finish draining — briefly after
-    /// `wait_idle` completes. Awaiting the reference drain makes an immediate
-    /// same-fixed-port rebind succeed in a tight stop/start loop. Bounded so a
-    /// leaked socket clone can only delay, never hang, shutdown.
+    /// Settle every original socket retained from the first shutdown attempt.
+    /// Weak-owner disappearance is necessary but insufficient because an Arc's
+    /// inner destructor may still be running. A successful OS bind probe is the
+    /// completion proof for each actual address. Failed records remain pending
+    /// so a later shutdown retries the originals rather than the replacement.
     #[cfg(not(wasm_browser))]
-    async fn await_socket_fd_release(
-        released: Vec<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>>,
-    ) {
-        /// How often to poll for lingering socket references during shutdown.
+    async fn settle_released_sockets(&self) -> Result<(), NatTraversalError> {
         const SOCKET_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-        /// Bounded wait for connection driver tasks to release the fixed-port
-        /// socket; a leaked clone delays rebind but must not hang shutdown.
-        const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+        const DEFAULT_SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
-        if released.is_empty() {
-            return;
+        let records = self.pending_socket_releases.lock().clone();
+        if records.is_empty() {
+            return Ok(());
         }
-        let watchers: Vec<_> = released.iter().map(Arc::downgrade).collect();
-        drop(released);
 
-        let wait = async {
+        #[cfg(test)]
+        self.socket_release_wait_started.notify_one();
+        #[cfg(test)]
+        let release_timeout = self
+            .socket_release_timeout
+            .lock()
+            .unwrap_or(DEFAULT_SOCKET_RELEASE_TIMEOUT);
+        #[cfg(not(test))]
+        let release_timeout = DEFAULT_SOCKET_RELEASE_TIMEOUT;
+        let deadline = Instant::now() + release_timeout;
+        let mut observations: Vec<_> = records
+            .iter()
+            .map(|record| (record.address, "not_yet_observed"))
+            .collect();
+
+        for (index, record) in records.iter().enumerate() {
             loop {
-                if watchers.iter().all(|weak| weak.upgrade().is_none()) {
-                    return;
+                if record.socket.upgrade().is_none() {
+                    match std::net::UdpSocket::bind(record.address) {
+                        Ok(probe) => {
+                            observations[index].1 = "released_and_probe_bound";
+                            drop(probe);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                            observations[index].1 = "weak_gone_but_address_in_use";
+                        }
+                        Err(error) => {
+                            return Err(NatTraversalError::NetworkError(format!(
+                                "{SHUTDOWN_SOCKET_RELEASE_PROBE_PREFIX} {}: {error}",
+                                record.address
+                            )));
+                        }
+                    }
+                } else {
+                    observations[index].1 = "weak_socket_owner_still_live";
+                }
+
+                if Instant::now() >= deadline {
+                    let mut addresses: Vec<_> = records.iter().map(|item| item.address).collect();
+                    addresses.sort_unstable();
+                    addresses.dedup();
+                    observations.sort_unstable_by_key(|(address, _)| *address);
+                    return Err(NatTraversalError::NetworkError(format!(
+                        "{SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX} {addresses:?}; \
+                         last_observations={observations:?}"
+                    )));
                 }
                 sleep(SOCKET_RELEASE_POLL_INTERVAL).await;
             }
-        };
-        if timeout(SOCKET_RELEASE_TIMEOUT, wait).await.is_err() {
-            warn!(
-                "timed out waiting for UDP socket references to drop; \
-                 fixed port may remain briefly unavailable for rebind"
-            );
         }
+
+        self.pending_socket_releases.lock().clear();
+        Ok(())
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn clone_socket_for_shutdown_test(
+        &self,
+    ) -> std::io::Result<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>> {
+        self.inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?
+            .clone_socket_for_shutdown_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_socket_release_timeout_for_test(&self, duration: Duration) {
+        *self.socket_release_timeout.lock() = Some(duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_listener_shutdown_timeout_for_test(&self, duration: Duration) {
+        *self.listener_shutdown_timeout.lock() = Some(duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_listener_confirmation_timeout_for_test(&self) {
+        self.force_listener_confirmation_timeout
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_release_wait_notify_for_test(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.socket_release_wait_started)
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn shutdown_socket_address_for_test(&self) -> std::io::Result<SocketAddr> {
+        self.inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?
+            .local_addr()
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn install_failing_local_addrs_socket_for_test(&self) -> std::io::Result<()> {
+        let endpoint = self
+            .inner_endpoint
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("endpoint has no UDP socket"))?;
+        let socket = endpoint.clone_socket_for_shutdown_test()?;
+        endpoint.rebind_abstract(Arc::new(FailingLocalAddrsSocket { inner: socket }))
+    }
+
+    #[cfg(all(test, not(wasm_browser)))]
+    pub(crate) fn pending_socket_release_count_for_test(&self) -> usize {
+        self.pending_socket_releases.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_listener_count_for_test(&self) -> usize {
+        self.transport_listener_handles.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_stubborn_transport_listener_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(done_tx));
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        self.transport_listener_handles.lock().push(handle);
+        (ready_rx, done_rx)
     }
 
     /// Discover address candidates for a peer
@@ -9271,7 +9778,19 @@ impl NatTraversalEndpoint {
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
-                        tokio::spawn(async move {
+                        // Register the outgoing attempt under the same worker
+                        // lock shutdown drains. Re-check the shutdown flag
+                        // while holding that lock: either this handle is
+                        // published before shutdown takes the registry, or no
+                        // task is spawned after shutdown has begun.
+                        let mut workers = self.accept_worker_handles.lock();
+                        if self.shutdown.load(Ordering::Relaxed) {
+                            return Err(NatTraversalError::NetworkError(
+                                "endpoint is shutting down".to_string(),
+                            ));
+                        }
+                        workers.retain(|handle| !handle.is_finished());
+                        let handle = tokio::spawn(async move {
                             match connecting.await {
                                 Ok(connection) => {
                                     // Check if another task already inserted a connection for this peer
@@ -9341,6 +9860,7 @@ impl NatTraversalEndpoint {
                                 }
                             }
                         });
+                        workers.push(handle);
                     }
 
                     Ok(())
@@ -11307,6 +11827,50 @@ impl crate::TokenStore for DefaultTokenStore {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "network-discovery")]
+    #[test]
+    fn registration_gate_timeout_cleanup_is_isolated() {
+        let shutdown_a = Arc::new(AtomicBool::new(false));
+        let shutdown_b = Arc::new(AtomicBool::new(false));
+        let guard_a = arm_registration_gate_for_test(&shutdown_a);
+        let guard_b = arm_registration_gate_for_test(&shutdown_b);
+        let gate_a = take_registration_gate_for_pause(&shutdown_a).expect("A gate armed");
+
+        // Exercise cleanup with a pre-existing poison and a deterministic
+        // zero-duration timeout. The timeout panic unwinds through guard A;
+        // its Drop must remain infallible and remove only A's registry entry.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = gate_a.released.lock().expect("initial A gate lock");
+            panic!("poison A's release mutex");
+        }));
+        assert!(poisoned.is_err(), "poison control must unwind");
+        let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard_a = guard_a;
+            gate_a.wait_for_release_with_timeout(Duration::ZERO);
+        }));
+        assert!(timed_out.is_err(), "zero-duration gate wait must time out");
+        assert!(
+            take_registration_gate_for_pause(&shutdown_a).is_none(),
+            "unwound guard A must remove its registry entry"
+        );
+
+        let gate_b = take_registration_gate_for_pause(&shutdown_b).expect("B gate remains armed");
+        assert_eq!(gate_b.parked_count.load(Ordering::SeqCst), 0);
+        assert!(
+            !*gate_b
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "A's cleanup must not release B"
+        );
+        drop(gate_b);
+        drop(guard_b);
+        assert!(
+            take_registration_gate_for_pause(&shutdown_b).is_none(),
+            "guard B must remove its own registry entry"
+        );
+    }
+
     #[test]
     fn test_nat_traversal_config_default() {
         let config = NatTraversalConfig::default();
@@ -12262,6 +12826,7 @@ mod tests {
             },
         );
 
+        let workers_before_poll = endpoint.accept_worker_handles.lock().len();
         let events = endpoint
             .poll(std::time::Instant::now())
             .expect("poll should succeed");
@@ -12287,6 +12852,11 @@ mod tests {
             NatTraversalEvent::HolePunchingStarted { peer_id: event_peer, .. }
                 if *event_peer == peer_id
         )));
+        assert_eq!(
+            endpoint.accept_worker_handles.lock().len(),
+            workers_before_poll + 1,
+            "the outgoing hole-punch attempt must be registered for shutdown cleanup"
+        );
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
@@ -13756,6 +14326,77 @@ mod tests {
             .expect("loopback handshake must not hang")
             .expect("loopback handshake must succeed");
         (server, client, conn)
+    }
+
+    #[test]
+    fn receive_generation_allocation_is_monotonic_and_never_wraps() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(allocate_connection_generation(&counter), Some(1));
+        assert_eq!(allocate_connection_generation(&counter), Some(2));
+        let exhausted = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_connection_generation(&exhausted),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(allocate_connection_generation(&exhausted), None);
+        assert_eq!(allocate_connection_generation(&exhausted), None);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn receive_generation_reused_stable_id_uses_new_registration() {
+        let (_server, client, connection) = loopback_quic_connection().await;
+        let peer = PeerId([0x51; 32]);
+        let register = || {
+            NatTraversalEndpoint::register_connection_lifecycle_parts(
+                client.local_peer_id,
+                &client.connections,
+                &client.connection_lifecycle,
+                &client.next_connection_generation,
+                &client.emitted_established_events,
+                &AtomicBool::new(false),
+                peer,
+                connection.clone(),
+            )
+        };
+        let first = register();
+        let ConnectionRegistrationOutcome::Live {
+            generation: old, ..
+        } = first
+        else {
+            assert!(matches!(first, ConnectionRegistrationOutcome::Live { .. }));
+            return;
+        };
+        // Model allocator pointer/stable_id reuse after retirement without relying
+        // on a platform allocator to recycle a real connection allocation.
+        client.connection_lifecycle.write().get_mut(&peer).unwrap()[0].state =
+            ConnectionLifecycleState::Closed {
+                reason: ConnectionCloseReason::LocallyClosed,
+                closed_at_unix_ms: now_unix_ms(),
+            };
+        let replacement = register();
+        assert!(matches!(
+            replacement,
+            ConnectionRegistrationOutcome::Live { .. }
+        ));
+        let ConnectionRegistrationOutcome::Live {
+            generation: new, ..
+        } = replacement
+        else {
+            return;
+        };
+        assert!(new > old);
+        assert_eq!(
+            client
+                .connection_snapshot_by_stable_id(&peer, connection.stable_id())
+                .map(|snapshot| snapshot.generation),
+            Some(new)
+        );
+        assert_eq!(client.current_connection_generation(&peer), Some(new));
+        assert!(Arc::ptr_eq(
+            &client.next_connection_generation,
+            &CONNECTION_GENERATIONS
+        ));
     }
 
     /// Seed a single tracked generation for `peer_id` directly into the

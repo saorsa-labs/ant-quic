@@ -291,6 +291,26 @@ const BUFFERED_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 struct ConnectionDriver(ConnectionRef);
 
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailureAction {
+    DropDatagram,
+    TerminateConnection,
+}
+
+fn send_failure_action(
+    error: &io::Error,
+    destination: SocketAddr,
+    active_destination: SocketAddr,
+) -> SendFailureAction {
+    // A failed candidate probe is not evidence that the established path is
+    // unusable. Its validation will time out without taking down this driver.
+    if is_transient_socket_error(error) || destination != active_destination {
+        SendFailureAction::DropDatagram
+    } else {
+        SendFailureAction::TerminateConnection
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
@@ -305,7 +325,33 @@ impl Future for ConnectionDriver {
             conn.buffered_registry.remove(conn.handle.0);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                // A fatal send failure on the active path must not strand a
+                // Live connection after its driver exits. Wake all pending
+                // operations and remove its endpoint route immediately.
+                conn.inner.close(
+                    conn.runtime.now(),
+                    0u32.into(),
+                    Bytes::from_static(b"local UDP send failure"),
+                );
+                conn.terminate(
+                    ConnectionError::TransportError(crate::TransportError {
+                        code: crate::TransportErrorCode::INTERNAL_ERROR,
+                        frame: None,
+                        reason: format!("local UDP send failure: {error}"),
+                    }),
+                    &self.0.shared,
+                );
+                let _ = conn
+                    .endpoint_events
+                    .send((conn.handle, crate::EndpointEvent::drained()));
+                conn.endpoint_drained_notified = true;
+                conn.buffered_registry.remove(conn.handle.0);
+                return Poll::Ready(Err(error));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -1331,6 +1377,7 @@ impl ConnectionRef {
                 binding_started: false,
                 buffered_registry,
                 last_buffered_refresh: None,
+                endpoint_drained_notified: false,
             }),
             shared: Shared::default(),
         }))
@@ -1423,6 +1470,9 @@ pub(crate) struct State {
     buffered_registry: Arc<crate::high_level::endpoint::BufferedBytesRegistry>,
     /// Last #368 snapshot refresh (throttle anchor).
     last_buffered_refresh: Option<Instant>,
+    /// A fatal driver exit can retire the endpoint route before this state is
+    /// dropped; do not emit a duplicate Drained event then.
+    endpoint_drained_notified: bool,
 }
 
 impl State {
@@ -1491,21 +1541,18 @@ impl State {
                     }
                 }
                 Poll::Ready(Err(e)) => {
-                    // A destination the host cannot reach (a peer-advertised
-                    // NAT candidate on an unreachable subnet or address family)
-                    // must not be fatal. Returning `Err` here ends the
-                    // connection driver task for good: the connection stays
-                    // `Live` to the application while emitting no ACKs, no PTO
-                    // probes and no idle-timeout CONNECTION_CLOSE, so the peer
-                    // sees a black hole while this side reports a healthy
-                    // connection indefinitely. Drop the datagram and let loss
-                    // recovery retransmit over a path that works — the same
-                    // treatment the endpoint receive path already gives this
-                    // error class (x0x issue #262).
-                    if is_transient_socket_error(&e) {
+                    // Do not kill a healthy active path for a failed alternate
+                    // NAT candidate. Its validation timer will retire it. A
+                    // hard error on the active path must terminate the whole
+                    // connection so it cannot remain falsely Live.
+                    if send_failure_action(&e, t.destination, self.inner.remote_address())
+                        == SendFailureAction::DropDatagram
+                    {
                         debug!(
-                            "ignoring transient socket send error to {}: {}",
-                            t.destination, e
+                            "dropping failed UDP transmit to {} (active path {}): {}",
+                            t.destination,
+                            self.inner.remote_address(),
+                            e
                         );
                         continue;
                     }
@@ -1756,7 +1803,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if !self.inner.is_drained() {
+        if !self.inner.is_drained() && !self.endpoint_drained_notified {
             // Ensure the endpoint can tidy up
             let _ = self
                 .endpoint_events
@@ -1773,13 +1820,235 @@ impl fmt::Debug for State {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io::{self, IoSliceMut},
+        net::{Ipv4Addr, SocketAddr},
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
 
+    use quinn_udp::{RecvMeta, Transmit};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::time::{Duration, timeout};
 
-    use crate::config::{ClientConfig, ServerConfig};
-    use crate::high_level::Endpoint;
+    use super::{SendFailureAction, send_failure_action};
+    use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
+    use crate::high_level::{
+        Endpoint,
+        runtime::{AsyncUdpSocket, UdpSender, default_runtime},
+    };
+
+    #[derive(Debug)]
+    struct DeniedSender(Arc<AtomicUsize>);
+
+    impl UdpSender for DeniedSender {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _transmit: &Transmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Err(io::Error::from_raw_os_error(1)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeniedSocket(Arc<AtomicUsize>);
+
+    impl AsyncUdpSocket for DeniedSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(DeniedSender(self.0.clone()))
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 12345)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlternateDeniedSocket {
+        active: SocketAddr,
+        alternate: SocketAddr,
+        denied_calls: Arc<AtomicUsize>,
+        successful_calls: Arc<AtomicUsize>,
+    }
+
+    impl UdpSender for AlternateDeniedSocket {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            transmit: &Transmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if transmit.destination == self.alternate {
+                self.denied_calls.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Err(io::Error::from_raw_os_error(1)))
+            } else if transmit.destination == self.active {
+                self.successful_calls.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncUdpSocket for AlternateDeniedSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(Self {
+                active: self.active,
+                alternate: self.alternate,
+                denied_calls: self.denied_calls.clone(),
+                successful_calls: self.successful_calls.clone(),
+            })
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 12345)))
+        }
+    }
+
+    #[test]
+    fn fatal_send_error_only_terminates_the_active_path() {
+        let active = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345));
+        let alternate = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 12345));
+        let denied = io::Error::from_raw_os_error(1);
+        assert_eq!(
+            send_failure_action(&denied, alternate, active),
+            SendFailureAction::DropDatagram,
+            "a blocked candidate cannot close the established path"
+        );
+        assert_eq!(
+            send_failure_action(&denied, active, active),
+            SendFailureAction::TerminateConnection,
+            "a blocked established path cannot remain Live"
+        );
+        assert_eq!(
+            send_failure_action(&io::Error::from_raw_os_error(101), active, active),
+            SendFailureAction::DropDatagram,
+            "transient active-path failures retain loss recovery"
+        );
+        // ENOBUFS on the ACTIVE path is kernel buffer pressure, not a dead
+        // path: the datagram drops and loss recovery retransmits (macOS
+        // errno 55, Linux 105 — matched via libc in is_transient_socket_error).
+        #[cfg(unix)]
+        assert_eq!(
+            send_failure_action(&io::Error::from_raw_os_error(libc::ENOBUFS), active, active),
+            SendFailureAction::DropDatagram,
+            "ENOBUFS under send pressure must not close an active connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_active_send_wakes_waiters_and_removes_endpoint_route() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let socket = Arc::new(DeniedSocket(send_calls.clone()));
+        let runtime = default_runtime().expect("tokio test runtime");
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let connecting = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345)),
+                "localhost",
+            )
+            .expect("start connection");
+        let connection =
+            super::Connection(connecting.conn.as_ref().expect("connection exists").clone());
+
+        let reason = timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("fatal send must wake connection waiter");
+        assert!(matches!(reason, crate::ConnectionError::TransportError(_)));
+        assert!(send_calls.load(Ordering::Relaxed) > 0);
+        assert!(!connection.is_alive());
+        assert!(
+            timeout(Duration::from_secs(1), connection.open_uni())
+                .await
+                .expect("closed stream open must wake")
+                .is_err()
+        );
+        timeout(Duration::from_secs(1), endpoint.wait_idle())
+            .await
+            .expect("fatal send must remove endpoint route");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_alternate_transmit_keeps_active_connection_driving() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let active = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345));
+        let alternate = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 12345));
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let successful_calls = Arc::new(AtomicUsize::new(0));
+        let socket = Arc::new(AlternateDeniedSocket {
+            active,
+            alternate,
+            denied_calls: denied_calls.clone(),
+            successful_calls: successful_calls.clone(),
+        });
+        let runtime = default_runtime().expect("tokio test runtime");
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let connecting = endpoint
+            .connect(active, "localhost")
+            .expect("start connection");
+        let conn = connecting.conn.as_ref().expect("connection exists");
+        let connection = super::Connection(conn.clone());
+        {
+            // The current-thread runtime has not polled the spawned driver yet.
+            let mut state = conn.state.lock("inject alternate transmit");
+            assert_eq!(state.inner.remote_address(), active);
+            state.buffered_transmit = Some(crate::Transmit {
+                destination: alternate,
+                ecn: None,
+                size: 0,
+                segment_size: None,
+                src_ip: None,
+            });
+        }
+        timeout(Duration::from_secs(1), async {
+            while denied_calls.load(Ordering::Relaxed) == 0
+                || successful_calls.load(Ordering::Relaxed) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("alternate failure must not prevent an active-path send");
+        assert_eq!(denied_calls.load(Ordering::Relaxed), 1);
+        assert!(successful_calls.load(Ordering::Relaxed) > 0);
+        assert!(
+            connection.is_alive(),
+            "alternate failure closed the connection"
+        );
+        assert!(connection.close_reason().is_none());
+    }
 
     fn gen_self_signed_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])

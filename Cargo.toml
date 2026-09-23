@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "ant-quic"
-version = "0.27.52"
+version = "0.27.53"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
@@ -18,7 +18,9 @@ categories = ["network-programming", "asynchronous"]
 exclude = [
     ".claude-flow/",
     ".minimax/",
+    ".pi/",
     ".planning.archived/",
+    ".planning.archived.*/",
     ".github/",
     ".githooks/",
     ".serena/",
@@ -110,7 +112,8 @@ dirs = "5.0"
 keyring = "3"
 
 # Crypto dependencies (required for PQC)
-rustls = { version = "0.23.40", default-features = false, features = ["std", "aws-lc-rs"] } # floor is 0.23.40: MLKEM1024 via rustls::crypto::aws_lc_rs::kx_group (issue #223)
+# RUSTSEC-2026-0285 requires >=0.23.45; retains MLKEM1024 support from 0.23.40 (issue #223).
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws-lc-rs"] }
 aws-lc-rs = { version = "1.16", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"] }
 rustls-platform-verifier = { version = "0.6", optional = true }
 # PQC crypto - required in v0.12.0+

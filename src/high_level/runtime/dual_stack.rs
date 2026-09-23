@@ -77,8 +77,8 @@ impl DualStackSocket {
                 "at least one socket (IPv4 or IPv6) must be provided",
             ));
         }
-        let v4_addr = v4.as_ref().and_then(|s| s.local_addr().ok());
-        let v6_addr = v6.as_ref().and_then(|s| s.local_addr().ok());
+        let v4_addr = v4.as_ref().map(|socket| socket.local_addr()).transpose()?;
+        let v6_addr = v6.as_ref().map(|socket| socket.local_addr()).transpose()?;
         Ok(Self {
             v4: v4.map(Arc::new),
             v6: v6.map(Arc::new),
@@ -251,6 +251,17 @@ impl AsyncUdpSocket for DualStackSocket {
             io::ErrorKind::NotConnected,
             "no socket bound",
         ))
+    }
+
+    fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        let addresses: Vec<_> = [self.v4_addr, self.v6_addr].into_iter().flatten().collect();
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "dual-stack socket has no bound addresses",
+            ));
+        }
+        Ok(addresses)
     }
 
     fn may_fragment(&self) -> bool {

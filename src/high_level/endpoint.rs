@@ -50,11 +50,12 @@ use super::{
 use crate::{EndpointConfig, VarInt};
 
 /// Transient per-datagram socket errors that must NOT terminate the endpoint
-/// driver (x0x issue #262).
+/// driver (x0x issue #262), nor the connection driver's active-path send
+/// classification.
 ///
 /// On Linux, an unconnected UDP socket surfaces asynchronous ICMP errors
-/// (host/net unreachable, port unreachable) as a pending socket error on the
-/// next `recvmsg` — i.e. one unreachable *peer* manifests as a recv error on
+/// (host/net unreachable, port unreachable) as a pending socket error on
+/// the next `recvmsg` — i.e. one unreachable *peer* manifests as a recv error on
 /// the *shared* socket. Terminating the driver on such an error kills all
 /// QUIC I/O for the process: `driver_lost` makes every future `connect()`
 /// fail synchronously and nothing polls the socket again, while the host
@@ -62,11 +63,20 @@ use crate::{EndpointConfig, VarInt};
 /// wedged state for 14+ hours. These errors are scoped to a single datagram
 /// exchange: drop it and keep polling.
 ///
+/// ENOBUFS is the send-side sibling: quinn-udp passes it through verbatim
+/// from `sendmsg` when the kernel socket buffer is momentarily full under
+/// send pressure (macOS 55, Linux 105). std leaves it `Uncategorized`, so it
+/// must be matched as a raw errno — the libc constant is used per platform
+/// instead of magic numbers. Treating it as fatal made active macOS
+/// connections close with INTERNAL_ERROR "local UDP send failure" under
+/// load; dropping the datagram hands the loss to QUIC recovery, which
+/// retransmits once the buffers drain.
+///
 /// Raw errnos cover platform gaps in `io::ErrorKind` mapping: 49
 /// (EADDRNOTAVAIL, macOS), 51/65 (ENETUNREACH/EHOSTUNREACH, macOS),
 /// 101/113 (ENETUNREACH/EHOSTUNREACH, Linux).
 pub(crate) fn is_transient_socket_error(error: &io::Error) -> bool {
-    matches!(
+    if matches!(
         error.kind(),
         io::ErrorKind::AddrNotAvailable
             | io::ErrorKind::ConnectionRefused
@@ -75,7 +85,16 @@ pub(crate) fn is_transient_socket_error(error: &io::Error) -> bool {
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::NotConnected
             | io::ErrorKind::TimedOut
-    ) || matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if error.raw_os_error() == Some(libc::ENOBUFS) {
+            return true;
+        }
+    }
+    matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
 }
 
 /// `EndpointRef`s held by driver infrastructure rather than user-visible
@@ -484,7 +503,7 @@ impl Endpoint {
     /// the OS file descriptor stays open until the last clone drops (issue
     /// #199). Returns an empty `Vec` when the socket was already released.
     #[cfg(not(wasm_browser))]
-    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<Vec<Arc<dyn AsyncUdpSocket>>> {
+    pub(crate) fn release_socket_for_shutdown(&self) -> io::Result<Vec<ReleasedUdpSocket>> {
         let (old_addr, runtime) = {
             let state = self
                 .inner
@@ -523,15 +542,48 @@ impl Endpoint {
         if state.socket_released_for_shutdown {
             return Ok(Vec::new());
         }
+        // Capture every address from the same locked state that is about to be
+        // swapped. Any failure returns before the irreversible mutation.
+        let socket_addresses = state.socket.local_addrs()?;
+        let previous_addresses = state
+            .prev_socket
+            .as_ref()
+            .map(|socket| socket.local_addrs())
+            .transpose()?;
+        let previous_addresses = match (state.prev_socket.is_some(), previous_addresses) {
+            (true, Some(addresses)) => Some(addresses),
+            (false, None) => None,
+            _ => {
+                return Err(io::Error::other(
+                    "previous UDP socket address custody was not captured",
+                ));
+            }
+        };
         let mut released = Vec::with_capacity(2);
-        released.push(mem::replace(&mut state.socket, replacement));
-        if let Some(prev_socket) = state.prev_socket.take() {
-            released.push(prev_socket);
+        released.push(ReleasedUdpSocket {
+            socket: mem::replace(&mut state.socket, replacement),
+            addresses: socket_addresses,
+        });
+        if let (Some(prev_socket), Some(addresses)) = (state.prev_socket.take(), previous_addresses)
+        {
+            released.push(ReleasedUdpSocket {
+                socket: prev_socket,
+                addresses,
+            });
         }
         state.ipv6 = replacement_addr.is_ipv6();
         state.socket_released_for_shutdown = true;
 
         Ok(released)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_socket_for_shutdown_test(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        self.inner
+            .state
+            .lock()
+            .map(|state| Arc::clone(&state.socket))
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))
     }
 
     /// Get the number of connections that are currently open
@@ -620,6 +672,12 @@ impl Endpoint {
             .await;
         }
     }
+}
+
+#[cfg(not(wasm_browser))]
+pub(crate) struct ReleasedUdpSocket {
+    pub(crate) socket: Arc<dyn AsyncUdpSocket>,
+    pub(crate) addresses: Vec<SocketAddr>,
 }
 
 /// Statistics on [Endpoint] activity
@@ -1642,6 +1700,25 @@ mod driver_error_tests {
                 "{kind:?} must remain driver-fatal"
             );
         }
+    }
+
+    /// WHY: ENOBUFS (macOS 55, Linux 105) arrives from `sendmsg` when the
+    /// kernel socket buffer is momentarily full under send pressure; quinn-udp
+    /// passes it through verbatim and std leaves it `Uncategorized`. It is
+    /// per-datagram backpressure, not a dead socket: classifying it fatal made
+    /// active macOS connections close with INTERNAL_ERROR "local UDP send
+    /// failure" under load. A genuinely fatal error must stay fatal.
+    #[cfg(unix)]
+    #[test]
+    fn enobufs_is_transient_but_fatal_errors_are_not() {
+        assert!(
+            is_transient_socket_error(&io::Error::from_raw_os_error(libc::ENOBUFS)),
+            "ENOBUFS is momentary buffer pressure; QUIC loss recovery retransmits"
+        );
+        assert!(
+            !is_transient_socket_error(&io::Error::from_raw_os_error(libc::EPERM)),
+            "EPERM remains driver-fatal"
+        );
     }
 }
 

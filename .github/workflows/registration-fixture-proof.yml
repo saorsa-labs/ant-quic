@@ -1,0 +1,135 @@
+name: Registration fixture proof
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'src/nat_traversal_api.rs'
+      - 'src/p2p_endpoint.rs'
+      - 'scripts/registration-fixture-proof.py'
+      - 'Cargo.lock'
+      - '.github/workflows/registration-fixture-proof.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registration-fixture-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure owned build directory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf 'CARGO_TARGET_DIR=%s/registration-fixture-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: registration-fixture-proof
+          save-if: 'false'
+
+      - name: Capture source custody
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p registration-fixture-logs
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          {
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'sha=%s\n' "$GITHUB_SHA"
+            printf 'tree=%s\n' "$(git rev-parse HEAD^{tree})"
+            printf 'source_sha256=%s\n' "$(sha256sum src/nat_traversal_api.rs | awk '{print $1}')"
+            printf 'test_sha256=%s\n' "$(sha256sum src/p2p_endpoint.rs | awk '{print $1}')"
+            printf 'helper_sha256=%s\n' "$(sha256sum scripts/registration-fixture-proof.py | awk '{print $1}')"
+            printf 'cargo_lock_sha256=%s\n' "$(sha256sum Cargo.lock | awk '{print $1}')"
+          } | tee registration-fixture-logs/custody.txt
+
+      - name: Run positive fixture
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          selector='p2p_endpoint::tests::shutdown_during_inbound_handshake_leaves_no_stale_entry'
+          set +e
+          cargo test --locked --lib --all-features "$selector" -- --exact --list --test-threads=1 >registration-fixture-logs/positive-list.log 2>&1
+          list_exit=$?
+          set -e
+          printf '%s\n' "$list_exit" > registration-fixture-logs/positive-list-native-exit.txt
+          cat registration-fixture-logs/positive-list.log
+          [[ "$list_exit" -eq 0 ]]
+          matches="$(python3 -c 'import sys; s=sys.argv[2]; print(sum(x.strip() == s + ": test" for x in open(sys.argv[1], encoding="utf-8")))' registration-fixture-logs/positive-list.log "$selector")"
+          [[ "$matches" -eq 1 ]]
+          set +e
+          cargo test --locked --lib --all-features "$selector" -- --exact --nocapture --test-threads=1 >registration-fixture-logs/positive-run.log 2>&1
+          native_exit=$?
+          set -e
+          printf '%s\n' "$native_exit" > registration-fixture-logs/positive-native-exit.txt
+          cat registration-fixture-logs/positive-run.log
+          [[ "$native_exit" -eq 0 ]]
+          python3 scripts/registration-fixture-proof.py verify positive registration-fixture-logs/positive-run.log
+
+      - name: Run negative fixture
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          selector='p2p_endpoint::tests::shutdown_during_inbound_handshake_leaves_no_stale_entry'
+          negative="$RUNNER_TEMP/registration-fixture-negative-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "$negative" > registration-fixture-logs/negative-worktree.txt
+          git worktree add --detach "$negative" "$GITHUB_SHA"
+          python3 scripts/registration-fixture-proof.py mutate "$negative/src/nat_traversal_api.rs" registration-fixture-logs/negative-mutation.json
+          git -C "$negative" diff --binary -- src/nat_traversal_api.rs > registration-fixture-logs/negative.diff
+          sha256sum registration-fixture-logs/negative.diff | tee registration-fixture-logs/negative-diff-sha256.txt
+          sha256sum "$negative/Cargo.lock" | tee registration-fixture-logs/negative-cargo-lock-sha256.txt
+          [[ "$(git -C "$negative" status --short)" == ' M src/nat_traversal_api.rs' ]]
+          set +e
+          cargo test --manifest-path "$negative/Cargo.toml" --locked --lib --all-features "$selector" -- --exact --nocapture --test-threads=1 >registration-fixture-logs/negative-run.log 2>&1
+          native_exit=$?
+          set -e
+          printf '%s\n' "$native_exit" > registration-fixture-logs/negative-native-exit.txt
+          cat registration-fixture-logs/negative-run.log
+          [[ "$native_exit" -eq 101 ]]
+          python3 scripts/registration-fixture-proof.py verify negative registration-fixture-logs/negative-run.log
+
+      - name: Verify checkout custody
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          git diff --exit-code
+          git diff --cached --exit-code
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registration-fixture-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: registration-fixture-logs/
+          if-no-files-found: error

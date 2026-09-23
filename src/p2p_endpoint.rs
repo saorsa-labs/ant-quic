@@ -89,6 +89,7 @@ use crate::crypto::raw_public_keys::key_utils::{
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
 pub use crate::nat_traversal_api::TraversalPhase;
+use crate::nat_traversal_api::UNAUTHENTICATED_GENERATION;
 use crate::nat_traversal_api::{
     ConstrainedEventWithAddr, NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, PeerId,
     TraversalFailureReason,
@@ -235,8 +236,6 @@ const BIDI_PREFIX_READ_TIMEOUT: Duration = if cfg!(test) {
 // MUST be the same length or the app comparison would read the wrong byte
 // window. This compile-time assertion keeps that invariant locked.
 const _: () = assert!(APP_BIDI_STREAM_MAGIC.len() == ACK_BIDI_REQUEST_MAGIC.len());
-
-use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
 /// Free-slot fraction (of capacity) at or below which a data-channel
 /// saturation event is recorded.
@@ -561,6 +560,26 @@ where
     None
 }
 
+fn direct_stage_timeout(
+    configured_timeout: Duration,
+    overall_timeout: Duration,
+    custom_strategy_supplied: bool,
+    address_only: bool,
+    relay_reserve: Option<Duration>,
+) -> Duration {
+    if custom_strategy_supplied || !address_only {
+        return configured_timeout.min(overall_timeout);
+    }
+
+    let minimum_direct = configured_timeout.min(overall_timeout);
+    let maximum_relay_reserve = overall_timeout.saturating_sub(minimum_direct);
+    overall_timeout.saturating_sub(
+        relay_reserve
+            .unwrap_or(Duration::ZERO)
+            .min(maximum_relay_reserve),
+    )
+}
+
 fn cached_peer_avg_rtt(peer: &CachedPeer) -> Option<Duration> {
     (peer.stats.avg_rtt_ms > 0).then(|| Duration::from_millis(u64::from(peer.stats.avg_rtt_ms)))
 }
@@ -829,10 +848,10 @@ pub struct P2pEndpoint {
     direct_path_statuses: Arc<ParkingRwLock<HashMap<PeerId, DirectPathStatus>>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
-    data_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
+    data_tx: mpsc::Sender<(PeerId, u64, Vec<u8>)>,
 
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
-    data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
+    data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, u64, Vec<u8>)>>>,
 
     /// Configured `data_tx` capacity (preserved for diagnostics; the
     /// `mpsc::Sender` only exposes remaining free slots).
@@ -2211,6 +2230,36 @@ fn close_reason_from_connection(
         .close_reason()
         .as_ref()
         .map(ConnectionCloseReason::from_connection_error)
+}
+
+fn send_generation_matches(
+    snapshot: Option<crate::nat_traversal_api::ConnectionLifecycleSnapshot>,
+    generation: u64,
+) -> bool {
+    generation != UNAUTHENTICATED_GENERATION
+        && snapshot.is_some_and(|entry| {
+            entry.generation == generation
+                && matches!(
+                    entry.state,
+                    crate::connection_lifecycle::ConnectionLifecycleState::Live
+                )
+        })
+}
+
+fn admit_pinned_send<B, F>(
+    snapshot: Option<crate::nat_traversal_api::ConnectionLifecycleSnapshot>,
+    generation: u64,
+    admit: F,
+) -> Result<B, EndpointError>
+where
+    F: FnOnce(u64) -> Result<B, EndpointError>,
+{
+    if !send_generation_matches(snapshot, generation) {
+        return Err(EndpointError::Connection(
+            "authenticated connection generation changed before write".to_owned(),
+        ));
+    }
+    admit(generation)
 }
 
 fn endpoint_error_from_connection_error(error: crate::ConnectionError) -> EndpointError {
@@ -4951,13 +5000,16 @@ impl P2pEndpoint {
             );
         }
 
+        let address_only = peer_id.is_none();
+        let relay_reserve = (config.relay_enabled && !config.relay_addrs.is_empty())
+            .then_some(config.relay_timeout);
         let mut strategy = ConnectionStrategy::new(config);
-        let overall_deadline = tokio::time::Instant::now()
-            + self
-                .config
-                .timeouts
-                .nat_traversal
-                .connection_establishment_timeout;
+        let connection_establishment_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+        let overall_deadline = tokio::time::Instant::now() + connection_establishment_timeout;
 
         info!(
             "Starting fallback connection: IPv4={:?}, IPv6={:?} (PeerId: {:?})",
@@ -5001,7 +5053,19 @@ impl P2pEndpoint {
                     }
 
                     let he_config = HappyEyeballsConfig::default();
-                    let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+                    // Address-only dials cannot use hole punching because they do not
+                    // carry an authenticated target PeerId. Give their direct stage
+                    // the authoritative overall establishment budget, reserving time
+                    // only when a relay path is actually available. This keeps the
+                    // dial bounded while avoiding an early RTT-derived terminal abort
+                    // under scheduler contention (issue #292).
+                    let direct_timeout = direct_stage_timeout(
+                        strategy.ipv4_timeout().max(strategy.ipv6_timeout()),
+                        overall_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        custom_strategy_supplied,
+                        address_only,
+                        relay_reserve,
+                    );
                     let handshake_timeout = self
                         .config
                         .timeouts
@@ -6228,7 +6292,7 @@ impl P2pEndpoint {
         ack_request_dedupe: &Arc<AckRequestDedupeCache>,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
         peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
-        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx: &mpsc::Sender<(PeerId, u64, Vec<u8>)>,
         data_tx_diagnostics: &DataChannelDiagnostics,
         data_tx_capacity: usize,
         event_tx: &broadcast::Sender<P2pEvent>,
@@ -6241,6 +6305,7 @@ impl P2pEndpoint {
         connection: &crate::high_level::Connection,
         peer_id: PeerId,
         conn_stable_id: usize,
+        generation: u64,
         mut send: crate::high_level::SendStream,
         mut recv: crate::high_level::RecvStream,
         max_read_bytes: usize,
@@ -6290,6 +6355,7 @@ impl P2pEndpoint {
                 &event_tx,
                 peer_id,
                 conn_stable_id,
+                generation,
                 send,
                 recv,
                 prefix,
@@ -6376,12 +6442,13 @@ impl P2pEndpoint {
         ack_request_dedupe: &AckRequestDedupeCache,
         connected_peers: &Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
         peer_activity: &Arc<RwLock<HashMap<PeerId, PeerActivityRecord>>>,
-        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx: &mpsc::Sender<(PeerId, u64, Vec<u8>)>,
         data_tx_diagnostics: &DataChannelDiagnostics,
         data_tx_capacity: usize,
         event_tx: &broadcast::Sender<P2pEvent>,
         peer_id: PeerId,
         conn_stable_id: usize,
+        generation: u64,
         send: crate::high_level::SendStream,
         mut recv: crate::high_level::RecvStream,
         prefix: Vec<u8>,
@@ -6505,6 +6572,7 @@ impl P2pEndpoint {
             data_tx_diagnostics,
             data_tx_capacity,
             peer_id,
+            generation,
             payload.to_vec(),
         )
         .await;
@@ -6598,10 +6666,11 @@ impl P2pEndpoint {
     }
 
     async fn admit_ack_requested_payload(
-        data_tx: &mpsc::Sender<(PeerId, Vec<u8>)>,
+        data_tx: &mpsc::Sender<(PeerId, u64, Vec<u8>)>,
         data_tx_diagnostics: &DataChannelDiagnostics,
         data_tx_capacity: usize,
         peer_id: PeerId,
+        generation: u64,
         payload: Vec<u8>,
     ) -> Result<(), ReceiveRejectReason> {
         // Sample channel pressure pre-reserve so high-water events are
@@ -6609,7 +6678,7 @@ impl P2pEndpoint {
         data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
         match timeout(ACK_RECEIVE_ADMISSION_TIMEOUT, data_tx.reserve()).await {
             Ok(Ok(permit)) => {
-                permit.send((peer_id, payload));
+                permit.send((peer_id, generation, payload));
                 Ok(())
             }
             Ok(Err(_closed)) => Err(ReceiveRejectReason::ConsumerGone),
@@ -7155,6 +7224,106 @@ impl P2pEndpoint {
             );
         }
         result
+    }
+
+    /// Send only on the authenticated QUIC connection with `generation`.
+    ///
+    /// Unlike [`Self::send`], this never switches to another connection or a
+    /// constrained transport. The connection is selected and checked before
+    /// opening a stream, then held for the entire write. Callers can safely
+    /// encode connection-scoped bytes before calling this method: a reconnect
+    /// between encoding and this check returns an error without sending them.
+    pub async fn send_on_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), EndpointError> {
+        self.send_on_generation_with_admission(peer_id, generation, |_| Ok(data))
+            .await
+    }
+
+    /// Send on one pinned generation after admitting bytes at the stream seam.
+    ///
+    /// `admit` runs exactly once only after `open_uni()` completes and the
+    /// connection is still live at the requested generation. It may inspect
+    /// current application policy and return connection-scoped bytes or refuse
+    /// the send. A refusal writes no bytes; neither this path nor its legacy
+    /// projection retries on a replacement connection or constrained engine.
+    pub async fn send_on_generation_with_admission<B, F>(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        admit: F,
+    ) -> Result<(), EndpointError>
+    where
+        B: AsRef<[u8]> + Send,
+        F: FnOnce(u64) -> Result<B, EndpointError> + Send,
+    {
+        if self.shutdown.is_cancelled() {
+            return Err(EndpointError::ShuttingDown);
+        }
+        let connection = self
+            .inner
+            .get_connection(peer_id)
+            .map_err(EndpointError::NatTraversal)?
+            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if !send_generation_matches(snapshot, generation) {
+            return Err(EndpointError::Connection(
+                "authenticated connection generation changed before send".to_owned(),
+            ));
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+
+        let mut stream = connection
+            .open_uni()
+            .await
+            .map_err(endpoint_error_from_connection_error)?;
+        // Stream credit can stall behind peer backpressure. Recheck after
+        // that wait, before admitting any connection-scoped bytes.
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+        let data = admit_pinned_send(snapshot, generation, admit)?;
+        // An admission callback can be nontrivial; reject a generation swap
+        // during that synchronous work before handing bytes to the stream.
+        let snapshot = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id());
+        if !send_generation_matches(snapshot, generation) {
+            return Err(EndpointError::Connection(
+                "authenticated connection generation changed after admission".to_owned(),
+            ));
+        }
+        if let Some(reason) = close_reason_from_connection(&connection) {
+            return Err(EndpointError::ConnectionClosed { reason });
+        }
+        stream
+            .write_all(data.as_ref())
+            .await
+            .map_err(endpoint_error_from_write_error)?;
+        stream.finish().map_err(|error| {
+            close_reason_from_connection(&connection)
+                .map(|reason| EndpointError::ConnectionClosed { reason })
+                .unwrap_or_else(|| EndpointError::Connection(error.to_string()))
+        })?;
+        note_peer_activity(
+            &self.connected_peers,
+            &self.peer_activity,
+            *peer_id,
+            PeerActivityKind::Sent,
+            Instant::now(),
+        )
+        .await;
+        Ok(())
     }
 
     /// Send data and wait until the remote ant-quic receive pipeline accepts it.
@@ -7913,6 +8082,19 @@ impl P2pEndpoint {
     ///
     /// Returns `EndpointError::ShuttingDown` if the endpoint is shutting down.
     pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), EndpointError> {
+        self.recv_with_generation()
+            .await
+            .map(|(peer, _, data)| (peer, data))
+    }
+
+    /// Receive data with the process-local generation captured by its connection reader.
+    ///
+    /// Shares a queue with [`Self::recv`]; each message is consumed exactly once.
+    /// `u64::MAX` means stale pre-authentication data or unproven provenance (including
+    /// constrained transports). It is never allocated to a tracked QUIC connection.
+    /// A queued generation can be older than [`Self::current_connection_generation`].
+    /// Returns [`EndpointError::ShuttingDown`] when the endpoint shuts down.
+    pub async fn recv_with_generation(&self) -> Result<(PeerId, u64, Vec<u8>), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -7922,7 +8104,15 @@ impl P2pEndpoint {
             let mut pending = self.pending_data.write().await;
             pending.cleanup_expired();
 
-            if let Some((peer_id, data)) = pending.pop_any() {
+            if let Some((peer_id, generation, data)) = pending.pop_any_with_generation() {
+                // Only invalidate the insertion-time stamp; never upgrade old bytes
+                // to a new session by looking up its generation after dequeue.
+                let generation = if self.current_connection_generation(&peer_id) == Some(generation)
+                {
+                    generation
+                } else {
+                    UNAUTHENTICATED_GENERATION
+                };
                 let data_len = data.len();
                 tracing::trace!(
                     "Received {} bytes from peer {:?} (from pending buffer)",
@@ -7955,7 +8145,7 @@ impl P2pEndpoint {
                     );
                 }
 
-                return Ok((peer_id, data));
+                return Ok((peer_id, generation, data));
             }
         }
 
@@ -7969,6 +8159,12 @@ impl P2pEndpoint {
             },
             _ = self.shutdown.cancelled() => Err(EndpointError::ShuttingDown),
         }
+    }
+
+    /// Generation of the currently live, open QUIC connection, if one is tracked.
+    /// This is a snapshot, not provenance for data returned by [`Self::recv`].
+    pub fn current_connection_generation(&self, peer: &PeerId) -> Option<u64> {
+        self.inner.current_connection_generation(peer)
     }
 
     // === Application byte-streams ============================================
@@ -8816,6 +9012,18 @@ impl P2pEndpoint {
 
     /// Shutdown the endpoint gracefully
     pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            warn!(%error, "P2P endpoint shutdown did not fully release its resources");
+        }
+    }
+
+    /// Shutdown the endpoint and report whether its original UDP sockets are
+    /// available for immediate reuse.
+    ///
+    /// Each inner phase is independently bounded. The complete cleanup future
+    /// is deliberately not wrapped in an outer timeout, because cancelling it
+    /// could skip listener cleanup and lose retry custody of released sockets.
+    pub async fn try_shutdown(&self) -> Result<(), EndpointError> {
         info!("Shutting down P2P endpoint");
         self.shutdown.cancel();
 
@@ -8844,12 +9052,8 @@ impl P2pEndpoint {
             let _ = self.disconnect(&peer_id).await;
         }
 
-        // Bounded timeout prevents blocking when the remote peer is unresponsive.
-        match timeout(SHUTDOWN_DRAIN_TIMEOUT, self.inner.shutdown()).await {
-            Err(_) => warn!("Inner endpoint shutdown timed out, proceeding"),
-            Ok(Err(e)) => warn!("Inner endpoint shutdown error: {e}"),
-            Ok(Ok(())) => {}
-        }
+        self.inner.shutdown().await?;
+        Ok(())
     }
 
     /// Check if endpoint is running
@@ -9400,6 +9604,11 @@ impl P2pEndpoint {
         let generation = lifecycle_snapshot
             .map(|snapshot| snapshot.generation)
             .unwrap_or(conn_stable_id as u64);
+        // Keep receive provenance separate from the reader-management fallback
+        // stable_id: only a lifecycle allocation can identify authenticated data.
+        let recv_generation = lifecycle_snapshot
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or(UNAUTHENTICATED_GENERATION);
         let cancel = CancellationToken::new();
         if let Some(snapshot) = lifecycle_snapshot {
             debug!(
@@ -9501,6 +9710,7 @@ impl P2pEndpoint {
                             &connection,
                             peer_id,
                             conn_stable_id,
+                            recv_generation,
                             send,
                             recv,
                             max_read_bytes,
@@ -9715,7 +9925,7 @@ impl P2pEndpoint {
             // counters even when the eventual `send().await` succeeds
             // after a brief block (X0X-0039).
             data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
-            if data_tx.send((peer_id, payload)).await.is_err() {
+            if data_tx.send((peer_id, recv_generation, payload)).await.is_err() {
                 debug!(
                     "Reader task for peer {:?}: channel closed, exiting",
                     peer_id
@@ -10007,7 +10217,11 @@ impl P2pEndpoint {
                         // events on the constrained ingress path are visible
                         // alongside the QUIC reader-task path (X0X-0039).
                         data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
-                        if data_tx.send((peer_id, data)).await.is_err() {
+                        if data_tx
+                            .send((peer_id, UNAUTHENTICATED_GENERATION, data))
+                            .await
+                            .is_err()
+                        {
                             debug!("Constrained poller: channel closed, exiting");
                             break;
                         }
@@ -10594,6 +10808,155 @@ mod tests {
     #[cfg(all(test, feature = "network-discovery"))]
     use crate::nat_traversal_api::tracked_connection_for_test;
 
+    #[test]
+    fn guarded_send_accepts_only_the_requested_live_generation() {
+        use crate::connection_lifecycle::ConnectionLifecycleState;
+        use crate::nat_traversal_api::ConnectionLifecycleSnapshot;
+
+        let live = ConnectionLifecycleSnapshot {
+            generation: 42,
+            stable_id: 7,
+            connection_id: [0; 32],
+            state: ConnectionLifecycleState::Live,
+            established_at_unix_ms: 0,
+        };
+        assert!(send_generation_matches(Some(live), 42));
+        assert!(!send_generation_matches(Some(live), 41));
+        assert!(!send_generation_matches(
+            Some(live),
+            UNAUTHENTICATED_GENERATION
+        ));
+        assert!(!send_generation_matches(None, 42));
+        let superseded = ConnectionLifecycleSnapshot {
+            state: ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 43,
+            },
+            ..live
+        };
+        assert!(!send_generation_matches(Some(superseded), 42));
+    }
+
+    #[test]
+    fn pinned_send_admission_refuses_stale_generation_and_propagates_policy_refusal() {
+        use crate::connection_lifecycle::ConnectionLifecycleState;
+        use crate::nat_traversal_api::ConnectionLifecycleSnapshot;
+        use std::cell::Cell;
+
+        let live = ConnectionLifecycleSnapshot {
+            generation: 42,
+            stable_id: 7,
+            connection_id: [0; 32],
+            state: ConnectionLifecycleState::Live,
+            established_at_unix_ms: 0,
+        };
+        let calls = Cell::new(0);
+        for snapshot in [
+            None,
+            Some(ConnectionLifecycleSnapshot {
+                generation: 43,
+                ..live
+            }),
+            Some(ConnectionLifecycleSnapshot {
+                state: ConnectionLifecycleState::Superseded {
+                    replaced_by_generation: 43,
+                },
+                ..live
+            }),
+        ] {
+            let result = admit_pinned_send(snapshot, 42, |_| {
+                calls.set(calls.get() + 1);
+                Ok(b"must not send".to_vec())
+            });
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.get(), 0, "stale connections must not call admission");
+
+        let admitted = admit_pinned_send(Some(live), 42, |actual| {
+            calls.set(calls.get() + 1);
+            assert_eq!(actual, 42);
+            Ok(b"admitted".to_vec())
+        })
+        .expect("live generation admits");
+        assert_eq!(admitted, b"admitted");
+        assert_eq!(calls.get(), 1);
+
+        let refused: Result<Vec<u8>, EndpointError> = admit_pinned_send(Some(live), 42, |_| {
+            Err(EndpointError::Connection("policy refused".to_owned()))
+        });
+        assert!(
+            matches!(refused, Err(EndpointError::Connection(reason)) if reason == "policy refused")
+        );
+    }
+
+    #[cfg(feature = "network-discovery")]
+    #[tokio::test]
+    async fn recv_generation_pending_data_reconnect_invalidates_old_stamp() {
+        let (a, b, _connection) = loopback_quic_pair().await;
+        let peer = b.peer_id();
+        let old = a
+            .current_connection_generation(&peer)
+            .expect("live generation");
+        a.pending_data
+            .write()
+            .await
+            .push_with_generation(&peer, old, b"pre-auth".to_vec())
+            .expect("buffer");
+        a.disconnect(&peer).await.expect("disconnect");
+        // The first close may already have reached the remote reader.
+        assert!(matches!(
+            b.disconnect(&a.peer_id()).await,
+            Ok(()) | Err(EndpointError::PeerNotFound(_))
+        ));
+        assert_eq!(a.current_connection_generation(&peer), None);
+        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b)))
+            .await
+            .expect("reconnect timeout")
+            .expect("reconnect");
+        let new = a
+            .current_connection_generation(&peer)
+            .expect("new live generation");
+        assert!(new > old);
+        let (sender, generation, data) = a.recv_with_generation().await.expect("drain");
+        assert_eq!(sender, peer);
+        assert_eq!(data, b"pre-auth");
+        assert_eq!(generation, UNAUTHENTICATED_GENERATION);
+        assert_ne!(
+            Some(generation),
+            a.current_connection_generation(&peer),
+            "stale pre-auth bytes cannot match a live session for legacy admission"
+        );
+        a.pending_data
+            .write()
+            .await
+            .push_with_generation(&peer, new, b"current".to_vec())
+            .expect("buffer current");
+        assert_eq!(
+            a.recv_with_generation().await.expect("current drain"),
+            (peer, new, b"current".to_vec())
+        );
+        a.pending_data
+            .write()
+            .await
+            .push(&peer, b"unproven".to_vec())
+            .expect("legacy insertion");
+        assert_eq!(
+            a.recv_with_generation().await.expect("unproven drain").1,
+            UNAUTHENTICATED_GENERATION
+        );
+        a.disconnect(&peer).await.expect("disconnect");
+        a.pending_data
+            .write()
+            .await
+            .push_with_generation(&peer, new, vec![1])
+            .expect("buffer closed");
+        assert_eq!(
+            a.recv_with_generation().await.expect("closed drain").1,
+            UNAUTHENTICATED_GENERATION
+        );
+        let _ = a.shutdown().await;
+        let _ = b.shutdown().await;
+    }
+
     fn collect_broadcast_events(
         events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
     ) -> Vec<P2pEvent> {
@@ -10631,14 +10994,22 @@ mod tests {
         // payload fills the queue; the second reserve cannot complete in
         // ACK_RECEIVE_ADMISSION_TIMEOUT and increments high_water_count.
         let capacity = 1usize;
-        let (tx, _rx) = mpsc::channel::<(PeerId, Vec<u8>)>(capacity);
+        let (tx, _rx) = mpsc::channel::<(PeerId, u64, Vec<u8>)>(capacity);
         let diags = DataChannelDiagnostics::default();
         let peer_id = PeerId([0x33; 32]);
         // Pre-fill so the next reserve must wait.
-        tx.send((peer_id, vec![0u8; 8])).await.expect("first send");
-        let admission =
-            P2pEndpoint::admit_ack_requested_payload(&tx, &diags, capacity, peer_id, vec![1u8; 8])
-                .await;
+        tx.send((peer_id, 1, vec![0u8; 8]))
+            .await
+            .expect("first send");
+        let admission = P2pEndpoint::admit_ack_requested_payload(
+            &tx,
+            &diags,
+            capacity,
+            peer_id,
+            1,
+            vec![1u8; 8],
+        )
+        .await;
         assert!(matches!(admission, Err(ReceiveRejectReason::Backpressured)));
         assert!(
             diags.high_water_count() >= 1,
@@ -10980,6 +11351,95 @@ mod tests {
         assert_eq!(
             cache.replay(peer_id, request_id, b"different payload"),
             Some(AckRequestDedupeReplay::Conflict)
+        );
+    }
+
+    #[test]
+    fn address_only_direct_budget_uses_available_overall_deadline() {
+        let configured = Duration::from_millis(2_082);
+        let overall = Duration::from_secs(30);
+
+        assert_eq!(
+            direct_stage_timeout(configured, overall, false, true, None),
+            overall,
+            "without a usable fallback, direct dialing owns the bounded overall budget"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                true,
+                Some(Duration::from_secs(10)),
+            ),
+            Duration::from_secs(20),
+            "a usable relay keeps its reserved slice"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                true,
+                Some(Duration::from_secs(30)),
+            ),
+            configured,
+            "an oversized relay reserve must not starve a viable direct route"
+        );
+        assert_eq!(
+            direct_stage_timeout(configured, overall, true, true, None),
+            configured,
+            "an explicit strategy remains authoritative"
+        );
+        assert_eq!(
+            direct_stage_timeout(configured, overall, false, false, None),
+            configured,
+            "peer-oriented dialing retains its adaptive fallback allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_only_direct_budget_allows_slow_race_but_keeps_overall_cap() {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().expect("loopback addr");
+        let configured = Duration::from_millis(20);
+        let overall = Duration::from_millis(300);
+        let effective = direct_stage_timeout(configured, overall, false, true, None);
+
+        let completed = timeout(
+            effective,
+            happy_eyeballs::race_connect(
+                &[addr],
+                &HappyEyeballsConfig::default(),
+                move |candidate| async move {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Ok::<SocketAddr, EndpointError>(candidate)
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            completed
+                .expect("race stays within overall deadline")
+                .expect("dial succeeds"),
+            (addr, addr),
+            "a delayed dial must survive the shorter adaptive cutoff"
+        );
+
+        let capped = timeout(
+            effective,
+            happy_eyeballs::race_connect(
+                &[addr],
+                &HappyEyeballsConfig::default(),
+                move |candidate| async move {
+                    tokio::time::sleep(overall + Duration::from_millis(100)).await;
+                    Ok::<SocketAddr, EndpointError>(candidate)
+                },
+            ),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "the direct race must still terminate at the configured overall deadline"
         );
     }
 
@@ -12260,6 +12720,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_shutdown_retains_original_socket_release_across_retry() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        endpoint
+            .inner
+            .set_socket_release_timeout_for_test(Duration::from_millis(25));
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::from_millis(25));
+        let (listener_ready, listener_done) = endpoint
+            .inner
+            .install_stubborn_transport_listener_for_test();
+        listener_ready.await.expect("listener probe starts");
+
+        let error = endpoint
+            .try_shutdown()
+            .await
+            .expect_err("held original socket must prevent release completion");
+        assert!(
+            matches!(
+                &error,
+                EndpointError::NatTraversal(NatTraversalError::NetworkError(message))
+                    if message.starts_with(
+                        crate::nat_traversal_api::SHUTDOWN_SOCKET_RELEASE_TIMEOUT_PREFIX
+                    )
+            ),
+            "unexpected shutdown error: {error}"
+        );
+        listener_done
+            .await
+            .expect("listener cleanup must complete before the error returns");
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 0);
+        assert!(endpoint.inner.pending_socket_release_count_for_test() > 0);
+        assert!(
+            std::net::UdpSocket::bind(held_addr).is_err(),
+            "the held original socket must still own its actual address"
+        );
+
+        drop(held_socket);
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("retry settles the retained original release record");
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "successful retry must make the original address immediately available: {rebound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_enumeration_failure_never_commits_the_socket_swap() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let original_addr = endpoint
+            .inner
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        endpoint
+            .inner
+            .install_failing_local_addrs_socket_for_test()
+            .expect("install address-enumeration fault socket");
+
+        for attempt in 0..2 {
+            let error = endpoint
+                .try_shutdown()
+                .await
+                .expect_err("address enumeration failure must remain retryable");
+            assert!(
+                matches!(
+                    &error,
+                    EndpointError::NatTraversal(NatTraversalError::NetworkError(_))
+                ),
+                "attempt {attempt}: unexpected error: {error}"
+            );
+            assert_eq!(
+                endpoint
+                    .inner
+                    .shutdown_socket_address_for_test()
+                    .expect("unswapped socket address"),
+                original_addr,
+                "failed address capture must happen before the one-time socket swap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_listener_cleanup_is_retained_for_retry() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::ZERO);
+        endpoint
+            .inner
+            .force_listener_confirmation_timeout_for_test();
+        let (listener_ready, listener_done) = endpoint
+            .inner
+            .install_stubborn_transport_listener_for_test();
+        listener_ready.await.expect("stubborn listener starts");
+
+        let error = endpoint
+            .try_shutdown()
+            .await
+            .expect_err("unconfirmed listener termination must be reported");
+        assert!(
+            matches!(
+                &error,
+                EndpointError::NatTraversal(NatTraversalError::NetworkError(message))
+                    if message.starts_with(
+                        crate::nat_traversal_api::SHUTDOWN_LISTENER_TIMEOUT_PREFIX
+                    )
+            ),
+            "unexpected listener shutdown error: {error}"
+        );
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 1);
+
+        endpoint
+            .inner
+            .set_listener_shutdown_timeout_for_test(Duration::from_secs(2));
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("retry confirms the retained aborted listener");
+        listener_done
+            .await
+            .expect("aborted listener future is terminal before retry returns");
+        assert_eq!(endpoint.inner.transport_listener_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn try_shutdown_waits_for_explicit_original_socket_release_barrier() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        let release_wait = endpoint.inner.socket_release_wait_notify_for_test();
+        let shutdown_endpoint = endpoint.clone();
+        let shutdown = tokio::spawn(async move { shutdown_endpoint.try_shutdown().await });
+
+        tokio::time::timeout(Duration::from_secs(2), release_wait.notified())
+            .await
+            .expect("shutdown reaches socket settlement");
+        assert!(
+            !shutdown.is_finished(),
+            "held socket must keep shutdown pending"
+        );
+        drop(held_socket);
+
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown completes after explicit release")
+            .expect("shutdown task joins")
+            .expect("socket settlement succeeds");
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "successful shutdown must make the actual address immediately available: {rebound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_try_shutdown_is_serialized_and_reuses_one_replacement() {
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_socket = endpoint
+            .inner
+            .clone_socket_for_shutdown_test()
+            .expect("clone actual endpoint socket");
+        let release_wait = endpoint.inner.socket_release_wait_notify_for_test();
+        let first = endpoint.clone();
+        let second = endpoint.clone();
+        let first_shutdown = tokio::spawn(async move { first.try_shutdown().await });
+        let second_shutdown = tokio::spawn(async move { second.try_shutdown().await });
+
+        tokio::time::timeout(Duration::from_secs(2), release_wait.notified())
+            .await
+            .expect("one serialized caller reaches socket settlement");
+        drop(held_socket);
+        for shutdown in [first_shutdown, second_shutdown] {
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .expect("serialized shutdown completes")
+                .expect("shutdown task joins")
+                .expect("serialized shutdown succeeds");
+        }
+
+        let replacement_addr = endpoint
+            .inner
+            .shutdown_socket_address_for_test()
+            .expect("replacement address");
+        endpoint
+            .try_shutdown()
+            .await
+            .expect("repeated shutdown remains successful");
+        assert_eq!(
+            endpoint
+                .inner
+                .shutdown_socket_address_for_test()
+                .expect("stable replacement address"),
+            replacement_addr,
+            "serialized/repeated shutdown must not grow a chain of replacements"
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_releases_udp_socket_for_same_process_rebind() {
         let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
         let local_addr = endpoint.local_addr().expect("endpoint local addr");
@@ -12317,7 +12987,10 @@ mod tests {
             // socket, so probe the address it actually holds.
             let held_addr = endpoint.local_addr().expect("endpoint local addr");
 
-            endpoint.shutdown().await;
+            endpoint
+                .try_shutdown()
+                .await
+                .expect("live-connection shutdown releases its fixed socket");
 
             let rebound = std::net::UdpSocket::bind(held_addr);
             assert!(
@@ -12357,7 +13030,10 @@ mod tests {
             .expect("connect should succeed");
             drop(connection);
 
-            endpoint.shutdown().await;
+            endpoint
+                .try_shutdown()
+                .await
+                .expect("live-connection shutdown releases its fixed socket");
 
             let rebound = std::net::UdpSocket::bind(held_addr);
             assert!(
@@ -16077,6 +16753,13 @@ mod tests {
             "the demoted first dial must remain open (Superseded survivor)"
         );
 
+        // These assertion-only B-side handles retain QUIC endpoint/socket
+        // custody beyond the lifecycle-map owners. Release them before strict
+        // shutdown so the resource-release proof measures production custody,
+        // while A's remote view below still proves every generation closed.
+        drop(c0_probe);
+        drop(c1);
+
         // B's inner endpoint shuts down — the path that, pre-fix, closed
         // only the canonical winner and left the Superseded survivor open.
         b.inner.shutdown().await.expect("inner shutdown");
@@ -16105,12 +16788,13 @@ mod tests {
     ///
     /// #286 round 2 — deterministic: the race is driven by the
     /// registration-gate test hook (`arm_registration_gate_for_test`), which
-    /// parks B's registration of the late dial between its fast-path
+    /// parks only B's registration of the late dial between its fast-path
     /// shutdown check and the map insert — the exact worst-case scheduling
     /// the in-lock re-check must survive (flag read early, insert attempted
-    /// after the sweep). With the registration parked, B's shutdown runs to
-    /// COMPLETION (sweep, drain, socket release), then the gate releases the
-    /// registration. Profile-independent: no sleeps, no handshake timing.
+    /// after the sweep). The test observes B's completed lifecycle sweep,
+    /// then releases the registration before shutdown joins the worker.
+    /// An unrelated C → D registration must complete while B remains parked,
+    /// proving the hook cannot capture concurrent tests or endpoints.
     /// Asserts (a) no entry survives in either map and (b) the remote
     /// observes the disconnect within the drain window.
     // Requires the network-discovery socket path: the fallback
@@ -16136,12 +16820,16 @@ mod tests {
 
         let a = build_endpoint().await;
         let b = build_endpoint().await;
+        let c = build_endpoint().await;
+        let d = build_endpoint().await;
         let a_for_accept = a.clone();
         tokio::spawn(async move { while a_for_accept.accept().await.is_some() {} });
         let b_addr = localhost_addr(b.local_addr().expect("b bound"));
         let a_addr = localhost_addr(a.local_addr().expect("a bound"));
         let b_id = b.peer_id();
         let a_id = a.peer_id();
+        let d_id = d.peer_id();
+        let d_addr = localhost_addr(d.local_addr().expect("d bound"));
 
         // Family 1 (B → A dial, registered on B; A adopts it through its
         // accept path): A holds a live connection to B whose fate the test
@@ -16168,31 +16856,66 @@ mod tests {
         // accept worker registers the inbound handshake through
         // register_connection_lifecycle_parts, which parks on the gate AFTER
         // its fast-path flag check.
-        let gate = crate::nat_traversal_api::arm_registration_gate_for_test();
+        let gate = b.inner.arm_registration_gate_for_test();
         let late_dial = {
             let a = a.clone();
             tokio::spawn(async move { a.attempt_direct_handshake(b_addr).await })
         };
-        let park_deadline = Instant::now() + Duration::from_secs(10);
-        while gate.parked_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(
-                Instant::now() < park_deadline,
-                "the late registration never reached the gate"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+            .await
+            .expect("the late registration never reached the gate");
 
-        // With the registration parked mid-flight, run B's shutdown to
-        // COMPLETION — flag stored, canonical drain, #285 lifecycle sweep,
-        // worker abort+join, bounded drain, socket release.
-        b.inner.shutdown().await.expect("inner shutdown");
+        // The gate is endpoint-scoped: an unrelated C → D handshake and
+        // registration completes while B remains parked. A process-global
+        // gate deadlocks here and the outer timeout fails deterministically.
+        let unrelated = tokio::spawn(async move {
+            let connection = c.attempt_direct_handshake(d_addr).await.map_err(|error| {
+                crate::nat_traversal_api::NatTraversalError::NetworkError(format!(
+                    "unrelated control handshake failed: {error}"
+                ))
+            })?;
+            c.inner.add_connection_with_outcome(d_id, connection)?;
+            Ok::<P2pEndpoint, crate::nat_traversal_api::NatTraversalError>(c)
+        });
+        let c = tokio::time::timeout(Duration::from_secs(10), unrelated)
+            .await
+            .expect("unrelated registration was captured by B's gate")
+            .expect("unrelated registration task")
+            .expect("unrelated registration");
+        assert_eq!(
+            gate.parked_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only B's selected registration may be parked"
+        );
+
+        // Start B's shutdown and hold it immediately after the lifecycle
+        // sweep, before any production drain or socket-release deadline.
+        let b_for_shutdown = b.clone();
+        let shutdown = tokio::spawn(async move { b_for_shutdown.inner.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_shutdown_paused())
+            .await
+            .expect("shutdown did not pause after its lifecycle sweep");
 
         // Release the parked registration: it resumes exactly in the
         // worst-case window (post-sweep). The in-lock re-check must refuse
         // it; on the unfixed tree it inserts the stale survivor.
-        gate.released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        crate::nat_traversal_api::disarm_registration_gate_for_test();
+        gate.release();
+        let registrar_outcome =
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_for_registrar_outcome())
+                .await
+                .expect("parked registrar did not finish");
+        assert_eq!(
+            registrar_outcome,
+            crate::nat_traversal_api::GatedRegistrarOutcome::RefusedAndDropped,
+            "a post-sweep registrar must be refused and drop its task-local connection"
+        );
+        gate.release_shutdown();
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(15), shutdown)
+            .await
+            .expect("B shutdown timeout")
+            .expect("B shutdown task")
+            .expect("B inner shutdown");
 
         // The dial's fate: refused (handshake completed, registration
         // refused, B closed the connection) or aborted (worker died
@@ -16239,6 +16962,8 @@ mod tests {
         );
 
         a.shutdown().await;
+        c.shutdown().await;
+        d.shutdown().await;
     }
 
     /// #280 (a): single stream owner. An application stream opened by the
