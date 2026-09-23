@@ -1948,6 +1948,15 @@ mod tests {
             SendFailureAction::DropDatagram,
             "transient active-path failures retain loss recovery"
         );
+        // ENOBUFS on the ACTIVE path is kernel buffer pressure, not a dead
+        // path: the datagram drops and loss recovery retransmits (macOS
+        // errno 55, Linux 105 — matched via libc in is_transient_socket_error).
+        #[cfg(unix)]
+        assert_eq!(
+            send_failure_action(&io::Error::from_raw_os_error(libc::ENOBUFS), active, active),
+            SendFailureAction::DropDatagram,
+            "ENOBUFS under send pressure must not close an active connection"
+        );
     }
 
     #[tokio::test]

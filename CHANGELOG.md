@@ -24,6 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `P2pEndpoint::try_shutdown` and `Node::try_shutdown` return transport cleanup
   failures to embedders. Existing unit-returning shutdown wrappers remain available.
 
+### Changed
+
+- **Shutdown behavior downstream consumers (saorsa-gossip, x0x) must know:**
+  - `NatTraversalEndpoint::shutdown` now returns an error when its original UDP
+    addresses cannot be proven released — the bind probe cannot re-bind the
+    address because the port was taken by another process, or the interface is
+    gone. Previously these failures were logged as warnings and shutdown
+    returned `Ok`. Failed release records stay pending, so a later
+    `shutdown`/`try_shutdown` retries them.
+  - The 5s outer timeout around `P2pEndpoint::shutdown` is removed. Each
+    cleanup phase keeps its own bound (`SHUTDOWN_DRAIN_TIMEOUT` 5s phases plus
+    the 2s socket-release settle), so a worst-case shutdown now takes ~22s
+    instead of being cancelled mid-cleanup at 5s. Concurrent callers serialize
+    on the shutdown lock: one caller performs the release, the others wait and
+    reuse its result rather than racing their own.
+  - `P2pEndpoint::shutdown` and `Node::shutdown` still swallow cleanup errors
+    after logging a warning; use the new `try_shutdown` to observe them.
+  - The connection generation counter is now process-wide: generations are
+    unique across every endpoint in the process, so the first generation of a
+    newly created endpoint is no longer 1.
+  - ENOBUFS send failures (macOS errno 55, Linux errno 105) are classified as
+    transient: under kernel send-buffer pressure the datagram is dropped and
+    QUIC loss recovery retransmits, instead of the connection closing with
+    INTERNAL_ERROR "local UDP send failure".
+
 ## [0.27.52] - 2026-09-13
 
 ### Fixed

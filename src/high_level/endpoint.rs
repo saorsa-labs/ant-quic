@@ -50,11 +50,12 @@ use super::{
 use crate::{EndpointConfig, VarInt};
 
 /// Transient per-datagram socket errors that must NOT terminate the endpoint
-/// driver (x0x issue #262).
+/// driver (x0x issue #262), nor the connection driver's active-path send
+/// classification.
 ///
 /// On Linux, an unconnected UDP socket surfaces asynchronous ICMP errors
-/// (host/net unreachable, port unreachable) as a pending socket error on the
-/// next `recvmsg` — i.e. one unreachable *peer* manifests as a recv error on
+/// (host/net unreachable, port unreachable) as a pending socket error on
+/// the next `recvmsg` — i.e. one unreachable *peer* manifests as a recv error on
 /// the *shared* socket. Terminating the driver on such an error kills all
 /// QUIC I/O for the process: `driver_lost` makes every future `connect()`
 /// fail synchronously and nothing polls the socket again, while the host
@@ -62,11 +63,20 @@ use crate::{EndpointConfig, VarInt};
 /// wedged state for 14+ hours. These errors are scoped to a single datagram
 /// exchange: drop it and keep polling.
 ///
+/// ENOBUFS is the send-side sibling: quinn-udp passes it through verbatim
+/// from `sendmsg` when the kernel socket buffer is momentarily full under
+/// send pressure (macOS 55, Linux 105). std leaves it `Uncategorized`, so it
+/// must be matched as a raw errno — the libc constant is used per platform
+/// instead of magic numbers. Treating it as fatal made active macOS
+/// connections close with INTERNAL_ERROR "local UDP send failure" under
+/// load; dropping the datagram hands the loss to QUIC recovery, which
+/// retransmits once the buffers drain.
+///
 /// Raw errnos cover platform gaps in `io::ErrorKind` mapping: 49
 /// (EADDRNOTAVAIL, macOS), 51/65 (ENETUNREACH/EHOSTUNREACH, macOS),
 /// 101/113 (ENETUNREACH/EHOSTUNREACH, Linux).
 pub(crate) fn is_transient_socket_error(error: &io::Error) -> bool {
-    matches!(
+    if matches!(
         error.kind(),
         io::ErrorKind::AddrNotAvailable
             | io::ErrorKind::ConnectionRefused
@@ -75,7 +85,16 @@ pub(crate) fn is_transient_socket_error(error: &io::Error) -> bool {
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::NotConnected
             | io::ErrorKind::TimedOut
-    ) || matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if error.raw_os_error() == Some(libc::ENOBUFS) {
+            return true;
+        }
+    }
+    matches!(error.raw_os_error(), Some(49 | 51 | 65 | 101 | 113))
 }
 
 /// `EndpointRef`s held by driver infrastructure rather than user-visible
@@ -1681,6 +1700,25 @@ mod driver_error_tests {
                 "{kind:?} must remain driver-fatal"
             );
         }
+    }
+
+    /// WHY: ENOBUFS (macOS 55, Linux 105) arrives from `sendmsg` when the
+    /// kernel socket buffer is momentarily full under send pressure; quinn-udp
+    /// passes it through verbatim and std leaves it `Uncategorized`. It is
+    /// per-datagram backpressure, not a dead socket: classifying it fatal made
+    /// active macOS connections close with INTERNAL_ERROR "local UDP send
+    /// failure" under load. A genuinely fatal error must stay fatal.
+    #[cfg(unix)]
+    #[test]
+    fn enobufs_is_transient_but_fatal_errors_are_not() {
+        assert!(
+            is_transient_socket_error(&io::Error::from_raw_os_error(libc::ENOBUFS)),
+            "ENOBUFS is momentary buffer pressure; QUIC loss recovery retransmits"
+        );
+        assert!(
+            !is_transient_socket_error(&io::Error::from_raw_os_error(libc::EPERM)),
+            "EPERM remains driver-fatal"
+        );
     }
 }
 

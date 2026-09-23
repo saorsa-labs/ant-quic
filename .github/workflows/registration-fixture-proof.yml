@@ -2,8 +2,14 @@ name: Registration fixture proof
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/ant-registration-fixture-barrier, codex/rustls-02345-security]
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'src/nat_traversal_api.rs'
+      - 'src/p2p_endpoint.rs'
+      - 'scripts/registration-fixture-proof.py'
+      - 'Cargo.lock'
+      - '.github/workflows/registration-fixture-proof.yml'
 
 permissions:
   contents: read
