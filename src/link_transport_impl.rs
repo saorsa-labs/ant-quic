@@ -1026,7 +1026,7 @@ use crate::link_transport::BoxedHandler;
 /// let transport = SharedTransport::new(quic_transport);
 ///
 /// transport.register_handler(my_gossip_handler.boxed()).await?;
-/// transport.register_handler(my_dht_handler.boxed()).await?;
+/// transport.register_handler(my_service_handler.boxed()).await?;
 ///
 /// transport.run().await?;
 /// ```
@@ -1603,7 +1603,7 @@ mod tests {
         assert_eq!(alpn_to_protocol_id(None), ProtocolId::DEFAULT);
 
         // Raw 16-byte form round-trips exactly.
-        let proto = ProtocolId::from("saorsa-dht/1.0.0");
+        let proto = ProtocolId::from("saorsa-overlay/1.0.0");
         assert_eq!(alpn_to_protocol_id(Some(proto.as_bytes())), proto);
 
         // UTF-8 string form maps like ProtocolId::from.
@@ -1813,7 +1813,7 @@ mod tests {
 
             assert!(transport.has_handler(StreamType::Membership).await);
             assert!(transport.has_handler(StreamType::PubSub).await);
-            assert!(!transport.has_handler(StreamType::DhtQuery).await);
+            assert!(!transport.has_handler(StreamType::ServiceQuery).await);
         }
 
         #[tokio::test]
@@ -1862,7 +1862,7 @@ mod tests {
             });
 
             let handler1 = MockHandler::new(vec![StreamType::Membership, StreamType::PubSub]);
-            let handler2 = MockHandler::new(vec![StreamType::DhtQuery]);
+            let handler2 = MockHandler::new(vec![StreamType::ServiceQuery]);
 
             transport.register_handler(handler1.boxed()).await.unwrap();
             transport.register_handler(handler2.boxed()).await.unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
             let filter = transport.build_stream_filter().await;
             assert!(filter.accepts(StreamType::Membership));
             assert!(filter.accepts(StreamType::PubSub));
-            assert!(filter.accepts(StreamType::DhtQuery));
+            assert!(filter.accepts(StreamType::ServiceQuery));
             assert!(!filter.accepts(StreamType::WebRtcSignal));
         }
 
@@ -1880,13 +1880,13 @@ mod tests {
                 local: PeerId::from([1u8; 32]),
             });
 
-            let handler = MockHandler::new(vec![StreamType::Membership, StreamType::DhtQuery]);
+            let handler = MockHandler::new(vec![StreamType::Membership, StreamType::ServiceQuery]);
             transport.register_handler(handler.boxed()).await.unwrap();
 
             let types = transport.registered_types().await;
             assert_eq!(types.len(), 2);
             assert!(types.contains(&StreamType::Membership));
-            assert!(types.contains(&StreamType::DhtQuery));
+            assert!(types.contains(&StreamType::ServiceQuery));
         }
 
         #[tokio::test]
@@ -1894,11 +1894,11 @@ mod tests {
             let transport = SharedTransport::new(MockTransport {
                 local: PeerId::from([1u8; 32]),
             });
-            let handler = MockHandler::new(vec![StreamType::DhtStore]);
+            let handler = MockHandler::new(vec![StreamType::ServiceStore]);
 
             transport.register_handler(handler.boxed()).await.unwrap();
 
-            let h = transport.get_handler(StreamType::DhtStore).await;
+            let h = transport.get_handler(StreamType::ServiceStore).await;
             assert!(h.is_some());
             assert_eq!(h.unwrap().name(), "MockHandler");
 
