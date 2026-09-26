@@ -1,265 +1,91 @@
-# MANDATORY: Pre-Submit Checks for Rust Patches
-
-**Before submitting ANY patch that touches Rust code (`*.rs`, `Cargo.toml`, `Cargo.lock`), you MUST run, in this exact order, until all three pass clean:**
-
-1. `cargo fmt --all`
-2. `cargo clippy --all-features --all-targets -- -D warnings -D clippy::panic -D clippy::unwrap_used -D clippy::expect_used`
-3. `cargo check --workspace --all-targets`
-
-Re-run after every code change. Do not silence warnings with `#[allow(...)]` unless the surrounding code already does. If a fix cannot pass these checks, report what failed — do NOT submit a known-failing patch.
-
-External validation pipelines (clawpatch, CI) gate on `-D warnings` clippy. Patches that skip these are rejected and the work is wasted.
-
----
-# AGENTS.md
-
-Repository guidelines for AI coding assistants working with ant-quic.
-
-> **Related AI Assistant Guides**: See also [CLAUDE.md](CLAUDE.md) and [GEMINI.md](GEMINI.md) for alternative AI assistant configurations. All guides share the same core project information.
-
-## Repository Independence
-
-**ant-quic is an independent project (NOT a Quinn fork for contributions).**
-
-- Do NOT open PRs to `quinn-rs/quinn`
-- Do NOT add `quinn-rs/quinn` as an upstream remote
-- Contribute only to `github.com/saorsa-labs/ant-quic`
-- Keep API patterns consistent locally
-
-## Project Overview
-
-ant-quic is a QUIC transport protocol implementation with advanced NAT traversal capabilities, optimized for P2P networks and the Autonomi ecosystem.
-
-**v0.13.0+: Pure Symmetric P2P Architecture**
-- **One Node Type**: All nodes are identical - every node can connect AND accept connections
-- **100% PQC Always**: ML-KEM-768 key exchange on every connection, no classical crypto fallback
-- **No Roles**: No Client/Server/Bootstrap distinction - all nodes are symmetric peers
-- **Known Peers**: Uses `known_peers` terminology instead of "bootstrap nodes"
-
-## Key Technical Decisions
-
-### Authentication: Pure PQC with Raw Public Keys (v0.2)
-
-We use **Pure Post-Quantum Cryptography** with raw public keys (inspired by RFC 7250):
-- Reference: `docs/rfcs/ant-quic-pqc-authentication.md` (our specification)
-- Identity: ML-DSA-65 key pairs (PeerId = SHA-256 hash → 32 bytes compact identifier)
-- Key Exchange: ML-KEM-768 (IANA 0x0201) - FIPS 203
-- Signatures: ML-DSA-65 (IANA 0x0901) - FIPS 204
-- No PKI infrastructure, no CA dependency
-- Peers authenticate directly via public key fingerprints
-
-v0.2: This is a greenfield network - NO hybrid algorithms, NO classical fallback.
-Single ML-DSA-65 key pair for identity and auth. PeerId = SHA-256(public_key) for compact 32-byte identifiers.
-
-### Post-Quantum Cryptography: Always On (v0.13.0+)
-
-**100% PQC on every connection** - there is no classical-only mode:
-- **ML-KEM-768**: Key encapsulation (FIPS 203, NIST Level 3)
-- **ML-DSA-65**: Digital signatures (FIPS 204, optional)
-- Reference: `docs/rfcs/fips-203-ml-kem.pdf`, `docs/rfcs/fips-204-ml-dsa.pdf`
-
-### Network: Dual-Stack IPv4 and IPv6 Support
-
-- Dual-stack socket binding when available
-- IPv4-mapped IPv6 addresses handled transparently
-- NAT traversal works across both IP versions
-- QUIC connection migration works across address families
-
-### NAT Traversal: Native QUIC (NO STUN, NO ICE, NO TURN)
-
-We use **native QUIC protocol extensions** based on the Seemann draft:
-- Reference: `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt`
-- Specification: [draft-seemann-quic-nat-traversal](https://datatracker.ietf.org/doc/draft-seemann-quic-nat-traversal/)
-
-We do **NOT** use:
-- STUN (Session Traversal Utilities for NAT)
-- ICE (Interactive Connectivity Establishment)
-- TURN (Traversal Using Relays around NAT)
-- External NAT traversal servers
-
-All NAT traversal is performed natively within QUIC using:
-
-**Transport Parameters:**
-- `0x3d7e9f0bca12fea6`: NAT traversal capability negotiation
-- `0x3d7e9f0bca12fea8`: RFC-compliant frame format
-- `0x9f81a176`: Address discovery configuration
-
-**Extension Frames:**
-- `ADD_ADDRESS`: 0x3d7e90 (IPv4), 0x3d7e91 (IPv6) - Advertise candidate addresses
-- `PUNCH_ME_NOW`: 0x3d7e92 (IPv4), 0x3d7e93 (IPv6) - Coordinate hole punching
-- `REMOVE_ADDRESS`: 0x3d7e94 - Remove stale address
-- `OBSERVED_ADDRESS`: 0x9f81a6 (IPv4), 0x9f81a7 (IPv6) - Report external address
-
-### Symmetric P2P Model (v0.13.0+)
-
-All nodes are equal. Any connected peer can:
-- Observe your external address from incoming packets
-- Report your address via OBSERVED_ADDRESS frames
-- Coordinate NAT traversal for other peers
-- Act as relay when direct connection fails
-
-Public dialing uses the unified connectivity surface:
-- `connect_known_peers()` seeds initial connectivity and address discovery
-- `connect_addr()` routes address-based dialing through the full orchestration path
-- `connect_peer()` routes identity-based dialing through the same orchestration path
-
-## Project Structure
-
-- `src/`: Core library (QUIC, NAT traversal, crypto, metrics)
-- `src/bin/`: CLI binary (`ant-quic`)
-- `src/unified_config.rs`: P2pConfig, NatConfig, MtuConfig
-- `tests/`: Integration suites (`quick/`, `standard/`, `long/`, `property_tests/`)
-- `examples/`: Runnable demos (`simple_chat`, dashboard, PQC)
-- `benches/`: Criterion benchmarks
-- `scripts/`: CI/coverage helpers
-- `docs/rfcs/`: Local copies of reference specifications
-- `.github/`: Workflows and CI configuration
-- `docs/`: Documentation
-
-## Build and Test Commands
-
-```bash
-# Build optimized
-cargo build --release
-
-# Test all
-cargo test --all-features
-
-# Quick checks (fmt, clippy, smoke tests)
-cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
-
-# Run binary (all nodes are symmetric)
-cargo run --bin ant-quic -- --listen 0.0.0.0:9000
-
-# Run example
-cargo run --example simple_chat -- --listen 0.0.0.0:9000
-
-# Fast compilation check
-cargo check --all-targets
-
-# Verbose tests
-cargo test -- --nocapture
-```
-
-## Primary API (v0.13.0+)
-
-```rust
-use ant_quic::{P2pEndpoint, P2pConfig};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = P2pConfig::builder()
-        .known_peer("peer.example.com:9000".parse()?)
-        .build()?;
-
-    let endpoint = P2pEndpoint::new(config).await?;
-    println!("Peer ID: {:?}", endpoint.peer_id());
-
-    // Seed connectivity and address discovery from configured known peers
-    endpoint.connect_known_peers().await?;
-
-    // Your external address is now discoverable
-    if let Some(addr) = endpoint.external_addr() {
-        println!("External address: {}", addr);
-    }
-
-    Ok(())
-}
-```
-
-## Coding Style
-
-- **Language**: Rust 2024 edition
-- **Formatting**: `cargo fmt --all`
-- **Linting**: `cargo clippy --all-targets -- -D warnings`
-- **Naming**: `snake_case` for functions/modules, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants
-
-### Error Handling
-
-- Non-test code must NOT use `unwrap`, `expect`, or `panic!`
-- Tests may use them
-- Use `thiserror` for custom error types
-- Use `tracing` for structured logging
-
-## Testing Guidelines
-
-- Unit tests: Embedded in source files with `#[cfg(test)]`
-- Integration tests: In `tests/` directory
-- Mark tests >5 minutes with `#[ignore]`
-- Aim for meaningful coverage before PRs
-
-## Commit Guidelines
-
-Conventional Commits required (see `cliff.toml`):
-- `feat(nat): add punch scheduling`
-- `fix(frame): correct varint parse`
-- `test: add pqc regressions`
-
-## Reference Specifications (docs/rfcs/)
-
-### Core Protocol
-- `rfc9000.txt` - QUIC base protocol
-- `ant-quic-pqc-authentication.md` - Pure PQC Raw Public Keys (v0.2 - our specification)
-
-### NAT Traversal (Native QUIC)
-- `draft-seemann-quic-nat-traversal-02.txt` - Primary NAT traversal spec
-- `draft-ietf-quic-address-discovery-00.txt` - Address discovery extension
-
-### Post-Quantum Cryptography
-- `fips-203-ml-kem.pdf` - ML-KEM (Kyber)
-- `fips-204-ml-dsa.pdf` - ML-DSA (Dilithium)
-- `draft-ietf-tls-hybrid-design-14.txt` - Hybrid key exchange
-
-## Key File Locations
-
-- **Main Library**: `src/lib.rs`
-- **P2P Endpoint**: `src/p2p_endpoint.rs` - Primary API
-- **Configuration**: `src/unified_config.rs` - P2pConfig, NatConfig
-- **NAT Traversal API**: `src/nat_traversal_api.rs`
-- **QUIC Node**: `src/quic_node.rs`
-- **PQC Implementation**: `src/crypto/pqc/`
-- **Binary**: `src/bin/ant-quic.rs`
-
----
-
-## AI Assistant Guide Synchronization
-
-| File | Purpose |
-|------|---------|
-| [CLAUDE.md](CLAUDE.md) | Claude Code (Anthropic) |
-| [AGENTS.md](AGENTS.md) | Generic AI coding assistants - this file |
-| [GEMINI.md](GEMINI.md) | Google Gemini |
-
-**Keep core technical information consistent across all three files:**
-- Repository independence (not a Quinn fork for contributions)
-- v0.13.0+ symmetric P2P architecture (no roles)
-- v0.2 Pure PQC: ML-KEM-768 (0x0201) + ML-DSA-65 (0x0901)
-- Native QUIC NAT traversal (NO STUN/ICE/TURN)
-- Correct frame IDs (0x3d7e90+, 0x9f81a6+)
-- Pure PQC Raw Public Keys (v0.2 - see `docs/rfcs/ant-quic-pqc-authentication.md`)
-- IPv4 and IPv6 dual-stack support
-
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+# ant-quic
+
+QUIC transport with native NAT traversal and pure post-quantum crypto, built for
+P2P networks (used by `saorsa-gossip`, `x0x` and the Autonomi ecosystem).
+Rust 2024, MSRV 1.88, MIT OR Apache-2.0.
+
+## Not a Quinn fork (for contributions)
+ant-quic began as a Quinn fork and GitHub still shows it as one, but it is an
+independent project. Never open PRs against, push to, or add a remote for
+`quinn-rs/quinn`; pass `--repo saorsa-labs/ant-quic` to `gh pr create` so it
+doesn't default to the upstream parent (`prevent-upstream-pr.yml` also guards
+this). `src/high_level/` is ant-quic's own evolved copy of Quinn's async API,
+not an external dependency.
+
+## Design invariants
+- **Symmetric P2P.** Every node connects, accepts and coordinates; there are no
+  client/server/bootstrap roles. Say "known peers" (`known_peers`), not
+  "bootstrap nodes". (ADR-004)
+- **Pure PQC, always on.** ML-KEM-768 (IANA 0x0201) key exchange and ML-DSA-65
+  (0x0901) signatures on every connection; no hybrid or classical fallback, no
+  feature flag. Authentication uses raw public keys (RFC 7250-style) — no X.509,
+  no CA. PeerId = SHA-256(ML-DSA-65 public key). Spec:
+  `docs/rfcs/ant-quic-pqc-authentication.md`. (ADR-003)
+- **Native QUIC NAT traversal — no STUN, ICE or TURN.** Addresses are learned from
+  local interfaces and from peers via `OBSERVED_ADDRESS`; hole punching is
+  coordinated over existing QUIC connections. When punching fails, the fallback is
+  a MASQUE CONNECT-UDP relay run by another peer (ADR-005/006/009/016).
+- Dual-stack: a single IPv6 socket with `IPV6_V6ONLY=0` serves IPv4 too (ADR-008).
+- WASM is not supported (raw UDP sockets).
+
+## Wire codepoints are frozen
+Deployed peers speak these, so never change them silently; differences from
+future RFCs must go through negotiation under our own spec versioning (ADR-012).
+They are pinned by tests in `src/transport_parameters.rs`,
+`tests/nat_traversal_frame_tests.rs` and `tests/frame_encoding_tests.rs`.
+- Transport params: `0x3d7e9f0bca12fea6` (NAT traversal), `0x3d7e9f0bca12fea8`
+  (RFC-format frames), `0x9f81a176` (address discovery)
+- Frames: `ADD_ADDRESS` 0x3d7e90/91, `PUNCH_ME_NOW` 0x3d7e92/93,
+  `REMOVE_ADDRESS` 0x3d7e94, `OBSERVED_ADDRESS` 0x9f81a6/a7 (IPv4/IPv6 pairs)
+
+The external drafts in `docs/rfcs/` (`draft-seemann-quic-nat-traversal-02`,
+`draft-ietf-quic-address-discovery-00`) are provenance, not conformance targets;
+the normative self-hosted spec `docs/rfcs/ant-quic-nat-traversal.md` is still to
+be written.
+
+## Wording rules for docs, comments and logs
+- Don't use "DHT"/"Kademlia"/"routing table" — ant-quic provides no record
+  storage/lookup; only a single explicit non-goal statement may name it (ADR-011).
+- Don't publish connectivity success percentages; describe tiers (Direct,
+  Punched, Relayed) qualitatively. Rates belong in telemetry (ADR-013).
+
+## Code map
+- Primary API: `P2pEndpoint` in `src/p2p_endpoint.rs`, configured with
+  `P2pConfig` (`src/unified_config.rs`). Dialing goes through one orchestration
+  path: `connect_known_peers()`, `connect_addr()`, `connect_peer()`.
+- `src/nat_traversal_api.rs` — `NatTraversalEndpoint` and its `poll()` state machine
+- `src/connection/nat_traversal.rs` — per-connection traversal state;
+  `src/candidate_discovery*` — candidate gathering
+- `src/endpoint.rs`, `src/connection/`, `src/frame*` — core QUIC with extension frames
+- `src/crypto/pqc/` — PQC; `src/masque/`, `src/relay/` — relay; `src/bootstrap_cache/`
+- `src/bin/ant-quic.rs` — CLI (`--listen`, default `[::]:0`; `--known-peers`; `--connect`)
+- Cargo features are deliberately few: default `platform-verifier`,
+  `network-discovery`; opt-in `ble` (macOS needs an app bundle, ADR-010),
+  `trace`, `arbitrary`, `__qlog`.
+
+## Build and test
+`just --list`. Main recipes:
+- `just full-test` — the PR-style gate: fmt-check, lint (`--all-features`),
+  lib/doc tests, `tests/quick`, `tests/standard`, release-mode `tests/property_tests`,
+  bench compile. CI's blocking clippy is `--all-features --lib --bins --examples
+  -D warnings`; test-target clippy runs but is non-blocking.
+- `just quick-test` skips a few environment-sensitive tests (`auto_binding`,
+  `binding_stream`, `kem_group_is_restricted_with_provider`) — see the justfile.
+- Heavy suites are manual: `heavy-nat` (Docker), `heavy-long`, `heavy-bench`,
+  `heavy-mdns` (needs `ANT_QUIC_LIVE_MDNS=1`), `heavy-upnp` (`ANT_QUIC_LIVE_UPNP=1`).
+- The workspace includes `ant-quic-workspace-hack`, managed by cargo-hakari
+  (`.config/hakari.toml`); after changing dependencies run `cargo hakari generate`.
+- Mark tests that take more than ~5 minutes `#[ignore]`.
+- Logging: `RUST_LOG=ant_quic::nat_traversal=debug`, `ant_quic::connection=trace`.
+- Commits follow Conventional Commits (changelog via `cliff.toml`).
+
+## Docs
+- Architecture: `docs/architecture/` (`ARCHITECTURE.md`, `PROTOCOL_EXTENSIONS.md`,
+  `PEER_IDENTITY_AND_ADDRESSING.md`); `docs/NAT_TRAVERSAL_GUIDE.md`,
+  `docs/TROUBLESHOOTING.md`
+- Specs and drafts: `docs/rfcs/`
+- ADRs: `docs/adr/` (process in `docs/adr/TOOLING.md`). Before changing
+  architecture, protocols, crypto, network behaviour, public APIs or operational
+  invariants, check the ADRs; new decisions go in a Proposed ADR from
+  `docs/adr/TEMPLATE.md`. Accepted ADRs are immutable (supersede instead), and
+  only a human marks an ADR Accepted.

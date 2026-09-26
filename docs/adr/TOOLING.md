@@ -35,7 +35,7 @@ If the published package name differs on your machine, install from the project 
 
 ## AI harness guidance: pi, Codex, Claude Code, OpenCode
 
-Add this project instruction to every AI coding harness profile (`AGENTS.md`, `CLAUDE.md`, Codex/OpenCode project rules, pi harness prompts, etc.):
+Add this project instruction to every AI coding harness profile (`AGENTS.md`, Codex/OpenCode project rules, pi harness prompts, etc.):
 
 ```text
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
