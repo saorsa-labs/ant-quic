@@ -2,7 +2,7 @@
 
 Repository guidelines for Google Gemini when working with ant-quic.
 
-> **Related AI Assistant Guides**: See also [CLAUDE.md](CLAUDE.md) and [AGENTS.md](AGENTS.md) for alternative AI assistant configurations. All guides share the same core project information.
+> **Related AI Assistant Guides**: See also [AGENTS.md](AGENTS.md) (read by Claude Code, Codex and other agents). Both guides share the same core project information.
 
 ## Repository Independence
 
@@ -203,11 +203,10 @@ Conventional Commits required:
 
 | File | Purpose |
 |------|---------|
-| [CLAUDE.md](CLAUDE.md) | Claude Code (Anthropic) |
-| [AGENTS.md](AGENTS.md) | Generic AI coding assistants |
+| [AGENTS.md](AGENTS.md) | Claude Code and other AI coding assistants |
 | [GEMINI.md](GEMINI.md) | Google Gemini - this file |
 
-**Keep core technical information consistent across all three files:**
+**Keep core technical information consistent across both files:**
 - Repository independence (not a Quinn fork for contributions)
 - v0.13.0+ symmetric P2P architecture (no roles)
 - v0.2 Pure PQC: ML-KEM-768 (0x0201) + ML-DSA-65 (0x0901)
