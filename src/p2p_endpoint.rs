@@ -7260,6 +7260,14 @@ impl P2pEndpoint {
                         window_secs = self.send_failure_log.window().as_secs(),
                         "sends to peer without a live connection (Peer not found) continue"
                     ),
+                    PeerNotFoundLog::Overflow { suppressed } => debug!(
+                        target: "ant_quic::send_error",
+                        peer_id = %peer_id,
+                        suppressed,
+                        window_secs = self.send_failure_log.window().as_secs(),
+                        "sends to untracked peers without a live connection (Peer not found); \
+                         per-peer log table full, aggregating"
+                    ),
                     PeerNotFoundLog::Suppressed => {}
                 }
             }
