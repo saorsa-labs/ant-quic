@@ -252,6 +252,9 @@ pub mod chat;
 /// Lifecycle close-reason helpers shared by the transport and P2P layers.
 mod connection_lifecycle;
 
+/// Bounded logging and counting of per-send failures (x0x#1036).
+mod send_failure_log;
+
 /// P2P endpoint - the primary API for ant-quic
 ///
 /// This module provides the main API for P2P networking with NAT traversal,
