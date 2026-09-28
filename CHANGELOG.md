@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.54] - 2026-09-28
+
+### Fixed
+
+- Count sends to unconnected peers while logging them at DEBUG at most once
+  per peer per minute; keep active log windows when the bounded peer table fills.
+  Other send failures remain WARN.
+
+
 ## [0.27.53] - 2026-09-21
 
 ### Fixed
