@@ -14,8 +14,13 @@
 //!   occurrence opens a window, later occurrences inside it are suppressed and
 //!   counted, and the first occurrence after the window closes reports how many
 //!   were suppressed;
-//! - the per-peer table is bounded; when full, new peers are counted but not
-//!   logged until an existing window expires, preserving active peer windows.
+//! - the per-peer table is bounded, so a stream of distinct unknown peers
+//!   cannot grow memory without limit. A full table never evicts an open
+//!   window; peers that do not fit share one aggregate overflow window that
+//!   is logged at most once per window with its suppressed count. Expired
+//!   windows are swept (at most once per overflow window) to free slots, and
+//!   any suppressed count they still held is carried into the next overflow
+//!   summary.
 //!
 //! Real transport errors are not routed through here and stay at `WARN`.
 
@@ -45,6 +50,13 @@ pub(crate) enum PeerNotFoundLog {
     },
     /// Inside an open window; do not log.
     Suppressed,
+    /// The per-peer table is full of open windows; log one aggregate line for
+    /// all untracked peers covering `suppressed` earlier sends.
+    Overflow {
+        /// Not-found sends to untracked peers suppressed since the last
+        /// overflow line, plus counts carried from swept expired windows.
+        suppressed: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,11 +65,21 @@ struct PeerWindow {
     suppressed: u64,
 }
 
+#[derive(Debug, Default)]
+struct WindowTable {
+    peers: HashMap<PeerId, PeerWindow>,
+    /// Shared window for peers that did not fit in `peers`.
+    overflow: Option<PeerWindow>,
+    /// Suppressed counts of swept expired windows, reported by the next
+    /// overflow line.
+    carried: u64,
+}
+
 /// Counter plus per-peer log window for not-found sends.
 #[derive(Debug)]
 pub(crate) struct SendFailureLog {
     peer_not_found_total: AtomicU64,
-    windows: Mutex<HashMap<PeerId, PeerWindow>>,
+    windows: Mutex<WindowTable>,
     window: Duration,
     max_tracked: usize,
 }
@@ -72,7 +94,7 @@ impl SendFailureLog {
     pub(crate) fn new(window: Duration, max_tracked: usize) -> Self {
         Self {
             peer_not_found_total: AtomicU64::new(0),
-            windows: Mutex::new(HashMap::new()),
+            windows: Mutex::new(WindowTable::default()),
             window,
             max_tracked: max_tracked.max(1),
         }
@@ -91,9 +113,13 @@ impl SendFailureLog {
     /// Record one not-found send to `peer_id` at `now` and decide what to log.
     pub(crate) fn record_peer_not_found(&self, peer_id: PeerId, now: Instant) -> PeerNotFoundLog {
         self.peer_not_found_total.fetch_add(1, Ordering::Relaxed);
-        let mut windows = self.windows.lock();
-        if let Some(entry) = windows.get_mut(&peer_id) {
-            if now.saturating_duration_since(entry.opened_at) < self.window {
+        let window = self.window;
+        let is_open = |entry: &PeerWindow| now.saturating_duration_since(entry.opened_at) < window;
+        let mut table = self.windows.lock();
+        let table = &mut *table;
+
+        if let Some(entry) = table.peers.get_mut(&peer_id) {
+            if is_open(entry) {
                 entry.suppressed = entry.suppressed.saturating_add(1);
                 return PeerNotFoundLog::Suppressed;
             }
@@ -109,31 +135,55 @@ impl SendFailureLog {
             };
         }
 
-        if windows.len() >= self.max_tracked {
-            let window = self.window;
-            windows.retain(|_, entry| now.saturating_duration_since(entry.opened_at) < window);
-            if windows.len() >= self.max_tracked {
-                // Preserve the active windows. Clearing them would let a
-                // high-cardinality burst reopen a known peer's window and
-                // emit one line per send despite the rate limit. Count this
-                // untracked peer above, but suppress its log until a slot
-                // becomes available.
-                return PeerNotFoundLog::Suppressed;
+        let overflow_open = table.overflow.as_ref().is_some_and(is_open);
+        if table.peers.len() >= self.max_tracked && !overflow_open {
+            // Sweep only expired windows, never open ones, and at most once
+            // per overflow window so a saturated table is not rescanned on
+            // every send.
+            let mut carried = 0u64;
+            table.peers.retain(|_, entry| {
+                let keep = is_open(entry);
+                if !keep {
+                    carried = carried.saturating_add(entry.suppressed);
+                }
+                keep
+            });
+            table.carried = table.carried.saturating_add(carried);
+        }
+
+        if table.peers.len() < self.max_tracked {
+            table.peers.insert(
+                peer_id,
+                PeerWindow {
+                    opened_at: now,
+                    suppressed: 0,
+                },
+            );
+            return PeerNotFoundLog::First;
+        }
+
+        match table.overflow.as_mut() {
+            Some(entry) if overflow_open => {
+                entry.suppressed = entry.suppressed.saturating_add(1);
+                PeerNotFoundLog::Suppressed
+            }
+            _ => {
+                let suppressed = table
+                    .overflow
+                    .map_or(0, |entry| entry.suppressed)
+                    .saturating_add(std::mem::take(&mut table.carried));
+                table.overflow = Some(PeerWindow {
+                    opened_at: now,
+                    suppressed: 0,
+                });
+                PeerNotFoundLog::Overflow { suppressed }
             }
         }
-        windows.insert(
-            peer_id,
-            PeerWindow {
-                opened_at: now,
-                suppressed: 0,
-            },
-        );
-        PeerNotFoundLog::First
     }
 
     #[cfg(test)]
     fn tracked_peers(&self) -> usize {
-        self.windows.lock().len()
+        self.windows.lock().peers.len()
     }
 }
 
@@ -204,6 +254,118 @@ mod tests {
         );
     }
 
+    fn numbered_peer(n: u32) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        PeerId(bytes)
+    }
+
+    /// Review of 724a6b6: the 4097th distinct peer cleared every open window,
+    /// so peer 1 logged `First` again and its suppressed count was lost.
+    #[test]
+    fn full_table_keeps_open_windows_and_aggregates_overflow() {
+        let log = SendFailureLog::new(Duration::from_secs(60), MAX_TRACKED_PEERS);
+        let t0 = Instant::now();
+        for n in 0..MAX_TRACKED_PEERS as u32 {
+            assert_eq!(
+                log.record_peer_not_found(numbered_peer(n), t0),
+                PeerNotFoundLog::First
+            );
+        }
+        let overflow_peer = numbered_peer(MAX_TRACKED_PEERS as u32);
+        assert_eq!(
+            log.record_peer_not_found(overflow_peer, t0),
+            PeerNotFoundLog::Overflow { suppressed: 0 }
+        );
+        assert_eq!(log.tracked_peers(), MAX_TRACKED_PEERS);
+
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(
+            log.record_peer_not_found(numbered_peer(1), t1),
+            PeerNotFoundLog::Suppressed,
+            "an open window must survive table overflow"
+        );
+        for n in 0..100u32 {
+            assert_eq!(
+                log.record_peer_not_found(numbered_peer(MAX_TRACKED_PEERS as u32 + 1 + n), t1),
+                PeerNotFoundLog::Suppressed,
+                "overflow peers share one aggregate window"
+            );
+        }
+
+        assert_eq!(
+            log.record_peer_not_found(numbered_peer(1), t0 + Duration::from_secs(61)),
+            PeerNotFoundLog::Summary { suppressed: 1 },
+            "peer 1's suppressed count must be reported"
+        );
+        assert_eq!(
+            log.peer_not_found_total(),
+            MAX_TRACKED_PEERS as u64 + 1 + 1 + 100 + 1
+        );
+    }
+
+    #[test]
+    fn overflow_summary_reports_suppressed_untracked_sends() {
+        let log = SendFailureLog::new(Duration::from_secs(60), 2);
+        let t0 = Instant::now();
+        assert_eq!(
+            log.record_peer_not_found(peer(1), t0),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(2), t0),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(3), t0),
+            PeerNotFoundLog::Overflow { suppressed: 0 }
+        );
+        for byte in 4..7 {
+            assert_eq!(
+                log.record_peer_not_found(peer(byte), t0 + Duration::from_secs(1)),
+                PeerNotFoundLog::Suppressed
+            );
+        }
+        // Keep both tracked windows open past the overflow window.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            log.record_peer_not_found(peer(1), t1),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(2), t1),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(9), t1 + Duration::from_secs(1)),
+            PeerNotFoundLog::Overflow { suppressed: 3 }
+        );
+    }
+
+    #[test]
+    fn expired_windows_free_slots_and_carry_their_counts() {
+        let log = SendFailureLog::new(Duration::from_secs(60), 1);
+        let t0 = Instant::now();
+        assert_eq!(
+            log.record_peer_not_found(peer(1), t0),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(1), t0),
+            PeerNotFoundLog::Suppressed
+        );
+        // Peer 1's window expired: the slot is reused, its count carried.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            log.record_peer_not_found(peer(2), t1),
+            PeerNotFoundLog::First
+        );
+        assert_eq!(
+            log.record_peer_not_found(peer(3), t1),
+            PeerNotFoundLog::Overflow { suppressed: 1 }
+        );
+    }
+
     #[test]
     fn tracked_peer_table_is_bounded() {
         let log = SendFailureLog::new(Duration::from_secs(60), 8);
@@ -213,38 +375,5 @@ mod tests {
             assert!(log.tracked_peers() <= 8);
         }
         assert_eq!(log.peer_not_found_total(), 256);
-    }
-
-    #[test]
-    fn overflow_preserves_active_peer_windows() {
-        let log = SendFailureLog::new(Duration::from_secs(60), 2);
-        let now = Instant::now();
-        assert_eq!(
-            log.record_peer_not_found(peer(1), now),
-            PeerNotFoundLog::First
-        );
-        assert_eq!(
-            log.record_peer_not_found(peer(2), now),
-            PeerNotFoundLog::First
-        );
-        assert_eq!(
-            log.record_peer_not_found(peer(3), now),
-            PeerNotFoundLog::Suppressed,
-            "an untracked peer cannot evict active windows"
-        );
-        assert_eq!(log.tracked_peers(), 2);
-        assert_eq!(
-            log.record_peer_not_found(peer(1), now),
-            PeerNotFoundLog::Suppressed,
-            "overflow must not reopen the first peer's window"
-        );
-        assert_eq!(log.peer_not_found_total(), 4);
-
-        assert_eq!(
-            log.record_peer_not_found(peer(3), now + Duration::from_secs(61)),
-            PeerNotFoundLog::First,
-            "expired windows free capacity for new peers"
-        );
-        assert_eq!(log.tracked_peers(), 1);
     }
 }

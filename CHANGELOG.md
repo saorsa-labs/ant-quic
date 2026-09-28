@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Count sends to unconnected peers while logging them at DEBUG at most once
-  per peer per minute; keep active log windows when the bounded peer table fills.
-  Other send failures remain WARN.
+  per peer per minute. A full bounded peer table preserves active windows and
+  uses one aggregate overflow log window for untracked peers. Other send
+  failures remain WARN.
 
 
 ## [0.27.53] - 2026-09-21
