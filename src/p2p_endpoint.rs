@@ -100,6 +100,7 @@ use crate::port_mapping::{
     spawn_best_effort_port_mapping,
 };
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
+use crate::send_failure_log::{PeerNotFoundLog, SendFailureLog};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::{AutoConnectPolicy, P2pConfig, TrustPolicy};
 use crate::{ConnectionCloseReason, Side};
@@ -970,6 +971,9 @@ pub struct P2pEndpoint {
     /// duplicate-safe retry replays the cached `Accepted`. Always `0` in
     /// production. See [`Self::inject_ack_response_drops_for_testing`].
     ack_response_drop_injection: Arc<AtomicUsize>,
+
+    /// Counts not-found sends and rate-limits their log lines (x0x#1036).
+    send_failure_log: Arc<SendFailureLog>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -1835,6 +1839,12 @@ pub struct EndpointStats {
 
     /// Average coordination time for NAT traversal
     pub average_coordination_time: Duration,
+
+    /// Sends that failed because the target peer had no live connection
+    /// (`EndpointError::PeerNotFound`), cumulative since the endpoint started.
+    ///
+    /// These are counted rather than logged per send; see x0x#1036.
+    pub send_peer_not_found: u64,
 }
 
 impl Default for EndpointStats {
@@ -1856,6 +1866,7 @@ impl Default for EndpointStats {
             connected_bootstrap_nodes: 0,
             start_time: Instant::now(),
             average_coordination_time: Duration::ZERO,
+            send_peer_not_found: 0,
         }
     }
 }
@@ -3344,6 +3355,7 @@ impl P2pEndpoint {
             peer_event_generations,
             coordinator_health: Arc::new(crate::coordinator_health::CoordinatorHealth::new()),
             ack_response_drop_injection: Arc::new(AtomicUsize::new(0)),
+            send_failure_log: Arc::new(SendFailureLog::default()),
         };
 
         // Spawn background pollers for transport and peer-address updates.
@@ -7216,14 +7228,56 @@ impl P2pEndpoint {
         }
         .await;
         if let Err(ref e) = result {
-            tracing::warn!(
-                target: "ant_quic::send_error",
-                peer_id = ?peer_id_for_log,
-                error = %e,
-                "send failed"
-            );
+            self.log_send_failure(&peer_id_for_log, e);
         }
         result
+    }
+
+    /// Log a failed [`Self::send`] without flooding (x0x#1036).
+    ///
+    /// A send to a peer with no live connection is expected whenever an
+    /// application's membership view lags the transport, so it is counted in
+    /// [`EndpointStats::send_peer_not_found`] and logged at debug at most once
+    /// per peer per window, with a count of the sends suppressed since. Other
+    /// failures are real transport errors and stay at warn.
+    fn log_send_failure(&self, peer_id: &PeerId, error: &EndpointError) {
+        match error {
+            EndpointError::PeerNotFound(_) => {
+                match self
+                    .send_failure_log
+                    .record_peer_not_found(*peer_id, Instant::now())
+                {
+                    PeerNotFoundLog::First => debug!(
+                        target: "ant_quic::send_error",
+                        peer_id = %peer_id,
+                        "send to peer without a live connection (Peer not found); \
+                         repeats are summarised per window"
+                    ),
+                    PeerNotFoundLog::Summary { suppressed } => debug!(
+                        target: "ant_quic::send_error",
+                        peer_id = %peer_id,
+                        suppressed,
+                        window_secs = self.send_failure_log.window().as_secs(),
+                        "sends to peer without a live connection (Peer not found) continue"
+                    ),
+                    PeerNotFoundLog::Overflow { suppressed } => debug!(
+                        target: "ant_quic::send_error",
+                        peer_id = %peer_id,
+                        suppressed,
+                        window_secs = self.send_failure_log.window().as_secs(),
+                        "sends to untracked peers without a live connection (Peer not found); \
+                         per-peer log table full, aggregating"
+                    ),
+                    PeerNotFoundLog::Suppressed => {}
+                }
+            }
+            _ => warn!(
+                target: "ant_quic::send_error",
+                peer_id = %peer_id,
+                error = %error,
+                "send failed"
+            ),
+        }
     }
 
     /// Send only on the authenticated QUIC connection with `generation`.
@@ -8317,7 +8371,9 @@ impl P2pEndpoint {
 
     /// Get endpoint statistics
     pub async fn stats(&self) -> EndpointStats {
-        self.stats.read().await.clone()
+        let mut stats = self.stats.read().await.clone();
+        stats.send_peer_not_found = self.send_failure_log.peer_not_found_total();
+        stats
     }
 
     // === #368 churn-residue instrumentation (test/368-churn-residue) ===
@@ -10673,6 +10729,7 @@ impl Clone for P2pEndpoint {
             peer_event_generations: Arc::clone(&self.peer_event_generations),
             coordinator_health: Arc::clone(&self.coordinator_health),
             ack_response_drop_injection: Arc::clone(&self.ack_response_drop_injection),
+            send_failure_log: Arc::clone(&self.send_failure_log),
         }
     }
 }
@@ -12717,6 +12774,63 @@ mod tests {
             .expect("valid config");
 
         P2pEndpoint::new(config).await.expect("endpoint starts")
+    }
+
+    /// Counts `ant_quic::send_error` events by level (x0x#1036 test seam).
+    #[derive(Clone, Default)]
+    struct SendErrorEventCounter {
+        debug: Arc<AtomicUsize>,
+        warn: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SendErrorEventCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if meta.target() != "ant_quic::send_error" {
+                return;
+            }
+            if *meta.level() == tracing::Level::WARN {
+                self.warn.fetch_add(1, Ordering::SeqCst);
+            } else if *meta.level() == tracing::Level::DEBUG {
+                self.debug.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// x0x#1036: N sends to a peer with no connection must produce one
+    /// bounded debug line, no warn lines, and still count all N.
+    #[tokio::test]
+    async fn repeated_peer_not_found_sends_log_once_and_count_all() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let counter = SendErrorEventCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let stale = PeerId([0xA7; 32]);
+        const SENDS: u64 = 500;
+        for _ in 0..SENDS {
+            let result = endpoint.send(&stale, b"payload").await;
+            assert!(
+                matches!(result, Err(EndpointError::PeerNotFound(peer)) if peer == stale),
+                "unexpected send result: {result:?}"
+            );
+        }
+
+        assert_eq!(endpoint.stats().await.send_peer_not_found, SENDS);
+        assert_eq!(counter.warn.load(Ordering::SeqCst), 0, "no WARN per send");
+        assert_eq!(
+            counter.debug.load(Ordering::SeqCst),
+            1,
+            "one bounded line for {SENDS} sends in one window"
+        );
+
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]
