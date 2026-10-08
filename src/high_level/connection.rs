@@ -323,6 +323,7 @@ impl Future for ConnectionDriver {
         if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
             conn.terminate(e, &self.0.shared);
             conn.buffered_registry.remove(conn.handle.0);
+            conn.release_socket();
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = match conn.drive_transmit(cx) {
@@ -349,6 +350,7 @@ impl Future for ConnectionDriver {
                     .send((conn.handle, crate::EndpointEvent::drained()));
                 conn.endpoint_drained_notified = true;
                 conn.buffered_registry.remove(conn.handle.0);
+                conn.release_socket();
                 return Poll::Ready(Err(error));
             }
         };
@@ -444,6 +446,7 @@ impl Future for ConnectionDriver {
             unreachable!("drained connections always have an error");
         }
         conn.buffered_registry.remove(conn.handle.0);
+        conn.release_socket();
         Poll::Ready(Ok(()))
     }
 }
@@ -1369,8 +1372,8 @@ impl ConnectionRef {
                 error: None,
                 ref_count: 0,
                 datagram_drop_events: VecDeque::new(),
-                udp_sender: socket.create_sender(),
-                socket,
+                udp_sender: Some(socket.create_sender()),
+                socket: Some(socket),
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
@@ -1457,8 +1460,11 @@ pub(crate) struct State {
     /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
     ref_count: usize,
     datagram_drop_events: VecDeque<DatagramDropStats>,
-    socket: Arc<dyn AsyncUdpSocket>,
-    udp_sender: Pin<Box<dyn UdpSender>>,
+    /// The endpoint's UDP socket and its sender. `None` once the driver has
+    /// exited: the connection sends nothing more, and a handle that outlives
+    /// the driver must not keep the socket open (#309).
+    socket: Option<Arc<dyn AsyncUdpSocket>>,
+    udp_sender: Option<Pin<Box<dyn UdpSender>>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
@@ -1480,8 +1486,10 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .udp_sender
+        let Some(udp_sender) = self.udp_sender.as_mut() else {
+            return Ok(false);
+        };
+        let max_datagrams = udp_sender
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
@@ -1525,8 +1533,7 @@ impl State {
             let is_gso_bundle = segment_count > 1;
 
             let len = t.size;
-            match self
-                .udp_sender
+            match udp_sender
                 .as_mut()
                 .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
@@ -1598,8 +1605,8 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
-                    self.socket = socket;
-                    self.udp_sender = self.socket.create_sender();
+                    self.socket = Some(socket);
+                    self.udp_sender = self.socket.as_ref().map(|socket| socket.create_sender());
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
@@ -1753,6 +1760,16 @@ impl State {
         if let Some(x) = self.driver.take() {
             x.wake();
         }
+    }
+
+    /// #309: the driver has exited, so the connection sends nothing more.
+    /// Let go of the endpoint's UDP socket. Application handles (and the
+    /// tasks that hold them) can outlive the driver, and they must not keep
+    /// the socket and its descriptor open after the endpoint released it.
+    fn release_socket(&mut self) {
+        self.buffered_transmit = None;
+        self.udp_sender = None;
+        self.socket = None;
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
