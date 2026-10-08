@@ -878,6 +878,9 @@ pub enum LinkEvent {
 ///     }
 /// }
 /// ```
+// `async_trait` marks the boxed futures `#[must_use]`; clippy 1.99 reports that
+// as `double_must_use` on every method.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ProtocolHandler: Send + Sync {
     /// Get the stream types this handler processes.

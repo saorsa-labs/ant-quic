@@ -54,6 +54,9 @@ pub(crate) const UNAUTHENTICATED_GENERATION: u64 = u64::MAX;
 static CONNECTION_GENERATIONS: std::sync::LazyLock<Arc<AtomicU64>> =
     std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(1)));
 
+// Rust 1.99 renamed `fetch_update` to `try_update`; the MSRV (1.88) only has
+// `fetch_update`.
+#[allow(deprecated)]
 fn allocate_connection_generation(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {

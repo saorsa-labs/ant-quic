@@ -6205,6 +6205,9 @@ impl P2pEndpoint {
     /// pending, `false` otherwise. The `load` fast-path keeps the production
     /// case (counter always 0) to a single relaxed read on the hot accept
     /// path. See [`Self::inject_ack_response_drops_for_testing`].
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the MSRV (1.88) only
+    // has `fetch_update`.
+    #[allow(deprecated)]
     fn take_ack_response_drop(counter: &AtomicUsize) -> bool {
         if counter.load(Ordering::Relaxed) == 0 {
             return false;

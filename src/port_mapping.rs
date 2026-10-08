@@ -139,6 +139,9 @@ struct ActivePortMapping {
     external_addr: SocketAddr,
 }
 
+// `async_trait` marks the boxed futures `#[must_use]`; clippy 1.99 reports that
+// as `double_must_use` on every method.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait GatewayControl: Send + Sync {
     fn gateway_addr(&self) -> SocketAddr;
@@ -163,6 +166,9 @@ trait GatewayControl: Send + Sync {
     async fn remove_port(&self, external_port: u16) -> Result<(), PortMappingError>;
 }
 
+// `async_trait` marks the boxed futures `#[must_use]`; clippy 1.99 reports that
+// as `double_must_use` on every method.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait GatewayDiscoverer: Send + Sync {
     async fn discover(&self) -> Result<Box<dyn GatewayControl>, PortMappingError>;
