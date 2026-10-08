@@ -1315,6 +1315,37 @@ mod tests {
         assert_eq!(server.session_count().await, 0);
     }
 
+    /// #305 round 2: a relay that advertises a loopback address cannot be
+    /// reached from outside the host, so its CONNECT-UDP data plane binds
+    /// loopback instead of the wildcard address.
+    #[tokio::test]
+    async fn loopback_relay_binds_data_plane_on_loopback() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            SocketAddr::new(loopback, 9000),
+        );
+        server
+            .handle_connect_request(
+                &ConnectUdpRequest::bind_any(),
+                SocketAddr::new(loopback, 12345),
+            )
+            .await
+            .expect("connect request");
+        let session_id = server.active_session_ids().await[0];
+        let sessions = server.sessions.read().await;
+        let session = sessions.get(&session_id).expect("session present");
+        let bound = session
+            .udp_socket()
+            .expect("session socket")
+            .local_addr()
+            .expect("socket local addr");
+        assert!(
+            bound.ip().is_loopback(),
+            "a loopback relay must not bind its data plane on {bound}"
+        );
+    }
+
     #[tokio::test]
     async fn test_set_public_address_updates_future_advertisements() {
         let config = MasqueRelayConfig::default();
