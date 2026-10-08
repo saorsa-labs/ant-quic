@@ -573,6 +573,17 @@ impl Endpoint {
         }
         state.ipv6 = replacement_addr.is_ipv6();
         state.socket_released_for_shutdown = true;
+        // #309: a connection that is still closing (or draining) when the
+        // shutdown drain ends keeps its driver, and the driver held the
+        // original socket for the rest of its closing period (3 PTO, which an
+        // inflated RTT estimate stretches beyond the drain budget). Move the
+        // remaining connections to the replacement, as a driver respawn does,
+        // so the original socket is released now.
+        let socket = state.socket.clone();
+        state
+            .recv_state
+            .connections
+            .broadcast_control(move || ConnectionEvent::Rebind(socket.clone()));
 
         Ok(released)
     }
