@@ -4616,7 +4616,9 @@ impl NatTraversalEndpoint {
 
                     self.incoming_notify.notify_waiters();
                     self.traversal_event_notify.notify_waiters();
-                    tokio::spawn(async move {
+                    // #305: tracked so shutdown joins the dial and the session
+                    // handle it stores before releasing the socket.
+                    let spawned = self.spawn_shutdown_tracked_worker(async move {
                         let mut last_error = None;
                         for addr in candidate_addrs {
                             match Self::establish_connection_to_validated_candidate_inner(
@@ -4655,6 +4657,13 @@ impl NatTraversalEndpoint {
                             );
                         }
                     });
+                    if let Err(error) = spawned {
+                        debug!(
+                            "coordinator control accepted request_id={} not dialled: {}",
+                            envelope.request_id, error
+                        );
+                        return Ok(true);
+                    }
 
                     info!(
                         "coordinator control accepted scheduled request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
@@ -4726,7 +4735,9 @@ impl NatTraversalEndpoint {
                             .connection_establishment_timeout;
                         let initiator_peer = *initiator;
 
-                        tokio::spawn(async move {
+                        // #305: tracked so shutdown joins the dial and the
+                        // session handle it stores before releasing the socket.
+                        let spawned = self.spawn_shutdown_tracked_worker(async move {
                             let mut last_error = None;
                             for addr in normalized_initiator_addrs {
                                 match Self::establish_connection_to_validated_candidate_inner(
@@ -4765,6 +4776,13 @@ impl NatTraversalEndpoint {
                                 );
                             }
                         });
+                        if let Err(error) = spawned {
+                            debug!(
+                                "coordinator control accepted inbound request_id={} not dialled: {}",
+                                envelope.request_id, error
+                            );
+                            return Ok(true);
+                        }
                     }
                     info!(
                         "coordinator control accepted handled inbound request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
@@ -5066,7 +5084,9 @@ impl NatTraversalEndpoint {
                     let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
-                    tokio::spawn(async move {
+                    // #305: tracked so shutdown cancels an in-flight
+                    // coordinator handshake before releasing the socket.
+                    self.spawn_shutdown_tracked_worker(async move {
                         match timeout(connect_timeout, connecting).await {
                             Ok(Ok(connection)) => {
                                 let (coordinator_peer_id, coordinator_connection) =
@@ -5159,7 +5179,7 @@ impl NatTraversalEndpoint {
                                 traversal_event_notify.notify_waiters();
                             }
                         }
-                    });
+                    })?;
 
                     Ok(())
                 }
@@ -6637,6 +6657,15 @@ impl NatTraversalEndpoint {
         }
 
         if let Ok(mut shared) = self.shared_relay_endpoint.lock() {
+            // #305: shutdown takes the shared relay endpoint under this lock
+            // after setting the flag, so never store one after that.
+            if self.shutdown.load(Ordering::Relaxed) {
+                drop(shared);
+                relay_endpoint.close(crate::VarInt::from_u32(0), b"Shutdown");
+                return Err(NatTraversalError::NetworkError(
+                    "endpoint is shutting down".to_string(),
+                ));
+            }
             *shared = Some(relay_endpoint.clone());
         }
 
@@ -6791,6 +6820,22 @@ impl NatTraversalEndpoint {
 
         // DashMap provides lock-free .insert()
         self.relay_sessions.insert(relay_addr, session);
+
+        // #305: shutdown clears `relay_sessions` after setting the flag. A
+        // session stored after that clear would keep the original socket
+        // alive, so take it back out.
+        if self.shutdown.load(Ordering::Relaxed) {
+            if let Some((_, session)) = self.relay_sessions.remove(&relay_addr)
+                && session.connection.close_reason().is_none()
+            {
+                session
+                    .connection
+                    .close(crate::VarInt::from_u32(0), b"Shutdown");
+            }
+            return Err(NatTraversalError::NetworkError(
+                "endpoint is shutting down".to_string(),
+            ));
+        }
 
         // Notify the relay manager
         if let Some(ref manager) = self.relay_manager {
@@ -8915,6 +8960,27 @@ impl NatTraversalEndpoint {
         arm_registration_gate_for_test(&self.shutdown)
     }
 
+    /// #305: spawn a detached dial worker in the registry that `shutdown`
+    /// aborts and joins, so an in-flight handshake (`Connecting`) or a
+    /// connection handle it stores cannot outlive the socket release. The
+    /// shutdown flag is re-checked under the registry lock: either the handle
+    /// is published before shutdown takes the registry, or the worker is
+    /// dropped unspawned (which implicitly closes any dial it owns).
+    fn spawn_shutdown_tracked_worker<F>(&self, worker: F) -> Result<(), NatTraversalError>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut workers = self.accept_worker_handles.lock();
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(NatTraversalError::NetworkError(
+                "endpoint is shutting down".to_string(),
+            ));
+        }
+        workers.retain(|handle| !handle.is_finished());
+        workers.push(tokio::spawn(worker));
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<(), NatTraversalError> {
         let _shutdown_guard = self.shutdown_lock.lock().await;
         let mut shutdown_error = None;
@@ -8999,15 +9065,32 @@ impl NatTraversalEndpoint {
             }
         }
 
+        // #305: drop the session and relay handles that the sweeps above do
+        // not reach, before the bounded drain so their closes are still sent.
+        // The dial workers that store session handles were joined above.
+        let relay_endpoint = self.release_traversal_holders_for_shutdown();
+
         // Bounded drain: in simultaneous-shutdown scenarios both sides may
-        // close at once, so wait_idle can stall until the idle timeout.
+        // close at once, so wait_idle can stall until the idle timeout. The
+        // closed shared relay endpoint drains in the same budget: its
+        // connections hold the relay socket, which owns the CONNECT-UDP
+        // streams on the original socket.
         if let Some(ref endpoint) = self.inner_endpoint {
-            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, endpoint.wait_idle())
-                .await
-                .is_err()
+            let relay_idle = async {
+                if let Some(relay_endpoint) = &relay_endpoint {
+                    relay_endpoint.wait_idle().await;
+                }
+            };
+            if tokio::time::timeout(
+                SHUTDOWN_DRAIN_TIMEOUT,
+                futures_util::future::join(endpoint.wait_idle(), relay_idle),
+            )
+            .await
+            .is_err()
             {
                 info!("wait_idle timed out during shutdown, proceeding");
             }
+            drop(relay_endpoint);
 
             // Drop lifecycle-tracked connection handles. Each TrackedConnection
             // holds a `Connection` clone, which keeps the endpoint's UDP socket
@@ -9126,6 +9209,66 @@ impl NatTraversalEndpoint {
 
         info!("NAT traversal endpoint shutdown completed");
         Ok(())
+    }
+
+    /// #305: release the connection handles that outlive the shutdown sweeps
+    /// of `connections` and the lifecycle map. Each one keeps the original UDP
+    /// socket alive, so the socket-release settle would time out with
+    /// `weak_socket_owner_still_live`:
+    /// - NAT-traversal session handles (`session_state.connection`);
+    /// - MASQUE relay sessions: the relay connection clone, and the relay
+    ///   socket that owns the CONNECT-UDP bind streams;
+    /// - the shared relay endpoint, which runs on that relay socket.
+    ///
+    /// Their connections are closed. The shared relay endpoint is closed and
+    /// returned so the bounded drain can wait for it to go idle.
+    fn release_traversal_holders_for_shutdown(&self) -> Option<InnerEndpoint> {
+        let mut released = Vec::new();
+
+        let session_peers: Vec<PeerId> = self.active_sessions.iter().map(|e| *e.key()).collect();
+        for peer_id in session_peers {
+            if let Some(mut session) = self.active_sessions.get_mut(&peer_id)
+                && let Some(connection) = session.session_state.connection.take()
+            {
+                released.push(connection);
+            }
+        }
+
+        let relay_addrs: Vec<SocketAddr> = self.relay_sessions.iter().map(|e| *e.key()).collect();
+        for relay_addr in relay_addrs {
+            if let Some((_, session)) = self.relay_sessions.remove(&relay_addr) {
+                // Dropping the session drops its relay socket reference; the
+                // socket's stream tasks end once the connection is closed.
+                released.push(session.connection);
+            }
+        }
+
+        for connection in &released {
+            if connection.close_reason().is_none() {
+                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+            }
+        }
+
+        let relay_endpoint = match self.shared_relay_endpoint.lock() {
+            Ok(mut shared) => shared.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(relay_endpoint) = &relay_endpoint {
+            relay_endpoint.close(crate::VarInt::from_u32(0), b"Shutdown");
+        }
+
+        if !released.is_empty() || relay_endpoint.is_some() {
+            info!(
+                "shutdown: released {} session/relay connection handle(s){}",
+                released.len(),
+                if relay_endpoint.is_some() {
+                    " and the shared relay endpoint"
+                } else {
+                    ""
+                }
+            );
+        }
+        relay_endpoint
     }
 
     /// Settle every original socket retained from the first shutdown attempt.
@@ -10870,7 +11013,9 @@ impl NatTraversalEndpoint {
                     let dial_shutdown = self.shutdown.clone();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
-                    tokio::spawn(async move {
+                    // #305: tracked so shutdown cancels an in-flight
+                    // coordinator handshake before releasing the socket.
+                    self.spawn_shutdown_tracked_worker(async move {
                         // Bound coordinator dial by the configured coordination budget.
                         match timeout(connect_timeout, connecting).await {
                             Ok(Ok(connection)) => {
@@ -10929,7 +11074,7 @@ impl NatTraversalEndpoint {
                                 );
                             }
                         }
-                    });
+                    })?;
 
                     // Return success to allow traversal to continue
                     // The actual coordination will happen once connected
@@ -12924,6 +13069,9 @@ mod tests {
             "successful punch results should advance immediately instead of waiting for a timeout"
         );
 
+        // Release the session map guard: shutdown takes sessions mutably
+        // to drop their connection handles (#305).
+        drop(session);
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
 
