@@ -910,7 +910,8 @@ impl Node {
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::ShuttingDown`] once shutdown has begun and the
+    /// Returns [`NodeError::Endpoint`] with [`EndpointError::ShuttingDown`]
+    /// once shutdown has begun and the
     /// internal queue is drained. Shutdown closes the queue and discards
     /// (resets) the streams that were not accepted yet, because each one
     /// keeps its connection, and so the node's UDP socket, alive.
