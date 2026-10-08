@@ -310,13 +310,19 @@ async fn node_open_bi_accept_bi_smoke() {
 }
 
 /// Regression: `accept_bi` drains the internal queue before returning
-/// `ShuttingDown`.
+/// `ShuttingDown`, until `try_shutdown` discards what is left.
 ///
-/// When a remote peer opens bidi streams and the local endpoint is subsequently
-/// shut down with handles still buffered in `app_bi_tx`, `accept_bi` must yield
-/// every queued handle before the shutdown arm fires. The `biased;` keyword in
-/// `P2pEndpoint::accept_bi`'s `tokio::select!` enforces this ordering by always
-/// polling the queue arm first.
+/// When a remote peer opens bidi streams and the local endpoint then begins
+/// shutting down (its shutdown token is cancelled) with handles still buffered
+/// in `app_bi_tx`, `accept_bi` must yield every queued handle before the
+/// shutdown arm fires. The `biased;` keyword in `P2pEndpoint::accept_bi`'s
+/// `tokio::select!` enforces this ordering by always polling the queue arm
+/// first.
+///
+/// `try_shutdown` then closes the queue and discards the handles nobody
+/// accepted (#305): each one keeps its connection, and with it the endpoint's
+/// UDP socket, alive, and shutdown closes that connection anyway. After
+/// `shutdown()` returns, `accept_bi` yields no stream.
 ///
 /// # Regression guard
 ///
@@ -387,11 +393,11 @@ async fn accept_bi_drains_queue_before_shutting_down() {
     // concurrent test load.
     sleep(Duration::from_millis(100)).await;
 
-    // Trigger shutdown. This cancels the CancellationToken shared by `b` and
-    // `b_drainer`. Now, for the first DRAIN_STREAMS calls to `accept_bi`, both
-    // the queue arm and the shutdown arm of the internal select are
-    // simultaneously ready.
-    b.shutdown().await;
+    // Begin shutdown: cancel the CancellationToken shared by `b` and
+    // `b_drainer` (the first step of `try_shutdown`). Now, for the first
+    // DRAIN_STREAMS calls to `accept_bi`, both the queue arm and the shutdown
+    // arm of the internal select are simultaneously ready.
+    b.inner_endpoint().shutdown_token().cancel();
 
     // All DRAIN_STREAMS handles must come back as `Ok` before `ShuttingDown`.
     // With `biased;`, the queue arm is always polled first, so the drain is
@@ -413,6 +419,20 @@ async fn accept_bi_drains_queue_before_shutting_down() {
     match b_drainer.accept_bi().await {
         Err(NodeError::Endpoint(EndpointError::ShuttingDown)) => {}
         other => panic!("expected ShuttingDown after full drain, got {other:?}"),
+    }
+
+    // Queue more handles, then complete shutdown without accepting them:
+    // `try_shutdown` discards them, so `accept_bi` returns `ShuttingDown`.
+    for _ in 0..DRAIN_STREAMS {
+        a_streams.push(a.open_bi(&b_id).await.expect("open_bi before shutdown"));
+    }
+    sleep(Duration::from_millis(100)).await;
+    b.shutdown().await;
+    match b_drainer.accept_bi().await {
+        Err(NodeError::Endpoint(EndpointError::ShuttingDown)) => {}
+        other => {
+            panic!("expected ShuttingDown after try_shutdown discarded the queue, got {other:?}")
+        }
     }
 
     // Drop here so streams stay alive through all assertions above.
