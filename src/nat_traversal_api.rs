@@ -14670,9 +14670,29 @@ mod tests {
         let held_addr = endpoint
             .shutdown_socket_address_for_test()
             .expect("original socket address");
+        let target_peer = PeerId([0x37; 32]);
+        let _unrelated =
+            dial_accepted_coordination_for_test(&endpoint, held_addr, target_addr, target_peer)
+                .await;
+
+        assert_shutdown_releases_original_socket(&endpoint, held_addr, "session handle").await;
+        target.shutdown().await.expect("target shutdown");
+    }
+
+    /// #305/#309: run the initiator side of an accepted coordination. Its
+    /// background dial connects to `target_addr`, inserts the connection into
+    /// the winner map, stores `session_state.connection` and hands the
+    /// connection to the detached `handle_connection` and observed-address
+    /// tasks. Returns once the session handle is stored, with the endpoints of
+    /// the unrelated coordinator connection, which the caller keeps alive.
+    async fn dial_accepted_coordination_for_test(
+        endpoint: &NatTraversalEndpoint,
+        held_addr: SocketAddr,
+        target_addr: SocketAddr,
+        target_peer: PeerId,
+    ) -> (NatTraversalEndpoint, NatTraversalEndpoint) {
         let local_peer = endpoint.local_peer_id();
         let coordinator_peer = PeerId([0x36; 32]);
-        let target_peer = PeerId([0x37; 32]);
 
         let now = std::time::Instant::now();
         endpoint.active_sessions.insert(
@@ -14726,7 +14746,7 @@ mod tests {
         .expect("encode coordination accepted");
         // The handler ignores its connection argument; use one that does not
         // touch the endpoint under test.
-        let (_unrelated_server, _unrelated_client, unrelated_connection) =
+        let (unrelated_server, unrelated_client, unrelated_connection) =
             loopback_quic_connection().await;
 
         let handled = endpoint
@@ -14746,9 +14766,147 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        (unrelated_server, unrelated_client)
+    }
 
-        assert_shutdown_releases_original_socket(&endpoint, held_addr, "session handle").await;
+    /// #309 holder 1: an application that keeps a handle to a connection the
+    /// shutdown sweep closed (x0x keeps one in its session registry) must not
+    /// keep the original UDP socket alive. The connection is closed and
+    /// drained, so it has no further use for the socket.
+    #[tokio::test]
+    async fn shutdown_releases_socket_while_application_holds_closed_connection() {
+        let server = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("server binds");
+        let server_addr = server
+            .shutdown_socket_address_for_test()
+            .expect("server address");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        let connecting = endpoint
+            .get_endpoint()
+            .expect("endpoint present")
+            .connect(server_addr, "peer")
+            .expect("initiate connection");
+        let connection = tokio::time::timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("loopback handshake must not hang")
+            .expect("loopback handshake must succeed");
+        let peer = PeerId([0x38; 32]);
+        endpoint.connections.insert(peer, connection);
+        let held = endpoint
+            .get_connection(&peer)
+            .expect("winner lookup")
+            .expect("winner present");
+
+        assert_shutdown_releases_original_socket(
+            &endpoint,
+            held_addr,
+            "application-held connection handle",
+        )
+        .await;
+        assert!(
+            held.close_reason().is_some(),
+            "shutdown closes the connection the application still holds"
+        );
+        drop(held);
+        server.shutdown().await.expect("server shutdown");
+    }
+
+    /// #309 holder 2: a later insert for the same peer displaces the
+    /// validated-candidate connection from the winner map without closing
+    /// it. No shutdown sweep reaches it, and while the peer stays up the
+    /// detached tasks that wait for its close hold it open. That open
+    /// connection must not keep the original UDP socket alive.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_displaced_winner_connection() {
+        let target = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("target binds");
+        let target_addr = target
+            .shutdown_socket_address_for_test()
+            .expect("target address");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        let target_peer = PeerId([0x39; 32]);
+        let _unrelated =
+            dial_accepted_coordination_for_test(&endpoint, held_addr, target_addr, target_peer)
+                .await;
+
+        // A later winner for the same peer overwrites the map entry. The
+        // session no longer refers to the dialled connection either.
+        let (_other_server, _other_client, other_connection) = loopback_quic_connection().await;
+        let displaced = endpoint
+            .connections
+            .insert(target_peer, other_connection)
+            .expect("the dialled connection was the winner");
+        if let Some(mut session) = endpoint.active_sessions.get_mut(&target_peer) {
+            session.session_state.connection = None;
+        }
+        assert!(
+            displaced.close_reason().is_none(),
+            "the displaced connection is still open at shutdown"
+        );
+        let displaced_weak = displaced.weak_handle();
+        drop(displaced);
+
+        assert_shutdown_releases_original_socket(&endpoint, held_addr, "displaced winner").await;
+        assert!(
+            displaced_weak
+                .upgrade()
+                .is_none_or(|connection| connection.close_reason().is_some()),
+            "shutdown must close the displaced connection"
+        );
         target.shutdown().await.expect("target shutdown");
+    }
+
+    /// #309 holder 3: a connection that is still closing when the bounded
+    /// drain ends has a live driver, and the driver holds the original
+    /// socket. Here a dial to a silent peer is abandoned mid-handshake with a
+    /// large initial RTT. No RTT sample ever arrives, so its closing period
+    /// (3 PTO) outlasts the drain and the settle. Releasing the original
+    /// socket must not wait for that closing period.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_connection_still_closing() {
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        let silent_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent peer");
+        let silent_addr = silent_peer.local_addr().expect("silent peer address");
+        let quic = endpoint.get_endpoint().expect("endpoint present");
+        let open_before = quic.open_connections();
+        let mut client_config = quic
+            .default_client_config
+            .clone()
+            .expect("default client config");
+        let mut transport = crate::TransportConfig::default();
+        transport.initial_rtt(Duration::from_secs(10));
+        client_config.transport_config(Arc::new(transport));
+        let connecting = quic
+            .connect_with(client_config, silent_addr, "peer")
+            .expect("initiate dial to the silent peer");
+        // Dropping the only handle closes the dial; its driver keeps running
+        // for the closing period.
+        drop(connecting);
+        assert_eq!(
+            quic.open_connections(),
+            open_before + 1,
+            "the abandoned dial must still be closing at shutdown"
+        );
+
+        assert_shutdown_releases_original_socket(&endpoint, held_addr, "closing connection").await;
+        drop(silent_peer);
     }
 
     /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
