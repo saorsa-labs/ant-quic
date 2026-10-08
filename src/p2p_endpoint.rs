@@ -13363,8 +13363,15 @@ mod tests {
             connected: 0,
             total: 1,
         });
+        // `open_connections` also counts handshaking connections; wait until
+        // the relay lists an established one, so shutdown starts after the
+        // CONNECT-UDP exchange is underway, not during the dial.
         wait_until("the relay handshake completes", || {
             mute_quic.open_connections() > 0
+                && mute_relay
+                    .list_connections()
+                    .map(|connections| !connections.is_empty())
+                    .unwrap_or(false)
         })
         .await;
         assert!(
