@@ -14328,6 +14328,173 @@ mod tests {
         (server, client, conn)
     }
 
+    /// Loopback-only config for the #305 shutdown socket-release tests.
+    fn loopback_shutdown_test_config() -> NatTraversalConfig {
+        NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("valid bind addr")),
+            ..Default::default()
+        }
+    }
+
+    /// #305: shutdown must report success and leave the original address
+    /// immediately bindable, i.e. no weak owner of the released socket is
+    /// still live after the settle.
+    async fn assert_shutdown_releases_original_socket(
+        endpoint: &NatTraversalEndpoint,
+        held_addr: SocketAddr,
+        holder: &str,
+    ) {
+        let result = endpoint.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "{holder} alive at shutdown must not retain the original socket: {result:?}"
+        );
+        assert_eq!(
+            endpoint.pending_socket_release_count_for_test(),
+            0,
+            "{holder}: a settled shutdown keeps no pending socket release"
+        );
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "{holder}: shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+    }
+
+    /// #305 holder 1: `send_coordination_request_v2` dials the coordinator
+    /// with `endpoint.connect` and awaits the handshake in a detached task.
+    /// A dial still mid-handshake at shutdown must not keep the original UDP
+    /// socket alive past the shutdown settle.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_coordinator_dial_in_flight() {
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        // A bound socket that never reads: the coordinator handshake can
+        // neither complete nor fail before shutdown.
+        let silent_coordinator =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent coordinator");
+        let coordinator = silent_coordinator
+            .local_addr()
+            .expect("silent coordinator address");
+        let quic = endpoint.get_endpoint().expect("endpoint present");
+        let open_before = quic.open_connections();
+
+        endpoint
+            .initiate_nat_traversal(PeerId([0x35; 32]), coordinator)
+            .expect("initiate traversal via the silent coordinator");
+        assert_eq!(
+            quic.open_connections(),
+            open_before + 1,
+            "the coordinator dial must be in flight at shutdown"
+        );
+
+        assert_shutdown_releases_original_socket(&endpoint, held_addr, "coordinator dial").await;
+        drop(silent_coordinator);
+    }
+
+    /// #305 holder 2: on `CoordinationAccepted` the initiator dials the target
+    /// in a background task, and the dial stores
+    /// `session_state.connection` in `active_sessions`. That session handle
+    /// must not keep the original UDP socket alive past the shutdown settle.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_validated_session_handle() {
+        let target = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("target binds");
+        let target_addr = target
+            .shutdown_socket_address_for_test()
+            .expect("target address");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        let local_peer = endpoint.local_peer_id();
+        let coordinator_peer = PeerId([0x36; 32]);
+        let target_peer = PeerId([0x37; 32]);
+
+        let now = std::time::Instant::now();
+        endpoint.active_sessions.insert(
+            target_peer,
+            NatTraversalSession {
+                peer_id: target_peer,
+                coordinator: target_addr,
+                attempt: 1,
+                started_at: now,
+                phase_started_at: now,
+                phase: TraversalPhase::Synchronization,
+                candidates: Vec::new(),
+                last_progress_at: now,
+                next_deadline: None,
+                retry_at: None,
+                last_failure: None,
+                session_state: SessionState {
+                    state: ConnectionState::Connecting,
+                    last_transition: now,
+                    connection: None,
+                    active_attempts: Vec::new(),
+                    metrics: ConnectionMetrics::default(),
+                },
+            },
+        );
+        let request_id = next_request_id();
+        let (expires_at_unix_ms, local_expires_at) =
+            wire_and_monotonic_expiry_after(Duration::from_secs(30));
+        remember_live_request(
+            local_peer,
+            target_peer,
+            LiveRequest {
+                request_id,
+                round: 1,
+                expires_at_unix_ms,
+                local_expires_at,
+                expected_coordinator: Some(coordinator_peer),
+            },
+        );
+        let accepted = encode_coordinator_control(&CoordinatorControlEnvelope {
+            request_id,
+            expires_at_unix_ms,
+            message: CoordinatorControlMessage::CoordinationAccepted {
+                initiator: local_peer,
+                target: target_peer,
+                round: 1,
+                initiator_addrs: vec![held_addr],
+                target_addrs: vec![target_addr],
+            },
+        })
+        .expect("encode coordination accepted");
+        // The handler ignores its connection argument; use one that does not
+        // touch the endpoint under test.
+        let (_unrelated_server, _unrelated_client, unrelated_connection) =
+            loopback_quic_connection().await;
+
+        let handled = endpoint
+            .handle_coordinator_control_message(coordinator_peer, unrelated_connection, &accepted)
+            .await
+            .expect("coordination accepted is handled");
+        assert!(handled, "coordination accepted must be consumed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !endpoint
+            .active_sessions
+            .get(&target_peer)
+            .is_some_and(|session| session.session_state.connection.is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accepted dial must store its session handle before shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_shutdown_releases_original_socket(&endpoint, held_addr, "session handle").await;
+        target.shutdown().await.expect("target shutdown");
+    }
+
     #[test]
     fn receive_generation_allocation_is_monotonic_and_never_wraps() {
         let counter = AtomicU64::new(1);
