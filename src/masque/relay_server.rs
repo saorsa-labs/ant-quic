@@ -511,8 +511,12 @@ impl MasqueRelayServer {
 
         // Bind a real UDP socket for this session's data plane.
         // Bind to INADDR_ANY / IN6ADDR_ANY with OS-assigned port, then advertise
-        // our public IP with the bound port.
-        let bind_addr: SocketAddr = if client_addr.is_ipv4() {
+        // our public IP with the bound port. A relay that advertises a loopback
+        // address cannot be reached from outside the host, so it binds that
+        // loopback address instead of opening a wildcard listener (#305).
+        let bind_addr: SocketAddr = if public_ip.is_loopback() {
+            SocketAddr::new(public_ip, 0)
+        } else if client_addr.is_ipv4() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)

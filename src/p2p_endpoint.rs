@@ -8316,7 +8316,10 @@ impl P2pEndpoint {
     /// # Errors
     ///
     /// Returns [`EndpointError::ShuttingDown`] once the endpoint has begun
-    /// shutting down and the internal queue is drained.
+    /// shutting down and the internal queue is drained. [`Self::try_shutdown`]
+    /// closes the queue and discards (resets) the streams that were not
+    /// accepted yet: each one keeps its connection, and so the endpoint's UDP
+    /// socket, alive, and shutdown closes that connection anyway.
     pub async fn accept_bi(
         &self,
     ) -> Result<
@@ -8332,8 +8335,9 @@ impl P2pEndpoint {
         // when a handle is already queued, so already-buffered app streams are
         // drained before the shutdown signal wins. Only when the queue is
         // empty does shutdown fire — matching the documented "drains the
-        // queue" contract. When the last sender is dropped, `rx.recv()` returns
-        // `None` (also `ShuttingDown`).
+        // queue" contract, until `try_shutdown` discards what is left (#305).
+        // When the queue is closed or the last sender is dropped, `rx.recv()`
+        // returns `None` (also `ShuttingDown`).
         tokio::select! {
             biased;
             item = rx.recv() => match item {
@@ -9102,6 +9106,29 @@ impl P2pEndpoint {
             }
         }
 
+        // #305 round 2: close the application bidi queue and discard the
+        // inbound streams `accept_bi` has not taken. Each queued stream holds
+        // its connection, and with it the original UDP socket; the connection
+        // is closed below, so these streams could not carry data anyway.
+        // Closing the queue first makes a late enqueue fail and drop its
+        // streams. The lock wait is bounded: an `accept_bi` caller holding it
+        // returns as soon as it observes the cancelled shutdown token.
+        match timeout(crate::SHUTDOWN_DRAIN_TIMEOUT, self.app_bi_rx.lock()).await {
+            Ok(mut app_bi_rx) => {
+                app_bi_rx.close();
+                let mut discarded = 0usize;
+                while app_bi_rx.try_recv().is_ok() {
+                    discarded += 1;
+                }
+                if discarded > 0 {
+                    debug!("shutdown: discarded {discarded} unaccepted application bidi stream(s)");
+                }
+            }
+            Err(_) => {
+                warn!("shutdown: application bidi queue busy; queued streams were not discarded");
+            }
+        }
+
         // Disconnect all peers
         let peers: Vec<PeerId> = self.connected_peers.read().await.keys().copied().collect();
         for peer_id in peers {
@@ -9175,7 +9202,14 @@ impl P2pEndpoint {
 
                 let mut established = None;
                 for bootstrap in relay_candidates {
-                    match endpoint.inner.setup_proactive_relay(bootstrap).await {
+                    // #305 round 2: the setup owns a fresh relay dial and its
+                    // CONNECT-UDP exchange, which nothing else closes. Drop
+                    // it on shutdown so it cannot keep the original socket.
+                    let setup = tokio::select! {
+                        _ = endpoint.shutdown.cancelled() => return,
+                        setup = endpoint.inner.setup_proactive_relay(bootstrap) => setup,
+                    };
+                    match setup {
                         Ok(relay_addr) => {
                             info!(
                                 "Proactive relay active at {} via bootstrap {}",
@@ -9837,6 +9871,9 @@ impl P2pEndpoint {
                             stream_read_deadline,
                             async {
             let mut recv_stream = recv_stream;
+            // Owned by this pipeline so it can release the transport handles
+            // before it waits on `data_tx` (#305 round 2).
+            let connection = connection;
 
 
             // Uncancellable: drain the already-ACKed bytes. Cancelling here
@@ -9980,6 +10017,14 @@ impl P2pEndpoint {
             // pre-send pressure so saturation events surface as observable
             // counters even when the eventual `send().await` succeeds
             // after a brief block (X0X-0039).
+            //
+            // #305 round 2: the payload is fully read, so release the stream
+            // and connection handles first. A wait for channel capacity must
+            // not keep the connection, and with it the endpoint's original
+            // UDP socket, alive past shutdown. The payload is still delivered
+            // when the application drains `recv()`.
+            drop(recv_stream);
+            drop(connection);
             data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
             if data_tx.send((peer_id, recv_generation, payload)).await.is_err() {
                 debug!(
@@ -13386,7 +13431,7 @@ mod tests {
             .await
             .expect("connect does not time out")
             .expect("connect succeeds");
-        let (_send, _recv) =
+        let (opener_send, opener_recv) =
             tokio::time::timeout(Duration::from_secs(10), opener.open_bi(&endpoint_id))
                 .await
                 .expect("open_bi does not time out")
@@ -13399,6 +13444,7 @@ mod tests {
 
         assert_try_shutdown_releases(&endpoint, held_addr, "queued app bidi stream").await;
         accept.abort();
+        drop((opener_send, opener_recv));
         opener.shutdown().await;
     }
 
