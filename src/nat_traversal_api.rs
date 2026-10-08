@@ -9070,16 +9070,6 @@ impl NatTraversalEndpoint {
         self.traversal_event_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
 
-        // Close all active connections
-        // DashMap: collect peer_ids then remove them one by one
-        let peer_ids: Vec<PeerId> = self.connections.iter().map(|e| *e.key()).collect();
-        for peer_id in peer_ids {
-            if let Some((_, connection)) = self.connections.remove(&peer_id) {
-                info!("Closing connection to peer {:?}", peer_id);
-                connection.close(crate::VarInt::from_u32(0), b"Shutdown");
-            }
-        }
-
         // #283: close every lifecycle-tracked generation — Superseded
         // survivors included — BEFORE the bounded drain. Previously only the
         // canonical `connections` entries were closed here; survivors were
@@ -9098,6 +9088,20 @@ impl NatTraversalEndpoint {
         }
         {
             let mut lifecycle = self.connection_lifecycle.write();
+            // Close all active connections (the winner map). #305 round 2:
+            // sweep it under the lifecycle write lock. Every registrar
+            // re-checks the shutdown flag and inserts into `connections`
+            // while holding this lock, so a registrar that passed its check
+            // has inserted before this sweep, and any later one refuses.
+            // Sweeping before taking the lock missed such an insert.
+            // DashMap: collect peer_ids then remove them one by one
+            let peer_ids: Vec<PeerId> = self.connections.iter().map(|e| *e.key()).collect();
+            for peer_id in peer_ids {
+                if let Some((_, connection)) = self.connections.remove(&peer_id) {
+                    info!("Closing connection to peer {:?}", peer_id);
+                    connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+                }
+            }
             let mut closed = 0usize;
             for entries in lifecycle.values_mut() {
                 for entry in entries.iter_mut() {
@@ -9184,7 +9188,21 @@ impl NatTraversalEndpoint {
             // Arc — and its OS file descriptor — alive until process exit
             // (issue #199). Connections are already closed above; the lifecycle
             // map is only pruned on new registrations, never on shutdown.
-            self.connection_lifecycle.write().clear();
+            // #305 round 2: under the same lock, also drop any winner-map
+            // entry restored after the sweep (repromotion of a lifecycle
+            // entry does not re-check the shutdown flag).
+            {
+                let mut lifecycle = self.connection_lifecycle.write();
+                let late_peers: Vec<PeerId> = self.connections.iter().map(|e| *e.key()).collect();
+                for peer_id in late_peers {
+                    if let Some((_, connection)) = self.connections.remove(&peer_id)
+                        && connection.close_reason().is_none()
+                    {
+                        connection.close(crate::VarInt::from_u32(0), b"Shutdown");
+                    }
+                }
+                lifecycle.clear();
+            }
 
             #[cfg(not(wasm_browser))]
             match endpoint.release_socket_for_shutdown() {
