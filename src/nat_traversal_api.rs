@@ -9164,6 +9164,16 @@ impl NatTraversalEndpoint {
         // The dial workers that store session handles were joined above.
         let relay_endpoint = self.release_traversal_holders_for_shutdown();
 
+        // #309: close every connection still open on the endpoint. The sweeps
+        // above close only the connections that the maps track. A connection
+        // that a later insert for the same peer displaced from the winner map
+        // is in none of them. The detached tasks that wait for its close keep
+        // it open, and with it the original socket, while the peer stays up.
+        // A closed endpoint also refuses new connections from here on.
+        if let Some(endpoint) = &self.inner_endpoint {
+            endpoint.close(crate::VarInt::from_u32(0), b"Shutdown");
+        }
+
         // Bounded drain: in simultaneous-shutdown scenarios both sides may
         // close at once, so wait_idle can stall until the idle timeout. The
         // closed shared relay endpoint drains in the same budget: its
