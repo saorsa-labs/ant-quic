@@ -13162,6 +13162,57 @@ mod tests {
         listener.shutdown().await;
     }
 
+    /// #305 holder 3: `ensure_shared_relay_endpoint` keeps a MASQUE relay
+    /// session (a `Connection` clone plus the CONNECT-UDP bind streams) in
+    /// `relay_sessions` and the shared relay endpoint. A live relay session
+    /// must not keep the original UDP socket alive past the shutdown settle.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_live_relay_session() {
+        let relay = fixed_port_endpoint(allocate_loopback_port()).await;
+        let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+        // The relay serves CONNECT-UDP on connections the application accepts.
+        let relay_accept = tokio::spawn({
+            let relay = relay.clone();
+            async move { while relay.accept().await.is_some() {} }
+        });
+
+        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        tokio::time::timeout(Duration::from_secs(10), endpoint.connect_addr(relay_addr))
+            .await
+            .expect("connect to relay does not time out")
+            .expect("connect to relay succeeds");
+        let (public_addr, relay_endpoint) = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.inner.ensure_shared_relay_endpoint(relay_addr),
+        )
+        .await
+        .expect("relay session setup does not time out")
+        .expect("relay session is established");
+        drop(relay_endpoint);
+        assert!(public_addr.is_some(), "relay allocates a public address");
+        assert_eq!(
+            endpoint.inner.relay_sessions().len(),
+            1,
+            "the relay session must be live at shutdown"
+        );
+
+        let result = endpoint.try_shutdown().await;
+        assert!(
+            result.is_ok(),
+            "a live relay session must not retain the original socket: {result:?}"
+        );
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
     #[tokio::test]
     async fn test_port_mapping_disabled_mode_starts_cleanly() {
         let config = P2pConfig::builder()
