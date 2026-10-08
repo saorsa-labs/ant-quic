@@ -241,6 +241,9 @@ impl fmt::Display for ProtocolEngine {
 ///     // ... implement remaining methods
 /// }
 /// ```
+// `async_trait` marks the boxed futures `#[must_use]`; clippy 1.99 reports that
+// as `double_must_use` on every method.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TransportProvider: Send + Sync + 'static {
     /// Human-readable name for this transport instance
