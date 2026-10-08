@@ -13168,7 +13168,7 @@ mod tests {
     /// must not keep the original UDP socket alive past the shutdown settle.
     #[tokio::test]
     async fn shutdown_releases_socket_with_live_relay_session() {
-        let relay = fixed_port_endpoint(allocate_loopback_port()).await;
+        let relay = fixed_port_endpoint(loopback_ephemeral_addr()).await;
         let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
         // The relay serves CONNECT-UDP on connections the application accepts.
         let relay_accept = tokio::spawn({
@@ -13176,8 +13176,9 @@ mod tests {
             async move { while relay.accept().await.is_some() {} }
         });
 
-        let endpoint = fixed_port_endpoint(allocate_loopback_port()).await;
+        let endpoint = fixed_port_endpoint(loopback_ephemeral_addr()).await;
         let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        assert!(held_addr.ip().is_loopback(), "endpoint binds loopback only");
         tokio::time::timeout(Duration::from_secs(10), endpoint.connect_addr(relay_addr))
             .await
             .expect("connect to relay does not time out")
@@ -13190,7 +13191,12 @@ mod tests {
         .expect("relay session setup does not time out")
         .expect("relay session is established");
         drop(relay_endpoint);
-        assert!(public_addr.is_some(), "relay allocates a public address");
+        // A loopback relay binds its CONNECT-UDP data plane on loopback, so
+        // this test opens no wildcard listener.
+        assert!(
+            public_addr.is_some_and(|addr| addr.ip().is_loopback()),
+            "relay allocates a loopback public address: {public_addr:?}"
+        );
         assert_eq!(
             endpoint.inner.relay_sessions().len(),
             1,
@@ -13211,6 +13217,189 @@ mod tests {
 
         relay.shutdown().await;
         relay_accept.abort();
+    }
+
+    /// An ephemeral loopback bind address: the endpoint binds it directly and
+    /// the test records the actual address, so no port is reserved and
+    /// released first.
+    fn loopback_ephemeral_addr() -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))
+    }
+
+    async fn loopback_endpoint_with(
+        configure: impl FnOnce(
+            crate::unified_config::P2pConfigBuilder,
+        ) -> crate::unified_config::P2pConfigBuilder,
+    ) -> P2pEndpoint {
+        let builder = P2pConfig::builder()
+            .bind_addr(loopback_ephemeral_addr())
+            .port_mapping_enabled(false);
+        let config = configure(builder).build().expect("valid config");
+        P2pEndpoint::new(config).await.expect("endpoint starts")
+    }
+
+    async fn assert_try_shutdown_releases(
+        endpoint: &P2pEndpoint,
+        held_addr: SocketAddr,
+        holder: &str,
+    ) {
+        let result = endpoint.try_shutdown().await;
+        assert!(
+            result.is_ok(),
+            "{holder} alive at shutdown must not retain the original socket: {result:?}"
+        );
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "{holder}: shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #305 round 2 (P2-2): the proactive relay manager dials a relay
+    /// candidate outside the worker registry. A dial still in flight at
+    /// shutdown must not keep the original socket alive.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_proactive_relay_dial_in_flight() {
+        let silent_relay =
+            std::net::UdpSocket::bind(loopback_ephemeral_addr()).expect("bind silent relay");
+        let relay_addr = silent_relay.local_addr().expect("silent relay address");
+        let endpoint = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let quic = endpoint.inner.get_endpoint().expect("endpoint present");
+        let open_before = quic.open_connections();
+
+        endpoint.inner.force_symmetric_nat_for_test();
+        let _ = endpoint.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 0,
+            total: 1,
+        });
+        wait_until("the proactive relay dial is in flight", || {
+            quic.open_connections() > open_before
+        })
+        .await;
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "proactive relay dial").await;
+        drop(silent_relay);
+    }
+
+    /// #305 round 2 (P2-2): a fresh relay connection that completed QUIC but
+    /// is still waiting for the CONNECT-UDP response is owned only by the
+    /// proactive relay setup. It must not keep the original socket alive.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_proactive_relay_awaiting_response() {
+        // A bare NAT traversal endpoint completes the QUIC handshake but
+        // never reads the CONNECT-UDP request.
+        let mute_relay = crate::nat_traversal_api::NatTraversalEndpoint::new(
+            crate::nat_traversal_api::NatTraversalConfig {
+                bind_addr: Some(loopback_ephemeral_addr()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("mute relay binds");
+        let mute_quic = mute_relay.get_endpoint().expect("mute relay endpoint");
+        let relay_addr = mute_quic.local_addr().expect("mute relay address");
+        let endpoint = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+
+        endpoint.inner.force_symmetric_nat_for_test();
+        let _ = endpoint.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 0,
+            total: 1,
+        });
+        wait_until("the relay handshake completes", || {
+            mute_quic.open_connections() > 0
+        })
+        .await;
+        assert!(
+            endpoint.inner.relay_sessions().is_empty(),
+            "the relay session is not published before the response"
+        );
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "relay awaiting response").await;
+        mute_relay.shutdown().await.expect("mute relay shutdown");
+    }
+
+    /// #305 round 2 (P2-3): a per-stream reader that has read a complete
+    /// message and waits for space in a full `data_tx` must not keep the
+    /// original socket alive at shutdown.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_reader_parked_on_full_data_channel() {
+        let endpoint = loopback_endpoint_with(|builder| builder.data_channel_capacity(1)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let endpoint_id = endpoint.peer_id();
+        let accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { while endpoint.accept().await.is_some() {} }
+        });
+        let sender = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), sender.connect_addr(held_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("connect succeeds");
+
+        // The channel holds one payload; the second payload's reader is left
+        // waiting in `data_tx.send()` (the application never calls recv()).
+        for payload in [&b"fills the channel"[..], &b"waits for capacity"[..]] {
+            sender
+                .send(&endpoint_id, payload)
+                .await
+                .expect("send to the endpoint");
+        }
+        let diagnostics = || endpoint.data_channel_diagnostics();
+        wait_until("the second reader waits for channel capacity", || {
+            let snapshot = diagnostics();
+            snapshot.data_tx_depth == 1 && snapshot.data_tx_high_water_count >= 2
+        })
+        .await;
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "reader parked on data_tx").await;
+        accept.abort();
+        sender.shutdown().await;
+    }
+
+    /// #305 round 2 (P2-4): an inbound application bidi stream queued for
+    /// `accept_bi` holds its connection. If the application never accepts
+    /// it, shutdown must still release the original socket.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_queued_app_bidi_stream() {
+        let endpoint = loopback_endpoint_with(|builder| builder).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let endpoint_id = endpoint.peer_id();
+        let accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { while endpoint.accept().await.is_some() {} }
+        });
+        let opener = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), opener.connect_addr(held_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("connect succeeds");
+        let (_send, _recv) =
+            tokio::time::timeout(Duration::from_secs(10), opener.open_bi(&endpoint_id))
+                .await
+                .expect("open_bi does not time out")
+                .expect("open_bi succeeds");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while endpoint.app_bi_rx.lock().await.is_empty() {
+            assert!(Instant::now() < deadline, "the app bidi stream is queued");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "queued app bidi stream").await;
+        accept.abort();
+        opener.shutdown().await;
     }
 
     #[tokio::test]

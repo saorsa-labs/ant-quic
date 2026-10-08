@@ -541,6 +541,11 @@ pub(crate) struct RegistrationGate {
     shutdown_paused_notify: tokio::sync::Notify,
     shutdown_released: AtomicBool,
     shutdown_release_notify: tokio::sync::Notify,
+    /// #305 round 2: park the registrar INSIDE the lifecycle write lock,
+    /// after its authoritative shutdown re-check, instead of before the lock.
+    in_lock: bool,
+    shutdown_at_sweep_lock: AtomicBool,
+    shutdown_at_sweep_lock_notify: tokio::sync::Notify,
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
@@ -595,6 +600,23 @@ impl RegistrationGate {
     pub(crate) fn release_shutdown(&self) {
         self.shutdown_released.store(true, Ordering::SeqCst);
         self.shutdown_release_notify.notify_waiters();
+    }
+
+    /// #305 round 2: wait until shutdown is about to take the lifecycle
+    /// write lock for its sweep.
+    pub(crate) async fn wait_until_shutdown_at_sweep_lock(&self) {
+        loop {
+            let reached = self.shutdown_at_sweep_lock_notify.notified();
+            if self.shutdown_at_sweep_lock.load(Ordering::SeqCst) {
+                return;
+            }
+            reached.await;
+        }
+    }
+
+    fn note_shutdown_at_sweep_lock(&self) {
+        self.shutdown_at_sweep_lock.store(true, Ordering::SeqCst);
+        self.shutdown_at_sweep_lock_notify.notify_waiters();
     }
 
     fn record_registrar_outcome(&self, outcome: GatedRegistrarOutcome) {
@@ -692,6 +714,23 @@ fn take_registration_gate_for_pause(shutting_down: &AtomicBool) -> Option<Arc<Re
 /// park and release it.
 #[cfg(all(test, feature = "network-discovery"))]
 fn arm_registration_gate_for_test(shutting_down: &Arc<AtomicBool>) -> RegistrationGateGuard {
+    arm_registration_gate_with_mode_for_test(shutting_down, false)
+}
+
+/// #305 round 2: arm a gate that parks the registrar inside the lifecycle
+/// write lock, after its authoritative shutdown re-check.
+#[cfg(all(test, feature = "network-discovery"))]
+fn arm_in_lock_registration_gate_for_test(
+    shutting_down: &Arc<AtomicBool>,
+) -> RegistrationGateGuard {
+    arm_registration_gate_with_mode_for_test(shutting_down, true)
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn arm_registration_gate_with_mode_for_test(
+    shutting_down: &Arc<AtomicBool>,
+    in_lock: bool,
+) -> RegistrationGateGuard {
     let gate = Arc::new(RegistrationGate {
         parked_count: std::sync::atomic::AtomicUsize::new(0),
         target_shutdown: Arc::as_ptr(shutting_down) as usize,
@@ -704,6 +743,9 @@ fn arm_registration_gate_for_test(shutting_down: &Arc<AtomicBool>) -> Registrati
         shutdown_paused_notify: tokio::sync::Notify::new(),
         shutdown_released: AtomicBool::new(false),
         shutdown_release_notify: tokio::sync::Notify::new(),
+        in_lock,
+        shutdown_at_sweep_lock: AtomicBool::new(false),
+        shutdown_at_sweep_lock_notify: tokio::sync::Notify::new(),
     });
     REGISTRATION_GATES
         .write()
@@ -914,6 +956,8 @@ pub struct NatTraversalEndpoint {
     listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
     #[cfg(test)]
     force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    force_symmetric_nat: std::sync::atomic::AtomicBool,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
     constrained_engine: Arc<ParkingMutex<ConstrainedEngine>>,
@@ -2284,6 +2328,8 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            force_symmetric_nat: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -2810,6 +2856,8 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            force_symmetric_nat: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
             constrained_event_rx: TokioMutex::new(constrained_event_rx),
@@ -3099,6 +3147,13 @@ impl NatTraversalEndpoint {
     /// setup. It is not a full NAT classification and does not prove filtering
     /// behavior or long-term mapping stability.
     pub(crate) fn is_symmetric_nat(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .force_symmetric_nat
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
         let mut observed_ports = std::collections::HashSet::new();
 
         for entry in self.connections.iter() {
@@ -7266,7 +7321,9 @@ impl NatTraversalEndpoint {
             return refuse_registration(&peer_id, connection);
         }
         #[cfg(all(test, feature = "network-discovery"))]
-        if let Some(gate) = take_registration_gate_for_pause(shutting_down) {
+        if let Some(gate) = take_registration_gate_for_pause(shutting_down)
+            && !gate.in_lock
+        {
             // #286 round 2 test hook: park this registration between the
             // fast-path check and the map insert, emulating the worst-case
             // scheduling (flag read early, insert attempted after the
@@ -7312,6 +7369,15 @@ impl NatTraversalEndpoint {
             if shutting_down.load(Ordering::Relaxed) {
                 drop(lifecycle);
                 return refuse_registration(&peer_id, connection);
+            }
+            #[cfg(all(test, feature = "network-discovery"))]
+            if let Some(gate) = take_registration_gate_for_pause(shutting_down)
+                && gate.in_lock
+            {
+                // #305 round 2 test hook: park after the in-lock re-check
+                // passed and before the winner-map insert, still holding the
+                // lifecycle write lock.
+                gate.wait_for_release();
             }
             let entries = lifecycle.entry(peer_id).or_default();
             // #277 (x0x#510): a lifecycle-Live entry whose connection is
@@ -8960,6 +9026,19 @@ impl NatTraversalEndpoint {
         arm_registration_gate_for_test(&self.shutdown)
     }
 
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_in_lock_registration_gate_for_test(&self) -> RegistrationGateGuard {
+        arm_in_lock_registration_gate_for_test(&self.shutdown)
+    }
+
+    /// #305 round 2 test hook: report symmetric NAT so the proactive relay
+    /// manager runs on loopback.
+    #[cfg(test)]
+    pub(crate) fn force_symmetric_nat_for_test(&self) {
+        self.force_symmetric_nat
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// #305: spawn a detached dial worker in the registry that `shutdown`
     /// aborts and joins, so an in-flight handshake (`Connecting`) or a
     /// connection handle it stores cannot outlive the socket release. The
@@ -9011,6 +9090,12 @@ impl NatTraversalEndpoint {
         // through to `repromote_surviving_connection`, which resurrects any
         // still-alive Superseded entry) until the idle timeout — the x0x#510
         // restart-class "old owner connection never observed as gone".
+        #[cfg(all(test, feature = "network-discovery"))]
+        if let Some(gate) = take_registration_gate_for_pause(self.shutdown.as_ref())
+            && gate.in_lock
+        {
+            gate.note_shutdown_at_sweep_lock();
+        }
         {
             let mut lifecycle = self.connection_lifecycle.write();
             let mut closed = 0usize;
@@ -9032,7 +9117,9 @@ impl NatTraversalEndpoint {
 
         #[cfg(all(test, feature = "network-discovery"))]
         {
-            if let Some(gate) = take_registration_gate_for_pause(self.shutdown.as_ref()) {
+            if let Some(gate) = take_registration_gate_for_pause(self.shutdown.as_ref())
+                && !gate.in_lock
+            {
                 gate.pause_shutdown_after_sweep().await;
             }
         }
@@ -14641,6 +14728,73 @@ mod tests {
 
         assert_shutdown_releases_original_socket(&endpoint, held_addr, "session handle").await;
         target.shutdown().await.expect("target shutdown");
+    }
+
+    /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
+    /// re-check, and is preempted before the winner-map insert, must not
+    /// leave a `connections` clone behind. The shutdown sweep of the winner
+    /// map has to be serialized with registration by the lifecycle lock.
+    #[cfg(feature = "network-discovery")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_sweeps_winner_registered_inside_lifecycle_lock() {
+        let (server, client, connection) = loopback_quic_connection().await;
+        let client = Arc::new(client);
+        let held_addr = client
+            .shutdown_socket_address_for_test()
+            .expect("original socket address");
+        let peer = PeerId([0x38; 32]);
+        let gate = client.arm_in_lock_registration_gate_for_test();
+
+        let registrar = {
+            let client = Arc::clone(&client);
+            tokio::task::spawn_blocking(move || {
+                client.add_connection_with_outcome(peer, connection)
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+            .await
+            .expect("the registrar parks inside the lifecycle lock");
+
+        let shutdown = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.shutdown().await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            gate.wait_until_shutdown_at_sweep_lock(),
+        )
+        .await
+        .expect("shutdown reaches the lifecycle sweep");
+        gate.release();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), registrar)
+            .await
+            .expect("the registrar finishes")
+            .expect("the registrar joins")
+            .expect("the registration completes");
+        assert!(
+            matches!(outcome, ConnectionRegistrationOutcome::Live { .. }),
+            "the parked registration passed its in-lock check before shutdown: {outcome:?}"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(30), shutdown)
+            .await
+            .expect("shutdown finishes")
+            .expect("shutdown joins");
+        assert!(
+            result.is_ok(),
+            "a winner registered inside the lifecycle lock must not retain the original socket: {result:?}"
+        );
+        assert!(
+            client.connections.is_empty(),
+            "shutdown leaves no winner-map clone"
+        );
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+        drop(gate);
+        server.shutdown().await.expect("server shutdown");
     }
 
     #[test]
