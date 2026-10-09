@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.56] - 2026-10-09
+
+### Fixed
+
+- **Shutdown releases the UDP socket in the remaining cases (#309).** After
+  0.27.55, about 1 in 100–500 embedded shutdowns still failed with
+  `weak_socket_owner_still_live`. Shutdown now:
+  - closes the inner endpoint after the targeted sweeps, so a connection that
+    no map holds any more (an overwritten coordinator-dial entry) is closed;
+  - drops a connection's socket, sender and event receiver when its driver
+    exits or is cancelled, so an application-held handle, or a `Rebind` sent
+    after cleanup, no longer keeps the socket alive;
+  - rebinds still-draining connections to the replacement socket during
+    socket release.
+  Dropping a pending connection driver now closes the connection, wakes its
+  waiters with a terminal error (keeping an earlier close reason), and sends
+  the endpoint exactly one Drained event.
+- NAT control sends (`send_nat_address_advertisement`, `send_nat_address_removal`,
+  `send_nat_punch_coordination`, `send_nat_punch_via_relay`) return the
+  connection's stored error once it is closed, instead of `Ok` without sending.
+
+
 ## [0.27.55] - 2026-10-08
 
 ### Fixed
