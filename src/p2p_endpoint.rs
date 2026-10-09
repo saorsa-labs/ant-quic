@@ -671,6 +671,9 @@ pub(crate) mod reader_test_hooks {
         };
         if attempt != 0 && hooks.panic_attempt.load(Ordering::SeqCst) == attempt {
             hooks.panicked.store(true, Ordering::SeqCst);
+            // Test-only: the #313 dead-reader regression needs a real panic in the
+            // reader task. This module is `cfg(test)`, so no production path panics.
+            #[allow(clippy::panic)]
             std::panic::panic_any("#313 test: injected reader-task panic");
         }
         if attempt != 0 && hooks.sync_park_attempt.load(Ordering::SeqCst) == attempt {
