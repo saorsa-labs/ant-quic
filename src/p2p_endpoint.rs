@@ -495,14 +495,67 @@ pub(crate) mod reader_test_hooks {
         /// Attempt whose reader task panics at its loop head (0 = none).
         pub(crate) panic_attempt: AtomicUsize,
         pub(crate) panicked: AtomicBool,
+        /// Attempt whose reader task blocks its worker thread at its loop
+        /// head, so it can observe neither cancel nor abort (0 = none).
+        pub(crate) sync_park_attempt: AtomicUsize,
+        pub(crate) sync_parked_now: AtomicBool,
+        /// Pause the reader-exit handler for this connection after it has
+        /// taken the exiting owner's record and before the owner-sensitive
+        /// side effects (tombstone, lifecycle, `handle_reader_exit`).
+        pub(crate) pause_exit_side_effects: AtomicBool,
+        pub(crate) exit_paused: AtomicBool,
         released: AtomicBool,
         notify: tokio::sync::Notify,
+        exit_released: AtomicBool,
+        exit_notify: tokio::sync::Notify,
+        sync_released: std::sync::Mutex<bool>,
+        sync_release_notify: std::sync::Condvar,
     }
 
     impl ReaderHooks {
         pub(crate) fn release(&self) {
             self.released.store(true, Ordering::SeqCst);
             self.notify.notify_waiters();
+        }
+
+        pub(crate) fn release_exit(&self) {
+            self.exit_released.store(true, Ordering::SeqCst);
+            self.exit_notify.notify_waiters();
+        }
+
+        pub(crate) fn release_sync_park(&self) {
+            let mut released = self
+                .sync_released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            self.sync_release_notify.notify_all();
+        }
+
+        fn sync_park(&self) {
+            self.sync_parked_now.store(true, Ordering::SeqCst);
+            let released = self
+                .sync_released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self
+                .sync_release_notify
+                .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.sync_parked_now.store(false, Ordering::SeqCst);
+        }
+
+        async fn wait_exit_released(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let notified = self.exit_notify.notified();
+                if self.exit_released.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return;
+                }
+            }
         }
 
         async fn wait_released(&self) {
@@ -534,6 +587,8 @@ pub(crate) mod reader_test_hooks {
     pub(crate) fn disarm(endpoint_key: usize, stable_id: usize) {
         if let Some(hooks) = HOOKS.lock().remove(&(endpoint_key, stable_id)) {
             hooks.release();
+            hooks.release_exit();
+            hooks.release_sync_park();
         }
     }
 
@@ -559,9 +614,26 @@ pub(crate) mod reader_test_hooks {
             hooks.panicked.store(true, Ordering::SeqCst);
             std::panic::panic_any("#313 test: injected reader-task panic");
         }
+        if attempt != 0 && hooks.sync_park_attempt.load(Ordering::SeqCst) == attempt {
+            hooks.sync_park();
+        }
         if attempt == 1 && hooks.pause_first_attempt_loop.load(Ordering::SeqCst) {
             hooks.wait_released().await;
         }
+    }
+
+    /// The reader-exit handler's point between taking the exiting owner's
+    /// record and running the owner-sensitive side effects.
+    pub(crate) async fn exit_side_effects_point(endpoint_key: usize, stable_id: usize) {
+        let hooks = HOOKS.lock().get(&(endpoint_key, stable_id)).cloned();
+        let Some(hooks) = hooks else {
+            return;
+        };
+        if !hooks.pause_exit_side_effects.load(Ordering::SeqCst) {
+            return;
+        }
+        hooks.exit_paused.store(true, Ordering::SeqCst);
+        hooks.wait_exit_released().await;
     }
 
     pub(crate) fn note_accept(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
@@ -10825,6 +10897,12 @@ impl P2pEndpoint {
                     );
                     continue;
                 }
+                #[cfg(all(test, feature = "network-discovery"))]
+                reader_test_hooks::exit_side_effects_point(
+                    Arc::as_ptr(&reader_handles) as usize,
+                    conn_stable_id,
+                )
+                .await;
 
                 // #368 F2: record the exited generation so the liveness
                 // probe can reject an exited-reader survivor immediately
@@ -19469,6 +19547,139 @@ mod tests {
             a.shutdown().await;
             b.shutdown().await;
             z.shutdown().await;
+        }
+
+        /// Round 2 (Codex P2-1): a predecessor's exit side effects must never
+        /// close the connection of a successor admitted for the same
+        /// connection. R1, a Standard reader started while X was Superseded,
+        /// is pre-cancelled and exits; its handler is paused after it has
+        /// taken R1's record and before its side effects. X is then
+        /// repromoted (Y dies within the promotion grace) and a successor
+        /// start for X is attempted. On d75fca7f the successor is admitted,
+        /// and R1's resumed `handle_reader_exit` (Live arm) closes X under it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn predecessor_exit_cannot_close_admitted_successor() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let b_peer = b.peer_id();
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let x = raw_dial(&a, b_addr).await;
+            a.inner
+                .add_connection(b_peer, x.clone())
+                .expect("register X");
+            let g_x = wait_for_generation(&a, &b_peer, "A registers X", |_| true).await;
+            let y = raw_dial(&a, b_addr).await;
+            a.inner
+                .add_connection(b_peer, y.clone())
+                .expect("register Y");
+            wait_for_winner(&a, &b_peer, "Y supersedes X", |connection| {
+                connection.stable_id() == y.stable_id()
+            })
+            .await;
+
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), x.stable_id());
+            hooks
+                .pause_exit_side_effects
+                .store(true, AtomicOrdering::SeqCst);
+            // R1: pre-cancelled because X is Superseded; it exits at once.
+            a.spawn_reader_task(b_peer, x.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !hooks.exit_paused.load(AtomicOrdering::SeqCst) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "R1's exit did not reach the side-effects point"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // Repromote X: Y dies and the next lookup promotes the young
+            // Superseded survivor.
+            y.close(0u32.into(), b"313 round 2 test");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while y.close_reason().is_none() {
+                assert!(tokio::time::Instant::now() < deadline, "Y closes");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let promoted = a
+                .inner
+                .get_connection(&b_peer)
+                .expect("lookup")
+                .expect("X is promoted");
+            assert_eq!(promoted.stable_id(), x.stable_id());
+            assert_eq!(a.inner.current_connection_generation(&b_peer), Some(g_x));
+
+            // A successor start for X while R1's exit side effects are pending.
+            let started = a
+                .start_reader(b_peer, x.clone(), ReaderStartMode::Adoption)
+                .await;
+            hooks.release_exit();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
+
+            assert!(
+                !(started == ReaderStart::Started && x.close_reason().is_some()),
+                "the predecessor's exit closed the connection of the successor admitted during \
+                 its exit window: {:?}",
+                x.close_reason()
+            );
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// Round 2 (Codex P2-2): teardown must not remove a reader's
+        /// reservation before the reader has stopped. R1 blocks its worker
+        /// thread, so it observes neither cancel nor abort. Peer cleanup then
+        /// runs, and a delayed adoption for the still-open raw connection H
+        /// is attempted while R1 is still running. On d75fca7f cleanup deleted
+        /// R1's record, so the adoption starts a second reader for H.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn delayed_adoption_after_cleanup_does_not_start_second_reader() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let h = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), h.stable_id());
+            hooks.sync_park_attempt.store(1, AtomicOrdering::SeqCst);
+            a.spawn_reader_task(b_peer, h.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !hooks.sync_parked_now.load(AtomicOrdering::SeqCst) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "R1 did not reach its loop head"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            a.cleanup_connection(&b_peer, DisconnectReason::ConnectionLost)
+                .await;
+            assert!(
+                h.close_reason().is_none(),
+                "the raw connection stays open through peer cleanup"
+            );
+            let started = a
+                .start_reader(b_peer, h.clone(), ReaderStartMode::Adoption)
+                .await;
+            let r1_still_running = hooks.sync_parked_now.load(AtomicOrdering::SeqCst);
+            hooks.release_sync_park();
+            reader_test_hooks::disarm(a.reader_hooks_key(), h.stable_id());
+
+            assert!(
+                !(started == ReaderStart::Started && r1_still_running),
+                "a delayed adoption started a second reader for H while the torn-down R1 had not \
+                 stopped"
+            );
+
+            a.shutdown().await;
+            b.shutdown().await;
         }
     }
 }
