@@ -311,6 +311,44 @@ fn send_failure_action(
     }
 }
 
+impl Drop for ConnectionDriver {
+    /// #309: a driver that is dropped before it completes (its runtime shut
+    /// down, or its task was aborted) runs none of the exits in `poll`, while
+    /// the application may still hold the connection. Retire the connection
+    /// here: close it, wake every waiter with a terminal error (an earlier
+    /// close reason is kept), retire the endpoint route once, and release the
+    /// socket.
+    fn drop(&mut self) {
+        let conn = &mut *self.0.state.lock("driver drop");
+        if conn.driver_exited {
+            return;
+        }
+        if conn.error.is_none() {
+            conn.inner.close(
+                conn.runtime.now(),
+                0u32.into(),
+                Bytes::from_static(b"connection driver dropped"),
+            );
+            conn.terminate(
+                ConnectionError::TransportError(crate::TransportError {
+                    code: crate::TransportErrorCode::INTERNAL_ERROR,
+                    frame: None,
+                    reason: "connection driver dropped".to_string(),
+                }),
+                &self.0.shared,
+            );
+        }
+        if !conn.inner.is_drained() && !conn.endpoint_drained_notified {
+            let _ = conn
+                .endpoint_events
+                .send((conn.handle, crate::EndpointEvent::drained()));
+            conn.endpoint_drained_notified = true;
+        }
+        conn.buffered_registry.remove(conn.handle.0);
+        conn.release_socket();
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
@@ -1381,6 +1419,7 @@ impl ConnectionRef {
                 buffered_registry,
                 last_buffered_refresh: None,
                 endpoint_drained_notified: false,
+                driver_exited: false,
             }),
             shared: Shared::default(),
         }))
@@ -1479,6 +1518,9 @@ pub(crate) struct State {
     /// A fatal driver exit can retire the endpoint route before this state is
     /// dropped; do not emit a duplicate Drained event then.
     endpoint_drained_notified: bool,
+    /// The driver has run its terminal cleanup (`release_socket`), on
+    /// completion or on cancellation (#309).
+    driver_exited: bool,
 }
 
 impl State {
@@ -1763,13 +1805,20 @@ impl State {
     }
 
     /// #309: the driver has exited, so the connection sends nothing more.
-    /// Let go of the endpoint's UDP socket. Application handles (and the
-    /// tasks that hold them) can outlive the driver, and they must not keep
-    /// the socket and its descriptor open after the endpoint released it.
+    /// Let go of every reference to a UDP socket: the socket, its sender, any
+    /// buffered transmit, and the event queue. The endpoint can queue a
+    /// `Rebind` (which carries a socket) after the driver's last receive poll,
+    /// so the queue is closed, which makes later sends fail, and the events
+    /// already in it are discarded. Application handles (and the tasks that
+    /// hold them) can outlive the driver, and they must not keep a socket and
+    /// its descriptor open.
     fn release_socket(&mut self) {
+        self.driver_exited = true;
         self.buffered_transmit = None;
         self.udp_sender = None;
         self.socket = None;
+        self.conn_events.close();
+        while self.conn_events.try_recv().is_ok() {}
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
