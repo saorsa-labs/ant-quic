@@ -768,6 +768,124 @@ fn arm_registration_gate_with_mode_for_test(
     RegistrationGateGuard { gate }
 }
 
+/// #313 test-only gate: parks the FIRST lifecycle registration of one
+/// endpoint before it allocates its generation; later registrations pass. A
+/// test can then register a second connection for the same peer first, and
+/// the parked one allocates the newer generation when released. The wait is
+/// synchronous (the registrar is synchronous), so tests need spare runtime
+/// worker threads. Production code never arms it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct FirstRegistrationGate {
+    target_shutdown: usize,
+    park_available: AtomicBool,
+    parked: AtomicBool,
+    parked_notify: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release_notify: std::sync::Condvar,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl FirstRegistrationGate {
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.release_notify.notify_all();
+    }
+
+    pub(crate) async fn wait_until_parked(&self) {
+        loop {
+            let parked = self.parked_notify.notified();
+            if self.parked.load(Ordering::SeqCst) {
+                return;
+            }
+            parked.await;
+        }
+    }
+
+    fn park_if_first(&self) {
+        if !self.park_available.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.parked.store(true, Ordering::SeqCst);
+        self.parked_notify.notify_waiters();
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = self
+            .release_notify
+            .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct FirstRegistrationGateGuard {
+    gate: Arc<FirstRegistrationGate>,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl std::ops::Deref for FirstRegistrationGateGuard {
+    type Target = FirstRegistrationGate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl Drop for FirstRegistrationGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut armed = FIRST_REGISTRATION_GATES.write();
+        if armed
+            .get(&self.gate.target_shutdown)
+            .and_then(Weak::upgrade)
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+        {
+            armed.remove(&self.gate.target_shutdown);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static FIRST_REGISTRATION_GATES: std::sync::LazyLock<
+    ParkingRwLock<HashMap<usize, Weak<FirstRegistrationGate>>>,
+> = std::sync::LazyLock::new(|| ParkingRwLock::new(HashMap::new()));
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn park_first_registration_for_test(shutting_down: &AtomicBool) {
+    let target_shutdown = std::ptr::from_ref(shutting_down) as usize;
+    let gate = FIRST_REGISTRATION_GATES
+        .read()
+        .get(&target_shutdown)
+        .and_then(Weak::upgrade);
+    if let Some(gate) = gate {
+        gate.park_if_first();
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn arm_first_registration_gate_for_test(
+    shutting_down: &Arc<AtomicBool>,
+) -> FirstRegistrationGateGuard {
+    let gate = Arc::new(FirstRegistrationGate {
+        target_shutdown: Arc::as_ptr(shutting_down) as usize,
+        park_available: AtomicBool::new(true),
+        parked: AtomicBool::new(false),
+        parked_notify: tokio::sync::Notify::new(),
+        released: std::sync::Mutex::new(false),
+        release_notify: std::sync::Condvar::new(),
+    });
+    FIRST_REGISTRATION_GATES
+        .write()
+        .insert(gate.target_shutdown, Arc::downgrade(&gate));
+    FirstRegistrationGateGuard { gate }
+}
+
 /// #310 test-only hole-punch winner gate: parks the first hole-punch winner
 /// of one endpoint after its handshake, immediately before it takes the
 /// lifecycle write lock for its winner-map insert, so a test can run a second
@@ -7483,6 +7601,8 @@ impl NatTraversalEndpoint {
             // is synchronous; unrelated endpoints continue registering.
             gate.wait_for_release();
         }
+        #[cfg(all(test, feature = "network-discovery"))]
+        park_first_registration_for_test(shutting_down);
         let Some(generation) = allocate_connection_generation(next_connection_generation) else {
             // Exhaustion is terminal for allocation: never wrap or issue the stale sentinel.
             connection.close(VarInt::from_u32(0), b"connection generation exhausted");
@@ -9212,6 +9332,100 @@ impl NatTraversalEndpoint {
     #[cfg(all(test, feature = "network-discovery"))]
     pub(crate) fn arm_in_lock_registration_gate_for_test(&self) -> RegistrationGateGuard {
         arm_in_lock_registration_gate_for_test(&self.shutdown)
+    }
+
+    /// #313 test hook: park only this endpoint's FIRST lifecycle registration
+    /// before it allocates its generation. Later registrations pass, so a
+    /// test can register a second connection for the peer first.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_first_registration_gate_for_test(&self) -> FirstRegistrationGateGuard {
+        arm_first_registration_gate_for_test(&self.shutdown)
+    }
+
+    /// #313 test hook: run one hole-punch candidate attempt for `peer_id` at
+    /// `address` (the raw hole-punch winner path).
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn attempt_hole_punch_candidate_for_test(
+        &self,
+        peer_id: PeerId,
+        address: SocketAddr,
+    ) -> Result<(), NatTraversalError> {
+        let candidate = CandidateAddress::new(address, 0, CandidateSource::Peer)
+            .map_err(|e| NatTraversalError::ConfigError(format!("test candidate: {e:?}")))?;
+        self.attempt_connection_to_candidate(peer_id, &candidate)
+    }
+
+    /// #313 test hook: deliver a `CoordinationAccepted` message to this
+    /// endpoint as if a coordinator had sent it. When this endpoint is the
+    /// initiator, the live request the handler requires is seeded first. The
+    /// handler ignores its connection argument; `any_connection` only fills it.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) async fn inject_accepted_coordination_for_test(
+        &self,
+        any_connection: InnerConnection,
+        initiator: PeerId,
+        target: PeerId,
+        initiator_addrs: Vec<SocketAddr>,
+        target_addrs: Vec<SocketAddr>,
+    ) -> Result<bool, NatTraversalError> {
+        let coordinator_peer = PeerId([0x31; 32]);
+        let request_id = next_request_id();
+        let (expires_at_unix_ms, local_expires_at) =
+            wire_and_monotonic_expiry_after(Duration::from_secs(30));
+        if initiator == self.local_peer_id {
+            remember_live_request(
+                self.local_peer_id,
+                target,
+                LiveRequest {
+                    request_id,
+                    round: 1,
+                    expires_at_unix_ms,
+                    local_expires_at,
+                    expected_coordinator: Some(coordinator_peer),
+                },
+            );
+        }
+        let accepted = encode_coordinator_control(&CoordinatorControlEnvelope {
+            request_id,
+            expires_at_unix_ms,
+            message: CoordinatorControlMessage::CoordinationAccepted {
+                initiator,
+                target,
+                round: 1,
+                initiator_addrs,
+                target_addrs,
+            },
+        })
+        .map_err(|e| NatTraversalError::ProtocolError(format!("encode: {e}")))?;
+        self.handle_coordinator_control_message(coordinator_peer, any_connection, &accepted)
+            .await
+    }
+
+    /// #313 test hook: register `connection` the way a fallback coordinator
+    /// dial does (`materialize_authenticated_connection`).
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn materialize_connection_for_test(
+        &self,
+        connection: InnerConnection,
+    ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
+        Self::materialize_authenticated_connection(
+            self.local_peer_id,
+            self.connections.as_ref(),
+            self.connection_lifecycle.as_ref(),
+            self.next_connection_generation.as_ref(),
+            self.emitted_established_events.as_ref(),
+            self.shutdown.as_ref(),
+            connection,
+        )
+    }
+
+    /// #313 test hook: replace the peer's lifecycle entries with `entry` and
+    /// make its connection the winner, under the lifecycle lock.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn seed_winner_for_test(&self, peer_id: PeerId, entry: TrackedConnection) {
+        let mut lifecycle = self.connection_lifecycle.write();
+        self.connections.insert(peer_id, entry.connection.clone());
+        lifecycle.insert(peer_id, vec![entry]);
     }
 
     /// #310 test hook: park this endpoint's first hole-punch winner just

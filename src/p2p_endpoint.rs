@@ -406,6 +406,145 @@ struct ReaderExitEvent {
     conn_stable_id: usize,
 }
 
+#[cfg(all(test, feature = "network-discovery"))]
+impl ReaderExitEvent {
+    /// #313 test seam: an exit event for `conn_stable_id` that no current
+    /// reader task sent (a late exit from a task that no longer owns it).
+    fn stale_for_test(peer_id: PeerId, generation: u64, conn_stable_id: usize) -> Self {
+        Self {
+            peer_id,
+            generation,
+            conn_stable_id,
+        }
+    }
+}
+
+/// #313 test-only instrumentation of reader starts, keyed by
+/// `(endpoint key, connection stable_id)`. Inert unless a test arms it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) mod reader_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    pub(crate) struct ReaderHooks {
+        /// Reader-start attempts for this connection since arming (1-based).
+        pub(crate) attempts: AtomicUsize,
+        /// Streams accepted by any reader task of this connection.
+        pub(crate) accepted_total: AtomicUsize,
+        /// Streams accepted by a reader task from attempt 2 or later.
+        pub(crate) accepted_by_later_attempts: AtomicUsize,
+        /// Park attempt 1's task at its loop head until released.
+        pub(crate) pause_first_attempt_loop: AtomicBool,
+        /// Attempt to park just before its duplicate check (0 = none).
+        pub(crate) park_before_dedup_attempt: AtomicUsize,
+        /// Attempt to park after it was found to be a duplicate (0 = none).
+        pub(crate) park_after_duplicate_attempt: AtomicUsize,
+        /// Attempt whose reader task panics at its loop head (0 = none).
+        pub(crate) panic_attempt: AtomicUsize,
+        pub(crate) panicked: AtomicBool,
+        released: AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl ReaderHooks {
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        async fn wait_released(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let notified = self.notify.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    type HookMap = HashMap<(usize, usize), Arc<ReaderHooks>>;
+    static HOOKS: LazyLock<parking_lot::Mutex<HookMap>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    pub(crate) fn arm(endpoint_key: usize, stable_id: usize) -> Arc<ReaderHooks> {
+        let hooks = Arc::new(ReaderHooks::default());
+        HOOKS
+            .lock()
+            .insert((endpoint_key, stable_id), Arc::clone(&hooks));
+        hooks
+    }
+
+    pub(crate) fn disarm(endpoint_key: usize, stable_id: usize) {
+        if let Some(hooks) = HOOKS.lock().remove(&(endpoint_key, stable_id)) {
+            hooks.release();
+        }
+    }
+
+    pub(crate) fn note_start(
+        endpoint_key: usize,
+        stable_id: usize,
+    ) -> (Option<Arc<ReaderHooks>>, usize) {
+        let hooks = HOOKS.lock().get(&(endpoint_key, stable_id)).cloned();
+        match hooks {
+            Some(hooks) => {
+                let attempt = hooks.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                (Some(hooks), attempt)
+            }
+            None => (None, 0),
+        }
+    }
+
+    pub(crate) async fn loop_head(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
+        let Some(hooks) = hooks else {
+            return;
+        };
+        if attempt != 0 && hooks.panic_attempt.load(Ordering::SeqCst) == attempt {
+            hooks.panicked.store(true, Ordering::SeqCst);
+            std::panic::panic_any("#313 test: injected reader-task panic");
+        }
+        if attempt == 1 && hooks.pause_first_attempt_loop.load(Ordering::SeqCst) {
+            hooks.wait_released().await;
+        }
+    }
+
+    pub(crate) fn note_accept(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
+        let Some(hooks) = hooks else {
+            return;
+        };
+        hooks.accepted_total.fetch_add(1, Ordering::SeqCst);
+        if attempt > 1 {
+            hooks
+                .accepted_by_later_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) async fn park_before_dedup(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
+        if let Some(hooks) = hooks
+            && attempt != 0
+            && hooks.park_before_dedup_attempt.load(Ordering::SeqCst) == attempt
+        {
+            hooks.wait_released().await;
+        }
+    }
+
+    pub(crate) async fn park_after_duplicate(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
+        if let Some(hooks) = hooks
+            && attempt != 0
+            && hooks.park_after_duplicate_attempt.load(Ordering::SeqCst) == attempt
+        {
+            hooks.wait_released().await;
+        }
+    }
+}
+
 impl PeerHintRecord {
     fn merge(&mut self, addrs: Vec<SocketAddr>, capabilities: Option<PeerCapabilities>) {
         for addr in addrs {
@@ -8416,6 +8555,51 @@ impl P2pEndpoint {
         self.reader_handles.read().await.len()
     }
 
+    /// #313 test seam: the key the reader-start instrumentation uses for
+    /// this endpoint.
+    #[cfg(all(test, feature = "network-discovery"))]
+    fn reader_hooks_key(&self) -> usize {
+        Arc::as_ptr(&self.reader_handles) as usize
+    }
+
+    /// #313 test seam: true when a reader task for this connection is
+    /// registered and still running.
+    #[cfg(all(test, feature = "network-discovery"))]
+    async fn live_reader_for_test(&self, peer_id: &PeerId, stable_id: usize) -> bool {
+        self.reader_handles
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|handles| {
+                handles.iter().any(|handle| {
+                    handle.conn_stable_id == stable_id && !handle.abort_handle.is_finished()
+                })
+            })
+    }
+
+    /// #313 test seam: number of registered reader handles for a peer.
+    #[cfg(all(test, feature = "network-discovery"))]
+    async fn reader_count_for_test(&self, peer_id: &PeerId) -> usize {
+        self.reader_handles
+            .read()
+            .await
+            .get(peer_id)
+            .map_or(0, Vec::len)
+    }
+
+    /// #313 test seam: cooperatively cancel this connection's reader task.
+    #[cfg(all(test, feature = "network-discovery"))]
+    async fn cancel_reader_for_test(&self, peer_id: &PeerId, stable_id: usize) {
+        if let Some(handles) = self.reader_handles.read().await.get(peer_id) {
+            for handle in handles
+                .iter()
+                .filter(|handle| handle.conn_stable_id == stable_id)
+            {
+                handle.cancel.cancel();
+            }
+        }
+    }
+
     /// Number of per-peer activity records (`peer_activity` map entries).
     #[doc(hidden)]
     pub async fn peer_activity_count(&self) -> usize {
@@ -9691,6 +9875,11 @@ impl P2pEndpoint {
         let ack_response_drop_injection = Arc::clone(&self.ack_response_drop_injection);
         let app_bi_tx = self.app_bi_tx.clone();
         let conn_stable_id = connection.stable_id();
+        #[cfg(all(test, feature = "network-discovery"))]
+        let (test_hooks, test_attempt) = reader_test_hooks::note_start(
+            Arc::as_ptr(&self.reader_handles) as usize,
+            conn_stable_id,
+        );
         let lifecycle_snapshot = self
             .inner
             .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
@@ -9729,8 +9918,12 @@ impl P2pEndpoint {
             },
         }
 
+        #[cfg(all(test, feature = "network-discovery"))]
+        let task_test_hooks = test_hooks.clone();
         let join_handle = tokio::spawn(async move {
             loop {
+                #[cfg(all(test, feature = "network-discovery"))]
+                reader_test_hooks::loop_head(task_test_hooks.as_ref(), test_attempt).await;
                 // Cancel only between streams. If the token fires while a
                 // spawned stream task is mid-`read_to_end()`, that task keeps
                 // the #166 uncancellable-drain property and finishes; the
@@ -9785,6 +9978,8 @@ impl P2pEndpoint {
                 // ordering was NEVER guaranteed — each uni stream carries one
                 // self-contained message. What changes is which stream gets
                 // read first, which QUIC never ordered anyway.
+                #[cfg(all(test, feature = "network-discovery"))]
+                reader_test_hooks::note_accept(task_test_hooks.as_ref(), test_attempt);
                 let recv_stream = match incoming {
                     IncomingStream::AckBidi { send, recv } => {
                         if !Self::handle_bidi_stream_inline(
@@ -10077,6 +10272,8 @@ impl P2pEndpoint {
             });
         });
         let abort_handle = join_handle.abort_handle();
+        #[cfg(all(test, feature = "network-discovery"))]
+        reader_test_hooks::park_before_dedup(test_hooks.as_ref(), test_attempt).await;
 
         // #280 round 2: enforce one reader per CONNECTION (stable_id). Readers
         // for OTHER generations of the same peer are still tolerated (issue
@@ -10096,6 +10293,8 @@ impl P2pEndpoint {
             );
             drop(handles);
             cancel.cancel();
+            #[cfg(all(test, feature = "network-discovery"))]
+            reader_test_hooks::park_after_duplicate(test_hooks.as_ref(), test_attempt).await;
             abort_handle.abort();
             return;
         }
@@ -18245,5 +18444,744 @@ mod tests {
 
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    /// #313: reader ownership and readers for raw (untracked) winners.
+    ///
+    /// Construction notes. Every replacement in these tests is a genuinely new
+    /// QUIC connection (a fresh dial), never a `connect_addr` re-dial, which
+    /// returns the existing live connection (#316). Waits observe the real
+    /// state (a registered generation, a running reader task, the winner map),
+    /// not the return of a waiter that spawns its reader in another task.
+    #[cfg(all(test, feature = "network-discovery"))]
+    mod raw_winner_reader_313 {
+        use super::*;
+        use crate::high_level::Connection as QuicConnection;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        const RECV_WINDOW: Duration = Duration::from_secs(5);
+
+        async fn winner(node: &P2pEndpoint, peer: &PeerId) -> Option<QuicConnection> {
+            node.inner.get_connection(peer).ok().flatten()
+        }
+
+        async fn wait_for_winner(
+            node: &P2pEndpoint,
+            peer: &PeerId,
+            what: &str,
+            accept: impl Fn(&QuicConnection) -> bool,
+        ) -> QuicConnection {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(connection) = winner(node, peer).await
+                    && accept(&connection)
+                {
+                    return connection;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting until {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn wait_for_reader(node: &P2pEndpoint, peer: &PeerId, stable_id: usize, what: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            while !node.live_reader_for_test(peer, stable_id).await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn wait_for_generation(
+            node: &P2pEndpoint,
+            peer: &PeerId,
+            what: &str,
+            accept: impl Fn(u64) -> bool,
+        ) -> u64 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(generation) = node.inner.current_connection_generation(peer)
+                    && accept(generation)
+                {
+                    return generation;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting until {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// True when `node` receives exactly `payload` from `from` in `within`.
+        async fn recv_within(
+            node: &P2pEndpoint,
+            from: PeerId,
+            payload: &[u8],
+            within: Duration,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                match tokio::time::timeout(remaining, node.recv()).await {
+                    Ok(Ok((peer, data))) if peer == from && data == payload => return true,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) | Err(_) => return false,
+                }
+            }
+        }
+
+        /// A raw QUIC dial from `node`'s endpoint: no lifecycle registration
+        /// and no reader at `node`.
+        async fn raw_dial(node: &P2pEndpoint, addr: SocketAddr) -> QuicConnection {
+            let endpoint = node.inner.get_endpoint().expect("quic endpoint");
+            let connecting = endpoint.connect(addr, "peer").expect("start raw dial");
+            tokio::time::timeout(Duration::from_secs(10), connecting)
+                .await
+                .expect("raw dial timed out")
+                .expect("raw dial handshake")
+        }
+
+        async fn saw_reader_exit(
+            events: &mut broadcast::Receiver<(PeerId, PeerLifecycleEvent)>,
+            peer: PeerId,
+            within: Duration,
+        ) -> bool {
+            tokio::time::timeout(within, async {
+                loop {
+                    match events.recv().await {
+                        Ok((event_peer, PeerLifecycleEvent::ReaderExited { .. }))
+                            if event_peer == peer =>
+                        {
+                            return true;
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+
+        /// RED on master (Codex §1). A's hole-punch winner H is finalised by
+        /// A's P2P waiter, which starts H's reader. B registers and accepts H.
+        /// Only then does A's accepted-coordination dial C complete: it
+        /// replaces H in A's winner map (nta:12011) with no reader. At B, C is
+        /// the newer generation of the same initiator family, so it is B's
+        /// winner and B sends on it. On master A never reads C, so B's message
+        /// is never delivered, although B's send succeeds.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn readerless_coordinator_winner_b_to_a() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            a.inner
+                .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                .expect("start hole-punch H");
+            let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                .await
+                .expect("A's waiter finalises H");
+            let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+            assert!(
+                a.inner.current_connection_generation(&b_peer).is_none(),
+                "H must be an untracked raw winner at A"
+            );
+            wait_for_reader(&a, &b_peer, h.stable_id(), "A's waiter-started reader on H").await;
+
+            let g_h = wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+            let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |_| true).await;
+            wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+
+            let handled = a
+                .inner
+                .inject_accepted_coordination_for_test(
+                    h.clone(),
+                    a_peer,
+                    b_peer,
+                    vec![a_addr],
+                    vec![b_addr],
+                )
+                .await
+                .expect("CoordinationAccepted handled");
+            assert!(handled, "CoordinationAccepted must be consumed");
+            let c = wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                connection.stable_id() != h.stable_id()
+            })
+            .await;
+            assert!(h.close_reason().is_none(), "H stays open");
+            assert!(
+                a.inner.current_connection_generation(&b_peer).is_none(),
+                "C must be an untracked raw winner at A"
+            );
+
+            wait_for_generation(&b, &a_peer, "B registers C as the newer generation", |g| {
+                g > g_h
+            })
+            .await;
+            let b_c = wait_for_winner(&b, &a_peer, "C is B's winner", |connection| {
+                connection.stable_id() != b_h.stable_id()
+            })
+            .await;
+            wait_for_reader(&b, &a_peer, b_c.stable_id(), "B's reader on C").await;
+
+            let payload = b"313 t2a: B to A on B's winner C";
+            b.send(&a_peer, payload)
+                .await
+                .expect("B's send on its winner C succeeds");
+            assert!(
+                recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                "B's message on its winner C was never delivered at A: A has no reader on its \
+                 raw coordinator winner C (#313)"
+            );
+            assert!(c.close_reason().is_none(), "C stays open");
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// RED on master: a raw hole-punch winner whose waiter is not running
+        /// (the waiter already returned, or the peer is the passive side) gets
+        /// no reader, so messages the peer sends on it are never delivered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn hole_punch_winner_without_waiter_is_read() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            a.inner
+                .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                .expect("start hole-punch H");
+            let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+            assert!(a.inner.current_connection_generation(&b_peer).is_none());
+
+            wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+            let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |_| true).await;
+            wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+
+            let payload = b"313: B to A on a waiterless hole-punch winner";
+            b.send(&a_peer, payload).await.expect("B's send succeeds");
+            assert!(
+                recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                "B's message on A's raw hole-punch winner was never delivered: no reader (#313)"
+            );
+            assert!(h.close_reason().is_none());
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// GREEN on master and must stay GREEN (Codex §1 flipped order). B
+        /// registers C before H and starts C's reader before H supersedes it.
+        /// B's winner is then H, which A reads; A's winner is C, which B still
+        /// reads. Both directions work, including after the 5 s drain grace.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+        async fn flipped_order_fixture_keeps_working() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+            let gate = b.inner.arm_first_registration_gate_for_test();
+
+            a.inner
+                .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                .expect("start hole-punch H");
+            let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                .await
+                .expect("A's waiter finalises H");
+            let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+            wait_for_reader(&a, &b_peer, h.stable_id(), "A's reader on H").await;
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                .await
+                .expect("B's registration of H parks before allocating its generation");
+
+            let handled = a
+                .inner
+                .inject_accepted_coordination_for_test(
+                    h.clone(),
+                    a_peer,
+                    b_peer,
+                    vec![a_addr],
+                    vec![b_addr],
+                )
+                .await
+                .expect("CoordinationAccepted handled");
+            assert!(handled);
+            wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                connection.stable_id() != h.stable_id()
+            })
+            .await;
+            let g_c = wait_for_generation(&b, &a_peer, "B registers C first", |_| true).await;
+            let b_c = wait_for_winner(&b, &a_peer, "C is B's winner", |_| true).await;
+            wait_for_reader(&b, &a_peer, b_c.stable_id(), "B's reader on C").await;
+
+            gate.release();
+            wait_for_generation(&b, &a_peer, "B registers H as the newer generation", |g| {
+                g > g_c
+            })
+            .await;
+            let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |connection| {
+                connection.stable_id() != b_c.stable_id()
+            })
+            .await;
+            wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+
+            for round in 0..2 {
+                if round == 1 {
+                    tokio::time::sleep(Duration::from_secs(7)).await;
+                }
+                let to_a = format!("313 t2b round {round}: B to A on H");
+                b.send(&a_peer, to_a.as_bytes())
+                    .await
+                    .expect("B sends on its winner H");
+                assert!(
+                    recv_within(&a, b_peer, to_a.as_bytes(), RECV_WINDOW).await,
+                    "round {round}: B to A on H not delivered"
+                );
+                let to_b = format!("313 t2b round {round}: A to B on C");
+                a.send(&b_peer, to_b.as_bytes())
+                    .await
+                    .expect("A sends on its winner C");
+                assert!(
+                    recv_within(&b, a_peer, to_b.as_bytes(), RECV_WINDOW).await,
+                    "round {round}: A to B on C not delivered"
+                );
+            }
+
+            drop(gate);
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// RED on master: the target-side accepted-coordination dial (nta:4948)
+        /// inserts C_B into B's winner map with no reader. C_B is A's only
+        /// connection to B, so A sends on it and B never reads it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn target_side_coordinator_winner_is_read() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let z = shim_node().await;
+            let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+            let _accept_z = shim_accept(&z);
+
+            // The handler ignores its connection argument; use one that does
+            // not touch the A-B pair.
+            let unrelated = raw_dial(&b, shim_addr(&z)).await;
+            let handled = b
+                .inner
+                .inject_accepted_coordination_for_test(
+                    unrelated,
+                    a_peer,
+                    b_peer,
+                    vec![a_addr],
+                    vec![b_addr],
+                )
+                .await
+                .expect("CoordinationAccepted handled");
+            assert!(handled);
+            let c_b = wait_for_winner(&b, &a_peer, "C_B is B's winner", |_| true).await;
+            assert!(
+                b.inner.current_connection_generation(&a_peer).is_none(),
+                "C_B must be an untracked raw winner at B"
+            );
+
+            wait_for_generation(&a, &b_peer, "A registers C_B", |_| true).await;
+            let a_c = wait_for_winner(&a, &b_peer, "C_B is A's winner", |_| true).await;
+            wait_for_reader(&a, &b_peer, a_c.stable_id(), "A's reader on C_B").await;
+
+            let payload = b"313 t2d: A to B on the target-side winner";
+            a.send(&b_peer, payload).await.expect("A's send succeeds");
+            assert!(
+                recv_within(&b, a_peer, payload, RECV_WINDOW).await,
+                "A's message on B's target-side coordinator winner was never delivered at B: \
+                 no reader (#313)"
+            );
+            assert!(c_b.close_reason().is_none());
+
+            a.shutdown().await;
+            b.shutdown().await;
+            z.shutdown().await;
+        }
+
+        /// RED on master: a connection registered by materialize (the
+        /// fallback dial to a coordinator node) is Live with no reader. X,
+        /// whose only connection to A it is, sends on it and A never reads.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn materialized_winner_is_read() {
+            let a = shim_node().await;
+            let x = shim_node().await;
+            let x_addr = shim_addr(&x);
+            let (a_peer, x_peer) = (a.peer_id(), x.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_x = shim_accept(&x);
+
+            let m = raw_dial(&a, x_addr).await;
+            let (peer, returned) = a
+                .inner
+                .materialize_connection_for_test(m.clone())
+                .expect("materialize registers M");
+            assert_eq!(peer, x_peer);
+            assert_eq!(
+                returned.stable_id(),
+                m.stable_id(),
+                "M wins: it is the first"
+            );
+
+            wait_for_generation(&x, &a_peer, "X registers M", |_| true).await;
+            let x_m = wait_for_winner(&x, &a_peer, "M is X's winner", |_| true).await;
+            wait_for_reader(&x, &a_peer, x_m.stable_id(), "X's reader on M").await;
+
+            let payload = b"313: X to A on a materialized connection";
+            x.send(&a_peer, payload).await.expect("X's send succeeds");
+            assert!(
+                recv_within(&a, x_peer, payload, RECV_WINDOW).await,
+                "X's message on A's materialized connection was never delivered: no reader (#313)"
+            );
+
+            a.shutdown().await;
+            x.shutdown().await;
+        }
+
+        /// GREEN on master and must stay GREEN: materialize forced to Rejected
+        /// (the existing winner E carries a maximal exporter id in a foreign
+        /// family) returns E, which already has A's reader. The rejected
+        /// candidate is closed by the registrar as before; E keeps exactly one
+        /// reader and stays open.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn materialize_forced_rejected_keeps_existing_reader() {
+            let a = shim_node().await;
+            let x = shim_node().await;
+            let (a_addr, x_addr) = (shim_addr(&a), shim_addr(&x));
+            let x_peer = x.peer_id();
+            let _accept_a = shim_accept(&a);
+            let _accept_x = shim_accept(&x);
+
+            tokio::time::timeout(Duration::from_secs(10), x.connect_addr(a_addr))
+                .await
+                .expect("connect timeout")
+                .expect("X connects to A");
+            let g0 = wait_for_generation(&a, &x_peer, "A registers E", |_| true).await;
+            let e = wait_for_winner(&a, &x_peer, "E is A's winner", |_| true).await;
+            wait_for_reader(&a, &x_peer, e.stable_id(), "A's reader on E").await;
+            a.inner.seed_winner_for_test(
+                x_peer,
+                crate::nat_traversal_api::tracked_connection_with_sort_keys_for_test(
+                    e.clone(),
+                    g0,
+                    0,
+                    [0xEE; 32],
+                    [0xFF; 32],
+                    TraversalMethod::Direct,
+                ),
+            );
+            let readers_before = a.reader_count_for_test(&x_peer).await;
+
+            let m = raw_dial(&a, x_addr).await;
+            let (_, returned) = a
+                .inner
+                .materialize_connection_for_test(m.clone())
+                .expect("materialize returns the existing winner");
+            assert_eq!(
+                returned.stable_id(),
+                e.stable_id(),
+                "a Rejected materialize returns the existing winner"
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while m.close_reason().is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the registrar closes the rejected candidate"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(e.close_reason().is_none(), "the existing winner stays open");
+            assert!(a.live_reader_for_test(&x_peer, e.stable_id()).await);
+            assert_eq!(
+                a.reader_count_for_test(&x_peer).await,
+                readers_before,
+                "no duplicate reader for the existing winner"
+            );
+
+            a.shutdown().await;
+            x.shutdown().await;
+        }
+
+        /// RED on master: a second reader start for a tracked connection that
+        /// already has its reader. Master spawns the duplicate before its
+        /// dedup check, then cancels it; the duplicate's exit event removes
+        /// the owner's handle (same generation, p2p reader-exit handler) and
+        /// `handle_reader_exit` closes the owner's live connection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn duplicate_reader_start_does_not_close_owner() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+                .await
+                .expect("connect timeout")
+                .expect("A connects to B");
+            let x = wait_for_winner(&a, &b_peer, "X is A's winner", |_| true).await;
+            wait_for_reader(&a, &b_peer, x.stable_id(), "A's reader on X").await;
+
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), x.stable_id());
+            hooks
+                .park_after_duplicate_attempt
+                .store(1, AtomicOrdering::SeqCst);
+            let mut events = a.subscribe_all_peer_events();
+            let duplicate = {
+                let a = Arc::clone(&a);
+                let x = x.clone();
+                tokio::spawn(async move { a.spawn_reader_task(b_peer, x).await })
+            };
+            let saw_exit = saw_reader_exit(&mut events, b_peer, Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            hooks.release();
+            duplicate.await.expect("duplicate start task");
+            reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
+
+            assert!(
+                x.close_reason().is_none(),
+                "a duplicate reader start closed the owner's live connection: {:?} \
+                 (reader exit observed: {saw_exit})",
+                x.close_reason()
+            );
+            assert!(a.live_reader_for_test(&b_peer, x.stable_id()).await);
+            let payload = b"313 t1a: B to A after a duplicate start";
+            b.send(&a_peer, payload).await.expect("B's send succeeds");
+            assert!(recv_within(&a, b_peer, payload, RECV_WINDOW).await);
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// RED on master: a duplicate reader start must do no stream work.
+        /// The owner is held at its loop head; master's duplicate task runs
+        /// its accept loop before the dedup check and accepts B's stream.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn duplicate_reader_start_does_no_stream_work() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let x = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
+
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), x.stable_id());
+            hooks
+                .pause_first_attempt_loop
+                .store(true, AtomicOrdering::SeqCst);
+            hooks
+                .park_before_dedup_attempt
+                .store(2, AtomicOrdering::SeqCst);
+            a.spawn_reader_task(b_peer, x.clone()).await;
+            let duplicate = {
+                let a = Arc::clone(&a);
+                let x = x.clone();
+                tokio::spawn(async move { a.spawn_reader_task(b_peer, x).await })
+            };
+
+            let payload = b"313 t1b: B to A while a duplicate start is pending";
+            b.send(&a_peer, payload).await.expect("B's send succeeds");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while hooks
+                .accepted_by_later_attempts
+                .load(AtomicOrdering::SeqCst)
+                == 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let stolen = hooks
+                .accepted_by_later_attempts
+                .load(AtomicOrdering::SeqCst);
+            hooks.release();
+            duplicate.await.expect("duplicate start task");
+            reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
+
+            assert_eq!(
+                stolen, 0,
+                "a duplicate reader start accepted a stream on a connection that already \
+                 had its reader"
+            );
+            assert!(recv_within(&a, b_peer, payload, RECV_WINDOW).await);
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// RED on master: an exit event from a task that does not own the
+        /// connection's reader (here injected) must do no cleanup. Master
+        /// removes the owner's handle by generation and closes the live
+        /// connection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn stale_reader_exit_does_no_cleanup_for_current_owner() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+                .await
+                .expect("connect timeout")
+                .expect("A connects to B");
+            let x = wait_for_winner(&a, &b_peer, "X is A's winner", |_| true).await;
+            wait_for_reader(&a, &b_peer, x.stable_id(), "A's reader on X").await;
+            let generation = a
+                .inner
+                .current_connection_generation(&b_peer)
+                .expect("X is tracked");
+
+            let mut events = a.subscribe_all_peer_events();
+            a.reader_exit_tx
+                .send(ReaderExitEvent::stale_for_test(
+                    b_peer,
+                    generation,
+                    x.stable_id(),
+                ))
+                .expect("exit channel open");
+            let saw_exit = saw_reader_exit(&mut events, b_peer, Duration::from_millis(1500)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            assert!(
+                x.close_reason().is_none(),
+                "a stale reader exit closed the current owner's connection: {:?}",
+                x.close_reason()
+            );
+            assert!(!saw_exit, "a stale reader exit must not be reported");
+            assert!(a.live_reader_for_test(&b_peer, x.stable_id()).await);
+            assert_eq!(
+                a.inner.current_connection_generation(&b_peer),
+                Some(generation)
+            );
+            let payload = b"313: B to A after a stale exit";
+            b.send(&a_peer, payload).await.expect("B's send succeeds");
+            assert!(recv_within(&a, b_peer, payload, RECV_WINDOW).await);
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// RED on master: a reader task that died without an exit event (here
+        /// an injected panic) leaves a finished handle. It must not count as
+        /// the connection's owner, or no reader can ever start again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn finished_reader_owner_does_not_block_new_reader() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let x = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
+
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), x.stable_id());
+            hooks.panic_attempt.store(1, AtomicOrdering::SeqCst);
+            a.spawn_reader_task(b_peer, x.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !(hooks.panicked.load(AtomicOrdering::SeqCst)
+                && !a.live_reader_for_test(&b_peer, x.stable_id()).await)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the injected reader panic did not finish the task"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            a.spawn_reader_task(b_peer, x.clone()).await;
+            reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
+            assert!(
+                a.live_reader_for_test(&b_peer, x.stable_id()).await,
+                "a finished reader handle blocked a new reader for the connection"
+            );
+            let payload = b"313: B to A after a reader task died";
+            b.send(&a_peer, payload).await.expect("B's send succeeds");
+            assert!(recv_within(&a, b_peer, payload, RECV_WINDOW).await);
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// GREEN on master and must stay GREEN: a reader on an untracked raw
+        /// winner exits with `Noop`, so its exit closes nothing and touches no
+        /// lifecycle or outer peer state.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn raw_winner_reader_exit_closes_nothing() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let x = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
+            a.spawn_reader_task(b_peer, x.clone()).await;
+            wait_for_reader(&a, &b_peer, x.stable_id(), "A's reader on raw X").await;
+            let connected_before = a.connected_peers_map_len().await;
+            let mut events = a.subscribe_all_peer_events();
+
+            a.cancel_reader_for_test(&b_peer, x.stable_id()).await;
+            assert!(
+                saw_reader_exit(&mut events, b_peer, Duration::from_secs(5)).await,
+                "the cancelled reader exits"
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            assert!(
+                x.close_reason().is_none(),
+                "a raw winner's reader exit must close nothing: {:?}",
+                x.close_reason()
+            );
+            assert!(a.inner.lifecycle_empty_for_test(&b_peer));
+            assert_eq!(a.connected_peers_map_len().await, connected_before);
+            loop {
+                match events.try_recv() {
+                    Ok((peer, event)) if peer == b_peer => assert!(
+                        !matches!(event, PeerLifecycleEvent::Closed { .. }),
+                        "no Closed event for a raw winner's reader exit: {event:?}"
+                    ),
+                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
     }
 }
