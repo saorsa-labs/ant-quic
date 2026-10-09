@@ -311,6 +311,44 @@ fn send_failure_action(
     }
 }
 
+impl Drop for ConnectionDriver {
+    /// #309: a driver that is dropped before it completes (its runtime shut
+    /// down, or its task was aborted) runs none of the exits in `poll`, while
+    /// the application may still hold the connection. Retire the connection
+    /// here: close it, wake every waiter with a terminal error (an earlier
+    /// close reason is kept), retire the endpoint route once, and release the
+    /// socket.
+    fn drop(&mut self) {
+        let conn = &mut *self.0.state.lock("driver drop");
+        if conn.driver_exited {
+            return;
+        }
+        if conn.error.is_none() {
+            conn.inner.close(
+                conn.runtime.now(),
+                0u32.into(),
+                Bytes::from_static(b"connection driver dropped"),
+            );
+            conn.terminate(
+                ConnectionError::TransportError(crate::TransportError {
+                    code: crate::TransportErrorCode::INTERNAL_ERROR,
+                    frame: None,
+                    reason: "connection driver dropped".to_string(),
+                }),
+                &self.0.shared,
+            );
+        }
+        if !conn.inner.is_drained() && !conn.endpoint_drained_notified {
+            let _ = conn
+                .endpoint_events
+                .send((conn.handle, crate::EndpointEvent::drained()));
+            conn.endpoint_drained_notified = true;
+        }
+        conn.buffered_registry.remove(conn.handle.0);
+        conn.release_socket();
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
@@ -323,6 +361,7 @@ impl Future for ConnectionDriver {
         if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
             conn.terminate(e, &self.0.shared);
             conn.buffered_registry.remove(conn.handle.0);
+            conn.release_socket();
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = match conn.drive_transmit(cx) {
@@ -349,6 +388,7 @@ impl Future for ConnectionDriver {
                     .send((conn.handle, crate::EndpointEvent::drained()));
                 conn.endpoint_drained_notified = true;
                 conn.buffered_registry.remove(conn.handle.0);
+                conn.release_socket();
                 return Poll::Ready(Err(error));
             }
         };
@@ -444,6 +484,7 @@ impl Future for ConnectionDriver {
             unreachable!("drained connections always have an error");
         }
         conn.buffered_registry.remove(conn.handle.0);
+        conn.release_socket();
         Poll::Ready(Ok(()))
     }
 }
@@ -796,6 +837,7 @@ impl Connection {
         priority: u32,
     ) -> Result<u64, crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_address_advertisement");
+        conn.check_open()?;
         conn.inner.send_nat_address_advertisement(address, priority)
     }
 
@@ -810,6 +852,7 @@ impl Connection {
     /// Queue a REMOVE_ADDRESS NAT traversal frame via the underlying connection
     pub fn send_nat_address_removal(&self, sequence: u64) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_address_removal");
+        conn.check_open()?;
         conn.inner.send_nat_address_removal(sequence)
     }
 
@@ -821,6 +864,7 @@ impl Connection {
         round: u32,
     ) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_punch_coordination");
+        conn.check_open()?;
         conn.inner
             .send_nat_punch_coordination(paired_with_sequence_number, address, round)
     }
@@ -836,6 +880,7 @@ impl Connection {
         round: u32,
     ) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_punch_via_relay");
+        conn.check_open()?;
         conn.inner
             .send_nat_punch_via_relay(target_peer_id, our_address, round)
     }
@@ -1361,7 +1406,7 @@ impl ConnectionRef {
                 connected: false,
                 timer: None,
                 timer_deadline: None,
-                conn_events,
+                conn_events: Some(conn_events),
                 endpoint_events,
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
@@ -1369,8 +1414,8 @@ impl ConnectionRef {
                 error: None,
                 ref_count: 0,
                 datagram_drop_events: VecDeque::new(),
-                udp_sender: socket.create_sender(),
-                socket,
+                udp_sender: Some(socket.create_sender()),
+                socket: Some(socket),
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
@@ -1378,6 +1423,7 @@ impl ConnectionRef {
                 buffered_registry,
                 last_buffered_refresh: None,
                 endpoint_drained_notified: false,
+                driver_exited: false,
             }),
             shared: Shared::default(),
         }))
@@ -1447,7 +1493,9 @@ pub(crate) struct State {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::Receiver<ConnectionEvent>,
+    /// Events from the endpoint. `None` once the driver's exit cleanup has
+    /// dropped the receiver (#309).
+    conn_events: Option<mpsc::Receiver<ConnectionEvent>>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
@@ -1457,8 +1505,11 @@ pub(crate) struct State {
     /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
     ref_count: usize,
     datagram_drop_events: VecDeque<DatagramDropStats>,
-    socket: Arc<dyn AsyncUdpSocket>,
-    udp_sender: Pin<Box<dyn UdpSender>>,
+    /// The endpoint's UDP socket and its sender. `None` once the driver has
+    /// exited: the connection sends nothing more, and a handle that outlives
+    /// the driver must not keep the socket open (#309).
+    socket: Option<Arc<dyn AsyncUdpSocket>>,
+    udp_sender: Option<Pin<Box<dyn UdpSender>>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
@@ -1473,6 +1524,9 @@ pub(crate) struct State {
     /// A fatal driver exit can retire the endpoint route before this state is
     /// dropped; do not emit a duplicate Drained event then.
     endpoint_drained_notified: bool,
+    /// The driver has run its terminal cleanup (`release_socket`), on
+    /// completion or on cancellation (#309).
+    driver_exited: bool,
 }
 
 impl State {
@@ -1480,8 +1534,10 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .udp_sender
+        let Some(udp_sender) = self.udp_sender.as_mut() else {
+            return Ok(false);
+        };
+        let max_datagrams = udp_sender
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
@@ -1525,8 +1581,7 @@ impl State {
             let is_gso_bundle = segment_count > 1;
 
             let len = t.size;
-            match self
-                .udp_sender
+            match udp_sender
                 .as_mut()
                 .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
@@ -1596,10 +1651,14 @@ impl State {
         cx: &mut Context,
     ) -> Result<(), ConnectionError> {
         loop {
-            match self.conn_events.poll_recv(cx) {
+            // After the exit cleanup no receiver is left and nothing arrives.
+            let Some(conn_events) = self.conn_events.as_mut() else {
+                return Ok(());
+            };
+            match conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
-                    self.socket = socket;
-                    self.udp_sender = self.socket.create_sender();
+                    self.socket = Some(socket);
+                    self.udp_sender = self.socket.as_ref().map(|socket| socket.create_sender());
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
@@ -1755,6 +1814,36 @@ impl State {
         }
     }
 
+    /// The stored terminal error, if any. A terminal connection has no driver
+    /// to send queued frames, so control sends must fail before they change
+    /// protocol state.
+    fn check_open(&self) -> Result<(), ConnectionError> {
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// #309: the driver has exited, so the connection sends nothing more.
+    /// Let go of every reference to a UDP socket: the socket, its sender, any
+    /// buffered transmit, and the event queue. The endpoint can send a
+    /// `Rebind` (which carries a socket) after the driver's last receive poll.
+    /// Closing and draining the queue is not enough: `try_send` reserves
+    /// capacity first and enqueues afterwards, so a send in flight can
+    /// enqueue after the drain. Dropping the receiver closes the queue and
+    /// discards its events, and a late event then belongs to the channel,
+    /// which is freed when the endpoint retires its sender, not to this
+    /// connection. Application handles (and the tasks that hold them) can
+    /// outlive the driver, and they must not keep a socket and its
+    /// descriptor open.
+    fn release_socket(&mut self) {
+        self.driver_exited = true;
+        self.buffered_transmit = None;
+        self.udp_sender = None;
+        self.socket = None;
+        self.conn_events = None;
+    }
+
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
@@ -1821,6 +1910,7 @@ impl fmt::Debug for State {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         io::{self, IoSliceMut},
         net::{Ipv4Addr, SocketAddr},
         pin::Pin,
@@ -1839,7 +1929,7 @@ mod tests {
     use crate::config::{ClientConfig, EndpointConfig, ServerConfig};
     use crate::high_level::{
         Endpoint,
-        runtime::{AsyncUdpSocket, UdpSender, default_runtime},
+        runtime::{AsyncTimer, AsyncUdpSocket, Runtime, TokioRuntime, UdpSender, default_runtime},
     };
 
     #[derive(Debug)]
@@ -2048,6 +2138,314 @@ mod tests {
             "alternate failure closed the connection"
         );
         assert!(connection.close_reason().is_none());
+    }
+
+    /// The endpoint and the socket that the next send rebinds it to.
+    type RebindOnSend = Arc<std::sync::Mutex<Option<(Endpoint, Arc<dyn AsyncUdpSocket>)>>>;
+
+    /// #309: on its first send it asks the endpoint to rebind, which queues a
+    /// `Rebind` for every connection, and then fails fatally. The driver has
+    /// already read its event queue in this poll, so the `Rebind` is still
+    /// queued when the driver exits.
+    #[derive(Debug)]
+    struct RebindThenDenySocket(RebindOnSend);
+
+    impl UdpSender for RebindThenDenySocket {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _transmit: &Transmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            let rebind = self.0.lock().ok().and_then(|mut slot| slot.take());
+            if let Some((endpoint, socket)) = rebind {
+                endpoint.rebind_abstract(socket).expect("queue a rebind");
+            }
+            Poll::Ready(Err(io::Error::from_raw_os_error(1)))
+        }
+    }
+
+    impl AsyncUdpSocket for RebindThenDenySocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(Self(self.0.clone()))
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 12345)))
+        }
+    }
+
+    /// Accepts every send and never receives, so a handshake stays pending.
+    #[derive(Debug)]
+    struct BlackholeSocket(Arc<AtomicUsize>);
+
+    impl UdpSender for BlackholeSocket {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _transmit: &Transmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncUdpSocket for BlackholeSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(Self(self.0.clone()))
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 12345)))
+        }
+    }
+
+    /// Spawns on Tokio and keeps the abort handle of every task, so a test can
+    /// cancel one connection driver (drop its future) while the endpoint
+    /// driver keeps running.
+    #[derive(Debug, Default)]
+    struct AbortableRuntime(std::sync::Mutex<Vec<tokio::task::AbortHandle>>);
+
+    impl AbortableRuntime {
+        fn spawned(&self) -> usize {
+            self.0.lock().map(|tasks| tasks.len()).unwrap_or_default()
+        }
+
+        fn abort_from(&self, first: usize) {
+            if let Ok(tasks) = self.0.lock() {
+                for task in tasks.iter().skip(first) {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    impl Runtime for AbortableRuntime {
+        fn new_timer(&self, i: crate::Instant) -> Pin<Box<dyn AsyncTimer>> {
+            TokioRuntime.new_timer(i)
+        }
+
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            let task = tokio::spawn(future);
+            if let Ok(mut tasks) = self.0.lock() {
+                tasks.push(task.abort_handle());
+            }
+        }
+
+        #[cfg(not(wasm_browser))]
+        fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+            TokioRuntime.wrap_udp_socket(t)
+        }
+
+        fn now(&self) -> crate::Instant {
+            TokioRuntime.now()
+        }
+    }
+
+    /// Rebind the endpoint twice, so it no longer refers to its current
+    /// socket (it keeps one previous socket).
+    fn move_endpoint_off_its_socket(endpoint: &Endpoint) {
+        for _ in 0..2 {
+            endpoint
+                .rebind_abstract(Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0)))))
+                .expect("rebind to a socket-free socket");
+        }
+    }
+
+    /// #309 review: the endpoint can queue a `Rebind` after the driver's last
+    /// receive poll. When the driver then exits, the queued event must not
+    /// keep its socket alive while the application holds the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exited_driver_discards_a_rebind_queued_after_its_last_poll() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let rebind_on_send: RebindOnSend = Arc::new(std::sync::Mutex::new(None));
+        let socket = Arc::new(RebindThenDenySocket(rebind_on_send.clone()));
+        let runtime = default_runtime().expect("tokio test runtime");
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let queued: Arc<dyn AsyncUdpSocket> = Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0))));
+        let queued_weak = Arc::downgrade(&queued);
+        *rebind_on_send.lock().expect("rebind slot") = Some((endpoint.clone(), queued));
+        let connecting = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345)),
+                "localhost",
+            )
+            .expect("start connection");
+        // The application keeps this handle after the driver exits.
+        let connection =
+            super::Connection(connecting.conn.as_ref().expect("connection exists").clone());
+
+        let reason = timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("the fatal send ends the driver");
+        assert!(matches!(reason, crate::ConnectionError::TransportError(_)));
+        assert!(
+            rebind_on_send.lock().expect("rebind slot").is_none(),
+            "the rebind was queued during the driver's last poll"
+        );
+        timeout(Duration::from_secs(1), endpoint.wait_idle())
+            .await
+            .expect("the fatal send removes the endpoint route");
+
+        move_endpoint_off_its_socket(&endpoint);
+        assert!(
+            queued_weak.upgrade().is_none(),
+            "a Rebind queued after the driver's last poll must not keep its socket alive"
+        );
+        drop(connection);
+        drop(connecting);
+    }
+
+    /// #309 review round 2: `try_send` reserves channel capacity and then
+    /// enqueues. A send that reserved capacity before the driver exited can
+    /// enqueue its `Rebind` after the exit cleanup emptied the queue. The
+    /// application-held connection must not own that late event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exited_driver_does_not_own_a_rebind_sent_after_its_cleanup() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let socket = Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0))));
+        let runtime = default_runtime().expect("tokio test runtime");
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let connecting = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345)),
+                "localhost",
+            )
+            .expect("start connection");
+        // The application keeps this handle after the driver exits.
+        let connection =
+            super::Connection(connecting.conn.as_ref().expect("connection exists").clone());
+        // The current-thread runtime has not polled the driver yet. Reserve
+        // capacity as an in-flight `try_send` would.
+        let mut permits = endpoint.reserve_connection_events_for_test();
+        assert_eq!(permits.len(), 1, "one connection, one reserved event");
+        let permit = permits.pop().expect("reserved event");
+
+        let reason = timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("the fatal send ends the driver");
+        assert!(matches!(reason, crate::ConnectionError::TransportError(_)));
+        timeout(Duration::from_secs(1), endpoint.wait_idle())
+            .await
+            .expect("the fatal send removes the endpoint route");
+
+        // The in-flight send completes after the driver's exit cleanup, and
+        // then its sender is retired.
+        let late: Arc<dyn AsyncUdpSocket> = Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0))));
+        let late_weak = Arc::downgrade(&late);
+        drop(permit.send(crate::high_level::ConnectionEvent::Rebind(late)));
+        assert!(
+            late_weak.upgrade().is_none(),
+            "a Rebind sent after the driver's exit cleanup must not keep its socket alive"
+        );
+        drop(connection);
+        drop(connecting);
+    }
+
+    /// #309 review: cancel a pending connection driver (drop its future, as a
+    /// runtime shutdown or an abort does) while the application holds the
+    /// connection. Returns the close reason the application observes.
+    async fn cancel_driver_with_retained_connection(close_first: bool) -> crate::ConnectionError {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let socket: Arc<dyn AsyncUdpSocket> = Arc::new(BlackholeSocket(sends.clone()));
+        let socket_weak = Arc::downgrade(&socket);
+        let runtime = Arc::new(AbortableRuntime::default());
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            socket,
+            runtime.clone(),
+        )
+        .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let spawned_before = runtime.spawned();
+        let connecting = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345)),
+                "localhost",
+            )
+            .expect("start connection");
+        assert_eq!(
+            runtime.spawned(),
+            spawned_before + 1,
+            "connect spawns exactly the connection driver"
+        );
+        let connection =
+            super::Connection(connecting.conn.as_ref().expect("connection exists").clone());
+        // The driver sends its first flight, then waits for a reply that
+        // never comes.
+        timeout(Duration::from_secs(1), async {
+            while sends.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver runs before it is cancelled");
+        if close_first {
+            connection.close(7u32.into(), b"done");
+        }
+
+        runtime.abort_from(spawned_before);
+        let reason = timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("a dropped driver must wake the connection's waiters");
+        timeout(Duration::from_secs(1), endpoint.wait_idle())
+            .await
+            .expect("a dropped driver must retire the endpoint route");
+        move_endpoint_off_its_socket(&endpoint);
+        assert!(
+            socket_weak.upgrade().is_none(),
+            "a dropped driver must release the socket while the application holds the connection"
+        );
+        drop(connection);
+        drop(connecting);
+        reason
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_driver_retires_a_retained_connection() {
+        let reason = cancel_driver_with_retained_connection(false).await;
+        assert!(
+            matches!(reason, crate::ConnectionError::TransportError(_)),
+            "a dropped driver ends the connection with a terminal error: {reason:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_driver_keeps_an_earlier_close_reason() {
+        let reason = cancel_driver_with_retained_connection(true).await;
+        assert_eq!(
+            reason,
+            crate::ConnectionError::LocallyClosed,
+            "a dropped driver must keep the close reason the connection already has"
+        );
     }
 
     fn gen_self_signed_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {

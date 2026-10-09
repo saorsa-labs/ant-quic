@@ -573,8 +573,41 @@ impl Endpoint {
         }
         state.ipv6 = replacement_addr.is_ipv6();
         state.socket_released_for_shutdown = true;
+        // #309: a connection that is still closing (or draining) when the
+        // shutdown drain ends keeps its driver, and the driver held the
+        // original socket for the rest of its closing period (3 PTO, which an
+        // inflated RTT estimate stretches beyond the drain budget). Move the
+        // remaining connections to the replacement, as a driver respawn does,
+        // so the original socket is released now.
+        let socket = state.socket.clone();
+        state
+            .recv_state
+            .connections
+            .broadcast_control(move || ConnectionEvent::Rebind(socket.clone()));
 
         Ok(released)
+    }
+
+    /// #309 test hook: reserve capacity on every connection's event channel,
+    /// as `try_send` does before it enqueues. Sending through a permit later
+    /// models a send that was in flight when the connection's driver exited.
+    #[cfg(test)]
+    pub(crate) fn reserve_connection_events_for_test(
+        &self,
+    ) -> Vec<mpsc::OwnedPermit<ConnectionEvent>> {
+        self.inner
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .recv_state
+                    .connections
+                    .senders
+                    .values()
+                    .filter_map(|channels| channels.sender.clone().try_reserve_owned().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
