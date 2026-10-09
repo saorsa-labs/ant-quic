@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed. The accept path now closes it with the reserved `Superseded` code
   after the 5 s drain grace, as the outbound dial path does.
 
+### Tests
+
+- `lifecycle_active_close::superseded_connection_surfaces_close_reason_quickly`
+  no longer depends on scheduling order (#307). It failed when the eventual
+  winner of the simultaneous open was registered first on both sides: both
+  sides then rejected the loser at registration, the test held no handle to
+  it, and its retry dials reused the live connection. The test now registers
+  the two connections in a fixed order and checks the loser's peer for either
+  winner. `p2p_endpoint::tests::inbound_supersede_closes_old_generation_after_drain_grace`
+  covers the accept-path fix.
+
 
 ## [0.27.56] - 2026-10-09
 
