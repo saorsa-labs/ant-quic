@@ -511,6 +511,33 @@ pub(crate) enum ConnectionRegistrationOutcome {
     Refused,
 }
 
+/// #310: outcome of a hole-punch candidate's winner-map insert, which
+/// bypasses lifecycle registration. The caller closes the connection when it
+/// was not inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolePunchWinnerInsert {
+    Inserted,
+    /// Another connection for the peer already holds the slot.
+    Duplicate,
+    /// The endpoint is shutting down; nothing was inserted.
+    ShuttingDown,
+}
+
+/// #310: outcome of an accepted-coordination dial's winner-map insert, which
+/// bypasses lifecycle registration and takes the peer's slot.
+#[derive(Debug)]
+enum ReplacingWinnerInsert {
+    /// The connection is in the winner map. `displaced_untracked` is the
+    /// different connection it replaced, when the lifecycle map does not
+    /// track it; nothing else owns it, so the caller closes it.
+    Inserted {
+        displaced_untracked: Option<InnerConnection>,
+    },
+    /// The endpoint is shutting down; nothing was inserted. The caller
+    /// closes the connection.
+    ShuttingDown,
+}
+
 /// #286 round 2: refuse a connection registration because the endpoint is
 /// shutting down, closing the connection rather than leaking it.
 pub(crate) fn refuse_registration(
@@ -757,9 +784,11 @@ fn arm_registration_gate_with_mode_for_test(
 }
 
 /// #310 test-only hole-punch winner gate: parks the first hole-punch winner
-/// of one endpoint after its handshake, immediately before its winner-map
-/// insert, so a test can run a second winner for the same peer to completion
-/// first. Later winners pass through. Production code never arms it.
+/// of one endpoint after its handshake, immediately before it takes the
+/// lifecycle write lock for its winner-map insert, so a test can run a second
+/// winner for the same peer to completion first. Before the #310 fix this
+/// point lay between the unlocked duplicate check and the insert. Later
+/// winners pass through. Production code never arms it.
 #[cfg(test)]
 pub(crate) struct WinnerInsertGate {
     target_shutdown: usize,
@@ -7745,6 +7774,78 @@ impl NatTraversalEndpoint {
         ))
     }
 
+    /// #310: insert a hole-punch candidate's connection into the winner map
+    /// unless a different connection for the peer is already there.
+    ///
+    /// The shutdown re-check, the duplicate check and the insert all run
+    /// under the lifecycle write lock. Every winner-map insert takes that
+    /// lock (lifecycle registration, repromotion and both untracked insert
+    /// paths), so no other insert can land between the check and the insert:
+    /// of two candidates that succeed together, exactly one is inserted and
+    /// the other is reported as a duplicate.
+    fn insert_hole_punch_winner_parts(
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
+        shutting_down: &AtomicBool,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> HolePunchWinnerInsert {
+        let _winner_map_lock = connection_lifecycle.write();
+        if shutting_down.load(Ordering::Relaxed) {
+            return HolePunchWinnerInsert::ShuttingDown;
+        }
+        let stable_id = connection.stable_id();
+        // The read guard is dropped at the end of this statement, before the
+        // insert below locks the same shard.
+        let occupied = connections
+            .get(&peer_id)
+            .is_some_and(|current| current.stable_id() != stable_id);
+        if occupied {
+            return HolePunchWinnerInsert::Duplicate;
+        }
+        connections.insert(peer_id, connection.clone());
+        HolePunchWinnerInsert::Inserted
+    }
+
+    /// #310: insert an accepted-coordination dial's connection into the
+    /// winner map, replacing any connection there.
+    ///
+    /// Runs under the lifecycle write lock like every other winner-map
+    /// insert. A displaced connection is returned for closing only when it
+    /// is a different connection (by `stable_id`) that the lifecycle map
+    /// does not track for this peer: such a connection has no other owner
+    /// that will close it. A tracked one stays in lifecycle custody (for
+    /// example a superseded generation kept open to drain its streams), and
+    /// a value with the same `stable_id` is the connection being inserted.
+    fn insert_replacing_winner_parts(
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
+        shutting_down: &AtomicBool,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> ReplacingWinnerInsert {
+        let lifecycle = connection_lifecycle.write();
+        if shutting_down.load(Ordering::Relaxed) {
+            return ReplacingWinnerInsert::ShuttingDown;
+        }
+        let stable_id = connection.stable_id();
+        let displaced_untracked =
+            connections
+                .insert(peer_id, connection.clone())
+                .filter(|displaced| {
+                    let displaced_id = displaced.stable_id();
+                    displaced_id != stable_id
+                        && !lifecycle.get(&peer_id).is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|entry| entry.stable_id() == displaced_id)
+                        })
+                });
+        ReplacingWinnerInsert::Inserted {
+            displaced_untracked,
+        }
+    }
+
     fn mark_connection_closed(
         &self,
         peer_id: &PeerId,
@@ -10194,23 +10295,6 @@ impl NatTraversalEndpoint {
                         let handle = tokio::spawn(async move {
                             match connecting.await {
                                 Ok(connection) => {
-                                    // Check if another task already inserted a connection for this peer
-                                    // This prevents race conditions when multiple candidates succeed
-                                    if connections.contains_key(&peer_id_clone) {
-                                        debug!(
-                                            "Connection already exists for peer {:?}, discarding duplicate from {}",
-                                            peer_id_clone, address
-                                        );
-                                        // Close the duplicate connection to free resources
-                                        connection.close(0u32.into(), b"duplicate connection");
-                                        return;
-                                    }
-
-                                    info!(
-                                        "Successfully connected to {} for peer {:?}",
-                                        address, peer_id_clone
-                                    );
-
                                     // #310 test hook: park the first winner
                                     // immediately before its winner-map
                                     // insert, so a second winner for the same
@@ -10219,16 +10303,35 @@ impl NatTraversalEndpoint {
                                     pause_hole_punch_winner_for_test(&punch_shutdown, &connection)
                                         .await;
 
-                                    // Store the connection
-                                    // DashMap provides lock-free .insert()
-                                    // #286 round 2: refuse when shutting
-                                    // down — close instead of inserting.
-                                    // Re-checked under the lifecycle write
-                                    // lock so the insert is linearized against
-                                    // the shutdown sweep.
-                                    {
-                                        let _sweep_lock = punch_lifecycle.write();
-                                        if punch_shutdown.load(Ordering::Relaxed) {
+                                    // Store the connection unless another
+                                    // candidate for this peer already won.
+                                    // #310: the duplicate check runs under
+                                    // the lifecycle write lock together with
+                                    // the insert, so two candidates that
+                                    // succeed together cannot both pass the
+                                    // check and the second overwrite (and
+                                    // orphan) the first. #286 round 2: the
+                                    // shutdown flag is re-checked under the
+                                    // same lock, so the insert is linearized
+                                    // against the shutdown sweep.
+                                    match Self::insert_hole_punch_winner_parts(
+                                        &connections,
+                                        &punch_lifecycle,
+                                        &punch_shutdown,
+                                        peer_id_clone,
+                                        &connection,
+                                    ) {
+                                        HolePunchWinnerInsert::Inserted => {}
+                                        HolePunchWinnerInsert::Duplicate => {
+                                            debug!(
+                                                "Connection already exists for peer {:?}, discarding duplicate from {}",
+                                                peer_id_clone, address
+                                            );
+                                            // Close the duplicate connection to free resources
+                                            connection.close(0u32.into(), b"duplicate connection");
+                                            return;
+                                        }
+                                        HolePunchWinnerInsert::ShuttingDown => {
                                             debug!(
                                                 peer_id = ?peer_id_clone,
                                                 "refusing hole-punch winner-map insert: endpoint is shutting down"
@@ -10237,8 +10340,12 @@ impl NatTraversalEndpoint {
                                                 .close(crate::VarInt::from_u32(0), b"Shutdown");
                                             return;
                                         }
-                                        connections.insert(peer_id_clone, connection.clone());
                                     }
+
+                                    info!(
+                                        "Successfully connected to {} for peer {:?}",
+                                        address, peer_id_clone
+                                    );
 
                                     // Send connection established event (we initiated hole punch = Client side)
                                     let _ =
@@ -11940,9 +12047,20 @@ impl NatTraversalEndpoint {
         // so the in-lock re-check does not cover it). The flag is re-checked
         // under the lifecycle write lock so the insert is linearized against
         // the shutdown sweep.
-        {
-            let _sweep_lock = sweep_lock_source.write();
-            if shutdown_flag.load(Ordering::Relaxed) {
+        // #310: under the same lock, an untracked connection that this
+        // insert displaces is handed back for closing instead of being
+        // orphaned.
+        let displaced_untracked = match Self::insert_replacing_winner_parts(
+            &connections,
+            &sweep_lock_source,
+            &shutdown_flag,
+            peer_id,
+            &connection,
+        ) {
+            ReplacingWinnerInsert::Inserted {
+                displaced_untracked,
+            } => displaced_untracked,
+            ReplacingWinnerInsert::ShuttingDown => {
                 debug!(
                     peer_id = ?peer_id,
                     "refusing validated-candidate winner-map insert: endpoint is shutting down"
@@ -11952,7 +12070,19 @@ impl NatTraversalEndpoint {
                     "endpoint is shutting down".to_string(),
                 ));
             }
-            connections.insert(peer_id, connection.clone());
+        };
+        if let Some(displaced) = displaced_untracked {
+            debug!(
+                peer_id = ?peer_id,
+                displaced_stable_id = displaced.stable_id(),
+                stable_id = connection.stable_id(),
+                "closing the untracked winner displaced by a validated-candidate connection"
+            );
+            if displaced.close_reason().is_none()
+                && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+            {
+                displaced.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+            }
         }
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
@@ -15418,6 +15548,108 @@ mod tests {
             .shutdown()
             .await
             .expect("tracked server shutdown");
+    }
+
+    /// #310: both untracked winner-map inserts compare `stable_id`s. The
+    /// hole-punch insert treats only a different connection as a duplicate.
+    /// The replacing insert hands back only a different connection that the
+    /// lifecycle map does not track: never the connection being inserted,
+    /// and never one in lifecycle custody. Both refuse after shutdown.
+    #[tokio::test]
+    async fn untracked_winner_inserts_compare_stable_ids_and_custody() {
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let peer = PeerId([0x3e; 32]);
+        let (first_server, first_client, first) = loopback_quic_connection().await;
+        let (second_server, second_client, second) = loopback_quic_connection().await;
+        let hole_punch = |connection: &InnerConnection| {
+            NatTraversalEndpoint::insert_hole_punch_winner_parts(
+                &endpoint.connections,
+                &endpoint.connection_lifecycle,
+                &endpoint.shutdown,
+                peer,
+                connection,
+            )
+        };
+        let replacing = |connection: &InnerConnection| {
+            NatTraversalEndpoint::insert_replacing_winner_parts(
+                &endpoint.connections,
+                &endpoint.connection_lifecycle,
+                &endpoint.shutdown,
+                peer,
+                connection,
+            )
+        };
+        let winner_id = || {
+            endpoint
+                .connections
+                .get(&peer)
+                .map(|entry| entry.value().stable_id())
+        };
+
+        assert_eq!(hole_punch(&first), HolePunchWinnerInsert::Inserted);
+        assert_eq!(
+            hole_punch(&first),
+            HolePunchWinnerInsert::Inserted,
+            "the same connection is not a duplicate of itself"
+        );
+        assert_eq!(hole_punch(&second), HolePunchWinnerInsert::Duplicate);
+        assert_eq!(
+            winner_id(),
+            Some(first.stable_id()),
+            "the first winner keeps the slot"
+        );
+
+        assert!(
+            matches!(
+                replacing(&first),
+                ReplacingWinnerInsert::Inserted {
+                    displaced_untracked: None
+                }
+            ),
+            "re-inserting the same connection displaces nothing to close"
+        );
+        match replacing(&second) {
+            ReplacingWinnerInsert::Inserted {
+                displaced_untracked: Some(displaced),
+            } => assert_eq!(
+                displaced.stable_id(),
+                first.stable_id(),
+                "the displaced untracked connection is handed back"
+            ),
+            other => panic!("expected the untracked first winner back, got {other:?}"),
+        }
+        assert_eq!(winner_id(), Some(second.stable_id()));
+
+        endpoint
+            .add_connection(peer, second.clone())
+            .expect("register the second connection");
+        assert!(
+            matches!(
+                replacing(&first),
+                ReplacingWinnerInsert::Inserted {
+                    displaced_untracked: None
+                }
+            ),
+            "a lifecycle-tracked connection stays in lifecycle custody"
+        );
+        assert_eq!(winner_id(), Some(first.stable_id()));
+        assert!(first.close_reason().is_none() && second.close_reason().is_none());
+
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        assert_eq!(hole_punch(&first), HolePunchWinnerInsert::ShuttingDown);
+        assert!(matches!(
+            replacing(&first),
+            ReplacingWinnerInsert::ShuttingDown
+        ));
+        assert_eq!(winner_id(), None, "nothing is inserted after shutdown");
+
+        drop((first, second));
+        for (client, server) in [(first_client, first_server), (second_client, second_server)] {
+            client.shutdown().await.expect("client shutdown");
+            server.shutdown().await.expect("server shutdown");
+        }
     }
 
     /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
