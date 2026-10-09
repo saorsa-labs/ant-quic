@@ -157,6 +157,31 @@ pub async fn make_node_with_keypair(
     )
 }
 
+/// #316 harness: an endpoint with the given identity, no known peers and mDNS
+/// off, so its only connections are the ones the test dials. Two of these on
+/// one keypair let a test open a genuinely new connection to the same
+/// `PeerId` while the first is still live (`connect_addr` to an address that
+/// is already connected returns the existing connection).
+pub async fn make_isolated_node_with_keypair(keypair: ReusableKeypair) -> Arc<P2pEndpoint> {
+    Arc::new(
+        P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .nat(NatConfig {
+                    enable_relay_fallback: false,
+                    ..Default::default()
+                })
+                .pqc(PqcConfig::default())
+                .mdns_enabled(false)
+                .keypair(keypair.0, keypair.1)
+                .build()
+                .expect("test config"),
+        )
+        .await
+        .expect("node creation"),
+    )
+}
+
 /// #368 harness: the reusable keypair type.
 pub type ReusableKeypair = (ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey);
 

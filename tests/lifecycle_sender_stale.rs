@@ -1,17 +1,31 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+//! A connection handle that the endpoint has superseded must stop working:
+//! the endpoint exposes the replacement and closes the old connection.
+//!
+//! #316: this test used to try the replacement by re-dialling the same
+//! addresses from both ends. `connect_addr` returns the existing live
+//! connection for an address it is already connected to, so the re-dials made
+//! no new connection, no `Replaced` event arrived and the test failed on every
+//! run. The replacement now comes from a genuinely new connection: A dials B',
+//! a second endpoint with B's identity on another port, while its connection
+//! to B is still live. A opens both connections, so they are in one lifecycle
+//! family and the newer one always wins. A is the deciding endpoint on its
+//! outbound path, so it closes the stale connection after the drain grace.
+
 mod support;
 
 use ant_quic::{ConnectionCloseReason, ConnectionError, PeerLifecycleEvent};
 use std::time::Duration;
 use support::{
-    make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop, test_guard,
-    wait_until,
+    CONNECT_TIMEOUT, make_isolated_node_with_keypair, normalize_local_addr, reset_lifecycle_events,
+    reusable_keypair, spawn_accept_loop, test_guard, wait_until,
 };
 use tokio::{sync::broadcast, time::timeout};
 
-const REPLACEMENT_ATTEMPTS: usize = 10;
-const REPLACEMENT_EVENT_WAIT: Duration = Duration::from_secs(2);
+/// Upper bound for lifecycle events and for the stale connection's close. A
+/// closes it after the 5 s superseded-reader drain grace; 20 s leaves a wide
+/// margin on a loaded runtime and stays below the 30 s idle timeout.
 const STALE_CLOSE_WAIT: Duration = Duration::from_secs(20);
 
 async fn try_wait_for_peer_event(
@@ -47,9 +61,9 @@ async fn stale_sender_connection_fails_after_supersede() {
     let _guard = test_guard().await;
     reset_lifecycle_events();
 
-    let a = make_node(vec![]).await;
-    let b = make_node(vec![]).await;
-    let a_addr = normalize_local_addr(a.local_addr().expect("a addr"));
+    let b_keypair = reusable_keypair();
+    let a = make_isolated_node_with_keypair(reusable_keypair()).await;
+    let b = make_isolated_node_with_keypair(b_keypair.clone()).await;
     let b_addr = normalize_local_addr(b.local_addr().expect("b addr"));
     let a_id = a.peer_id();
     let b_id = b.peer_id();
@@ -57,7 +71,11 @@ async fn stale_sender_connection_fails_after_supersede() {
     let accept_a = spawn_accept_loop(a.clone());
     let accept_b = spawn_accept_loop(b.clone());
 
-    a.connect_addr(b_addr).await.expect("initial a->b connect");
+    // C1, opened by A to B.
+    timeout(CONNECT_TIMEOUT, a.connect_addr(b_addr))
+        .await
+        .expect("initial a->b connect timeout")
+        .expect("initial a->b connect");
 
     let established = wait_for_peer_event(&mut a_peer_events, |event| {
         matches!(event, PeerLifecycleEvent::Established { .. })
@@ -82,38 +100,32 @@ async fn stale_sender_connection_fails_after_supersede() {
     let stale_conn = a_conn;
     let stale_stable_id = stale_conn.stable_id();
 
-    let mut replacement_generation = None;
-    for _ in 0..REPLACEMENT_ATTEMPTS {
-        let a_task = {
-            let a = a.clone();
-            tokio::spawn(async move { a.connect_addr(b_addr).await })
-        };
-        let b_task = {
-            let b = b.clone();
-            tokio::spawn(async move { b.connect_addr(a_addr).await })
-        };
-        let _ = a_task.await.expect("a replacement task");
-        let _ = b_task.await.expect("b replacement task");
+    // C2, opened by A to B' (B's identity, another port) while C1 is live.
+    let b2 = make_isolated_node_with_keypair(b_keypair).await;
+    assert_eq!(b2.peer_id(), b_id, "B' must have B's identity");
+    let b2_addr = normalize_local_addr(b2.local_addr().expect("b2 addr"));
+    let accept_b2 = spawn_accept_loop(b2.clone());
+    timeout(CONNECT_TIMEOUT, a.connect_addr(b2_addr))
+        .await
+        .expect("replacement a->b' connect timeout")
+        .expect("replacement a->b' connect");
 
-        if let Some(PeerLifecycleEvent::Replaced { new_generation, .. }) =
-            try_wait_for_peer_event(&mut a_peer_events, REPLACEMENT_EVENT_WAIT, |event| {
-                matches!(
-                    event,
-                    PeerLifecycleEvent::Replaced {
-                        old_generation,
-                        new_generation,
-                    } if *old_generation == initial_generation
-                        && *new_generation > initial_generation
-                )
-            })
-            .await
-        {
-            replacement_generation = Some(new_generation);
-            break;
-        }
-    }
     let replacement_generation =
-        replacement_generation.expect("timed out waiting for endpoint-level replacement");
+        match try_wait_for_peer_event(&mut a_peer_events, STALE_CLOSE_WAIT, |event| {
+            matches!(
+                event,
+                PeerLifecycleEvent::Replaced {
+                    old_generation,
+                    new_generation,
+                } if *old_generation == initial_generation
+                    && *new_generation > initial_generation
+            )
+        })
+        .await
+        {
+            Some(PeerLifecycleEvent::Replaced { new_generation, .. }) => new_generation,
+            other => panic!("timed out waiting for endpoint-level replacement: {other:?}"),
+        };
     let closed_old = wait_for_peer_event(&mut a_peer_events, |event| {
         matches!(
             event,
@@ -190,6 +202,8 @@ async fn stale_sender_connection_fails_after_supersede() {
 
     let _ = a.shutdown().await;
     let _ = b.shutdown().await;
+    let _ = b2.shutdown().await;
     accept_a.abort();
     accept_b.abort();
+    accept_b2.abort();
 }

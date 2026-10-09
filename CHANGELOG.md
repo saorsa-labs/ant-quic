@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- **Three replacement tests now make a genuinely new connection (#316).**
+  `reconnect_reader_task::recv_after_reconnect`,
+  `lifecycle_sender_stale::stale_sender_connection_fails_after_supersede` and
+  `b_events_parity::peer_lifecycle_subscriptions_track_establish_replace_and_close`
+  tried to replace a live connection by dialling an address that was already
+  connected. `connect_addr` returns the existing live connection in that case,
+  so no replacement happened: the first two tests failed on every run and the
+  third in 35–60% of runs. Each test now dials a second
+  endpoint with the peer's identity, on another port, while the first
+  connection is still live. The same endpoint opens both connections, so the
+  newer one always wins, and the test checks the same property as before.
 
 ## [0.27.57] - 2026-10-09
 
