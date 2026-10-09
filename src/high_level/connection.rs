@@ -2308,6 +2308,56 @@ mod tests {
         drop(connecting);
     }
 
+    /// #309 review round 2: `try_send` reserves channel capacity and then
+    /// enqueues. A send that reserved capacity before the driver exited can
+    /// enqueue its `Rebind` after the exit cleanup emptied the queue. The
+    /// application-held connection must not own that late event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exited_driver_does_not_own_a_rebind_sent_after_its_cleanup() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (chain, _) = gen_self_signed_cert();
+        let socket = Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0))));
+        let runtime = default_runtime().expect("tokio test runtime");
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .expect("socket-free endpoint");
+        endpoint.set_default_client_config(client_config(&chain));
+        let connecting = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345)),
+                "localhost",
+            )
+            .expect("start connection");
+        // The application keeps this handle after the driver exits.
+        let connection =
+            super::Connection(connecting.conn.as_ref().expect("connection exists").clone());
+        // The current-thread runtime has not polled the driver yet. Reserve
+        // capacity as an in-flight `try_send` would.
+        let mut permits = endpoint.reserve_connection_events_for_test();
+        assert_eq!(permits.len(), 1, "one connection, one reserved event");
+        let permit = permits.pop().expect("reserved event");
+
+        let reason = timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("the fatal send ends the driver");
+        assert!(matches!(reason, crate::ConnectionError::TransportError(_)));
+        timeout(Duration::from_secs(1), endpoint.wait_idle())
+            .await
+            .expect("the fatal send removes the endpoint route");
+
+        // The in-flight send completes after the driver's exit cleanup, and
+        // then its sender is retired.
+        let late: Arc<dyn AsyncUdpSocket> = Arc::new(DeniedSocket(Arc::new(AtomicUsize::new(0))));
+        let late_weak = Arc::downgrade(&late);
+        drop(permit.send(crate::high_level::ConnectionEvent::Rebind(late)));
+        assert!(
+            late_weak.upgrade().is_none(),
+            "a Rebind sent after the driver's exit cleanup must not keep its socket alive"
+        );
+        drop(connection);
+        drop(connecting);
+    }
+
     /// #309 review: cancel a pending connection driver (drop its future, as a
     /// runtime shutdown or an abort does) while the application holds the
     /// connection. Returns the close reason the application observes.

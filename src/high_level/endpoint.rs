@@ -588,6 +588,28 @@ impl Endpoint {
         Ok(released)
     }
 
+    /// #309 test hook: reserve capacity on every connection's event channel,
+    /// as `try_send` does before it enqueues. Sending through a permit later
+    /// models a send that was in flight when the connection's driver exited.
+    #[cfg(test)]
+    pub(crate) fn reserve_connection_events_for_test(
+        &self,
+    ) -> Vec<mpsc::OwnedPermit<ConnectionEvent>> {
+        self.inner
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .recv_state
+                    .connections
+                    .senders
+                    .values()
+                    .filter_map(|channels| channels.sender.clone().try_reserve_owned().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn clone_socket_for_shutdown_test(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
         self.inner
