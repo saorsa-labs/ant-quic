@@ -523,21 +523,6 @@ enum HolePunchWinnerInsert {
     ShuttingDown,
 }
 
-/// #310: outcome of an accepted-coordination dial's winner-map insert, which
-/// bypasses lifecycle registration and takes the peer's slot.
-#[derive(Debug)]
-enum ReplacingWinnerInsert {
-    /// The connection is in the winner map. `displaced_untracked` is the
-    /// different connection it replaced, when the lifecycle map does not
-    /// track it; nothing else owns it, so the caller closes it.
-    Inserted {
-        displaced_untracked: Option<InnerConnection>,
-    },
-    /// The endpoint is shutting down; nothing was inserted. The caller
-    /// closes the connection.
-    ShuttingDown,
-}
-
 /// #286 round 2: refuse a connection registration because the endpoint is
 /// shutting down, closing the connection rather than leaking it.
 pub(crate) fn refuse_registration(
@@ -7807,45 +7792,6 @@ impl NatTraversalEndpoint {
         HolePunchWinnerInsert::Inserted
     }
 
-    /// #310: insert an accepted-coordination dial's connection into the
-    /// winner map, replacing any connection there.
-    ///
-    /// Runs under the lifecycle write lock like every other winner-map
-    /// insert. A displaced connection is returned for closing only when it
-    /// is a different connection (by `stable_id`) that the lifecycle map
-    /// does not track for this peer: such a connection has no other owner
-    /// that will close it. A tracked one stays in lifecycle custody (for
-    /// example a superseded generation kept open to drain its streams), and
-    /// a value with the same `stable_id` is the connection being inserted.
-    fn insert_replacing_winner_parts(
-        connections: &dashmap::DashMap<PeerId, InnerConnection>,
-        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
-        shutting_down: &AtomicBool,
-        peer_id: PeerId,
-        connection: &InnerConnection,
-    ) -> ReplacingWinnerInsert {
-        let lifecycle = connection_lifecycle.write();
-        if shutting_down.load(Ordering::Relaxed) {
-            return ReplacingWinnerInsert::ShuttingDown;
-        }
-        let stable_id = connection.stable_id();
-        let displaced_untracked =
-            connections
-                .insert(peer_id, connection.clone())
-                .filter(|displaced| {
-                    let displaced_id = displaced.stable_id();
-                    displaced_id != stable_id
-                        && !lifecycle.get(&peer_id).is_some_and(|entries| {
-                            entries
-                                .iter()
-                                .any(|entry| entry.stable_id() == displaced_id)
-                        })
-                });
-        ReplacingWinnerInsert::Inserted {
-            displaced_untracked,
-        }
-    }
-
     fn mark_connection_closed(
         &self,
         peer_id: &PeerId,
@@ -12047,20 +11993,12 @@ impl NatTraversalEndpoint {
         // so the in-lock re-check does not cover it). The flag is re-checked
         // under the lifecycle write lock so the insert is linearized against
         // the shutdown sweep.
-        // #310: under the same lock, an untracked connection that this
-        // insert displaces is handed back for closing instead of being
-        // orphaned.
-        let displaced_untracked = match Self::insert_replacing_winner_parts(
-            &connections,
-            &sweep_lock_source,
-            &shutdown_flag,
-            peer_id,
-            &connection,
-        ) {
-            ReplacingWinnerInsert::Inserted {
-                displaced_untracked,
-            } => displaced_untracked,
-            ReplacingWinnerInsert::ShuttingDown => {
+        // #310: the connection this insert displaces is deliberately not
+        // closed. It may still carry an application reader and unfinished
+        // streams, and this path has no reader handover or drain for it.
+        {
+            let _sweep_lock = sweep_lock_source.write();
+            if shutdown_flag.load(Ordering::Relaxed) {
                 debug!(
                     peer_id = ?peer_id,
                     "refusing validated-candidate winner-map insert: endpoint is shutting down"
@@ -12070,19 +12008,7 @@ impl NatTraversalEndpoint {
                     "endpoint is shutting down".to_string(),
                 ));
             }
-        };
-        if let Some(displaced) = displaced_untracked {
-            debug!(
-                peer_id = ?peer_id,
-                displaced_stable_id = displaced.stable_id(),
-                stable_id = connection.stable_id(),
-                "closing the untracked winner displaced by a validated-candidate connection"
-            );
-            if displaced.close_reason().is_none()
-                && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
-            {
-                displaced.close(code, ConnectionCloseReason::Superseded.reason_bytes());
-            }
+            connections.insert(peer_id, connection.clone());
         }
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
@@ -15393,13 +15319,16 @@ mod tests {
             .expect("second target shutdown");
     }
 
-    /// #310: the accepted-coordination dial inserts its connection into the
-    /// winner map without lifecycle registration. Here it displaces a
-    /// hole-punch winner for the same peer, which the lifecycle map does not
-    /// track either. The displaced connection has no other owner that will
-    /// close it, so the coordinator insert must close it, not orphan it.
+    /// #310 round 2 (Codex P2-1): the accepted-coordination dial inserts its
+    /// connection into the winner map without lifecycle registration. Here
+    /// it displaces an untracked hole-punch winner H for the same peer that
+    /// the application still uses: it holds H (as `await_hole_punch_outcome`
+    /// returns it to a reader) with a stream in flight. That path has no
+    /// reader handover or stream drain, so the insert must not close H. H
+    /// must stay open: the unfinished stream completes, and a new stream on
+    /// H still delivers.
     #[tokio::test]
-    async fn coordinator_dial_closes_a_displaced_untracked_winner() {
+    async fn coordinator_dial_leaves_a_displaced_untracked_winner_open_and_usable() {
         let hole_punch_target =
             NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
                 .await
@@ -15425,18 +15354,35 @@ mod tests {
                 &winner_test_candidate(&hole_punch_target),
             )
             .expect("hole-punch dial starts");
-        let hole_punch_winner =
-            wait_for_winner(&endpoint, target_peer, "the hole-punch winner", |_| true).await;
-        let hole_punch_id = hole_punch_winner.stable_id();
-        let hole_punch_weak = hole_punch_winner.weak_handle();
-        // Only the hole-punch task's detached watchers hold it from here.
-        drop(hole_punch_winner);
+        let held = wait_for_winner(&endpoint, target_peer, "the hole-punch winner", |_| true).await;
+        let held_id = held.stable_id();
         assert!(
             endpoint
-                .connection_snapshot_by_stable_id(&target_peer, hole_punch_id)
+                .connection_snapshot_by_stable_id(&target_peer, held_id)
                 .is_none(),
             "the hole-punch winner is not lifecycle-tracked"
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let remote_side = loop {
+            if let Some(connection) = hole_punch_target
+                .connections
+                .iter()
+                .next()
+                .map(|entry| entry.value().clone())
+            {
+                break connection;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hole-punch target registers its side of the connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let mut in_flight = held.open_uni().await.expect("open a stream on H");
+        in_flight
+            .write_all(b"started before the replacement, ")
+            .await
+            .expect("write the first half");
 
         let _unrelated = dial_accepted_coordination_for_test(
             &endpoint,
@@ -15447,7 +15393,7 @@ mod tests {
         .await;
         let coordinator_winner =
             wait_for_winner(&endpoint, target_peer, "the coordinator winner", |winner| {
-                winner.stable_id() != hole_punch_id
+                winner.stable_id() != held_id
             })
             .await;
         assert!(
@@ -15455,17 +15401,49 @@ mod tests {
             "the coordinator winner is open"
         );
         drop(coordinator_winner);
+        assert!(
+            held.close_reason().is_none(),
+            "#310 round 2: the coordinator insert must not close the displaced untracked \
+             winner the application still uses: {:?}",
+            held.close_reason()
+        );
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while hole_punch_weak.is_alive() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "#310: the coordinator insert displaced the untracked hole-punch winner \
-                 (stable_id {hole_punch_id}) from the winner map but left it open (orphaned)"
+        in_flight
+            .write_all(b"finished after it")
+            .await
+            .expect("the in-flight stream keeps writing after the replacement");
+        in_flight.finish().expect("finish the in-flight stream");
+        let mut later = held
+            .open_uni()
+            .await
+            .expect("open a new stream on H after the replacement");
+        later
+            .write_all(b"opened after the replacement")
+            .await
+            .expect("write the new stream");
+        later.finish().expect("finish the new stream");
+
+        for expected in [
+            b"started before the replacement, finished after it".as_slice(),
+            b"opened after the replacement".as_slice(),
+        ] {
+            let mut received =
+                tokio::time::timeout(Duration::from_secs(10), remote_side.accept_uni())
+                    .await
+                    .expect("the stream reaches the remote side in time")
+                    .expect("the remote side accepts the stream");
+            let bytes = tokio::time::timeout(Duration::from_secs(10), received.read_to_end(1024))
+                .await
+                .expect("the stream completes in time")
+                .expect("the remote side reads the whole stream");
+            assert_eq!(
+                bytes, expected,
+                "H delivers its streams after the replacement"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(held.close_reason().is_none(), "H is still open");
 
+        drop((in_flight, later, held, remote_side));
         endpoint.shutdown().await.expect("endpoint shutdown");
         hole_punch_target
             .shutdown()
@@ -15550,13 +15528,12 @@ mod tests {
             .expect("tracked server shutdown");
     }
 
-    /// #310: both untracked winner-map inserts compare `stable_id`s. The
-    /// hole-punch insert treats only a different connection as a duplicate.
-    /// The replacing insert hands back only a different connection that the
-    /// lifecycle map does not track: never the connection being inserted,
-    /// and never one in lifecycle custody. Both refuse after shutdown.
+    /// #310: the hole-punch winner-map insert compares `stable_id`s: only a
+    /// different connection already in the slot makes the new one a
+    /// duplicate, and the connection in the slot is never closed or
+    /// replaced. It refuses after shutdown.
     #[tokio::test]
-    async fn untracked_winner_inserts_compare_stable_ids_and_custody() {
+    async fn hole_punch_winner_insert_compares_stable_ids() {
         let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
             .await
             .expect("endpoint binds");
@@ -15565,15 +15542,6 @@ mod tests {
         let (second_server, second_client, second) = loopback_quic_connection().await;
         let hole_punch = |connection: &InnerConnection| {
             NatTraversalEndpoint::insert_hole_punch_winner_parts(
-                &endpoint.connections,
-                &endpoint.connection_lifecycle,
-                &endpoint.shutdown,
-                peer,
-                connection,
-            )
-        };
-        let replacing = |connection: &InnerConnection| {
-            NatTraversalEndpoint::insert_replacing_winner_parts(
                 &endpoint.connections,
                 &endpoint.connection_lifecycle,
                 &endpoint.shutdown,
@@ -15600,49 +15568,13 @@ mod tests {
             Some(first.stable_id()),
             "the first winner keeps the slot"
         );
-
         assert!(
-            matches!(
-                replacing(&first),
-                ReplacingWinnerInsert::Inserted {
-                    displaced_untracked: None
-                }
-            ),
-            "re-inserting the same connection displaces nothing to close"
+            first.close_reason().is_none() && second.close_reason().is_none(),
+            "the insert closes nothing; the caller closes a duplicate"
         );
-        match replacing(&second) {
-            ReplacingWinnerInsert::Inserted {
-                displaced_untracked: Some(displaced),
-            } => assert_eq!(
-                displaced.stable_id(),
-                first.stable_id(),
-                "the displaced untracked connection is handed back"
-            ),
-            other => panic!("expected the untracked first winner back, got {other:?}"),
-        }
-        assert_eq!(winner_id(), Some(second.stable_id()));
-
-        endpoint
-            .add_connection(peer, second.clone())
-            .expect("register the second connection");
-        assert!(
-            matches!(
-                replacing(&first),
-                ReplacingWinnerInsert::Inserted {
-                    displaced_untracked: None
-                }
-            ),
-            "a lifecycle-tracked connection stays in lifecycle custody"
-        );
-        assert_eq!(winner_id(), Some(first.stable_id()));
-        assert!(first.close_reason().is_none() && second.close_reason().is_none());
 
         endpoint.shutdown().await.expect("endpoint shutdown");
         assert_eq!(hole_punch(&first), HolePunchWinnerInsert::ShuttingDown);
-        assert!(matches!(
-            replacing(&first),
-            ReplacingWinnerInsert::ShuttingDown
-        ));
         assert_eq!(winner_id(), None, "nothing is inserted after shutdown");
 
         drop((first, second));
