@@ -14919,6 +14919,63 @@ mod tests {
         drop(silent_peer);
     }
 
+    /// #309 review: a terminal connection has no driver to send queued
+    /// frames, so its NAT control sends must return the stored error before
+    /// they change protocol state. The application keeps this connection
+    /// after closing it.
+    async fn closed_nat_connection() -> (NatTraversalEndpoint, NatTraversalEndpoint, InnerConnection)
+    {
+        let (server, client, connection) = loopback_quic_connection().await;
+        assert!(
+            connection.nat_traversal_supported(),
+            "loopback endpoints negotiate NAT traversal"
+        );
+        connection.close(crate::VarInt::from_u32(0), b"done");
+        (server, client, connection)
+    }
+
+    fn nat_control_test_addr() -> SocketAddr {
+        "127.0.0.1:9000"
+            .parse()
+            .expect("valid NAT candidate address")
+    }
+
+    #[tokio::test]
+    async fn closed_connection_rejects_nat_address_advertisement() {
+        let (_server, _client, connection) = closed_nat_connection().await;
+        assert_eq!(
+            connection.send_nat_address_advertisement(nat_control_test_addr(), 1),
+            Err(crate::ConnectionError::LocallyClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_rejects_nat_address_removal() {
+        let (_server, _client, connection) = closed_nat_connection().await;
+        assert_eq!(
+            connection.send_nat_address_removal(0),
+            Err(crate::ConnectionError::LocallyClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_rejects_nat_punch_coordination() {
+        let (_server, _client, connection) = closed_nat_connection().await;
+        assert_eq!(
+            connection.send_nat_punch_coordination(0, nat_control_test_addr(), 1),
+            Err(crate::ConnectionError::LocallyClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_rejects_nat_punch_via_relay() {
+        let (_server, _client, connection) = closed_nat_connection().await;
+        assert_eq!(
+            connection.send_nat_punch_via_relay([0x3a; 32], nat_control_test_addr(), 1),
+            Err(crate::ConnectionError::LocallyClosed)
+        );
+    }
+
     /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
     /// re-check, and is preempted before the winner-map insert, must not
     /// leave a `connections` clone behind. The shutdown sweep of the winner
