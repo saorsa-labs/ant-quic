@@ -487,6 +487,15 @@ pub(crate) struct PromotedConnection {
     pub(crate) connection: InnerConnection,
 }
 
+/// #313: a winner the inner layer put in the winner map without starting an
+/// application reader for it (a raw hole-punch or accepted-coordination
+/// winner, or a materialized registration). The p2p layer only starts a
+/// reader for it; it publishes no peer state and no lifecycle event.
+pub(crate) struct ReaderAdoption {
+    pub(crate) peer_id: PeerId,
+    pub(crate) connection: InnerConnection,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectionCanonicalSortKey {
     connection_family_id: [u8; 32],
@@ -509,6 +518,18 @@ pub(crate) enum ConnectionRegistrationOutcome {
     /// and the connection has been closed by the registrar. Nothing was
     /// entered into either map.
     Refused,
+}
+
+/// #310: outcome of a hole-punch candidate's winner-map insert, which
+/// bypasses lifecycle registration. The caller closes the connection when it
+/// was not inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolePunchWinnerInsert {
+    Inserted,
+    /// Another connection for the peer already holds the slot.
+    Duplicate,
+    /// The endpoint is shutting down; nothing was inserted.
+    ShuttingDown,
 }
 
 /// #286 round 2: refuse a connection registration because the endpoint is
@@ -756,6 +777,259 @@ fn arm_registration_gate_with_mode_for_test(
     RegistrationGateGuard { gate }
 }
 
+/// #313 test-only gate: parks the FIRST lifecycle registration of one
+/// endpoint before it allocates its generation; later registrations pass. A
+/// test can then register a second connection for the same peer first, and
+/// the parked one allocates the newer generation when released. The wait is
+/// synchronous (the registrar is synchronous), so tests need spare runtime
+/// worker threads. Production code never arms it.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct FirstRegistrationGate {
+    target_shutdown: usize,
+    park_available: AtomicBool,
+    parked: AtomicBool,
+    parked_notify: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release_notify: std::sync::Condvar,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl FirstRegistrationGate {
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.release_notify.notify_all();
+    }
+
+    pub(crate) async fn wait_until_parked(&self) {
+        loop {
+            let parked = self.parked_notify.notified();
+            if self.parked.load(Ordering::SeqCst) {
+                return;
+            }
+            parked.await;
+        }
+    }
+
+    fn park_if_first(&self) {
+        if !self.park_available.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.parked.store(true, Ordering::SeqCst);
+        self.parked_notify.notify_waiters();
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = self
+            .release_notify
+            .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) struct FirstRegistrationGateGuard {
+    gate: Arc<FirstRegistrationGate>,
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl std::ops::Deref for FirstRegistrationGateGuard {
+    type Target = FirstRegistrationGate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+impl Drop for FirstRegistrationGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut armed = FIRST_REGISTRATION_GATES.write();
+        if armed
+            .get(&self.gate.target_shutdown)
+            .and_then(Weak::upgrade)
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+        {
+            armed.remove(&self.gate.target_shutdown);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+static FIRST_REGISTRATION_GATES: std::sync::LazyLock<
+    ParkingRwLock<HashMap<usize, Weak<FirstRegistrationGate>>>,
+> = std::sync::LazyLock::new(|| ParkingRwLock::new(HashMap::new()));
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn park_first_registration_for_test(shutting_down: &AtomicBool) {
+    let target_shutdown = std::ptr::from_ref(shutting_down) as usize;
+    let gate = FIRST_REGISTRATION_GATES
+        .read()
+        .get(&target_shutdown)
+        .and_then(Weak::upgrade);
+    if let Some(gate) = gate {
+        gate.park_if_first();
+    }
+}
+
+#[cfg(all(test, feature = "network-discovery"))]
+fn arm_first_registration_gate_for_test(
+    shutting_down: &Arc<AtomicBool>,
+) -> FirstRegistrationGateGuard {
+    let gate = Arc::new(FirstRegistrationGate {
+        target_shutdown: Arc::as_ptr(shutting_down) as usize,
+        park_available: AtomicBool::new(true),
+        parked: AtomicBool::new(false),
+        parked_notify: tokio::sync::Notify::new(),
+        released: std::sync::Mutex::new(false),
+        release_notify: std::sync::Condvar::new(),
+    });
+    FIRST_REGISTRATION_GATES
+        .write()
+        .insert(gate.target_shutdown, Arc::downgrade(&gate));
+    FirstRegistrationGateGuard { gate }
+}
+
+/// #310 test-only hole-punch winner gate: parks the first hole-punch winner
+/// of one endpoint after its handshake, immediately before it takes the
+/// lifecycle write lock for its winner-map insert, so a test can run a second
+/// winner for the same peer to completion first. Before the #310 fix this
+/// point lay between the unlocked duplicate check and the insert. Later
+/// winners pass through. Production code never arms it.
+#[cfg(test)]
+pub(crate) struct WinnerInsertGate {
+    target_shutdown: usize,
+    /// `true` while the single park is still available.
+    park_available: AtomicBool,
+    parked: std::sync::Mutex<Option<(usize, crate::high_level::WeakConnectionHandle)>>,
+    parked_notify: tokio::sync::Notify,
+    released: AtomicBool,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl WinnerInsertGate {
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release_notify.notify_waiters();
+    }
+
+    /// Wait until the first winner is parked; returns its `stable_id` and a
+    /// weak handle, so the test does not keep the parked connection open.
+    pub(crate) async fn wait_until_parked(
+        &self,
+    ) -> (usize, crate::high_level::WeakConnectionHandle) {
+        loop {
+            let parked = self.parked_notify.notified();
+            if let Some(parked_winner) = self
+                .parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return parked_winner;
+            }
+            parked.await;
+        }
+    }
+
+    async fn park(&self, connection: &InnerConnection) {
+        if !self.park_available.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        *self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((connection.stable_id(), connection.weak_handle()));
+        self.parked_notify.notify_waiters();
+        let released = async {
+            loop {
+                let notified = self.release_notify.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        // Bounded: an unreleased gate lets the winner continue after the
+        // deadline instead of hanging the test.
+        let _ = tokio::time::timeout(Duration::from_secs(30), released).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct WinnerInsertGateGuard {
+    gate: Arc<WinnerInsertGate>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for WinnerInsertGateGuard {
+    type Target = WinnerInsertGate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+#[cfg(test)]
+impl Drop for WinnerInsertGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut armed = WINNER_INSERT_GATES.write();
+        if armed
+            .get(&self.gate.target_shutdown)
+            .and_then(Weak::upgrade)
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+        {
+            armed.remove(&self.gate.target_shutdown);
+        }
+    }
+}
+
+#[cfg(test)]
+static WINNER_INSERT_GATES: std::sync::LazyLock<
+    ParkingRwLock<HashMap<usize, Weak<WinnerInsertGate>>>,
+> = std::sync::LazyLock::new(|| ParkingRwLock::new(HashMap::new()));
+
+#[cfg(test)]
+fn arm_winner_insert_gate_for_test(shutting_down: &Arc<AtomicBool>) -> WinnerInsertGateGuard {
+    let gate = Arc::new(WinnerInsertGate {
+        target_shutdown: Arc::as_ptr(shutting_down) as usize,
+        park_available: AtomicBool::new(true),
+        parked: std::sync::Mutex::new(None),
+        parked_notify: tokio::sync::Notify::new(),
+        released: AtomicBool::new(false),
+        release_notify: tokio::sync::Notify::new(),
+    });
+    WINNER_INSERT_GATES
+        .write()
+        .insert(gate.target_shutdown, Arc::downgrade(&gate));
+    WinnerInsertGateGuard { gate }
+}
+
+/// #310 test hook: park the first hole-punch winner of the endpoint that owns
+/// `shutting_down`, if a test armed a gate for it.
+#[cfg(test)]
+async fn pause_hole_punch_winner_for_test(
+    shutting_down: &AtomicBool,
+    connection: &InnerConnection,
+) {
+    let target_shutdown = std::ptr::from_ref(shutting_down) as usize;
+    let gate = WINNER_INSERT_GATES
+        .read()
+        .get(&target_shutdown)
+        .and_then(Weak::upgrade);
+    if let Some(gate) = gate {
+        gate.park(connection).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReaderExitOutcome {
     Noop,
@@ -874,6 +1148,9 @@ pub struct NatTraversalEndpoint {
     /// Arc would leak the whole endpoint (#277 round 2) — the sender keeps
     /// only the channel alive.
     connection_promoted_tx: ParkingRwLock<Option<mpsc::UnboundedSender<PromotedConnection>>>,
+    /// #313: p2p-layer receiver for winners that need a reader (see
+    /// [`ReaderAdoption`]). Installed once at p2p construction.
+    reader_adoption_tx: ParkingRwLock<Option<mpsc::UnboundedSender<ReaderAdoption>>>,
     /// #368: orphan connections closed by repromotion refusal or the janitor.
     orphan_connections_closed: std::sync::atomic::AtomicU64,
     /// Monotonic local generation counter used for tracked connections.
@@ -2292,6 +2569,7 @@ impl NatTraversalEndpoint {
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
+            reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -2820,6 +3098,7 @@ impl NatTraversalEndpoint {
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
+            reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -4665,6 +4944,7 @@ impl NatTraversalEndpoint {
                     let observed_address_tx = self.observed_address_tx.clone();
                     let shutdown_flag = Arc::clone(&self.shutdown);
                     let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connection_timeout = self
                         .timeout_config
                         .nat_traversal
@@ -4691,6 +4971,7 @@ impl NatTraversalEndpoint {
                                 event_callback.clone(),
                                 Arc::clone(&shutdown_flag),
                                 Arc::clone(&sweep_lock_source),
+                                reader_adoption_tx.clone(),
                                 connection_timeout,
                                 target_peer,
                                 addr,
@@ -4787,6 +5068,7 @@ impl NatTraversalEndpoint {
                         let observed_address_tx = self.observed_address_tx.clone();
                         let shutdown_flag = Arc::clone(&self.shutdown);
                         let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
+                        let reader_adoption_tx = self.reader_adoption_sender();
                         let connection_timeout = self
                             .timeout_config
                             .nat_traversal
@@ -4810,6 +5092,7 @@ impl NatTraversalEndpoint {
                                     event_callback.clone(),
                                     Arc::clone(&shutdown_flag),
                                     Arc::clone(&sweep_lock_source),
+                                    reader_adoption_tx.clone(),
                                     connection_timeout,
                                     initiator_peer,
                                     addr,
@@ -4979,6 +5262,8 @@ impl NatTraversalEndpoint {
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
         shutting_down: &AtomicBool,
+        // #313: the p2p layer's reader-adoption receiver (see `ReaderAdoption`).
+        reader_adoption_tx: Option<&mpsc::UnboundedSender<ReaderAdoption>>,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -4998,8 +5283,14 @@ impl NatTraversalEndpoint {
             connection.clone(),
         );
 
+        // #313: no caller of this registrar starts an application reader, so
+        // signal the handle actually returned (the new winner, or the existing
+        // winner after a rejection); the p2p reader start is idempotent.
         match outcome {
-            ConnectionRegistrationOutcome::Live { .. } => Ok((peer_id, connection)),
+            ConnectionRegistrationOutcome::Live { .. } => {
+                Self::signal_reader_adoption(reader_adoption_tx, peer_id, &connection);
+                Ok((peer_id, connection))
+            }
             ConnectionRegistrationOutcome::Refused => Err(NatTraversalError::NetworkError(
                 "endpoint is shutting down".to_string(),
             )),
@@ -5013,6 +5304,7 @@ impl NatTraversalEndpoint {
                                 .to_string(),
                         )
                     })?;
+                Self::signal_reader_adoption(reader_adoption_tx, peer_id, &existing);
                 Ok((peer_id, existing))
             }
         }
@@ -5140,6 +5432,7 @@ impl NatTraversalEndpoint {
                     let envelope = envelope.clone();
                     let traversal_event_notify = self.traversal_event_notify.clone();
                     let dial_shutdown = self.shutdown.clone();
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     // #305: tracked so shutdown cancels an in-flight
@@ -5155,6 +5448,7 @@ impl NatTraversalEndpoint {
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
                                         dial_shutdown.as_ref(),
+                                        reader_adoption_tx.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -7336,6 +7630,8 @@ impl NatTraversalEndpoint {
             // is synchronous; unrelated endpoints continue registering.
             gate.wait_for_release();
         }
+        #[cfg(all(test, feature = "network-discovery"))]
+        park_first_registration_for_test(shutting_down);
         let Some(generation) = allocate_connection_generation(next_connection_generation) else {
             // Exhaustion is terminal for allocation: never wrap or issue the stale sentinel.
             connection.close(VarInt::from_u32(0), b"connection generation exhausted");
@@ -7612,6 +7908,39 @@ impl NatTraversalEndpoint {
         ))
     }
 
+    /// #310: insert a hole-punch candidate's connection into the winner map
+    /// unless a different connection for the peer is already there.
+    ///
+    /// The shutdown re-check, the duplicate check and the insert all run
+    /// under the lifecycle write lock. Every winner-map insert takes that
+    /// lock (lifecycle registration, repromotion and both untracked insert
+    /// paths), so no other insert can land between the check and the insert:
+    /// of two candidates that succeed together, exactly one is inserted and
+    /// the other is reported as a duplicate.
+    fn insert_hole_punch_winner_parts(
+        connections: &dashmap::DashMap<PeerId, InnerConnection>,
+        connection_lifecycle: &ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>,
+        shutting_down: &AtomicBool,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) -> HolePunchWinnerInsert {
+        let _winner_map_lock = connection_lifecycle.write();
+        if shutting_down.load(Ordering::Relaxed) {
+            return HolePunchWinnerInsert::ShuttingDown;
+        }
+        let stable_id = connection.stable_id();
+        // The read guard is dropped at the end of this statement, before the
+        // insert below locks the same shard.
+        let occupied = connections
+            .get(&peer_id)
+            .is_some_and(|current| current.stable_id() != stable_id);
+        if occupied {
+            return HolePunchWinnerInsert::Duplicate;
+        }
+        connections.insert(peer_id, connection.clone());
+        HolePunchWinnerInsert::Inserted
+    }
+
     fn mark_connection_closed(
         &self,
         peer_id: &PeerId,
@@ -7766,6 +8095,62 @@ impl NatTraversalEndpoint {
         tx: mpsc::UnboundedSender<PromotedConnection>,
     ) {
         *self.connection_promoted_tx.write() = Some(tx);
+    }
+
+    /// #313: install the p2p-layer receiver for winners that need a reader.
+    /// Must be called once at construction, before any connection churn.
+    pub(crate) fn set_reader_adoption_sender(&self, tx: mpsc::UnboundedSender<ReaderAdoption>) {
+        *self.reader_adoption_tx.write() = Some(tx);
+    }
+
+    /// #313: the installed reader-adoption sender, cloned for a task that
+    /// produces winners.
+    fn reader_adoption_sender(&self) -> Option<mpsc::UnboundedSender<ReaderAdoption>> {
+        self.reader_adoption_tx.read().clone()
+    }
+
+    /// #313: ask the p2p layer to start a reader for a winner this layer
+    /// published without one. The signal is sent only when the connection's
+    /// authenticated identity is `peer_id`; otherwise nothing is sent and
+    /// nothing is closed, so a mismatched connection is never adopted under
+    /// another peer's key.
+    fn signal_reader_adoption(
+        tx: Option<&mpsc::UnboundedSender<ReaderAdoption>>,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) {
+        let Some(tx) = tx else {
+            return;
+        };
+        if Self::derive_peer_id_from_connection(connection) != Some(peer_id) {
+            debug!(
+                peer_id = ?peer_id,
+                stable_id = connection.stable_id(),
+                "not adopting a reader: authenticated identity does not match the winner key"
+            );
+            return;
+        }
+        let _ = tx.send(ReaderAdoption {
+            peer_id,
+            connection: connection.clone(),
+        });
+    }
+
+    /// #313 test seam: deliver an adoption signal for `connection` under
+    /// `peer_id` straight to the p2p consumer, bypassing the producer-side
+    /// identity check.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn send_reader_adoption_for_test(
+        &self,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) {
+        if let Some(tx) = self.reader_adoption_tx.read().as_ref() {
+            let _ = tx.send(ReaderAdoption {
+                peer_id,
+                connection,
+            });
+        }
     }
 
     /// #277 round 2: classify a tracked generation's transport (Direct /
@@ -9034,6 +9419,108 @@ impl NatTraversalEndpoint {
         arm_in_lock_registration_gate_for_test(&self.shutdown)
     }
 
+    /// #313 test hook: park only this endpoint's FIRST lifecycle registration
+    /// before it allocates its generation. Later registrations pass, so a
+    /// test can register a second connection for the peer first.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_first_registration_gate_for_test(&self) -> FirstRegistrationGateGuard {
+        arm_first_registration_gate_for_test(&self.shutdown)
+    }
+
+    /// #313 test hook: run one hole-punch candidate attempt for `peer_id` at
+    /// `address` (the raw hole-punch winner path).
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn attempt_hole_punch_candidate_for_test(
+        &self,
+        peer_id: PeerId,
+        address: SocketAddr,
+    ) -> Result<(), NatTraversalError> {
+        let candidate = CandidateAddress::new(address, 0, CandidateSource::Peer)
+            .map_err(|e| NatTraversalError::ConfigError(format!("test candidate: {e:?}")))?;
+        self.attempt_connection_to_candidate(peer_id, &candidate)
+    }
+
+    /// #313 test hook: deliver a `CoordinationAccepted` message to this
+    /// endpoint as if a coordinator had sent it. When this endpoint is the
+    /// initiator, the live request the handler requires is seeded first. The
+    /// handler ignores its connection argument; `any_connection` only fills it.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) async fn inject_accepted_coordination_for_test(
+        &self,
+        any_connection: InnerConnection,
+        initiator: PeerId,
+        target: PeerId,
+        initiator_addrs: Vec<SocketAddr>,
+        target_addrs: Vec<SocketAddr>,
+    ) -> Result<bool, NatTraversalError> {
+        let coordinator_peer = PeerId([0x31; 32]);
+        let request_id = next_request_id();
+        let (expires_at_unix_ms, local_expires_at) =
+            wire_and_monotonic_expiry_after(Duration::from_secs(30));
+        if initiator == self.local_peer_id {
+            remember_live_request(
+                self.local_peer_id,
+                target,
+                LiveRequest {
+                    request_id,
+                    round: 1,
+                    expires_at_unix_ms,
+                    local_expires_at,
+                    expected_coordinator: Some(coordinator_peer),
+                },
+            );
+        }
+        let accepted = encode_coordinator_control(&CoordinatorControlEnvelope {
+            request_id,
+            expires_at_unix_ms,
+            message: CoordinatorControlMessage::CoordinationAccepted {
+                initiator,
+                target,
+                round: 1,
+                initiator_addrs,
+                target_addrs,
+            },
+        })
+        .map_err(|e| NatTraversalError::ProtocolError(format!("encode: {e}")))?;
+        self.handle_coordinator_control_message(coordinator_peer, any_connection, &accepted)
+            .await
+    }
+
+    /// #313 test hook: register `connection` the way a fallback coordinator
+    /// dial does (`materialize_authenticated_connection`).
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn materialize_connection_for_test(
+        &self,
+        connection: InnerConnection,
+    ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
+        Self::materialize_authenticated_connection(
+            self.local_peer_id,
+            self.connections.as_ref(),
+            self.connection_lifecycle.as_ref(),
+            self.next_connection_generation.as_ref(),
+            self.emitted_established_events.as_ref(),
+            self.shutdown.as_ref(),
+            self.reader_adoption_sender().as_ref(),
+            connection,
+        )
+    }
+
+    /// #313 test hook: replace the peer's lifecycle entries with `entry` and
+    /// make its connection the winner, under the lifecycle lock.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn seed_winner_for_test(&self, peer_id: PeerId, entry: TrackedConnection) {
+        let mut lifecycle = self.connection_lifecycle.write();
+        self.connections.insert(peer_id, entry.connection.clone());
+        lifecycle.insert(peer_id, vec![entry]);
+    }
+
+    /// #310 test hook: park this endpoint's first hole-punch winner just
+    /// before its winner-map insert.
+    #[cfg(test)]
+    pub(crate) fn arm_winner_insert_gate_for_test(&self) -> WinnerInsertGateGuard {
+        arm_winner_insert_gate_for_test(&self.shutdown)
+    }
+
     /// #305 round 2 test hook: report symmetric NAT so the proactive relay
     /// manager runs on loopback.
     #[cfg(test)]
@@ -10036,6 +10523,7 @@ impl NatTraversalEndpoint {
                         // task cannot insert past the sweep.
                         let punch_shutdown = self.shutdown.clone();
                         let punch_lifecycle = self.connection_lifecycle.clone();
+                        let reader_adoption_tx = self.reader_adoption_sender();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
@@ -10054,33 +10542,52 @@ impl NatTraversalEndpoint {
                         let handle = tokio::spawn(async move {
                             match connecting.await {
                                 Ok(connection) => {
-                                    // Check if another task already inserted a connection for this peer
-                                    // This prevents race conditions when multiple candidates succeed
-                                    if connections.contains_key(&peer_id_clone) {
-                                        debug!(
-                                            "Connection already exists for peer {:?}, discarding duplicate from {}",
-                                            peer_id_clone, address
-                                        );
-                                        // Close the duplicate connection to free resources
-                                        connection.close(0u32.into(), b"duplicate connection");
-                                        return;
-                                    }
+                                    // #310 test hook: park the first winner
+                                    // immediately before its winner-map
+                                    // insert, so a second winner for the same
+                                    // peer can complete first.
+                                    #[cfg(test)]
+                                    pause_hole_punch_winner_for_test(&punch_shutdown, &connection)
+                                        .await;
 
-                                    info!(
-                                        "Successfully connected to {} for peer {:?}",
-                                        address, peer_id_clone
-                                    );
-
-                                    // Store the connection
-                                    // DashMap provides lock-free .insert()
-                                    // #286 round 2: refuse when shutting
-                                    // down — close instead of inserting.
-                                    // Re-checked under the lifecycle write
-                                    // lock so the insert is linearized against
-                                    // the shutdown sweep.
-                                    {
-                                        let _sweep_lock = punch_lifecycle.write();
-                                        if punch_shutdown.load(Ordering::Relaxed) {
+                                    // Store the connection unless another
+                                    // candidate for this peer already won.
+                                    // #310: the duplicate check runs under
+                                    // the lifecycle write lock together with
+                                    // the insert, so two candidates that
+                                    // succeed together cannot both pass the
+                                    // check and the second overwrite (and
+                                    // orphan) the first. #286 round 2: the
+                                    // shutdown flag is re-checked under the
+                                    // same lock, so the insert is linearized
+                                    // against the shutdown sweep.
+                                    match Self::insert_hole_punch_winner_parts(
+                                        &connections,
+                                        &punch_lifecycle,
+                                        &punch_shutdown,
+                                        peer_id_clone,
+                                        &connection,
+                                    ) {
+                                        HolePunchWinnerInsert::Inserted => {
+                                            // #313: no waiter may be running for
+                                            // this winner; ask the p2p layer for
+                                            // its reader (idempotent there).
+                                            Self::signal_reader_adoption(
+                                                reader_adoption_tx.as_ref(),
+                                                peer_id_clone,
+                                                &connection,
+                                            );
+                                        }
+                                        HolePunchWinnerInsert::Duplicate => {
+                                            debug!(
+                                                "Connection already exists for peer {:?}, discarding duplicate from {}",
+                                                peer_id_clone, address
+                                            );
+                                            // Close the duplicate connection to free resources
+                                            connection.close(0u32.into(), b"duplicate connection");
+                                            return;
+                                        }
+                                        HolePunchWinnerInsert::ShuttingDown => {
                                             debug!(
                                                 peer_id = ?peer_id_clone,
                                                 "refusing hole-punch winner-map insert: endpoint is shutting down"
@@ -10089,8 +10596,12 @@ impl NatTraversalEndpoint {
                                                 .close(crate::VarInt::from_u32(0), b"Shutdown");
                                             return;
                                         }
-                                        connections.insert(peer_id_clone, connection.clone());
                                     }
+
+                                    info!(
+                                        "Successfully connected to {} for peer {:?}",
+                                        address, peer_id_clone
+                                    );
 
                                     // Send connection established event (we initiated hole punch = Client side)
                                     let _ =
@@ -11129,6 +11640,7 @@ impl NatTraversalEndpoint {
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
                     let dial_shutdown = self.shutdown.clone();
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     // #305: tracked so shutdown cancels an in-flight
@@ -11147,6 +11659,7 @@ impl NatTraversalEndpoint {
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
                                         dial_shutdown.as_ref(),
+                                        reader_adoption_tx.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -11725,6 +12238,7 @@ impl NatTraversalEndpoint {
             self.event_callback.clone(),
             Arc::clone(&self.shutdown),
             Arc::clone(&self.connection_lifecycle),
+            self.reader_adoption_sender(),
             self.timeout_config
                 .nat_traversal
                 .connection_establishment_timeout,
@@ -11749,6 +12263,8 @@ impl NatTraversalEndpoint {
         // shutdown sweep).
         shutdown_flag: Arc<AtomicBool>,
         sweep_lock_source: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
+        // #313: the p2p layer's reader-adoption receiver (see `ReaderAdoption`).
+        reader_adoption_tx: Option<mpsc::UnboundedSender<ReaderAdoption>>,
         connection_timeout: Duration,
         peer_id: PeerId,
         candidate_address: SocketAddr,
@@ -11792,6 +12308,9 @@ impl NatTraversalEndpoint {
         // so the in-lock re-check does not cover it). The flag is re-checked
         // under the lifecycle write lock so the insert is linearized against
         // the shutdown sweep.
+        // #310: the connection this insert displaces is deliberately not
+        // closed. It may still carry an application reader and unfinished
+        // streams, and this path has no reader handover or drain for it.
         {
             let _sweep_lock = sweep_lock_source.write();
             if shutdown_flag.load(Ordering::Relaxed) {
@@ -11806,6 +12325,10 @@ impl NatTraversalEndpoint {
             }
             connections.insert(peer_id, connection.clone());
         }
+        // #313: this winner has no application reader yet, and the waiter that
+        // finalised an earlier winner may already have returned. Ask the p2p
+        // layer for its reader; the displaced winner keeps its own.
+        Self::signal_reader_adoption(reader_adoption_tx.as_ref(), peer_id, &connection);
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
         }
@@ -14996,6 +15519,388 @@ mod tests {
             Err(crate::ConnectionError::LocallyClosed)
         );
         shutdown_nat_test_endpoints(server, client, connection).await;
+    }
+
+    /// #310: a loopback hole-punch candidate on its own target endpoint.
+    /// Each winner in these tests dials a different target, so no target
+    /// sees two connections from one peer and closes one in its own
+    /// lifecycle tiebreak.
+    fn winner_test_candidate(target: &NatTraversalEndpoint) -> CandidateAddress {
+        let address = target
+            .shutdown_socket_address_for_test()
+            .expect("target address");
+        CandidateAddress::new(address, 0, CandidateSource::Peer).expect("loopback candidate")
+    }
+
+    /// #310: wait until the winner map holds a connection for `peer` that
+    /// satisfies `accept`, and return it.
+    async fn wait_for_winner(
+        endpoint: &NatTraversalEndpoint,
+        peer: PeerId,
+        what: &str,
+        accept: impl Fn(&InnerConnection) -> bool,
+    ) -> InnerConnection {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(winner) = endpoint
+                .connections
+                .get(&peer)
+                .map(|entry| entry.value().clone())
+                .filter(|winner| accept(winner))
+            {
+                return winner;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "#310: {what} did not reach the winner map"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #310: two hole-punch winners for one peer. The gate parks the first
+    /// winner after its handshake, immediately before its winner-map insert,
+    /// and the second winner takes the slot meanwhile. When the first winner
+    /// resumes, the winner map must keep the second winner open and the
+    /// first one must be closed. A connection that is open but not in the
+    /// winner map is orphaned: its detached close and observed-address
+    /// watchers keep it alive with no owner that will ever close it.
+    #[tokio::test]
+    async fn concurrent_hole_punch_winners_leave_no_orphaned_connection() {
+        let first_target = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("first target binds");
+        let second_target = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("second target binds");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let peer = PeerId([0x3b; 32]);
+        let gate = endpoint.arm_winner_insert_gate_for_test();
+
+        endpoint
+            .attempt_connection_to_candidate(peer, &winner_test_candidate(&first_target))
+            .expect("first candidate dial starts");
+        let (first_id, first) =
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                .await
+                .expect("the first winner completes its handshake and parks");
+        assert!(first.is_alive(), "the parked first winner is open");
+        assert!(
+            !endpoint.connections.contains_key(&peer),
+            "the parked first winner has not inserted yet"
+        );
+
+        endpoint
+            .attempt_connection_to_candidate(peer, &winner_test_candidate(&second_target))
+            .expect("second candidate dial starts");
+        let second = wait_for_winner(&endpoint, peer, "the second winner", |winner| {
+            winner.stable_id() != first_id
+        })
+        .await;
+        let second_id = second.stable_id();
+        let second_weak = second.weak_handle();
+        drop(second);
+
+        gate.release();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let winner_id = endpoint
+                .connections
+                .get(&peer)
+                .map(|entry| entry.value().stable_id());
+            let first_open = first.is_alive();
+            let second_open = second_weak.is_alive();
+            if winner_id == Some(second_id) && second_open && !first_open {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "#310: after both winners decide, the winner map must keep the second winner \
+                 open and the first must be closed (an open connection outside the map is \
+                 orphaned): winner_stable_id={winner_id:?}, first (stable_id {first_id}) \
+                 open={first_open}, second (stable_id {second_id}) open={second_open}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(gate);
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        first_target
+            .shutdown()
+            .await
+            .expect("first target shutdown");
+        second_target
+            .shutdown()
+            .await
+            .expect("second target shutdown");
+    }
+
+    /// #310 round 2 (Codex P2-1): the accepted-coordination dial inserts its
+    /// connection into the winner map without lifecycle registration. Here
+    /// it displaces an untracked hole-punch winner H for the same peer that
+    /// the application still uses: it holds H (as `await_hole_punch_outcome`
+    /// returns it to a reader) with a stream in flight. That path has no
+    /// reader handover or stream drain, so the insert must not close H. H
+    /// must stay open: the unfinished stream completes, and a new stream on
+    /// H still delivers.
+    #[tokio::test]
+    async fn coordinator_dial_leaves_a_displaced_untracked_winner_open_and_usable() {
+        let hole_punch_target =
+            NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("hole-punch target binds");
+        let coordination_target =
+            NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("coordination target binds");
+        let coordination_target_addr = coordination_target
+            .shutdown_socket_address_for_test()
+            .expect("coordination target address");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("endpoint address");
+        let target_peer = PeerId([0x3c; 32]);
+
+        endpoint
+            .attempt_connection_to_candidate(
+                target_peer,
+                &winner_test_candidate(&hole_punch_target),
+            )
+            .expect("hole-punch dial starts");
+        let held = wait_for_winner(&endpoint, target_peer, "the hole-punch winner", |_| true).await;
+        let held_id = held.stable_id();
+        assert!(
+            endpoint
+                .connection_snapshot_by_stable_id(&target_peer, held_id)
+                .is_none(),
+            "the hole-punch winner is not lifecycle-tracked"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let remote_side = loop {
+            if let Some(connection) = hole_punch_target
+                .connections
+                .iter()
+                .next()
+                .map(|entry| entry.value().clone())
+            {
+                break connection;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hole-punch target registers its side of the connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let mut in_flight = held.open_uni().await.expect("open a stream on H");
+        in_flight
+            .write_all(b"started before the replacement, ")
+            .await
+            .expect("write the first half");
+
+        let _unrelated = dial_accepted_coordination_for_test(
+            &endpoint,
+            held_addr,
+            coordination_target_addr,
+            target_peer,
+        )
+        .await;
+        let coordinator_winner =
+            wait_for_winner(&endpoint, target_peer, "the coordinator winner", |winner| {
+                winner.stable_id() != held_id
+            })
+            .await;
+        assert!(
+            coordinator_winner.close_reason().is_none(),
+            "the coordinator winner is open"
+        );
+        drop(coordinator_winner);
+        assert!(
+            held.close_reason().is_none(),
+            "#310 round 2: the coordinator insert must not close the displaced untracked \
+             winner the application still uses: {:?}",
+            held.close_reason()
+        );
+
+        in_flight
+            .write_all(b"finished after it")
+            .await
+            .expect("the in-flight stream keeps writing after the replacement");
+        in_flight.finish().expect("finish the in-flight stream");
+        let mut later = held
+            .open_uni()
+            .await
+            .expect("open a new stream on H after the replacement");
+        later
+            .write_all(b"opened after the replacement")
+            .await
+            .expect("write the new stream");
+        later.finish().expect("finish the new stream");
+
+        for expected in [
+            b"started before the replacement, finished after it".as_slice(),
+            b"opened after the replacement".as_slice(),
+        ] {
+            let mut received =
+                tokio::time::timeout(Duration::from_secs(10), remote_side.accept_uni())
+                    .await
+                    .expect("the stream reaches the remote side in time")
+                    .expect("the remote side accepts the stream");
+            let bytes = tokio::time::timeout(Duration::from_secs(10), received.read_to_end(1024))
+                .await
+                .expect("the stream completes in time")
+                .expect("the remote side reads the whole stream");
+            assert_eq!(
+                bytes, expected,
+                "H delivers its streams after the replacement"
+            );
+        }
+        assert!(held.close_reason().is_none(), "H is still open");
+
+        drop((in_flight, later, held, remote_side));
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        hole_punch_target
+            .shutdown()
+            .await
+            .expect("hole-punch target shutdown");
+        coordination_target
+            .shutdown()
+            .await
+            .expect("coordination target shutdown");
+    }
+
+    /// #310: a connection the lifecycle map tracks stays in the lifecycle's
+    /// custody when the coordinator insert displaces it from the winner map.
+    /// The insert must not close it: lifecycle-tracked generations are
+    /// retired by the lifecycle (for example, kept open to drain streams).
+    #[tokio::test]
+    async fn coordinator_dial_leaves_a_displaced_tracked_winner_open() {
+        let coordination_target =
+            NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("coordination target binds");
+        let coordination_target_addr = coordination_target
+            .shutdown_socket_address_for_test()
+            .expect("coordination target address");
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let held_addr = endpoint
+            .shutdown_socket_address_for_test()
+            .expect("endpoint address");
+        let target_peer = PeerId([0x3d; 32]);
+        let (tracked_server, tracked_client, tracked) = loopback_quic_connection().await;
+        let tracked_id = tracked.stable_id();
+        endpoint
+            .add_connection(target_peer, tracked.clone())
+            .expect("register the tracked winner");
+        assert!(
+            endpoint
+                .connection_snapshot_by_stable_id(&target_peer, tracked_id)
+                .is_some(),
+            "the registered winner is lifecycle-tracked"
+        );
+
+        let _unrelated = dial_accepted_coordination_for_test(
+            &endpoint,
+            held_addr,
+            coordination_target_addr,
+            target_peer,
+        )
+        .await;
+        let coordinator_winner =
+            wait_for_winner(&endpoint, target_peer, "the coordinator winner", |winner| {
+                winner.stable_id() != tracked_id
+            })
+            .await;
+        drop(coordinator_winner);
+
+        assert!(
+            tracked.close_reason().is_none(),
+            "the coordinator insert must not close a lifecycle-tracked connection"
+        );
+        assert!(
+            endpoint
+                .connection_snapshot_by_stable_id(&target_peer, tracked_id)
+                .is_some(),
+            "the displaced connection stays lifecycle-tracked"
+        );
+
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        coordination_target
+            .shutdown()
+            .await
+            .expect("coordination target shutdown");
+        drop(tracked);
+        tracked_client
+            .shutdown()
+            .await
+            .expect("tracked client shutdown");
+        tracked_server
+            .shutdown()
+            .await
+            .expect("tracked server shutdown");
+    }
+
+    /// #310: the hole-punch winner-map insert compares `stable_id`s: only a
+    /// different connection already in the slot makes the new one a
+    /// duplicate, and the connection in the slot is never closed or
+    /// replaced. It refuses after shutdown.
+    #[tokio::test]
+    async fn hole_punch_winner_insert_compares_stable_ids() {
+        let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("endpoint binds");
+        let peer = PeerId([0x3e; 32]);
+        let (first_server, first_client, first) = loopback_quic_connection().await;
+        let (second_server, second_client, second) = loopback_quic_connection().await;
+        let hole_punch = |connection: &InnerConnection| {
+            NatTraversalEndpoint::insert_hole_punch_winner_parts(
+                &endpoint.connections,
+                &endpoint.connection_lifecycle,
+                &endpoint.shutdown,
+                peer,
+                connection,
+            )
+        };
+        let winner_id = || {
+            endpoint
+                .connections
+                .get(&peer)
+                .map(|entry| entry.value().stable_id())
+        };
+
+        assert_eq!(hole_punch(&first), HolePunchWinnerInsert::Inserted);
+        assert_eq!(
+            hole_punch(&first),
+            HolePunchWinnerInsert::Inserted,
+            "the same connection is not a duplicate of itself"
+        );
+        assert_eq!(hole_punch(&second), HolePunchWinnerInsert::Duplicate);
+        assert_eq!(
+            winner_id(),
+            Some(first.stable_id()),
+            "the first winner keeps the slot"
+        );
+        assert!(
+            first.close_reason().is_none() && second.close_reason().is_none(),
+            "the insert closes nothing; the caller closes a duplicate"
+        );
+
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        assert_eq!(hole_punch(&first), HolePunchWinnerInsert::ShuttingDown);
+        assert_eq!(winner_id(), None, "nothing is inserted after shutdown");
+
+        drop((first, second));
+        for (client, server) in [(first_client, first_server), (second_client, second_server)] {
+            client.shutdown().await.expect("client shutdown");
+            server.shutdown().await.expect("server shutdown");
+        }
     }
 
     /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
