@@ -6205,6 +6205,9 @@ impl P2pEndpoint {
     /// pending, `false` otherwise. The `load` fast-path keeps the production
     /// case (counter always 0) to a single relaxed read on the hot accept
     /// path. See [`Self::inject_ack_response_drops_for_testing`].
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the MSRV (1.88) only
+    // has `fetch_update`.
+    #[allow(deprecated)]
     fn take_ack_response_drop(counter: &AtomicUsize) -> bool {
         if counter.load(Ordering::Relaxed) == 0 {
             return false;
@@ -8316,7 +8319,10 @@ impl P2pEndpoint {
     /// # Errors
     ///
     /// Returns [`EndpointError::ShuttingDown`] once the endpoint has begun
-    /// shutting down and the internal queue is drained.
+    /// shutting down and the internal queue is drained. [`Self::try_shutdown`]
+    /// closes the queue and discards (resets) the streams that were not
+    /// accepted yet: each one keeps its connection, and so the endpoint's UDP
+    /// socket, alive, and shutdown closes that connection anyway.
     pub async fn accept_bi(
         &self,
     ) -> Result<
@@ -8332,8 +8338,9 @@ impl P2pEndpoint {
         // when a handle is already queued, so already-buffered app streams are
         // drained before the shutdown signal wins. Only when the queue is
         // empty does shutdown fire — matching the documented "drains the
-        // queue" contract. When the last sender is dropped, `rx.recv()` returns
-        // `None` (also `ShuttingDown`).
+        // queue" contract, until `try_shutdown` discards what is left (#305).
+        // When the queue is closed or the last sender is dropped, `rx.recv()`
+        // returns `None` (also `ShuttingDown`).
         tokio::select! {
             biased;
             item = rx.recv() => match item {
@@ -9102,6 +9109,29 @@ impl P2pEndpoint {
             }
         }
 
+        // #305 round 2: close the application bidi queue and discard the
+        // inbound streams `accept_bi` has not taken. Each queued stream holds
+        // its connection, and with it the original UDP socket; the connection
+        // is closed below, so these streams could not carry data anyway.
+        // Closing the queue first makes a late enqueue fail and drop its
+        // streams. The lock wait is bounded: an `accept_bi` caller holding it
+        // returns as soon as it observes the cancelled shutdown token.
+        match timeout(crate::SHUTDOWN_DRAIN_TIMEOUT, self.app_bi_rx.lock()).await {
+            Ok(mut app_bi_rx) => {
+                app_bi_rx.close();
+                let mut discarded = 0usize;
+                while app_bi_rx.try_recv().is_ok() {
+                    discarded += 1;
+                }
+                if discarded > 0 {
+                    debug!("shutdown: discarded {discarded} unaccepted application bidi stream(s)");
+                }
+            }
+            Err(_) => {
+                warn!("shutdown: application bidi queue busy; queued streams were not discarded");
+            }
+        }
+
         // Disconnect all peers
         let peers: Vec<PeerId> = self.connected_peers.read().await.keys().copied().collect();
         for peer_id in peers {
@@ -9175,7 +9205,14 @@ impl P2pEndpoint {
 
                 let mut established = None;
                 for bootstrap in relay_candidates {
-                    match endpoint.inner.setup_proactive_relay(bootstrap).await {
+                    // #305 round 2: the setup owns a fresh relay dial and its
+                    // CONNECT-UDP exchange, which nothing else closes. Drop
+                    // it on shutdown so it cannot keep the original socket.
+                    let setup = tokio::select! {
+                        _ = endpoint.shutdown.cancelled() => return,
+                        setup = endpoint.inner.setup_proactive_relay(bootstrap) => setup,
+                    };
+                    match setup {
                         Ok(relay_addr) => {
                             info!(
                                 "Proactive relay active at {} via bootstrap {}",
@@ -9837,6 +9874,9 @@ impl P2pEndpoint {
                             stream_read_deadline,
                             async {
             let mut recv_stream = recv_stream;
+            // Owned by this pipeline so it can release the transport handles
+            // before it waits on `data_tx` (#305 round 2).
+            let connection = connection;
 
 
             // Uncancellable: drain the already-ACKed bytes. Cancelling here
@@ -9980,6 +10020,14 @@ impl P2pEndpoint {
             // pre-send pressure so saturation events surface as observable
             // counters even when the eventual `send().await` succeeds
             // after a brief block (X0X-0039).
+            //
+            // #305 round 2: the payload is fully read, so release the stream
+            // and connection handles first. A wait for channel capacity must
+            // not keep the connection, and with it the endpoint's original
+            // UDP socket, alive past shutdown. The payload is still delivered
+            // when the application drains `recv()`.
+            drop(recv_stream);
+            drop(connection);
             data_tx_diagnostics.observe_capacity(data_tx.capacity(), data_tx_capacity);
             if data_tx.send((peer_id, recv_generation, payload)).await.is_err() {
                 debug!(
@@ -13160,6 +13208,254 @@ mod tests {
         }
 
         listener.shutdown().await;
+    }
+
+    /// #305 holder 3: `ensure_shared_relay_endpoint` keeps a MASQUE relay
+    /// session (a `Connection` clone plus the CONNECT-UDP bind streams) in
+    /// `relay_sessions` and the shared relay endpoint. A live relay session
+    /// must not keep the original UDP socket alive past the shutdown settle.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_live_relay_session() {
+        let relay = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+        // The relay serves CONNECT-UDP on connections the application accepts.
+        let relay_accept = tokio::spawn({
+            let relay = relay.clone();
+            async move { while relay.accept().await.is_some() {} }
+        });
+
+        let endpoint = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        assert!(held_addr.ip().is_loopback(), "endpoint binds loopback only");
+        tokio::time::timeout(Duration::from_secs(10), endpoint.connect_addr(relay_addr))
+            .await
+            .expect("connect to relay does not time out")
+            .expect("connect to relay succeeds");
+        let (public_addr, relay_endpoint) = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.inner.ensure_shared_relay_endpoint(relay_addr),
+        )
+        .await
+        .expect("relay session setup does not time out")
+        .expect("relay session is established");
+        drop(relay_endpoint);
+        // A loopback relay binds its CONNECT-UDP data plane on loopback, so
+        // this test opens no wildcard listener.
+        assert!(
+            public_addr.is_some_and(|addr| addr.ip().is_loopback()),
+            "relay allocates a loopback public address: {public_addr:?}"
+        );
+        assert_eq!(
+            endpoint.inner.relay_sessions().len(),
+            1,
+            "the relay session must be live at shutdown"
+        );
+
+        let result = endpoint.try_shutdown().await;
+        assert!(
+            result.is_ok(),
+            "a live relay session must not retain the original socket: {result:?}"
+        );
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// An ephemeral loopback bind address: the endpoint binds it directly and
+    /// the test records the actual address, so no port is reserved and
+    /// released first.
+    fn loopback_ephemeral_addr() -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))
+    }
+
+    async fn loopback_endpoint_with(
+        configure: impl FnOnce(
+            crate::unified_config::P2pConfigBuilder,
+        ) -> crate::unified_config::P2pConfigBuilder,
+    ) -> P2pEndpoint {
+        let builder = P2pConfig::builder()
+            .bind_addr(loopback_ephemeral_addr())
+            .port_mapping_enabled(false);
+        let config = configure(builder).build().expect("valid config");
+        P2pEndpoint::new(config).await.expect("endpoint starts")
+    }
+
+    async fn assert_try_shutdown_releases(
+        endpoint: &P2pEndpoint,
+        held_addr: SocketAddr,
+        holder: &str,
+    ) {
+        let result = endpoint.try_shutdown().await;
+        assert!(
+            result.is_ok(),
+            "{holder} alive at shutdown must not retain the original socket: {result:?}"
+        );
+        assert_eq!(endpoint.inner.pending_socket_release_count_for_test(), 0);
+        let rebound = std::net::UdpSocket::bind(held_addr);
+        assert!(
+            rebound.is_ok(),
+            "{holder}: shutdown must make {held_addr} immediately bindable: {rebound:?}"
+        );
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #305 round 2 (P2-2): the proactive relay manager dials a relay
+    /// candidate outside the worker registry. A dial still in flight at
+    /// shutdown must not keep the original socket alive.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_proactive_relay_dial_in_flight() {
+        let silent_relay =
+            std::net::UdpSocket::bind(loopback_ephemeral_addr()).expect("bind silent relay");
+        let relay_addr = silent_relay.local_addr().expect("silent relay address");
+        let endpoint = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let quic = endpoint.inner.get_endpoint().expect("endpoint present");
+        let open_before = quic.open_connections();
+
+        endpoint.inner.force_symmetric_nat_for_test();
+        let _ = endpoint.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 0,
+            total: 1,
+        });
+        wait_until("the proactive relay dial is in flight", || {
+            quic.open_connections() > open_before
+        })
+        .await;
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "proactive relay dial").await;
+        drop(silent_relay);
+    }
+
+    /// #305 round 2 (P2-2): a fresh relay connection that completed QUIC but
+    /// is still waiting for the CONNECT-UDP response is owned only by the
+    /// proactive relay setup. It must not keep the original socket alive.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_proactive_relay_awaiting_response() {
+        // A bare NAT traversal endpoint completes the QUIC handshake but
+        // never reads the CONNECT-UDP request.
+        let mute_relay = crate::nat_traversal_api::NatTraversalEndpoint::new(
+            crate::nat_traversal_api::NatTraversalConfig {
+                bind_addr: Some(loopback_ephemeral_addr()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("mute relay binds");
+        let mute_quic = mute_relay.get_endpoint().expect("mute relay endpoint");
+        let relay_addr = mute_quic.local_addr().expect("mute relay address");
+        let endpoint = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+
+        endpoint.inner.force_symmetric_nat_for_test();
+        let _ = endpoint.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 0,
+            total: 1,
+        });
+        // `open_connections` also counts handshaking connections; wait until
+        // the relay lists an established one, so shutdown starts after the
+        // CONNECT-UDP exchange is underway, not during the dial.
+        wait_until("the relay handshake completes", || {
+            mute_quic.open_connections() > 0
+                && mute_relay
+                    .list_connections()
+                    .map(|connections| !connections.is_empty())
+                    .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            endpoint.inner.relay_sessions().is_empty(),
+            "the relay session is not published before the response"
+        );
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "relay awaiting response").await;
+        mute_relay.shutdown().await.expect("mute relay shutdown");
+    }
+
+    /// #305 round 2 (P2-3): a per-stream reader that has read a complete
+    /// message and waits for space in a full `data_tx` must not keep the
+    /// original socket alive at shutdown.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_reader_parked_on_full_data_channel() {
+        let endpoint = loopback_endpoint_with(|builder| builder.data_channel_capacity(1)).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let endpoint_id = endpoint.peer_id();
+        let accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { while endpoint.accept().await.is_some() {} }
+        });
+        let sender = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), sender.connect_addr(held_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("connect succeeds");
+
+        // The channel holds one payload; the second payload's reader is left
+        // waiting in `data_tx.send()` (the application never calls recv()).
+        for payload in [&b"fills the channel"[..], &b"waits for capacity"[..]] {
+            sender
+                .send(&endpoint_id, payload)
+                .await
+                .expect("send to the endpoint");
+        }
+        let diagnostics = || endpoint.data_channel_diagnostics();
+        wait_until("the second reader waits for channel capacity", || {
+            let snapshot = diagnostics();
+            snapshot.data_tx_depth == 1 && snapshot.data_tx_high_water_count >= 2
+        })
+        .await;
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "reader parked on data_tx").await;
+        accept.abort();
+        sender.shutdown().await;
+    }
+
+    /// #305 round 2 (P2-4): an inbound application bidi stream queued for
+    /// `accept_bi` holds its connection. If the application never accepts
+    /// it, shutdown must still release the original socket.
+    #[tokio::test]
+    async fn shutdown_releases_socket_with_queued_app_bidi_stream() {
+        let endpoint = loopback_endpoint_with(|builder| builder).await;
+        let held_addr = endpoint.local_addr().expect("endpoint local addr");
+        let endpoint_id = endpoint.peer_id();
+        let accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { while endpoint.accept().await.is_some() {} }
+        });
+        let opener = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), opener.connect_addr(held_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("connect succeeds");
+        let (opener_send, opener_recv) =
+            tokio::time::timeout(Duration::from_secs(10), opener.open_bi(&endpoint_id))
+                .await
+                .expect("open_bi does not time out")
+                .expect("open_bi succeeds");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while endpoint.app_bi_rx.lock().await.is_empty() {
+            assert!(Instant::now() < deadline, "the app bidi stream is queued");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_try_shutdown_releases(&endpoint, held_addr, "queued app bidi stream").await;
+        accept.abort();
+        drop((opener_send, opener_recv));
+        opener.shutdown().await;
     }
 
     #[tokio::test]

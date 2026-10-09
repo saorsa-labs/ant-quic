@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.55] - 2026-10-08
+
+### Fixed
+
+- **Shutdown releases the original UDP socket (#305).** `NatTraversalEndpoint`
+  shutdown left handles that kept the socket alive, so the socket-release settle
+  failed with `weak_socket_owner_still_live`. Embedders that relaunch a node in
+  the same process could then not rebind. Shutdown now:
+  - tracks and joins hole-punch coordinator dials and other detached dial tasks;
+  - clears NAT-traversal session connection handles, relay sessions and the
+    shared relay endpoint, and drains the relay endpoint with the main endpoint
+    inside the existing budget;
+  - sweeps the winner map under the lifecycle write lock, so a registration that
+    races shutdown is refused or removed;
+  - cancels in-flight proactive relay setup;
+  - drops per-stream reader handles before a reader waits on application
+    back-pressure.
+- A relay that advertises a loopback address binds its CONNECT-UDP data plane on
+  loopback.
+
+### Changed
+
+- `try_shutdown` (and the `shutdown` wrappers) closes the application
+  bidirectional-stream queue and discards (resets) streams that were not yet
+  accepted. After the shutdown token is cancelled, `accept_bi` still drains
+  buffered streams until that discard; afterwards it returns
+  `EndpointError::ShuttingDown` (`NodeError::Endpoint` for `Node`). Streams
+  already returned by `accept_bi` are unaffected.
+
+
+## [0.27.54] - 2026-09-28
+
+### Fixed
+
+- Count sends to unconnected peers while logging them at DEBUG at most once
+  per peer per minute. A full bounded peer table preserves active windows and
+  uses one aggregate overflow log window for untracked peers. Other send
+  failures remain WARN.
+
+
 ## [0.27.53] - 2026-09-21
 
 ### Fixed

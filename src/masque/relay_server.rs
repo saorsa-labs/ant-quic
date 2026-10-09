@@ -511,8 +511,12 @@ impl MasqueRelayServer {
 
         // Bind a real UDP socket for this session's data plane.
         // Bind to INADDR_ANY / IN6ADDR_ANY with OS-assigned port, then advertise
-        // our public IP with the bound port.
-        let bind_addr: SocketAddr = if client_addr.is_ipv4() {
+        // our public IP with the bound port. A relay that advertises a loopback
+        // address cannot be reached from outside the host, so it binds that
+        // loopback address instead of opening a wildcard listener (#305).
+        let bind_addr: SocketAddr = if public_ip.is_loopback() {
+            SocketAddr::new(public_ip, 0)
+        } else if client_addr.is_ipv4() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
@@ -1313,6 +1317,37 @@ mod tests {
 
         assert_eq!(server.public_address(), public_addr);
         assert_eq!(server.session_count().await, 0);
+    }
+
+    /// #305 round 2: a relay that advertises a loopback address cannot be
+    /// reached from outside the host, so its CONNECT-UDP data plane binds
+    /// loopback instead of the wildcard address.
+    #[tokio::test]
+    async fn loopback_relay_binds_data_plane_on_loopback() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            SocketAddr::new(loopback, 9000),
+        );
+        server
+            .handle_connect_request(
+                &ConnectUdpRequest::bind_any(),
+                SocketAddr::new(loopback, 12345),
+            )
+            .await
+            .expect("connect request");
+        let session_id = server.active_session_ids().await[0];
+        let sessions = server.sessions.read().await;
+        let session = sessions.get(&session_id).expect("session present");
+        let bound = session
+            .udp_socket()
+            .expect("session socket")
+            .local_addr()
+            .expect("socket local addr");
+        assert!(
+            bound.ip().is_loopback(),
+            "a loopback relay must not bind its data plane on {bound}"
+        );
     }
 
     #[tokio::test]
