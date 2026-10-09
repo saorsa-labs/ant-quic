@@ -487,6 +487,15 @@ pub(crate) struct PromotedConnection {
     pub(crate) connection: InnerConnection,
 }
 
+/// #313: a winner the inner layer put in the winner map without starting an
+/// application reader for it (a raw hole-punch or accepted-coordination
+/// winner, or a materialized registration). The p2p layer only starts a
+/// reader for it; it publishes no peer state and no lifecycle event.
+pub(crate) struct ReaderAdoption {
+    pub(crate) peer_id: PeerId,
+    pub(crate) connection: InnerConnection,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectionCanonicalSortKey {
     connection_family_id: [u8; 32],
@@ -1139,6 +1148,9 @@ pub struct NatTraversalEndpoint {
     /// Arc would leak the whole endpoint (#277 round 2) — the sender keeps
     /// only the channel alive.
     connection_promoted_tx: ParkingRwLock<Option<mpsc::UnboundedSender<PromotedConnection>>>,
+    /// #313: p2p-layer receiver for winners that need a reader (see
+    /// [`ReaderAdoption`]). Installed once at p2p construction.
+    reader_adoption_tx: ParkingRwLock<Option<mpsc::UnboundedSender<ReaderAdoption>>>,
     /// #368: orphan connections closed by repromotion refusal or the janitor.
     orphan_connections_closed: std::sync::atomic::AtomicU64,
     /// Monotonic local generation counter used for tracked connections.
@@ -2557,6 +2569,7 @@ impl NatTraversalEndpoint {
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
+            reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -3085,6 +3098,7 @@ impl NatTraversalEndpoint {
             connection_lifecycle: Arc::new(ParkingRwLock::new(HashMap::new())),
             reader_liveness_probe: ParkingRwLock::new(None),
             connection_promoted_tx: ParkingRwLock::new(None),
+            reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
             local_peer_id: Self::generate_local_peer_id(),
@@ -4930,6 +4944,7 @@ impl NatTraversalEndpoint {
                     let observed_address_tx = self.observed_address_tx.clone();
                     let shutdown_flag = Arc::clone(&self.shutdown);
                     let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connection_timeout = self
                         .timeout_config
                         .nat_traversal
@@ -4956,6 +4971,7 @@ impl NatTraversalEndpoint {
                                 event_callback.clone(),
                                 Arc::clone(&shutdown_flag),
                                 Arc::clone(&sweep_lock_source),
+                                reader_adoption_tx.clone(),
                                 connection_timeout,
                                 target_peer,
                                 addr,
@@ -5052,6 +5068,7 @@ impl NatTraversalEndpoint {
                         let observed_address_tx = self.observed_address_tx.clone();
                         let shutdown_flag = Arc::clone(&self.shutdown);
                         let sweep_lock_source = Arc::clone(&self.connection_lifecycle);
+                        let reader_adoption_tx = self.reader_adoption_sender();
                         let connection_timeout = self
                             .timeout_config
                             .nat_traversal
@@ -5075,6 +5092,7 @@ impl NatTraversalEndpoint {
                                     event_callback.clone(),
                                     Arc::clone(&shutdown_flag),
                                     Arc::clone(&sweep_lock_source),
+                                    reader_adoption_tx.clone(),
                                     connection_timeout,
                                     initiator_peer,
                                     addr,
@@ -5244,6 +5262,8 @@ impl NatTraversalEndpoint {
         next_connection_generation: &AtomicU64,
         emitted_established_events: &dashmap::DashSet<PeerId>,
         shutting_down: &AtomicBool,
+        // #313: the p2p layer's reader-adoption receiver (see `ReaderAdoption`).
+        reader_adoption_tx: Option<&mpsc::UnboundedSender<ReaderAdoption>>,
         connection: InnerConnection,
     ) -> Result<(PeerId, InnerConnection), NatTraversalError> {
         let peer_id = Self::derive_peer_id_from_connection(&connection).ok_or_else(|| {
@@ -5263,8 +5283,14 @@ impl NatTraversalEndpoint {
             connection.clone(),
         );
 
+        // #313: no caller of this registrar starts an application reader, so
+        // signal the handle actually returned (the new winner, or the existing
+        // winner after a rejection); the p2p reader start is idempotent.
         match outcome {
-            ConnectionRegistrationOutcome::Live { .. } => Ok((peer_id, connection)),
+            ConnectionRegistrationOutcome::Live { .. } => {
+                Self::signal_reader_adoption(reader_adoption_tx, peer_id, &connection);
+                Ok((peer_id, connection))
+            }
             ConnectionRegistrationOutcome::Refused => Err(NatTraversalError::NetworkError(
                 "endpoint is shutting down".to_string(),
             )),
@@ -5278,6 +5304,7 @@ impl NatTraversalEndpoint {
                                 .to_string(),
                         )
                     })?;
+                Self::signal_reader_adoption(reader_adoption_tx, peer_id, &existing);
                 Ok((peer_id, existing))
             }
         }
@@ -5405,6 +5432,7 @@ impl NatTraversalEndpoint {
                     let envelope = envelope.clone();
                     let traversal_event_notify = self.traversal_event_notify.clone();
                     let dial_shutdown = self.shutdown.clone();
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     // #305: tracked so shutdown cancels an in-flight
@@ -5420,6 +5448,7 @@ impl NatTraversalEndpoint {
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
                                         dial_shutdown.as_ref(),
+                                        reader_adoption_tx.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -8068,6 +8097,62 @@ impl NatTraversalEndpoint {
         *self.connection_promoted_tx.write() = Some(tx);
     }
 
+    /// #313: install the p2p-layer receiver for winners that need a reader.
+    /// Must be called once at construction, before any connection churn.
+    pub(crate) fn set_reader_adoption_sender(&self, tx: mpsc::UnboundedSender<ReaderAdoption>) {
+        *self.reader_adoption_tx.write() = Some(tx);
+    }
+
+    /// #313: the installed reader-adoption sender, cloned for a task that
+    /// produces winners.
+    fn reader_adoption_sender(&self) -> Option<mpsc::UnboundedSender<ReaderAdoption>> {
+        self.reader_adoption_tx.read().clone()
+    }
+
+    /// #313: ask the p2p layer to start a reader for a winner this layer
+    /// published without one. The signal is sent only when the connection's
+    /// authenticated identity is `peer_id`; otherwise nothing is sent and
+    /// nothing is closed, so a mismatched connection is never adopted under
+    /// another peer's key.
+    fn signal_reader_adoption(
+        tx: Option<&mpsc::UnboundedSender<ReaderAdoption>>,
+        peer_id: PeerId,
+        connection: &InnerConnection,
+    ) {
+        let Some(tx) = tx else {
+            return;
+        };
+        if Self::derive_peer_id_from_connection(connection) != Some(peer_id) {
+            debug!(
+                peer_id = ?peer_id,
+                stable_id = connection.stable_id(),
+                "not adopting a reader: authenticated identity does not match the winner key"
+            );
+            return;
+        }
+        let _ = tx.send(ReaderAdoption {
+            peer_id,
+            connection: connection.clone(),
+        });
+    }
+
+    /// #313 test seam: deliver an adoption signal for `connection` under
+    /// `peer_id` straight to the p2p consumer, bypassing the producer-side
+    /// identity check.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn send_reader_adoption_for_test(
+        &self,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) {
+        if let Some(tx) = self.reader_adoption_tx.read().as_ref() {
+            let _ = tx.send(ReaderAdoption {
+                peer_id,
+                connection,
+            });
+        }
+    }
+
     /// #277 round 2: classify a tracked generation's transport (Direct /
     /// Relay). Relay registrations mark their generation right after
     /// registering; promotions then re-register the survivor with its real
@@ -9415,6 +9500,7 @@ impl NatTraversalEndpoint {
             self.next_connection_generation.as_ref(),
             self.emitted_established_events.as_ref(),
             self.shutdown.as_ref(),
+            self.reader_adoption_sender().as_ref(),
             connection,
         )
     }
@@ -10437,6 +10523,7 @@ impl NatTraversalEndpoint {
                         // task cannot insert past the sweep.
                         let punch_shutdown = self.shutdown.clone();
                         let punch_lifecycle = self.connection_lifecycle.clone();
+                        let reader_adoption_tx = self.reader_adoption_sender();
                         let peer_id_clone = peer_id;
                         let address = candidate.address;
 
@@ -10481,7 +10568,16 @@ impl NatTraversalEndpoint {
                                         peer_id_clone,
                                         &connection,
                                     ) {
-                                        HolePunchWinnerInsert::Inserted => {}
+                                        HolePunchWinnerInsert::Inserted => {
+                                            // #313: no waiter may be running for
+                                            // this winner; ask the p2p layer for
+                                            // its reader (idempotent there).
+                                            Self::signal_reader_adoption(
+                                                reader_adoption_tx.as_ref(),
+                                                peer_id_clone,
+                                                &connection,
+                                            );
+                                        }
                                         HolePunchWinnerInsert::Duplicate => {
                                             debug!(
                                                 "Connection already exists for peer {:?}, discarding duplicate from {}",
@@ -11544,6 +11640,7 @@ impl NatTraversalEndpoint {
                     let target_peer_id = peer_id;
                     let external_addr = our_external_address;
                     let dial_shutdown = self.shutdown.clone();
+                    let reader_adoption_tx = self.reader_adoption_sender();
                     let connect_timeout = Self::coordination_connect_timeout(&self.config);
 
                     // #305: tracked so shutdown cancels an in-flight
@@ -11562,6 +11659,7 @@ impl NatTraversalEndpoint {
                                         next_connection_generation.as_ref(),
                                         emitted_established_events.as_ref(),
                                         dial_shutdown.as_ref(),
+                                        reader_adoption_tx.as_ref(),
                                         connection,
                                     ) {
                                         Ok(result) => result,
@@ -12140,6 +12238,7 @@ impl NatTraversalEndpoint {
             self.event_callback.clone(),
             Arc::clone(&self.shutdown),
             Arc::clone(&self.connection_lifecycle),
+            self.reader_adoption_sender(),
             self.timeout_config
                 .nat_traversal
                 .connection_establishment_timeout,
@@ -12164,6 +12263,8 @@ impl NatTraversalEndpoint {
         // shutdown sweep).
         shutdown_flag: Arc<AtomicBool>,
         sweep_lock_source: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
+        // #313: the p2p layer's reader-adoption receiver (see `ReaderAdoption`).
+        reader_adoption_tx: Option<mpsc::UnboundedSender<ReaderAdoption>>,
         connection_timeout: Duration,
         peer_id: PeerId,
         candidate_address: SocketAddr,
@@ -12224,6 +12325,10 @@ impl NatTraversalEndpoint {
             }
             connections.insert(peer_id, connection.clone());
         }
+        // #313: this winner has no application reader yet, and the waiter that
+        // finalised an earlier winner may already have returned. Ask the p2p
+        // layer for its reader; the displaced winner keeps its own.
+        Self::signal_reader_adoption(reader_adoption_tx.as_ref(), peer_id, &connection);
         if let Some(mut entry) = active_sessions.get_mut(&peer_id) {
             entry.value_mut().session_state.connection = Some(connection.clone());
         }
