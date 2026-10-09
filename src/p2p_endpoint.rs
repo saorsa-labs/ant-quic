@@ -6846,15 +6846,19 @@ impl P2pEndpoint {
         }
 
         let result = tokio::select! {
-            r = self.inner.accept_connection() => r,
+            r = self.inner.accept_connection_with_outcome() => r,
             _ = self.shutdown.cancelled() => return None,
         };
 
         match result {
-            Ok((peer_id, connection)) => {
+            Ok((peer_id, connection, accepted_registration)) => {
                 let remote_addr = connection.remote_address();
                 let mut resolved_peer_id = peer_id;
-                let mut registration = None;
+                // #307: keep the inbound registration's outcome. If this
+                // connection superseded a live generation, the drain-grace
+                // close below must run for it, as it does when an outbound
+                // dial supersedes one. A re-keyed registration replaces it.
+                let mut registration = Some(accepted_registration);
 
                 if let Some(actual_peer_id) = self
                     .inner
@@ -17187,6 +17191,125 @@ mod tests {
         }
 
         a.shutdown().await;
+    }
+
+    /// #307: a connection superseded by an INBOUND registration must be
+    /// closed with the reserved `Superseded` code after the drain grace, as
+    /// one superseded by an outbound dial is. Before the fix the inbound
+    /// accept path dropped `superseded_generation`, so `accept` never
+    /// scheduled the close: A marked the old generation `Superseded` but
+    /// left the QUIC connection open, and A's peer on it never saw a close.
+    ///
+    /// Construction (deterministic): B and B' are two endpoints with one
+    /// identity. B dials A (C1), then B' dials A (C2). At A both are inbound
+    /// with the same initiator, so they are one family and the newer
+    /// generation, C2, always wins. A is the only endpoint that holds both
+    /// connections, so only A can close C1. B holds only C1 and never closes
+    /// it, so B's view of C1 shows whether A closed it and with which code.
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_supersede_closes_old_generation_after_drain_grace() {
+        async fn build_endpoint(
+            keypair: Option<(crate::MlDsaPublicKey, crate::MlDsaSecretKey)>,
+        ) -> P2pEndpoint {
+            let mut builder = crate::unified_config::P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false);
+            if let Some((public_key, secret_key)) = keypair {
+                builder = builder.keypair(public_key, secret_key);
+            }
+            P2pEndpoint::new(builder.build().expect("test config"))
+                .await
+                .expect("endpoint binds")
+        }
+        fn spawn_accept_loop(endpoint: &P2pEndpoint) -> tokio::task::JoinHandle<()> {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move { while endpoint.accept().await.is_some() {} })
+        }
+
+        let (b_public_key, b_secret_key) = generate_ml_dsa_keypair().expect("keypair");
+        let a = build_endpoint(None).await;
+        let b = build_endpoint(Some((b_public_key.clone(), b_secret_key.clone()))).await;
+        let accept_a = spawn_accept_loop(&a);
+        let accept_b = spawn_accept_loop(&b);
+        let a_addr = localhost_addr(a.local_addr().expect("a bound"));
+        let a_id = a.peer_id();
+        let b_id = b.peer_id();
+
+        // C1: B -> A. Wait until A has registered it inbound.
+        tokio::time::timeout(Duration::from_secs(10), b.connect_addr(a_addr))
+            .await
+            .expect("C1 connect timeout")
+            .expect("C1 connect");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let a_view_c1 = loop {
+            if let Some(connection) = a.get_quic_connection(&b_id).expect("a lookup") {
+                break connection;
+            }
+            assert!(Instant::now() < deadline, "A never registered C1");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let b_view_c1 = b
+            .get_quic_connection(&a_id)
+            .expect("b lookup")
+            .expect("B view of C1");
+
+        // C2: B' -> A, same initiator family at A, so C2 supersedes C1.
+        let b2 = build_endpoint(Some((b_public_key, b_secret_key))).await;
+        assert_eq!(b2.peer_id(), b_id, "B' must have B's identity");
+        let accept_b2 = spawn_accept_loop(&b2);
+        tokio::time::timeout(Duration::from_secs(10), b2.connect_addr(a_addr))
+            .await
+            .expect("C2 connect timeout")
+            .expect("C2 connect");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let live = a.get_quic_connection(&b_id).expect("a lookup");
+            if live.is_some_and(|connection| connection.stable_id() != a_view_c1.stable_id()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "C2 never superseded C1 at A");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A must close C1 once the drain grace ends. The bound is generous
+        // for a loaded runtime and stays below the 30 s idle timeout.
+        let deadline = Instant::now() + SUPERSEDED_READER_DRAIN_GRACE + Duration::from_secs(15);
+        let close_reason = loop {
+            if let Some(close_reason) = b_view_c1.close_reason() {
+                break close_reason;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "A never closed C1 after an inbound connection superseded it"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        match close_reason {
+            crate::ConnectionError::ApplicationClosed(frame) => assert_eq!(
+                ConnectionCloseReason::from_app_error_code(frame.error_code),
+                Some(ConnectionCloseReason::Superseded),
+                "C1 must be closed with the reserved Superseded code"
+            ),
+            other => panic!("expected an application close of C1, got {other:?}"),
+        }
+
+        // The winner stays open.
+        let b2_view_c2 = b2
+            .get_quic_connection(&a_id)
+            .expect("b2 lookup")
+            .expect("B' keeps C2");
+        assert!(b2_view_c2.close_reason().is_none(), "C2 must stay open");
+
+        a.shutdown().await;
+        b.shutdown().await;
+        b2.shutdown().await;
+        accept_a.abort();
+        accept_b.abort();
+        accept_b2.abort();
     }
 
     /// #286: an inbound handshake completing DURING `shutdown()` — after the

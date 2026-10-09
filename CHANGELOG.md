@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A connection superseded by an inbound connection is now closed (#307).**
+  When an inbound connection won the supersede decision, the accept path
+  dropped the superseded generation, so `P2pEndpoint::accept` never started
+  its drain-grace close. The old connection stayed open until its peer closed
+  it or it timed out, although the lifecycle events already reported it
+  closed. The accept path now closes it with the reserved `Superseded` code
+  after the 5 s drain grace, as the outbound dial path does.
+
 
 ## [0.27.56] - 2026-10-09
 

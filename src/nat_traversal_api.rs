@@ -385,7 +385,7 @@ const MAX_ACTIVE_TRAVERSAL_SESSIONS: usize = 100;
 
 /// Hard cap on incoming connections queued in `pending_accepts` awaiting
 /// `accept_connection()` (audit #215). Entries are only produced after a
-/// completed, authenticated handshake and are tiny (`PendingAccept` is 40
+/// completed, authenticated handshake and are tiny (`PendingAccept` is 56
 /// bytes), but an application that never drains the queue would otherwise let
 /// it grow with every inbound connection.
 const MAX_PENDING_ACCEPTS: usize = 1024;
@@ -394,6 +394,10 @@ const MAX_PENDING_ACCEPTS: usize = 1024;
 struct PendingAccept {
     peer_id: PeerId,
     generation: u64,
+    /// The live generation this inbound registration superseded, if any.
+    /// The accepting caller schedules its drain-grace close, as the outbound
+    /// dial path does for the generation it supersedes (#307).
+    superseded_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3259,10 +3263,11 @@ impl NatTraversalEndpoint {
                                     peer_id,
                                     conn.clone(),
                                 );
-                                let generation = match outcome {
-                                    ConnectionRegistrationOutcome::Live { generation, .. } => {
-                                        generation
-                                    }
+                                let (generation, superseded_generation) = match outcome {
+                                    ConnectionRegistrationOutcome::Live {
+                                        generation,
+                                        superseded_generation,
+                                    } => (generation, superseded_generation),
                                     ConnectionRegistrationOutcome::Rejected {
                                         winner_generation,
                                     } => {
@@ -3284,6 +3289,7 @@ impl NatTraversalEndpoint {
                                     PendingAccept {
                                         peer_id,
                                         generation,
+                                        superseded_generation,
                                     },
                                 );
                                 if let Some(ref tx) = relay_event_tx {
@@ -5883,15 +5889,18 @@ impl NatTraversalEndpoint {
                                     connection.clone(),
                                 );
 
-                                let generation = match outcome {
-                                    ConnectionRegistrationOutcome::Live { generation, .. } => {
+                                let (generation, superseded_generation) = match outcome {
+                                    ConnectionRegistrationOutcome::Live {
+                                        generation,
+                                        superseded_generation,
+                                    } => {
                                         #[cfg(all(test, feature = "network-discovery"))]
                                         if let Some(gate) = &registration_gate {
                                             gate.record_registrar_outcome(
                                                 GatedRegistrarOutcome::LiveInserted,
                                             );
                                         }
-                                        generation
+                                        (generation, superseded_generation)
                                     }
                                     ConnectionRegistrationOutcome::Rejected {
                                         winner_generation,
@@ -5923,6 +5932,7 @@ impl NatTraversalEndpoint {
                                     PendingAccept {
                                         peer_id,
                                         generation,
+                                        superseded_generation,
                                     },
                                 );
                                 incoming_notify.notify_one();
@@ -7000,6 +7010,22 @@ impl NatTraversalEndpoint {
     /// observer event only. If the application does not drain the queue, the
     /// oldest queued connections are evicted and will not be returned here.
     pub async fn accept_connection(&self) -> Result<(PeerId, InnerConnection), NatTraversalError> {
+        self.accept_connection_with_outcome()
+            .await
+            .map(|(peer_id, connection, _)| (peer_id, connection))
+    }
+
+    /// [`Self::accept_connection`], plus the registration outcome recorded
+    /// when the inbound connection was registered.
+    ///
+    /// The outcome is always `Live`. Its `superseded_generation` names the
+    /// live generation this inbound connection replaced, so the caller can
+    /// schedule that generation's drain-grace close. Without it, a connection
+    /// superseded by an inbound winner stayed open until its peer closed it
+    /// or it idled out (#307).
+    pub(crate) async fn accept_connection_with_outcome(
+        &self,
+    ) -> Result<(PeerId, InnerConnection, ConnectionRegistrationOutcome), NatTraversalError> {
         debug!("Waiting for incoming connection via accept queue...");
         loop {
             // Check shutdown
@@ -7034,7 +7060,14 @@ impl NatTraversalEndpoint {
                     "Retrieved accepted connection from peer {:?}",
                     pending.peer_id
                 );
-                return Ok((pending.peer_id, connection));
+                return Ok((
+                    pending.peer_id,
+                    connection,
+                    ConnectionRegistrationOutcome::Live {
+                        generation: pending.generation,
+                        superseded_generation: pending.superseded_generation,
+                    },
+                ));
             }
 
             self.incoming_notify.notified().await;
@@ -14454,6 +14487,7 @@ mod tests {
                 PendingAccept {
                     peer_id: PeerId(id),
                     generation: i as u64,
+                    superseded_generation: None,
                 },
             );
         }
@@ -15855,10 +15889,12 @@ mod tests {
             queue.push_back(PendingAccept {
                 peer_id: peer_a,
                 generation: 1,
+                superseded_generation: None,
             });
             queue.push_back(PendingAccept {
                 peer_id: peer_b,
                 generation: 1,
+                superseded_generation: None,
             });
         }
 
