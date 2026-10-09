@@ -1406,7 +1406,7 @@ impl ConnectionRef {
                 connected: false,
                 timer: None,
                 timer_deadline: None,
-                conn_events,
+                conn_events: Some(conn_events),
                 endpoint_events,
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
@@ -1493,7 +1493,9 @@ pub(crate) struct State {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::Receiver<ConnectionEvent>,
+    /// Events from the endpoint. `None` once the driver's exit cleanup has
+    /// dropped the receiver (#309).
+    conn_events: Option<mpsc::Receiver<ConnectionEvent>>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
@@ -1649,7 +1651,11 @@ impl State {
         cx: &mut Context,
     ) -> Result<(), ConnectionError> {
         loop {
-            match self.conn_events.poll_recv(cx) {
+            // After the exit cleanup no receiver is left and nothing arrives.
+            let Some(conn_events) = self.conn_events.as_mut() else {
+                return Ok(());
+            };
+            match conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
                     self.socket = Some(socket);
                     self.udp_sender = self.socket.as_ref().map(|socket| socket.create_sender());
@@ -1820,19 +1826,22 @@ impl State {
 
     /// #309: the driver has exited, so the connection sends nothing more.
     /// Let go of every reference to a UDP socket: the socket, its sender, any
-    /// buffered transmit, and the event queue. The endpoint can queue a
-    /// `Rebind` (which carries a socket) after the driver's last receive poll,
-    /// so the queue is closed, which makes later sends fail, and the events
-    /// already in it are discarded. Application handles (and the tasks that
-    /// hold them) can outlive the driver, and they must not keep a socket and
-    /// its descriptor open.
+    /// buffered transmit, and the event queue. The endpoint can send a
+    /// `Rebind` (which carries a socket) after the driver's last receive poll.
+    /// Closing and draining the queue is not enough: `try_send` reserves
+    /// capacity first and enqueues afterwards, so a send in flight can
+    /// enqueue after the drain. Dropping the receiver closes the queue and
+    /// discards its events, and a late event then belongs to the channel,
+    /// which is freed when the endpoint retires its sender, not to this
+    /// connection. Application handles (and the tasks that hold them) can
+    /// outlive the driver, and they must not keep a socket and its
+    /// descriptor open.
     fn release_socket(&mut self) {
         self.driver_exited = true;
         self.buffered_transmit = None;
         self.udp_sender = None;
         self.socket = None;
-        self.conn_events.close();
-        while self.conn_events.try_recv().is_ok() {}
+        self.conn_events = None;
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
