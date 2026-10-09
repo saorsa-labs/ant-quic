@@ -390,6 +390,14 @@ struct ReaderTaskHandle {
     /// slot. Exit events carry it, so only the owning task's exit removes the
     /// handle or runs lifecycle cleanup.
     owner_id: u64,
+    /// #313: where this owner record is in its lifecycle. The record exists
+    /// from reservation until the task has terminated AND every owner-
+    /// sensitive side effect of its exit is done; while it exists, no other
+    /// reader can be admitted for the same connection.
+    state: ReaderOwnerState,
+    /// #313: set by the task immediately before it sends its exit event, so
+    /// a terminated task with an exit still to process is never reaped.
+    exit_sent: Arc<std::sync::atomic::AtomicBool>,
     /// Cooperative shutdown signal. Honored only at stream-accept boundaries,
     /// so an in-flight `read_to_end()` always completes before the task exits.
     /// This prevents silent loss of already-ACKed bytes during connection
@@ -436,23 +444,71 @@ enum ReaderStart {
     Started,
     /// A running reader task already owns it; nothing was spawned.
     AlreadyOwned,
-    /// Adoption only: the connection is closed or no longer Live.
+    /// The connection's previous owner is still stopping or exiting; nothing
+    /// was spawned. Admission waits until that record is reaped.
+    Blocked,
+    /// Adoption only: the connection is closed or no longer Live, or the
+    /// endpoint is shutting down.
     NotStarted,
 }
 
-/// #313: drop handles of reader tasks for `conn_stable_id` that finished
-/// without their exit being processed (a panic or an abort sends no exit
-/// event), so a dead task never counts as the connection's reader owner.
-fn prune_finished_reader_handles(
-    handles: &mut HashMap<PeerId, Vec<ReaderTaskHandle>>,
-    conn_stable_id: usize,
-) {
+/// #313: lifecycle of a reader owner record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderOwnerState {
+    /// The reader task is running (or has just ended and its exit is queued).
+    Running,
+    /// Teardown (peer cleanup or shutdown) cancelled and aborted the task;
+    /// abort is a request, so the task may still run until `is_finished()`.
+    Stopping,
+    /// The exit handler is running this owner's exit side effects.
+    Exiting,
+    /// The exit side effects are done; the record goes once the task has
+    /// terminated.
+    Exited,
+}
+
+impl ReaderTaskHandle {
+    /// A reader that counts as running: counted, probed and cancellable.
+    fn is_running(&self) -> bool {
+        self.state == ReaderOwnerState::Running
+    }
+
+    /// The record may be dropped: the task has terminated, and its exit, if
+    /// it sent one, has been fully processed. A task that ended without an
+    /// exit event (panic, abort) is reaped once it has terminated.
+    fn is_reapable(&self) -> bool {
+        if !self.abort_handle.is_finished() {
+            return false;
+        }
+        match self.state {
+            ReaderOwnerState::Exited => true,
+            ReaderOwnerState::Exiting => false,
+            ReaderOwnerState::Running | ReaderOwnerState::Stopping => {
+                !self.exit_sent.load(Ordering::SeqCst)
+            }
+        }
+    }
+}
+
+/// #313: drop every reapable owner record.
+fn reap_reader_handles(handles: &mut HashMap<PeerId, Vec<ReaderTaskHandle>>) {
     for entries in handles.values_mut() {
-        entries.retain(|handle| {
-            handle.conn_stable_id != conn_stable_id || !handle.abort_handle.is_finished()
-        });
+        entries.retain(|handle| !handle.is_reapable());
     }
     handles.retain(|_, entries| !entries.is_empty());
+}
+
+/// #313: teardown of a peer's readers. Running owners are cancelled and
+/// aborted and marked Stopping; their records stay until reaped, so no other
+/// reader can be admitted for those connections before they have stopped.
+fn stop_peer_readers(handles: &mut HashMap<PeerId, Vec<ReaderTaskHandle>>, peer_id: &PeerId) {
+    if let Some(entries) = handles.get_mut(peer_id) {
+        for handle in entries.iter_mut().filter(|handle| handle.is_running()) {
+            handle.state = ReaderOwnerState::Stopping;
+            handle.cancel.cancel();
+            handle.abort_handle.abort();
+        }
+    }
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
@@ -2819,20 +2875,16 @@ async fn do_cleanup_connection(
     // Tear down all background readers for this peer. Cooperative cancel first
     // (allows any in-flight `read_to_end()` to complete and deliver its bytes),
     // then `abort()` as a backstop in case a reader is wedged.
-    let handles = if if_unroutable {
+    //
+    // #313: the readers' records are kept (Stopping) until each task has
+    // terminated, so no reader can be admitted for those connections while a
+    // torn-down reader may still accept or dispatch streams.
+    {
         let mut handles = reader_handles.write().await;
-        if inner.is_peer_connected(peer_id) {
+        if if_unroutable && inner.is_peer_connected(peer_id) {
             return false;
         }
-        handles.remove(peer_id)
-    } else {
-        reader_handles.write().await.remove(peer_id)
-    };
-    if let Some(handles) = handles {
-        for handle in handles {
-            handle.cancel.cancel();
-            handle.abort_handle.abort();
-        }
+        stop_peer_readers(&mut handles, peer_id);
     }
 
     let removed = if if_unroutable {
@@ -8668,14 +8720,20 @@ impl P2pEndpoint {
             .read()
             .await
             .values()
-            .map(Vec::len)
-            .sum()
+            .flatten()
+            .filter(|handle| handle.is_running())
+            .count()
     }
 
     /// Number of distinct peers in the reader-handles map.
     #[doc(hidden)]
     pub async fn reader_handle_peer_count(&self) -> usize {
-        self.reader_handles.read().await.len()
+        self.reader_handles
+            .read()
+            .await
+            .values()
+            .filter(|handles| handles.iter().any(ReaderTaskHandle::is_running))
+            .count()
     }
 
     /// #313 test seam: the key the reader-start instrumentation uses for
@@ -8695,7 +8753,9 @@ impl P2pEndpoint {
             .get(peer_id)
             .is_some_and(|handles| {
                 handles.iter().any(|handle| {
-                    handle.conn_stable_id == stable_id && !handle.abort_handle.is_finished()
+                    handle.is_running()
+                        && handle.conn_stable_id == stable_id
+                        && !handle.abort_handle.is_finished()
                 })
             })
     }
@@ -8707,7 +8767,9 @@ impl P2pEndpoint {
             .read()
             .await
             .get(peer_id)
-            .map_or(0, Vec::len)
+            .map_or(0, |handles| {
+                handles.iter().filter(|handle| handle.is_running()).count()
+            })
     }
 
     /// #313 test seam: cooperatively cancel this connection's reader task.
@@ -8716,7 +8778,7 @@ impl P2pEndpoint {
         if let Some(handles) = self.reader_handles.read().await.get(peer_id) {
             for handle in handles
                 .iter()
-                .filter(|handle| handle.conn_stable_id == stable_id)
+                .filter(|handle| handle.is_running() && handle.conn_stable_id == stable_id)
             {
                 handle.cancel.cancel();
             }
@@ -8770,8 +8832,9 @@ impl P2pEndpoint {
                 reader_handles.try_read().map_or(true, |handles| {
                     handles.get(peer_id).is_some_and(|entries| {
                         entries.iter().any(|entry| {
-                            (entry.generation == generation
-                                || entry.conn_stable_id == generation as usize)
+                            entry.is_running()
+                                && (entry.generation == generation
+                                    || entry.conn_stable_id == generation as usize)
                                 && !entry.abort_handle.is_finished()
                         })
                     })
@@ -9151,7 +9214,7 @@ impl P2pEndpoint {
                     .read()
                     .await
                     .get(peer_id)
-                    .is_some_and(|handles| !handles.is_empty()),
+                    .is_some_and(|handles| handles.iter().any(ReaderTaskHandle::is_running)),
             )
         } else if constrained_connected {
             Some(false)
@@ -9456,15 +9519,14 @@ impl P2pEndpoint {
             warn!("Failed to save bootstrap cache on shutdown: {e}");
         }
 
-        // Abort all background reader tasks.
-        let handles = {
+        // Abort all background reader tasks. #313: their records stay
+        // (Stopping) until reaped, so nothing can be admitted for those
+        // connections before the tasks have stopped.
+        {
             let mut handles = self.reader_handles.write().await;
-            std::mem::take(&mut *handles)
-        };
-        for entries in handles.into_values() {
-            for handle in entries {
-                handle.cancel.cancel();
-                handle.abort_handle.abort();
+            let peers: Vec<PeerId> = handles.keys().copied().collect();
+            for peer_id in &peers {
+                stop_peer_readers(&mut handles, peer_id);
             }
         }
 
@@ -9997,10 +10059,11 @@ impl P2pEndpoint {
                 return;
             }
             let handles = reader_handles.read().await;
-            if let Some(handle) = handles
-                .get(&peer_id)
-                .and_then(|entries| entries.iter().find(|entry| entry.generation == generation))
-            {
+            if let Some(handle) = handles.get(&peer_id).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.is_running() && entry.generation == generation)
+            }) {
                 handle.cancel.cancel();
             }
         });
@@ -10074,7 +10137,8 @@ impl P2pEndpoint {
             .inner
             .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
         if mode == ReaderStartMode::Adoption
-            && (connection.close_reason().is_some()
+            && (self.shutdown.is_cancelled()
+                || connection.close_reason().is_some()
                 || lifecycle_snapshot.is_some_and(|snapshot| {
                     !matches!(
                         snapshot.state,
@@ -10125,27 +10189,65 @@ impl P2pEndpoint {
         // #313 (#280 round 2): one reader per CONNECTION (stable_id). Readers
         // for OTHER connections of the same peer are still tolerated (#166
         // drain semantics). The owner is reserved here, under the write lock,
-        // before the task is spawned, and the lock is held until its handle
-        // is stored; the task's exit report takes the same lock, so it cannot
-        // be processed before the handle exists.
+        // before the task is spawned, and the lock is held until its record
+        // is stored. A connection is admitted only when it has NO owner
+        // record: not a running owner, not one that teardown is stopping, and
+        // not one whose exit side effects are still running. Records go only
+        // when reaped (task terminated, exit fully processed).
         let mut handles = self.reader_handles.write().await;
-        prune_finished_reader_handles(&mut handles, conn_stable_id);
-        if handles
+        reap_reader_handles(&mut handles);
+        let mut running_owner = false;
+        let mut pending_owner = false;
+        for handle in handles
             .values()
             .flatten()
-            .any(|handle| handle.conn_stable_id == conn_stable_id)
+            .filter(|handle| handle.conn_stable_id == conn_stable_id)
         {
+            if handle.is_running() && !handle.abort_handle.is_finished() {
+                running_owner = true;
+            } else {
+                pending_owner = true;
+            }
+        }
+        if running_owner || pending_owner {
             drop(handles);
             debug!(
                 peer_id = ?peer_id,
                 conn_stable_id,
-                "reader already owned for this connection; duplicate start spawns nothing"
+                running_owner,
+                "reader owner record present for this connection; this start spawns nothing"
             );
             #[cfg(all(test, feature = "network-discovery"))]
             reader_test_hooks::park_after_duplicate(test_hooks.as_ref(), test_attempt).await;
-            return ReaderStart::AlreadyOwned;
+            return if running_owner {
+                ReaderStart::AlreadyOwned
+            } else {
+                ReaderStart::Blocked
+            };
+        }
+        if mode == ReaderStartMode::Adoption {
+            // Re-check under the lock: the snapshot taken before the lock
+            // await may be stale. An adoption starts only on a connection
+            // that is still open and still untracked or Live under the same
+            // generation.
+            let current = self
+                .inner
+                .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
+            let unchanged = current.map(|snapshot| snapshot.generation)
+                == lifecycle_snapshot.map(|snapshot| snapshot.generation)
+                && current.is_none_or(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        crate::connection_lifecycle::ConnectionLifecycleState::Live
+                    )
+                });
+            if !unchanged || connection.close_reason().is_some() || self.shutdown.is_cancelled() {
+                return ReaderStart::NotStarted;
+            }
         }
         let owner_id = NEXT_READER_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let exit_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_exit_sent = Arc::clone(&exit_sent);
 
         #[cfg(all(test, feature = "network-discovery"))]
         let task_test_hooks = test_hooks.clone();
@@ -10494,18 +10596,29 @@ impl P2pEndpoint {
                 };
             }
 
-            let _ = reader_exit_tx.send(ReaderExitEvent {
-                peer_id,
-                generation,
-                conn_stable_id,
-                owner_id,
-            });
+            // #313: mark the exit as sent before sending it (no await in
+            // between), so the record is not reaped before its exit is
+            // processed.
+            task_exit_sent.store(true, Ordering::SeqCst);
+            if reader_exit_tx
+                .send(ReaderExitEvent {
+                    peer_id,
+                    generation,
+                    conn_stable_id,
+                    owner_id,
+                })
+                .is_err()
+            {
+                task_exit_sent.store(false, Ordering::SeqCst);
+            }
         });
         let abort_handle = join_handle.abort_handle();
         handles.entry(peer_id).or_default().push(ReaderTaskHandle {
             generation,
             conn_stable_id,
             owner_id,
+            state: ReaderOwnerState::Running,
+            exit_sent,
             cancel,
             abort_handle,
         });
@@ -10854,49 +10967,52 @@ impl P2pEndpoint {
                     return;
                 };
 
-                // #313: only the owning task's exit is processed. Remove the
-                // exiting owner's handle (never another task's handle that
-                // happens to share its generation). An exit whose owner is
-                // gone while a DIFFERENT owner now reads the same connection
-                // is stale: no tombstone, no lifecycle event, no
-                // `handle_reader_exit`, no ACK-waiter cleanup.
+                // #313 owner protocol. Claim the exiting owner's record under
+                // the lock and keep it (state Exiting) while the owner-sensitive
+                // side effects below run: tombstone, `ReaderExited`,
+                // `handle_reader_exit`, ACK-waiter and peer cleanup. While the
+                // record exists no other reader can be admitted for this
+                // connection, so these side effects can never act on a
+                // successor. An exit with no owner record (a stale or foreign
+                // event) does nothing.
                 //
                 // With per-connection readers (issue #166), a peer may have
                 // several live readers. Only the LAST one to exit should
                 // trigger peer-wide cleanup; if other readers remain, this
-                // peer is still alive on another connection.
-                let (owner_removed, other_owner, last_reader) = {
+                // peer is still alive on another connection. An owner that
+                // teardown already stopped is never the last reader: the
+                // teardown did the peer cleanup.
+                let claim = {
                     let mut handles = reader_handles.write().await;
-                    let other_owner = handles.values().flatten().any(|handle| {
-                        handle.conn_stable_id == conn_stable_id && handle.owner_id != owner_id
+                    reap_reader_handles(&mut handles);
+                    let claimed = handles.get_mut(&peer_id).and_then(|entries| {
+                        entries
+                            .iter_mut()
+                            .find(|handle| handle.owner_id == owner_id)
+                            .map(|record| {
+                                let was_stopping = record.state == ReaderOwnerState::Stopping;
+                                record.state = ReaderOwnerState::Exiting;
+                                was_stopping
+                            })
                     });
-                    match handles.get_mut(&peer_id) {
-                        Some(vec) => {
-                            let before = vec.len();
-                            vec.retain(|h| h.owner_id != owner_id);
-                            let owner_removed = vec.len() != before;
-                            if vec.is_empty() {
-                                handles.remove(&peer_id);
-                                (owner_removed, other_owner, true)
-                            } else {
-                                (owner_removed, other_owner, false)
-                            }
-                        }
-                        // The peer was already removed by an explicit
-                        // `cleanup_connection` (e.g., shutdown, stale reaper).
-                        // No further handle cleanup needed.
-                        None => (false, other_owner, false),
-                    }
+                    claimed.map(|was_stopping| {
+                        let other_running = handles.get(&peer_id).is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|handle| handle.owner_id != owner_id && handle.is_running())
+                        });
+                        !was_stopping && !other_running
+                    })
                 };
-                if !owner_removed && other_owner {
+                let Some(last_reader) = claim else {
                     debug!(
                         peer_id = ?peer_id,
                         conn_stable_id,
                         owner_id,
-                        "ignoring a stale reader exit: another task owns this connection's reader"
+                        "ignoring a reader exit with no owner record"
                     );
                     continue;
-                }
+                };
                 #[cfg(all(test, feature = "network-discovery"))]
                 reader_test_hooks::exit_side_effects_point(
                     Arc::as_ptr(&reader_handles) as usize,
@@ -10904,46 +11020,48 @@ impl P2pEndpoint {
                 )
                 .await;
 
-                // #368 F2: record the exited generation so the liveness
-                // probe can reject an exited-reader survivor immediately
-                // (bounded per peer).
-                {
-                    let mut exited = exited_reader_generations.write().await;
-                    let deque = exited.entry(peer_id).or_default();
-                    deque.push_back(generation);
-                    while deque.len() > EXITED_READER_TOMBSTONE_CAP {
-                        deque.pop_front();
+                'side_effects: {
+                    // #368 F2: record the exited generation so the liveness
+                    // probe can reject an exited-reader survivor immediately
+                    // (bounded per peer).
+                    {
+                        let mut exited = exited_reader_generations.write().await;
+                        let deque = exited.entry(peer_id).or_default();
+                        deque.push_back(generation);
+                        while deque.len() > EXITED_READER_TOMBSTONE_CAP {
+                            deque.pop_front();
+                        }
                     }
-                }
 
-                let snapshot_before =
-                    inner.connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
-                emit_peer_lifecycle_event(
-                    &peer_event_tx,
-                    peer_event_channels.as_ref(),
-                    peer_id,
-                    PeerLifecycleEvent::ReaderExited { generation },
-                );
+                    let snapshot_before =
+                        inner.connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
+                    emit_peer_lifecycle_event(
+                        &peer_event_tx,
+                        peer_event_channels.as_ref(),
+                        peer_id,
+                        PeerLifecycleEvent::ReaderExited { generation },
+                    );
 
-                let exit_outcome = inner.handle_reader_exit(&peer_id, generation, conn_stable_id);
-                match exit_outcome {
-                    crate::nat_traversal_api::ReaderExitOutcome::Noop => {
-                        debug!(
-                            "Reader task exited for peer {:?} (generation {}, conn stable_id {}); no lifecycle entry remained",
-                            peer_id, generation, conn_stable_id
-                        );
-                        continue;
-                    }
-                    crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped {
-                        close_reason,
-                    } => {
-                        if let Some(snapshot) = snapshot_before {
-                            fail_ack_waiters_for_connection(
-                                ack_waiters.as_ref(),
-                                snapshot.stable_id,
-                                close_reason,
+                    let exit_outcome =
+                        inner.handle_reader_exit(&peer_id, generation, conn_stable_id);
+                    match exit_outcome {
+                        crate::nat_traversal_api::ReaderExitOutcome::Noop => {
+                            debug!(
+                                "Reader task exited for peer {:?} (generation {}, conn stable_id {}); no lifecycle entry remained",
+                                peer_id, generation, conn_stable_id
                             );
-                            match snapshot.state {
+                            break 'side_effects;
+                        }
+                        crate::nat_traversal_api::ReaderExitOutcome::ConnectionReaped {
+                            close_reason,
+                        } => {
+                            if let Some(snapshot) = snapshot_before {
+                                fail_ack_waiters_for_connection(
+                                    ack_waiters.as_ref(),
+                                    snapshot.stable_id,
+                                    close_reason,
+                                );
+                                match snapshot.state {
                                 crate::connection_lifecycle::ConnectionLifecycleState::Superseded { .. }
                                 | crate::connection_lifecycle::ConnectionLifecycleState::Live => {
                                     emit_peer_lifecycle_event(
@@ -10959,123 +11077,138 @@ impl P2pEndpoint {
                                 crate::connection_lifecycle::ConnectionLifecycleState::Closing { .. }
                                 | crate::connection_lifecycle::ConnectionLifecycleState::Closed { .. } => {}
                             }
-                        }
-                        // `ConnectionReaped` means this generation lost the
-                        // connection race (superseded / closing / closed). That
-                        // must NOT suppress peer-wide cleanup unless a live
-                        // replacement reader/connection actually exists.
-                        //
-                        // Under supersession churn the winner map can already
-                        // point at a dead connection by the time the *final*
-                        // reader exits; the previous unconditional skip left the
-                        // peer stranded in `connected_peers` (and therefore
-                        // `is_peer_connected()`-true for x0x reconnect
-                        // suppression) with no reader left to drive cleanup.
-                        //
-                        // Defer only when a surviving reader remains
-                        // (`!last_reader`) or a live connection still occupies
-                        // the winner map (`is_peer_connected`) — i.e. a genuine
-                        // replacement exists. Otherwise run the normal disconnect
-                        // path so the peer is removed and reconnect is unsuppressed.
-                        if !last_reader || inner.is_peer_connected(&peer_id) {
+                            }
+                            // `ConnectionReaped` means this generation lost the
+                            // connection race (superseded / closing / closed). That
+                            // must NOT suppress peer-wide cleanup unless a live
+                            // replacement reader/connection actually exists.
+                            //
+                            // Under supersession churn the winner map can already
+                            // point at a dead connection by the time the *final*
+                            // reader exits; the previous unconditional skip left the
+                            // peer stranded in `connected_peers` (and therefore
+                            // `is_peer_connected()`-true for x0x reconnect
+                            // suppression) with no reader left to drive cleanup.
+                            //
+                            // Defer only when a surviving reader remains
+                            // (`!last_reader`) or a live connection still occupies
+                            // the winner map (`is_peer_connected`) — i.e. a genuine
+                            // replacement exists. Otherwise run the normal disconnect
+                            // path so the peer is removed and reconnect is unsuppressed.
+                            if !last_reader || inner.is_peer_connected(&peer_id) {
+                                debug!(
+                                    "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped, live replacement remains",
+                                    peer_id, generation, conn_stable_id
+                                );
+                                break 'side_effects;
+                            }
                             debug!(
-                                "Reader task exited for peer {:?} (generation {}, conn stable_id {}); superseded connection reaped, live replacement remains",
+                                "Last reader task for peer {:?} (generation {}, conn stable_id {}) reaped with no live replacement — triggering peer cleanup",
                                 peer_id, generation, conn_stable_id
                             );
-                            continue;
+                            do_cleanup_connection(
+                                &*connected_peers,
+                                &*inner,
+                                &*reader_handles,
+                                &*direct_path_statuses,
+                                &*stats,
+                                &event_tx,
+                                &peer_event_tx,
+                                peer_event_channels.as_ref(),
+                                peer_event_generations.as_ref(),
+                                ack_waiters.as_ref(),
+                                &peer_id,
+                                DisconnectReason::ConnectionLost,
+                                ConnectionCloseReason::ReaderExit,
+                                CleanupScope::IfUnroutable,
+                            )
+                            .await;
                         }
-                        debug!(
-                            "Last reader task for peer {:?} (generation {}, conn stable_id {}) reaped with no live replacement — triggering peer cleanup",
-                            peer_id, generation, conn_stable_id
-                        );
-                        do_cleanup_connection(
-                            &*connected_peers,
-                            &*inner,
-                            &*reader_handles,
-                            &*direct_path_statuses,
-                            &*stats,
-                            &event_tx,
-                            &peer_event_tx,
-                            peer_event_channels.as_ref(),
-                            peer_event_generations.as_ref(),
-                            ack_waiters.as_ref(),
-                            &peer_id,
-                            DisconnectReason::ConnectionLost,
-                            ConnectionCloseReason::ReaderExit,
-                            CleanupScope::IfUnroutable,
-                        )
-                        .await;
-                    }
-                    crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected {
-                        close_reason,
-                    } => {
-                        emit_peer_lifecycle_event(
-                            &peer_event_tx,
-                            peer_event_channels.as_ref(),
-                            peer_id,
-                            PeerLifecycleEvent::Closing {
-                                generation,
-                                reason: close_reason,
-                            },
-                        );
-                        emit_peer_lifecycle_event(
-                            &peer_event_tx,
-                            peer_event_channels.as_ref(),
-                            peer_id,
-                            PeerLifecycleEvent::Closed {
-                                generation,
-                                reason: close_reason,
-                            },
-                        );
-                        fail_ack_waiters_for_connection(
-                            ack_waiters.as_ref(),
-                            conn_stable_id,
+                        crate::nat_traversal_api::ReaderExitOutcome::PeerDisconnected {
                             close_reason,
-                        );
-                        // Retain the generation in `peer_event_generations` so a
-                        // replacement connection racing this close still sees the
-                        // prior generation and emits Replaced{old,new}. The next
-                        // register_connected_peer overwrites the entry.
+                        } => {
+                            emit_peer_lifecycle_event(
+                                &peer_event_tx,
+                                peer_event_channels.as_ref(),
+                                peer_id,
+                                PeerLifecycleEvent::Closing {
+                                    generation,
+                                    reason: close_reason,
+                                },
+                            );
+                            emit_peer_lifecycle_event(
+                                &peer_event_tx,
+                                peer_event_channels.as_ref(),
+                                peer_id,
+                                PeerLifecycleEvent::Closed {
+                                    generation,
+                                    reason: close_reason,
+                                },
+                            );
+                            fail_ack_waiters_for_connection(
+                                ack_waiters.as_ref(),
+                                conn_stable_id,
+                                close_reason,
+                            );
+                            // Retain the generation in `peer_event_generations` so a
+                            // replacement connection racing this close still sees the
+                            // prior generation and emits Replaced{old,new}. The next
+                            // register_connected_peer overwrites the entry.
 
-                        if !last_reader {
+                            if !last_reader {
+                                debug!(
+                                    "Live reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still draining, deferring peer cleanup",
+                                    peer_id, generation, conn_stable_id
+                                );
+                                break 'side_effects;
+                            }
+
+                            if inner.is_peer_connected(&peer_id) {
+                                debug!(
+                                    "Last reader exited for peer {:?}, but a replacement registered before cleanup",
+                                    peer_id
+                                );
+                                break 'side_effects;
+                            }
+
                             debug!(
-                                "Live reader task exited for peer {:?} (generation {}, conn stable_id {}); other readers still draining, deferring peer cleanup",
+                                "Last live reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
                                 peer_id, generation, conn_stable_id
                             );
-                            continue;
+
+                            do_cleanup_connection(
+                                &*connected_peers,
+                                &*inner,
+                                &*reader_handles,
+                                &*direct_path_statuses,
+                                &*stats,
+                                &event_tx,
+                                &peer_event_tx,
+                                peer_event_channels.as_ref(),
+                                peer_event_generations.as_ref(),
+                                ack_waiters.as_ref(),
+                                &peer_id,
+                                DisconnectReason::ConnectionLost,
+                                close_reason,
+                                CleanupScope::IfUnroutable,
+                            )
+                            .await;
                         }
-
-                        if inner.is_peer_connected(&peer_id) {
-                            debug!(
-                                "Last reader exited for peer {:?}, but a replacement registered before cleanup",
-                                peer_id
-                            );
-                            continue;
-                        }
-
-                        debug!(
-                            "Last live reader task for peer {:?} (generation {}, conn stable_id {}) exited — triggering cleanup",
-                            peer_id, generation, conn_stable_id
-                        );
-
-                        do_cleanup_connection(
-                            &*connected_peers,
-                            &*inner,
-                            &*reader_handles,
-                            &*direct_path_statuses,
-                            &*stats,
-                            &event_tx,
-                            &peer_event_tx,
-                            peer_event_channels.as_ref(),
-                            peer_event_generations.as_ref(),
-                            ack_waiters.as_ref(),
-                            &peer_id,
-                            DisconnectReason::ConnectionLost,
-                            close_reason,
-                            CleanupScope::IfUnroutable,
-                        )
-                        .await;
                     }
+                }
+
+                // #313: the exit's side effects are done; the record goes once
+                // the task has terminated (now or at a later reap).
+                {
+                    let mut handles = reader_handles.write().await;
+                    if let Some(record) = handles.get_mut(&peer_id).and_then(|entries| {
+                        entries
+                            .iter_mut()
+                            .find(|handle| handle.owner_id == owner_id)
+                    }) {
+                        record.state = ReaderOwnerState::Exited;
+                    }
+                    reap_reader_handles(&mut handles);
                 }
             }
         });
@@ -18306,6 +18439,8 @@ mod tests {
                     generation: 1,
                     conn_stable_id: 0,
                     owner_id: 0,
+                    state: ReaderOwnerState::Running,
+                    exit_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],
@@ -18560,6 +18695,8 @@ mod tests {
                     generation: 1,
                     conn_stable_id: 0,
                     owner_id: 0,
+                    state: ReaderOwnerState::Running,
+                    exit_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],
@@ -19625,6 +19762,11 @@ mod tests {
                  its exit window: {:?}",
                 x.close_reason()
             );
+            assert_ne!(
+                started,
+                ReaderStart::Started,
+                "no successor may be admitted while its predecessor's exit side effects are pending"
+            );
 
             a.shutdown().await;
             b.shutdown().await;
@@ -19677,6 +19819,83 @@ mod tests {
                 "a delayed adoption started a second reader for H while the torn-down R1 had not \
                  stopped"
             );
+            assert!(
+                r1_still_running,
+                "the fixture keeps R1 running through the adoption"
+            );
+            assert_ne!(
+                started,
+                ReaderStart::Started,
+                "no reader may be admitted for H while the torn-down owner has not stopped"
+            );
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// Fix-only control (round 2, P2-2): a torn-down owner blocks admission
+        /// only until it has terminated. Teardown marks R1 Stopping; while R1
+        /// runs, a start for H is `Blocked`; after R1 has stopped and its
+        /// record has been reaped, a start for H is admitted again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn torn_down_owner_blocks_admission_only_until_it_stops() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let h = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+            let hooks = reader_test_hooks::arm(a.reader_hooks_key(), h.stable_id());
+            hooks.sync_park_attempt.store(1, AtomicOrdering::SeqCst);
+            a.spawn_reader_task(b_peer, h.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !hooks.sync_parked_now.load(AtomicOrdering::SeqCst) {
+                assert!(tokio::time::Instant::now() < deadline, "R1 parks");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            a.cleanup_connection(&b_peer, DisconnectReason::ConnectionLost)
+                .await;
+            assert_eq!(
+                a.start_reader(b_peer, h.clone(), ReaderStartMode::Adoption)
+                    .await,
+                ReaderStart::Blocked,
+                "a start while the torn-down owner still runs is blocked"
+            );
+            assert_eq!(
+                a.reader_handle_count().await,
+                0,
+                "a stopping owner is not counted as a running reader"
+            );
+
+            hooks.release_sync_park();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let admitted = loop {
+                let outcome = a
+                    .start_reader(b_peer, h.clone(), ReaderStartMode::Adoption)
+                    .await;
+                if outcome == ReaderStart::Started {
+                    break true;
+                }
+                assert_eq!(
+                    outcome,
+                    ReaderStart::Blocked,
+                    "only Blocked before admission"
+                );
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            reader_test_hooks::disarm(a.reader_hooks_key(), h.stable_id());
+            assert!(
+                admitted,
+                "admission resumes once the torn-down owner has stopped"
+            );
+            assert!(a.live_reader_for_test(&b_peer, h.stable_id()).await);
+            assert!(h.close_reason().is_none());
 
             a.shutdown().await;
             b.shutdown().await;
