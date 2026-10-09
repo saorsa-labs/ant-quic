@@ -386,6 +386,10 @@ struct ReaderTaskHandle {
     /// differ from the lifecycle generation after registration; the
     /// reader-liveness probe matches EITHER (F3, #368 r1).
     conn_stable_id: usize,
+    /// #313: identity of the reader task that owns this connection's reader
+    /// slot. Exit events carry it, so only the owning task's exit removes the
+    /// handle or runs lifecycle cleanup.
+    owner_id: u64,
     /// Cooperative shutdown signal. Honored only at stream-accept boundaries,
     /// so an in-flight `read_to_end()` always completes before the task exits.
     /// This prevents silent loss of already-ACKed bytes during connection
@@ -404,6 +408,51 @@ struct ReaderExitEvent {
     peer_id: PeerId,
     generation: u64,
     conn_stable_id: usize,
+    /// #313: the exiting task's owner id (see [`ReaderTaskHandle::owner_id`]).
+    owner_id: u64,
+}
+
+/// #313: process-wide source of reader owner ids. Starts at 1; `u64::MAX` is
+/// never issued.
+static NEXT_READER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// #313: how a reader start treats the connection's lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderStartMode {
+    /// The existing reader-start callers: unchanged behaviour (a tracked
+    /// connection that is no longer Live gets a pre-cancelled reader).
+    Standard,
+    /// Reader adoption for a winner the inner layer published without a
+    /// reader. Never starts on a closed connection or on a tracked connection
+    /// that is not Live, so an adoption can never reach the pre-cancel path
+    /// and its immediate close.
+    Adoption,
+}
+
+/// #313: result of a reader start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderStart {
+    /// A new reader task owns the connection's reader slot.
+    Started,
+    /// A running reader task already owns it; nothing was spawned.
+    AlreadyOwned,
+    /// Adoption only: the connection is closed or no longer Live.
+    NotStarted,
+}
+
+/// #313: drop handles of reader tasks for `conn_stable_id` that finished
+/// without their exit being processed (a panic or an abort sends no exit
+/// event), so a dead task never counts as the connection's reader owner.
+fn prune_finished_reader_handles(
+    handles: &mut HashMap<PeerId, Vec<ReaderTaskHandle>>,
+    conn_stable_id: usize,
+) {
+    for entries in handles.values_mut() {
+        entries.retain(|handle| {
+            handle.conn_stable_id != conn_stable_id || !handle.abort_handle.is_finished()
+        });
+    }
+    handles.retain(|_, entries| !entries.is_empty());
 }
 
 #[cfg(all(test, feature = "network-discovery"))]
@@ -415,6 +464,7 @@ impl ReaderExitEvent {
             peer_id,
             generation,
             conn_stable_id,
+            owner_id: u64::MAX,
         }
     }
 }
@@ -3516,6 +3566,7 @@ impl P2pEndpoint {
         // reader_handles) and start the orphan-connection janitor.
         endpoint.install_reader_liveness_probe();
         endpoint.spawn_connection_promoted_consumer();
+        endpoint.spawn_reader_adoption_consumer();
         endpoint.spawn_orphan_connection_janitor();
 
         Ok(endpoint)
@@ -8727,6 +8778,58 @@ impl P2pEndpoint {
         });
     }
 
+    /// #313: start readers for winners the inner layer published without one
+    /// (raw hole-punch and accepted-coordination winners, and materialized
+    /// registrations). Reader only: it records no peer state, emits no
+    /// lifecycle event and leaves winner-map routing unchanged. The start is
+    /// idempotent per connection and never starts on a closed or no-longer-
+    /// Live tracked connection, so an adoption cannot close anything.
+    fn spawn_reader_adoption_consumer(&self) {
+        let (adoption_tx, mut adoption_rx) = mpsc::unbounded_channel();
+        self.inner.set_reader_adoption_sender(adoption_tx);
+        let endpoint = self.clone();
+        let shutdown = self.shutdown_token();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    adoption = adoption_rx.recv() => {
+                        let Some(adoption) = adoption else {
+                            break;
+                        };
+                        let crate::nat_traversal_api::ReaderAdoption {
+                            peer_id,
+                            connection,
+                        } = adoption;
+                        if endpoint
+                            .inner
+                            .extract_peer_id_from_connection(&connection)
+                            .await
+                            != Some(peer_id)
+                        {
+                            debug!(
+                                peer_id = ?peer_id,
+                                stable_id = connection.stable_id(),
+                                "dropping reader adoption: authenticated identity does not match"
+                            );
+                            continue;
+                        }
+                        let stable_id = connection.stable_id();
+                        let started = endpoint
+                            .start_reader(peer_id, connection, ReaderStartMode::Adoption)
+                            .await;
+                        debug!(
+                            peer_id = ?peer_id,
+                            stable_id,
+                            ?started,
+                            "reader adoption for a published winner"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// #368 backstop janitor: every 5 s, close open tracked connections
     /// (Live or Superseded, alive, no close reason) whose generation has had
     /// no live reader for the whole 10 s grace — each pins every inbound
@@ -9849,6 +9952,21 @@ impl P2pEndpoint {
     /// correctness property against issue #166. Explicit teardown
     /// (`cleanup_connection`, `shutdown`) also calls `abort()` as a backstop.
     async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
+        let _ = self
+            .start_reader(peer_id, connection, ReaderStartMode::Standard)
+            .await;
+    }
+
+    /// #313: start the connection's reader unless a running task already
+    /// owns it. The owner is reserved under the `reader_handles` write lock
+    /// before any task exists, so a duplicate start spawns nothing, does no
+    /// stream work and sends no exit event.
+    async fn start_reader(
+        &self,
+        peer_id: PeerId,
+        connection: crate::high_level::Connection,
+        mode: ReaderStartMode,
+    ) -> ReaderStart {
         let data_tx = self.data_tx.clone();
         let data_tx_diagnostics = Arc::clone(&self.data_tx_diagnostics);
         let stream_read_errors_survived = Arc::clone(&self.stream_read_errors_survived);
@@ -9883,6 +10001,17 @@ impl P2pEndpoint {
         let lifecycle_snapshot = self
             .inner
             .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
+        if mode == ReaderStartMode::Adoption
+            && (connection.close_reason().is_some()
+                || lifecycle_snapshot.is_some_and(|snapshot| {
+                    !matches!(
+                        snapshot.state,
+                        crate::connection_lifecycle::ConnectionLifecycleState::Live
+                    )
+                }))
+        {
+            return ReaderStart::NotStarted;
+        }
         let generation = lifecycle_snapshot
             .map(|snapshot| snapshot.generation)
             .unwrap_or(conn_stable_id as u64);
@@ -9917,6 +10046,34 @@ impl P2pEndpoint {
                 recv: crate::high_level::RecvStream,
             },
         }
+
+        #[cfg(all(test, feature = "network-discovery"))]
+        reader_test_hooks::park_before_dedup(test_hooks.as_ref(), test_attempt).await;
+
+        // #313 (#280 round 2): one reader per CONNECTION (stable_id). Readers
+        // for OTHER connections of the same peer are still tolerated (#166
+        // drain semantics). The owner is reserved here, under the write lock,
+        // before the task is spawned, and the lock is held until its handle
+        // is stored; the task's exit report takes the same lock, so it cannot
+        // be processed before the handle exists.
+        let mut handles = self.reader_handles.write().await;
+        prune_finished_reader_handles(&mut handles, conn_stable_id);
+        if handles
+            .values()
+            .flatten()
+            .any(|handle| handle.conn_stable_id == conn_stable_id)
+        {
+            drop(handles);
+            debug!(
+                peer_id = ?peer_id,
+                conn_stable_id,
+                "reader already owned for this connection; duplicate start spawns nothing"
+            );
+            #[cfg(all(test, feature = "network-discovery"))]
+            reader_test_hooks::park_after_duplicate(test_hooks.as_ref(), test_attempt).await;
+            return ReaderStart::AlreadyOwned;
+        }
+        let owner_id = NEXT_READER_OWNER_ID.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(all(test, feature = "network-discovery"))]
         let task_test_hooks = test_hooks.clone();
@@ -10269,41 +10426,19 @@ impl P2pEndpoint {
                 peer_id,
                 generation,
                 conn_stable_id,
+                owner_id,
             });
         });
         let abort_handle = join_handle.abort_handle();
-        #[cfg(all(test, feature = "network-discovery"))]
-        reader_test_hooks::park_before_dedup(test_hooks.as_ref(), test_attempt).await;
-
-        // #280 round 2: enforce one reader per CONNECTION (stable_id). Readers
-        // for OTHER generations of the same peer are still tolerated (issue
-        // #166 drain semantics) — only a duplicate for the same connection is
-        // skipped, turning the single-reader invariant from a call-site audit
-        // into an enforced guarantee.
-        let mut handles = self.reader_handles.write().await;
-        if handles.get(&peer_id).is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|handle| handle.conn_stable_id == conn_stable_id)
-        }) {
-            debug!(
-                peer_id = ?peer_id,
-                conn_stable_id,
-                "reader already registered for this connection; cancelling duplicate spawn"
-            );
-            drop(handles);
-            cancel.cancel();
-            #[cfg(all(test, feature = "network-discovery"))]
-            reader_test_hooks::park_after_duplicate(test_hooks.as_ref(), test_attempt).await;
-            abort_handle.abort();
-            return;
-        }
         handles.entry(peer_id).or_default().push(ReaderTaskHandle {
             generation,
             conn_stable_id,
+            owner_id,
             cancel,
             abort_handle,
         });
+        drop(handles);
+        ReaderStart::Started
     }
 
     async fn apply_peer_address_update(
@@ -10640,17 +10775,57 @@ impl P2pEndpoint {
                     peer_id,
                     generation,
                     conn_stable_id,
+                    owner_id,
                 }) = maybe_reader_exit
                 else {
                     debug!("Reader exit handler stopping: all reader-exit senders dropped");
                     return;
                 };
 
+                // #313: only the owning task's exit is processed. Remove the
+                // exiting owner's handle (never another task's handle that
+                // happens to share its generation). An exit whose owner is
+                // gone while a DIFFERENT owner now reads the same connection
+                // is stale: no tombstone, no lifecycle event, no
+                // `handle_reader_exit`, no ACK-waiter cleanup.
+                //
                 // With per-connection readers (issue #166), a peer may have
-                // several live readers. Only the LAST one to exit should trigger
-                // peer-wide cleanup. Remove the exiting handle from the vec; if
-                // other readers remain, this peer is still alive on another
-                // connection and we skip cleanup.
+                // several live readers. Only the LAST one to exit should
+                // trigger peer-wide cleanup; if other readers remain, this
+                // peer is still alive on another connection.
+                let (owner_removed, other_owner, last_reader) = {
+                    let mut handles = reader_handles.write().await;
+                    let other_owner = handles.values().flatten().any(|handle| {
+                        handle.conn_stable_id == conn_stable_id && handle.owner_id != owner_id
+                    });
+                    match handles.get_mut(&peer_id) {
+                        Some(vec) => {
+                            let before = vec.len();
+                            vec.retain(|h| h.owner_id != owner_id);
+                            let owner_removed = vec.len() != before;
+                            if vec.is_empty() {
+                                handles.remove(&peer_id);
+                                (owner_removed, other_owner, true)
+                            } else {
+                                (owner_removed, other_owner, false)
+                            }
+                        }
+                        // The peer was already removed by an explicit
+                        // `cleanup_connection` (e.g., shutdown, stale reaper).
+                        // No further handle cleanup needed.
+                        None => (false, other_owner, false),
+                    }
+                };
+                if !owner_removed && other_owner {
+                    debug!(
+                        peer_id = ?peer_id,
+                        conn_stable_id,
+                        owner_id,
+                        "ignoring a stale reader exit: another task owns this connection's reader"
+                    );
+                    continue;
+                }
+
                 // #368 F2: record the exited generation so the liveness
                 // probe can reject an exited-reader survivor immediately
                 // (bounded per peer).
@@ -10662,24 +10837,6 @@ impl P2pEndpoint {
                         deque.pop_front();
                     }
                 }
-                let last_reader = {
-                    let mut handles = reader_handles.write().await;
-                    match handles.get_mut(&peer_id) {
-                        Some(vec) => {
-                            vec.retain(|h| h.generation != generation);
-                            if vec.is_empty() {
-                                handles.remove(&peer_id);
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        // The peer was already removed by an explicit
-                        // `cleanup_connection` (e.g., shutdown, stale reaper).
-                        // No further cleanup needed.
-                        None => false,
-                    }
-                };
 
                 let snapshot_before =
                     inner.connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
@@ -18070,6 +18227,7 @@ mod tests {
                 vec![ReaderTaskHandle {
                     generation: 1,
                     conn_stable_id: 0,
+                    owner_id: 0,
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],
@@ -18323,6 +18481,7 @@ mod tests {
                 vec![ReaderTaskHandle {
                     generation: 1,
                     conn_stable_id: 0,
+                    owner_id: 0,
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                 }],
@@ -19182,6 +19341,134 @@ mod tests {
 
             a.shutdown().await;
             b.shutdown().await;
+        }
+
+        /// Fix-only control (C6): the consumer re-checks identity. A signal
+        /// whose key is not the connection's authenticated identity starts no
+        /// reader under either key and closes nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn adoption_identity_mismatch_starts_no_reader() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let x = raw_dial(&a, b_addr).await;
+            wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
+            let wrong_peer = PeerId([0x42; 32]);
+            a.inner.send_reader_adoption_for_test(wrong_peer, x.clone());
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert_eq!(a.reader_count_for_test(&wrong_peer).await, 0);
+            assert!(!a.live_reader_for_test(&b_peer, x.stable_id()).await);
+            assert!(x.close_reason().is_none());
+
+            // Positive control: the correctly keyed signal starts the reader.
+            a.inner.send_reader_adoption_for_test(b_peer, x.clone());
+            wait_for_reader(&a, &b_peer, x.stable_id(), "the correctly keyed adoption").await;
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// Fix-only control (C5): an adoption for a tracked connection that is
+        /// no longer Live spawns nothing, so it cannot reach the pre-cancel
+        /// path that closes the connection at once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn adoption_skips_non_live_tracked_connection() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let b_peer = b.peer_id();
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            let m1 = raw_dial(&a, b_addr).await;
+            a.inner
+                .add_connection(b_peer, m1.clone())
+                .expect("register M1");
+            let m2 = raw_dial(&a, b_addr).await;
+            a.inner
+                .add_connection(b_peer, m2.clone())
+                .expect("register M2");
+            wait_for_winner(&a, &b_peer, "M2 supersedes M1", |connection| {
+                connection.stable_id() == m2.stable_id()
+            })
+            .await;
+
+            a.inner.send_reader_adoption_for_test(b_peer, m1.clone());
+            a.inner.send_reader_adoption_for_test(b_peer, m2.clone());
+            wait_for_reader(&a, &b_peer, m2.stable_id(), "the Live winner is adopted").await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert!(
+                !a.live_reader_for_test(&b_peer, m1.stable_id()).await,
+                "no reader is started for the Superseded M1"
+            );
+            assert!(
+                m1.close_reason().is_none(),
+                "an adoption must not close the Superseded M1: {:?}",
+                m1.close_reason()
+            );
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// Fix-only control (C4): adopting a raw winner starts its reader and
+        /// nothing else. No outer peer record, no lifecycle event, no
+        /// lifecycle entry, and the winner map still routes to the same
+        /// connection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn raw_winner_adoption_is_reader_only() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let z = shim_node().await;
+            let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+            let _accept_z = shim_accept(&z);
+            let mut b_events = b.subscribe_all_peer_events();
+
+            let unrelated = raw_dial(&b, shim_addr(&z)).await;
+            let handled = b
+                .inner
+                .inject_accepted_coordination_for_test(
+                    unrelated,
+                    a_peer,
+                    b_peer,
+                    vec![a_addr],
+                    vec![b_addr],
+                )
+                .await
+                .expect("CoordinationAccepted handled");
+            assert!(handled);
+            let c_b = wait_for_winner(&b, &a_peer, "C_B is B's winner", |_| true).await;
+            wait_for_reader(&b, &a_peer, c_b.stable_id(), "B's adopted reader on C_B").await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            assert!(
+                !b.connected_peers.read().await.contains_key(&a_peer),
+                "a reader adoption must not record an outer peer"
+            );
+            assert!(b.inner.lifecycle_empty_for_test(&a_peer));
+            let routed = winner(&b, &a_peer).await.expect("B still routes to A");
+            assert_eq!(routed.stable_id(), c_b.stable_id(), "routing unchanged");
+            loop {
+                match b_events.try_recv() {
+                    Ok((peer, event)) => assert!(
+                        peer != a_peer,
+                        "a reader adoption must emit no lifecycle event: {event:?}"
+                    ),
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+
+            a.shutdown().await;
+            b.shutdown().await;
+            z.shutdown().await;
         }
     }
 }
