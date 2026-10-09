@@ -14934,6 +14934,24 @@ mod tests {
         (server, client, connection)
     }
 
+    /// Shut down both endpoints of a NAT send test, so each test also proves
+    /// its own teardown. The application still holds the closed connection.
+    async fn shutdown_nat_test_endpoints(
+        server: NatTraversalEndpoint,
+        client: NatTraversalEndpoint,
+        connection: InnerConnection,
+    ) {
+        client
+            .shutdown()
+            .await
+            .expect("client shutdown releases its socket");
+        server
+            .shutdown()
+            .await
+            .expect("server shutdown releases its socket");
+        drop(connection);
+    }
+
     fn nat_control_test_addr() -> SocketAddr {
         "127.0.0.1:9000"
             .parse()
@@ -14942,38 +14960,42 @@ mod tests {
 
     #[tokio::test]
     async fn closed_connection_rejects_nat_address_advertisement() {
-        let (_server, _client, connection) = closed_nat_connection().await;
+        let (server, client, connection) = closed_nat_connection().await;
         assert_eq!(
             connection.send_nat_address_advertisement(nat_control_test_addr(), 1),
             Err(crate::ConnectionError::LocallyClosed)
         );
+        shutdown_nat_test_endpoints(server, client, connection).await;
     }
 
     #[tokio::test]
     async fn closed_connection_rejects_nat_address_removal() {
-        let (_server, _client, connection) = closed_nat_connection().await;
+        let (server, client, connection) = closed_nat_connection().await;
         assert_eq!(
             connection.send_nat_address_removal(0),
             Err(crate::ConnectionError::LocallyClosed)
         );
+        shutdown_nat_test_endpoints(server, client, connection).await;
     }
 
     #[tokio::test]
     async fn closed_connection_rejects_nat_punch_coordination() {
-        let (_server, _client, connection) = closed_nat_connection().await;
+        let (server, client, connection) = closed_nat_connection().await;
         assert_eq!(
             connection.send_nat_punch_coordination(0, nat_control_test_addr(), 1),
             Err(crate::ConnectionError::LocallyClosed)
         );
+        shutdown_nat_test_endpoints(server, client, connection).await;
     }
 
     #[tokio::test]
     async fn closed_connection_rejects_nat_punch_via_relay() {
-        let (_server, _client, connection) = closed_nat_connection().await;
+        let (server, client, connection) = closed_nat_connection().await;
         assert_eq!(
             connection.send_nat_punch_via_relay([0x3a; 32], nat_control_test_addr(), 1),
             Err(crate::ConnectionError::LocallyClosed)
         );
+        shutdown_nat_test_endpoints(server, client, connection).await;
     }
 
     /// #305 round 2 (P2-1): a registrar that passed its in-lock shutdown
