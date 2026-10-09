@@ -837,6 +837,7 @@ impl Connection {
         priority: u32,
     ) -> Result<u64, crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_address_advertisement");
+        conn.check_open()?;
         conn.inner.send_nat_address_advertisement(address, priority)
     }
 
@@ -851,6 +852,7 @@ impl Connection {
     /// Queue a REMOVE_ADDRESS NAT traversal frame via the underlying connection
     pub fn send_nat_address_removal(&self, sequence: u64) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_address_removal");
+        conn.check_open()?;
         conn.inner.send_nat_address_removal(sequence)
     }
 
@@ -862,6 +864,7 @@ impl Connection {
         round: u32,
     ) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_punch_coordination");
+        conn.check_open()?;
         conn.inner
             .send_nat_punch_coordination(paired_with_sequence_number, address, round)
     }
@@ -877,6 +880,7 @@ impl Connection {
         round: u32,
     ) -> Result<(), crate::ConnectionError> {
         let conn = &mut *self.0.state.lock("send_nat_punch_via_relay");
+        conn.check_open()?;
         conn.inner
             .send_nat_punch_via_relay(target_peer_id, our_address, round)
     }
@@ -1801,6 +1805,16 @@ impl State {
     pub(crate) fn wake(&mut self) {
         if let Some(x) = self.driver.take() {
             x.wake();
+        }
+    }
+
+    /// The stored terminal error, if any. A terminal connection has no driver
+    /// to send queued frames, so control sends must fail before they change
+    /// protocol state.
+    fn check_open(&self) -> Result<(), ConnectionError> {
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
