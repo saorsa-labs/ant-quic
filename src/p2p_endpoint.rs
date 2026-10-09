@@ -444,8 +444,11 @@ enum ReaderStart {
     Started,
     /// A running reader task already owns it; nothing was spawned.
     AlreadyOwned,
-    /// The connection's previous owner is still stopping or exiting; nothing
-    /// was spawned. Admission waits until that record is reaped.
+    /// The connection's previous owner is still stopping or exiting; this
+    /// start attempt is refused and nothing was spawned. The attempt is not
+    /// retained or retried: no caller queues it (the adoption consumer only
+    /// logs the result, the Standard wrapper discards it). A later start
+    /// attempt can succeed once that record has been reaped.
     Blocked,
     /// Adoption only: the connection is closed or no longer Live, or the
     /// endpoint is shutting down.
