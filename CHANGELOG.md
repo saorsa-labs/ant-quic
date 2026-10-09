@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.57] - 2026-10-09
+
+### Fixed
+
+- **Concurrent hole-punch winners no longer orphan a live connection (#310).**
+  Two successful hole-punch candidates for the same peer could both pass the
+  duplicate check before either took the lifecycle lock, and the second
+  silently displaced the first. The check and the insert now run in one
+  lifecycle-lock section: exactly one winner is inserted and the other is
+  closed as a duplicate. The accepted-coordination insert keeps its behaviour
+  (it replaces the winner and closes nothing).
+- **Raw hole-punch, accepted-coordination and materialized winners get an
+  application reader (#313).** A coordinator-dialled connection, or a
+  hole-punch winner whose waiter had already returned, could be the winner
+  with no reader, so messages the peer sent on it were never delivered even
+  though its send succeeded. The P2P layer now starts the reader for these
+  winners, and only the reader: no peer record, no lifecycle event, no
+  routing change, no close.
+- **One reader owner per connection (#313).** A duplicate reader start
+  spawns nothing, does no stream work and sends no exit event. A reader's
+  record is kept until its task has stopped and its exit cleanup is done, so
+  an old reader's exit can no longer close a successor's connection, and peer
+  cleanup or shutdown can no longer let a second reader start while a
+  torn-down one still runs. A reader task that died without an exit event no
+  longer blocks a new reader.
+
+
 ## [0.27.56] - 2026-10-09
 
 ### Fixed
