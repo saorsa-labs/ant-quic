@@ -804,6 +804,12 @@ async fn test_tiebreaker_deterministic() {
     // connection, (Client, Client), although both ends then settle on the
     // same winner. Wait until both ends keep the same connection, then check
     // the sides.
+    //
+    // This checks agreement only. Rejection closes and repromotion can also
+    // bring both ends onto one connection after a wrong cross-family decision,
+    // so the decision rule itself (keep the greater lifecycle connection id,
+    // for either registration order and local side) is checked separately in
+    // `tests/lifecycle_cross_family_tiebreak.rs`.
     let (retained_a, retained_b) =
         wait_for_one_retained_connection(&node_a, peer_id_b, &node_b, peer_id_a).await;
 

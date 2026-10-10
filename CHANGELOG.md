@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tiebreaker chose the same winner on both ends in every diagnosed run. The
   test now waits (up to 10 s) until both ends keep the same QUIC connection,
   then checks that they hold opposite sides of it.
+- **New `lifecycle_cross_family_tiebreak` test checks the cross-family decision
+  itself (#317).** Agreement alone can also follow a wrong decision, because
+  rejection closes and repromotion recover from it. The new test lets one
+  endpoint decide between two connections to one peer identity with different
+  initiators, in both registration orders (so with both local sides), and
+  checks from the lifecycle trace and the winner map that it keeps the greater
+  lifecycle connection id. Each order is repeated until both outcomes occur, so
+  a decision biased to one side or to registration order fails.
 
 ## [0.27.57] - 2026-10-09
 
