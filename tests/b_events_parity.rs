@@ -5,9 +5,12 @@ mod support;
 use ant_quic::{ConnectionCloseReason, PeerId, PeerLifecycleEvent};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{make_node, normalize_local_addr, spawn_accept_loop, test_guard};
+use support::{
+    CONNECT_TIMEOUT, make_isolated_node_with_keypair, normalize_local_addr, reusable_keypair,
+    spawn_accept_loop, test_guard,
+};
 use tokio::sync::broadcast;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 
 type PeerEventStore = Arc<Mutex<Vec<PeerLifecycleEvent>>>;
 type AllPeerEventStore = Arc<Mutex<Vec<(PeerId, PeerLifecycleEvent)>>>;
@@ -135,17 +138,32 @@ async fn wait_for_peer_stream_parity(
     }
 }
 
+/// The per-peer and all-peer lifecycle subscriptions report the same events
+/// for one peer across establish, replace and close.
+///
+/// #316: the replacement used to come from simultaneous opens and re-dials of
+/// the same addresses from both ends. `connect_addr` returns the existing live
+/// connection for an address it is already connected to, so the re-dials made
+/// no new connection, and a `Replaced` appeared only when the initial
+/// simultaneous open happened to register its connections in a superseding
+/// order (fewer than half the runs). The replacement now comes from a
+/// genuinely new connection: the sender dials receiver', a second endpoint
+/// with the receiver's identity on another port, while its connection to the
+/// receiver is still live. The sender opens both connections, so they are in
+/// one lifecycle family and the newer one always wins. The sender is the
+/// deciding endpoint on its outbound path, so it retires the old generation
+/// after the drain grace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     let _guard = test_guard().await;
 
-    let receiver = make_node(vec![]).await;
+    let receiver_keypair = reusable_keypair();
+    let receiver = make_isolated_node_with_keypair(receiver_keypair.clone()).await;
     let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
     let receiver_id = receiver.peer_id();
     let accept_receiver = spawn_accept_loop(receiver.clone());
 
-    let sender = make_node(vec![receiver_addr]).await;
-    let sender_addr = normalize_local_addr(sender.local_addr().expect("sender addr"));
+    let sender = make_isolated_node_with_keypair(reusable_keypair()).await;
     let accept_sender = spawn_accept_loop(sender.clone());
 
     let (peer_events, peer_events_task) =
@@ -153,22 +171,11 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     let (all_peer_events, all_peer_events_task) =
         spawn_all_peer_event_collector(sender.subscribe_all_peer_events());
 
-    let sender_connect = {
-        let sender = sender.clone();
-        tokio::spawn(async move { sender.connect_addr(receiver_addr).await })
-    };
-    let receiver_connect = {
-        let receiver = receiver.clone();
-        tokio::spawn(async move { receiver.connect_addr(sender_addr).await })
-    };
-    sender_connect
+    // Establish: C1, opened by the sender to the receiver.
+    timeout(CONNECT_TIMEOUT, sender.connect_addr(receiver_addr))
         .await
-        .expect("sender connect task")
+        .expect("initial sender connect timeout")
         .expect("initial sender connect");
-    receiver_connect
-        .await
-        .expect("receiver connect task")
-        .expect("initial receiver connect");
 
     let established = wait_for_peer_event("established(peer)", &peer_events, |event| {
         matches!(event, PeerLifecycleEvent::Established { .. })
@@ -190,35 +197,25 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             generation: initial_generation,
         }
     );
+    let initial_connection = sender
+        .get_quic_connection(&receiver_id)
+        .expect("sender lookup")
+        .expect("sender live C1");
 
-    'replacement: for _ in 0..10 {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if peer_events.lock().unwrap().iter().any(|event| {
-                matches!(
-                    event,
-                    PeerLifecycleEvent::Replaced {
-                        old_generation,
-                        new_generation,
-                    } if *old_generation == initial_generation && *new_generation > initial_generation
-                )
-            }) {
-                break 'replacement;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-
-        let sender_connect = {
-            let sender = sender.clone();
-            tokio::spawn(async move { sender.connect_addr(receiver_addr).await })
-        };
-        let receiver_connect = {
-            let receiver = receiver.clone();
-            tokio::spawn(async move { receiver.connect_addr(sender_addr).await })
-        };
-        let _ = sender_connect.await.expect("sender replacement task");
-        let _ = receiver_connect.await.expect("receiver replacement task");
-    }
+    // Replace: C2, opened by the sender to receiver' (the receiver's identity,
+    // another port) while C1 is live.
+    let receiver2 = make_isolated_node_with_keypair(receiver_keypair).await;
+    assert_eq!(
+        receiver2.peer_id(),
+        receiver_id,
+        "receiver' must have the receiver's identity"
+    );
+    let receiver2_addr = normalize_local_addr(receiver2.local_addr().expect("receiver2 addr"));
+    let accept_receiver2 = spawn_accept_loop(receiver2.clone());
+    timeout(CONNECT_TIMEOUT, sender.connect_addr(receiver2_addr))
+        .await
+        .expect("replacement sender connect timeout")
+        .expect("replacement sender connect");
 
     let replacement_generation =
         match wait_for_peer_event("replaced(peer)", &peer_events, |event| {
@@ -241,6 +238,15 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
             }
             other => panic!("unexpected replacement event: {other:?}"),
         };
+    let replacement_connection = sender
+        .get_quic_connection(&receiver_id)
+        .expect("sender lookup")
+        .expect("sender live C2");
+    assert_ne!(
+        replacement_connection.stable_id(),
+        initial_connection.stable_id(),
+        "the replacement must be a new QUIC connection"
+    );
 
     let (_, replaced_all) = wait_for_all_peer_event(
         "replaced(all)",
@@ -443,8 +449,10 @@ async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
 
     sender.shutdown().await;
     receiver.shutdown().await;
+    receiver2.shutdown().await;
     accept_sender.abort();
     accept_receiver.abort();
+    accept_receiver2.abort();
     peer_events_task.abort();
     all_peer_events_task.abort();
 }

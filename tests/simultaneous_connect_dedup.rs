@@ -68,17 +68,71 @@ async fn assert_connected_peer_set(node: &Node, expected: &[PeerId], label: &str
     }
 }
 
-async fn assert_single_connected_peer(
-    node: &Node,
-    expected_peer_id: PeerId,
-    label: &str,
-) -> PeerConnection {
-    assert_connected_peer_set(node, &[expected_peer_id], label).await;
-    node.connected_peers()
-        .await
-        .into_iter()
-        .find(|peer| peer.peer_id == expected_peer_id)
-        .expect("connected peer set should contain expected peer")
+/// Upper bound for both ends of a simultaneous open to settle on one retained
+/// connection. They normally agree a few milliseconds after the second
+/// `connect_addr` returns.
+const RETAINED_CONNECTION_WAIT: Duration = Duration::from_secs(10);
+
+/// One end's view of the connection it keeps for a peer: its
+/// `connected_peers()` record, the side of its live QUIC connection, and a
+/// TLS exporter value that is equal at both ends of the same connection.
+#[derive(Debug)]
+struct RetainedView {
+    record: PeerConnection,
+    live_side: Side,
+    exporter: [u8; 32],
+}
+
+async fn retained_view(node: &Node, peer: PeerId) -> Option<RetainedView> {
+    let peers = node.connected_peers().await;
+    let [record] = peers.as_slice() else {
+        return None;
+    };
+    if record.peer_id != peer {
+        return None;
+    }
+    let live = node
+        .inner_endpoint()
+        .get_quic_connection(&peer)
+        .ok()
+        .flatten()?;
+    let mut exporter = [0u8; 32];
+    live.export_keying_material(&mut exporter, b"ant-quic test retained connection", b"")
+        .ok()?;
+    Some(RetainedView {
+        record: record.clone(),
+        live_side: live.side(),
+        exporter,
+    })
+}
+
+/// Wait until each end has exactly the other as its one connected peer, both
+/// ends keep the same QUIC connection (equal exporter values), and each end's
+/// `connected_peers()` record describes that connection. Returns the records.
+async fn wait_for_one_retained_connection(
+    node_a: &Node,
+    peer_b: PeerId,
+    node_b: &Node,
+    peer_a: PeerId,
+) -> (PeerConnection, PeerConnection) {
+    let deadline = tokio::time::Instant::now() + RETAINED_CONNECTION_WAIT;
+    loop {
+        let view_a = retained_view(node_a, peer_b).await;
+        let view_b = retained_view(node_b, peer_a).await;
+        if let (Some(a), Some(b)) = (&view_a, &view_b)
+            && a.exporter == b.exporter
+            && a.record.side == a.live_side
+            && b.record.side == b.live_side
+        {
+            return (a.record.clone(), b.record.clone());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "endpoints did not settle on one retained connection within \
+             {RETAINED_CONNECTION_WAIT:?}: A={view_a:?} B={view_b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Test that calling connect_addr() twice to the same address returns the
@@ -742,10 +796,22 @@ async fn test_tiebreaker_deterministic() {
         "B's connection should point to A's peer ID"
     );
 
-    let retained_a =
-        assert_single_connected_peer(&node_a, peer_id_b, "node_a after tiebreaker").await;
-    let retained_b =
-        assert_single_connected_peer(&node_b, peer_id_a, "node_b after tiebreaker").await;
+    // #317: `connect_addr` returns when the local outbound handshake is done.
+    // When the winner is the other end's outbound connection, this end
+    // registers it as an inbound connection through its accept path a few
+    // milliseconds later. A single sample taken as soon as both dials return
+    // could therefore still show each end holding its own outbound
+    // connection, (Client, Client), although both ends then settle on the
+    // same winner. Wait until both ends keep the same connection, then check
+    // the sides.
+    //
+    // This checks agreement only. Rejection closes and repromotion can also
+    // bring both ends onto one connection after a wrong cross-family decision,
+    // so the decision rule itself (keep the greater lifecycle connection id,
+    // for either registration order and local side) is checked separately in
+    // `tests/lifecycle_cross_family_tiebreak.rs`.
+    let (retained_a, retained_b) =
+        wait_for_one_retained_connection(&node_a, peer_id_b, &node_b, peer_id_a).await;
 
     assert!(
         matches!(
