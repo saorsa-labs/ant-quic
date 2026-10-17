@@ -1661,6 +1661,9 @@ pub struct NatTraversalEndpoint {
     next_connection_generation: Arc<AtomicU64>,
     /// Local peer ID
     local_peer_id: PeerId,
+    /// Current local identity shared with accept tasks started before
+    /// `set_local_peer_id` installs the authenticated identity.
+    accept_local_peer_id: Arc<ParkingRwLock<PeerId>>,
     /// Timeout configuration
     timeout_config: crate::config::nat_timeouts::TimeoutConfig,
     /// Track peers for which ConnectionEstablished has already been emitted
@@ -3057,6 +3060,7 @@ impl NatTraversalEndpoint {
 
         let (observed_address_tx, observed_address_rx) = mpsc::unbounded_channel();
 
+        let local_peer_id = Self::generate_local_peer_id();
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
@@ -3080,7 +3084,8 @@ impl NatTraversalEndpoint {
             reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
-            local_peer_id: Self::generate_local_peer_id(),
+            local_peer_id,
+            accept_local_peer_id: Arc::new(ParkingRwLock::new(local_peer_id)),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -3286,7 +3291,7 @@ impl NatTraversalEndpoint {
             let connections_clone = endpoint.connections.clone();
             let connection_lifecycle_clone = endpoint.connection_lifecycle.clone();
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
-            let local_peer_id = endpoint.local_peer_id;
+            let local_peer_id = endpoint.accept_local_peer_id.clone();
             let emitted_events_clone = emitted_established_events.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
@@ -3587,6 +3592,7 @@ impl NatTraversalEndpoint {
 
         let (observed_address_tx, observed_address_rx) = mpsc::unbounded_channel();
 
+        let local_peer_id = Self::generate_local_peer_id();
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
@@ -3610,7 +3616,8 @@ impl NatTraversalEndpoint {
             reader_adoption_tx: ParkingRwLock::new(None),
             orphan_connections_closed: std::sync::atomic::AtomicU64::new(0),
             next_connection_generation: Arc::clone(&CONNECTION_GENERATIONS),
-            local_peer_id: Self::generate_local_peer_id(),
+            local_peer_id,
+            accept_local_peer_id: Arc::new(ParkingRwLock::new(local_peer_id)),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -3816,7 +3823,7 @@ impl NatTraversalEndpoint {
             let connections_clone = endpoint.connections.clone();
             let connection_lifecycle_clone = endpoint.connection_lifecycle.clone();
             let next_connection_generation_clone = endpoint.next_connection_generation.clone();
-            let local_peer_id = endpoint.local_peer_id;
+            let local_peer_id = endpoint.accept_local_peer_id.clone();
             let emitted_events_clone = emitted_established_events.clone();
             let observed_address_tx_clone = endpoint.observed_address_tx.clone();
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
@@ -4005,7 +4012,7 @@ impl NatTraversalEndpoint {
             let connections = self.connections.clone();
             let connection_lifecycle = self.connection_lifecycle.clone();
             let next_connection_generation = self.next_connection_generation.clone();
-            let local_peer_id = self.local_peer_id;
+            let local_peer_id = self.accept_local_peer_id.clone();
             let emitted_events = self.emitted_established_events.clone();
             let observed_address_tx = self.observed_address_tx.clone();
             let traversal_event_notify = self.traversal_event_notify.clone();
@@ -4038,6 +4045,7 @@ impl NatTraversalEndpoint {
                                     remote,
                                     hex::encode(&peer_id.0[..8])
                                 );
+                                let local_peer_id = *local_peer_id.read();
                                 let outcome = Self::register_connection_lifecycle_parts(
                                     local_peer_id,
                                     connections.as_ref(),
@@ -4889,6 +4897,7 @@ impl NatTraversalEndpoint {
     /// Get current NAT traversal statistics
     pub fn set_local_peer_id(&mut self, peer_id: PeerId) {
         self.local_peer_id = peer_id;
+        *self.accept_local_peer_id.write() = peer_id;
     }
 
     pub fn bootstrap_addresses(&self) -> Vec<SocketAddr> {
@@ -6611,7 +6620,7 @@ impl NatTraversalEndpoint {
         let connections_clone = self.connections.clone();
         let connection_lifecycle_clone = self.connection_lifecycle.clone();
         let next_connection_generation_clone = self.next_connection_generation.clone();
-        let local_peer_id = self.local_peer_id;
+        let local_peer_id = self.accept_local_peer_id.clone();
         let emitted_events_clone = self.emitted_established_events.clone();
         let observed_address_tx_clone = self.observed_address_tx.clone();
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
@@ -6650,7 +6659,7 @@ impl NatTraversalEndpoint {
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         connection_lifecycle: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
         next_connection_generation: Arc<AtomicU64>,
-        local_peer_id: PeerId,
+        local_peer_id: Arc<ParkingRwLock<PeerId>>,
         emitted_events: Arc<dashmap::DashSet<PeerId>>,
         observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
@@ -6664,6 +6673,7 @@ impl NatTraversalEndpoint {
                     let connections = connections.clone();
                     let connection_lifecycle = connection_lifecycle.clone();
                     let next_connection_generation = next_connection_generation.clone();
+                    let local_peer_id = local_peer_id.clone();
                     let emitted_events = emitted_events.clone();
                     let observed_address_tx = observed_address_tx.clone();
                     let traversal_event_notify = traversal_event_notify.clone();
@@ -6692,6 +6702,7 @@ impl NatTraversalEndpoint {
                                         )
                                     });
 
+                                let local_peer_id = *local_peer_id.read();
                                 let outcome = Self::register_connection_lifecycle_parts(
                                     local_peer_id,
                                     connections.as_ref(),
@@ -16695,6 +16706,97 @@ mod tests {
         NatTraversalEndpoint::new(config, None, None)
             .await
             .expect("identified endpoint binds")
+    }
+
+    #[cfg(feature = "network-discovery")]
+    async fn assert_inbound_outbound_lifecycle_family_matches(with_socket: bool) {
+        let (acceptor_keypair, acceptor_peer) = test_identity();
+        let (initiator_keypair, initiator_peer) = test_identity();
+        let mut config = loopback_shutdown_test_config();
+        config.identity_key = Some(acceptor_keypair);
+        let mut acceptor = if with_socket {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("loopback socket");
+            NatTraversalEndpoint::new_with_socket(config, None, None, Some(socket)).await
+        } else {
+            NatTraversalEndpoint::new(config, None, None).await
+        }
+        .expect("acceptor binds");
+        let mut initiator = identified_test_endpoint(&initiator_keypair).await;
+
+        // The accept task already exists when P2pEndpoint sets its identity.
+        // Also hold the completed handshake to catch copies made by the task
+        // itself, rather than reading the identity at registration time.
+        assert_ne!(acceptor.local_peer_id(), acceptor_peer);
+        let hold = acceptor.arm_inbound_hold_for_test();
+        initiator.set_local_peer_id(initiator_peer);
+        let acceptor_addr = acceptor.get_endpoint().unwrap().local_addr().unwrap();
+        let outbound = tokio::time::timeout(
+            Duration::from_secs(10),
+            initiator
+                .get_endpoint()
+                .unwrap()
+                .connect(acceptor_addr, "peer")
+                .expect("start loopback connection"),
+        )
+        .await
+        .expect("handshake completes")
+        .expect("handshake succeeds");
+        assert_eq!(outbound.side(), Side::Client);
+        initiator
+            .add_connection(acceptor_peer, outbound.clone())
+            .expect("register outbound connection");
+        let held = tokio::time::timeout(Duration::from_secs(10), hold.wait_for_held(1))
+            .await
+            .expect("accept loop reaches inbound registration");
+        acceptor.set_local_peer_id(acceptor_peer);
+        hold.release(held[0].0);
+        let (remote_peer, inbound) =
+            tokio::time::timeout(Duration::from_secs(10), acceptor.accept_connection())
+                .await
+                .expect("inbound registration completes")
+                .expect("accept inbound connection");
+        assert_eq!(remote_peer, initiator_peer);
+        assert_eq!(inbound.side(), Side::Server);
+
+        let family = |endpoint: &NatTraversalEndpoint, peer, stable_id| {
+            endpoint.connection_lifecycle.read()[&peer]
+                .iter()
+                .find(|entry| entry.stable_id() == stable_id)
+                .expect("connection has a lifecycle entry")
+                .connection_family_id
+        };
+        let inbound_family = family(&acceptor, initiator_peer, inbound.stable_id());
+        let outbound_family = family(&initiator, acceptor_peer, outbound.stable_id());
+        assert_eq!(
+            inbound_family, outbound_family,
+            "inbound and outbound registrations of the same peer pair and initiator share a family"
+        );
+        assert_eq!(
+            inbound_family,
+            NatTraversalEndpoint::lifecycle_connection_family_id_from_initiator(
+                acceptor_peer,
+                initiator_peer,
+                initiator_peer,
+            ),
+            "the family uses the authenticated local identity"
+        );
+
+        drop(inbound);
+        drop(outbound);
+        acceptor.shutdown().await.expect("acceptor shutdown");
+        initiator.shutdown().await.expect("initiator shutdown");
+    }
+
+    #[cfg(feature = "network-discovery")]
+    #[tokio::test]
+    async fn inbound_outbound_lifecycle_family_matches_after_set_local_peer_id() {
+        assert_inbound_outbound_lifecycle_family_matches(false).await;
+    }
+
+    #[cfg(feature = "network-discovery")]
+    #[tokio::test]
+    async fn inbound_outbound_lifecycle_family_matches_after_set_local_peer_id_with_socket() {
+        assert_inbound_outbound_lifecycle_family_matches(true).await;
     }
 
     /// #305: shutdown must report success and leave the original address
