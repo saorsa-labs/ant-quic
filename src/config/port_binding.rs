@@ -540,18 +540,28 @@ mod tests {
 
     #[test]
     fn test_bind_explicit_port() {
-        let config = EndpointPortConfig {
-            port: PortBinding::Explicit(12345),
-            ip_mode: IpMode::IPv4Only,
-            ..Default::default()
-        };
+        for _ in 0..32 {
+            let reservation = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .expect("OS-assigned bind should succeed");
+            let port = reservation.local_addr().expect("socket address").port();
+            let config = EndpointPortConfig {
+                port: PortBinding::Explicit(port),
+                ip_mode: IpMode::IPv4Only,
+                ..Default::default()
+            };
 
-        let result = bind_endpoint(&config);
-        assert!(result.is_ok());
+            // Another process can claim the port between releasing it and rebinding.
+            drop(reservation);
+            let bound = match bind_endpoint(&config) {
+                Err(EndpointConfigError::PortInUse(_)) => continue,
+                result => result.expect("explicit bind should succeed"),
+            };
 
-        let bound = result.expect("bind_endpoint should succeed");
-        assert_eq!(bound.addrs.len(), 1);
-        assert_eq!(bound.addrs[0].port(), 12345);
+            assert_eq!(bound.addrs.len(), 1);
+            assert_eq!(bound.addrs[0].port(), port);
+            return;
+        }
+        panic!("could not rebind an OS-assigned port after 32 attempts");
     }
 
     #[test]
@@ -573,17 +583,18 @@ mod tests {
     fn test_bind_port_conflict() {
         // First binding succeeds
         let config1 = EndpointPortConfig {
-            port: PortBinding::Explicit(23456),
+            port: PortBinding::OsAssigned,
             ip_mode: IpMode::IPv4Only,
             retry_behavior: PortRetryBehavior::FailFast,
             ..Default::default()
         };
 
-        let _bound1 = bind_endpoint(&config1).expect("First bind should succeed");
+        let bound1 = bind_endpoint(&config1).expect("First bind should succeed");
+        let port = bound1.addrs[0].port();
 
         // Second binding to same port should fail
         let config2 = EndpointPortConfig {
-            port: PortBinding::Explicit(23456),
+            port: PortBinding::Explicit(port),
             ip_mode: IpMode::IPv4Only,
             retry_behavior: PortRetryBehavior::FailFast,
             ..Default::default()
@@ -592,7 +603,7 @@ mod tests {
         let result2 = bind_endpoint(&config2);
         assert!(matches!(
             result2,
-            Err(EndpointConfigError::PortInUse(23456))
+            Err(EndpointConfigError::PortInUse(conflicting_port)) if conflicting_port == port
         ));
     }
 
@@ -600,16 +611,17 @@ mod tests {
     fn test_bind_fallback_to_os_assigned() {
         // First binding
         let config1 = EndpointPortConfig {
-            port: PortBinding::Explicit(34567),
+            port: PortBinding::OsAssigned,
             ip_mode: IpMode::IPv4Only,
             ..Default::default()
         };
 
-        let _bound1 = bind_endpoint(&config1).expect("First bind should succeed");
+        let bound1 = bind_endpoint(&config1).expect("First bind should succeed");
+        let port = bound1.addrs[0].port();
 
         // Second binding with fallback
         let config2 = EndpointPortConfig {
-            port: PortBinding::Explicit(34567),
+            port: PortBinding::Explicit(port),
             ip_mode: IpMode::IPv4Only,
             retry_behavior: PortRetryBehavior::FallbackToOsAssigned,
             ..Default::default()
@@ -619,23 +631,38 @@ mod tests {
         assert!(result2.is_ok());
 
         let bound2 = result2.expect("bind_endpoint with fallback should succeed");
-        assert_ne!(bound2.addrs[0].port(), 34567); // Should get different port
+        assert_ne!(bound2.addrs[0].port(), port); // Should get different port
+        assert_ne!(bound2.addrs[0].port(), 0);
     }
 
     #[test]
     fn test_bind_port_range() {
-        let config = EndpointPortConfig {
-            port: PortBinding::Range(45000, 45010),
-            ip_mode: IpMode::IPv4Only,
-            ..Default::default()
-        };
+        for _ in 0..32 {
+            let reservation = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .expect("OS-assigned bind should succeed");
+            let start = reservation.local_addr().expect("socket address").port();
+            let Some(end) = start.checked_add(10) else {
+                continue;
+            };
+            let config = EndpointPortConfig {
+                port: PortBinding::Range(start, end),
+                ip_mode: IpMode::IPv4Only,
+                ..Default::default()
+            };
 
-        let result = bind_endpoint(&config);
-        assert!(result.is_ok());
+            // Keep the first port occupied to exercise skipping it. Other processes
+            // may occupy the rest of the range, so retry with a new allocation.
+            let bound = match bind_endpoint(&config) {
+                Err(EndpointConfigError::NoPortInRange(_, _)) => continue,
+                result => result.expect("range bind should succeed"),
+            };
 
-        let bound = result.expect("bind_endpoint should succeed");
-        let port = bound.addrs[0].port();
-        assert!((45000..=45010).contains(&port));
+            let port = bound.addrs[0].port();
+            assert!((start..=end).contains(&port));
+            assert_ne!(port, start);
+            return;
+        }
+        panic!("could not bind an OS-assigned port range after 32 attempts");
     }
 
     #[test]
