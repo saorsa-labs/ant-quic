@@ -117,6 +117,7 @@ impl ConnectionCloseReason {
             CLOSE_CODE_BANNED => Some(Self::Banned),
             CLOSE_CODE_LIFECYCLE_CLEANUP => Some(Self::LifecycleCleanup),
             CLOSE_CODE_LIVENESS_TIMEOUT => Some(Self::LivenessTimeout),
+            CLOSE_CODE_NO_READER => Some(Self::NoReader),
             _ => None,
         }
     }
@@ -276,6 +277,8 @@ mod tests {
 
     #[test]
     fn lifecycle_reasons_have_app_error_codes() {
+        // Every reason the endpoint may send via app_error_code must appear
+        // here so a newly reserved CLOSE_CODE_* cannot ship unmapped.
         let has_code = [
             ConnectionCloseReason::Superseded,
             ConnectionCloseReason::ReaderExit,
@@ -283,6 +286,7 @@ mod tests {
             ConnectionCloseReason::Banned,
             ConnectionCloseReason::LifecycleCleanup,
             ConnectionCloseReason::LivenessTimeout,
+            ConnectionCloseReason::NoReader,
         ];
 
         for reason in &has_code {
@@ -334,6 +338,8 @@ mod tests {
 
     #[test]
     fn from_app_error_code_roundtrip() {
+        // Covers every CLOSE_CODE_* the endpoint sends. A new coded reason
+        // that is missing from from_app_error_code fails this round-trip.
         let lifecycle_reasons = [
             ConnectionCloseReason::Superseded,
             ConnectionCloseReason::ReaderExit,
@@ -341,6 +347,7 @@ mod tests {
             ConnectionCloseReason::Banned,
             ConnectionCloseReason::LifecycleCleanup,
             ConnectionCloseReason::LivenessTimeout,
+            ConnectionCloseReason::NoReader,
         ];
 
         for reason in &lifecycle_reasons {
@@ -348,6 +355,27 @@ mod tests {
             let mapped = ConnectionCloseReason::from_app_error_code(code);
             assert_eq!(mapped, Some(*reason));
         }
+    }
+
+    #[test]
+    fn from_app_error_code_maps_no_reader() {
+        // Regression for #323: a remote NoReader close must not fall through
+        // to ApplicationClosed via from_connection_error.
+        let code = VarInt::from_u32(CLOSE_CODE_NO_READER);
+        assert_eq!(
+            ConnectionCloseReason::from_app_error_code(code),
+            Some(ConnectionCloseReason::NoReader)
+        );
+
+        let app_close = crate::frame::ApplicationClose {
+            error_code: code,
+            reason: Bytes::new(),
+        };
+        let frame = crate::ConnectionError::ApplicationClosed(app_close);
+        assert_eq!(
+            ConnectionCloseReason::from_connection_error(&frame),
+            ConnectionCloseReason::NoReader
+        );
     }
 
     #[test]
