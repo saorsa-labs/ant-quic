@@ -45,16 +45,21 @@ env:
   # Keep Criterion runs bounded; gate quality comes from CIs + same-commit control.
   BENCH_CRITERION_ARGS: "--sample-size 40 --warm-up-time 1 --measurement-time 2"
 
-# Required for posting comments on PRs
+# Read-only by default. Write scopes live on the job that needs them.
+# Fork pull_request runs stay read-only no matter what a job declares.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
+    # Comment on PR calls POST /issues/{n}/comments. Run 40476287761 was
+    # rejected with x-accepted-github-permissions: issues=write; pull_requests=write.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -329,31 +334,53 @@ jobs:
             }
             comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, allowlisted ant-quic bench ids only, CI overlap required, ABAB interleaved confirmation before fail. Mock/non-observing benches never fail the job._\n';
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
+            const head = context.payload.pull_request && context.payload.pull_request.head;
+            const headRepo = head && head.repo && head.repo.full_name;
+            const fromFork = Boolean(headRepo) &&
+              headRepo !== `${context.repo.owner}/${context.repo.repo}`;
 
-            const botComment = comments.find(c =>
-              c.user.type === 'Bot' &&
-              c.body.includes('## Benchmark Results')
-            );
-
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: comment
-              });
-            } else {
-              await github.rest.issues.createComment({
+            try {
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: comment
               });
+
+              const botComment = comments.find(c =>
+                c.user.type === 'Bot' &&
+                c.body.includes('## Benchmark Results')
+              );
+
+              if (botComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: comment
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: comment
+                });
+              }
+            } catch (error) {
+              // Fork pull_request tokens stay read-only (run 40476287761, HTTP 403).
+              // Same-repository 403s still fail the job.
+              if (fromFork && error.status === 403) {
+                core.warning(
+                  `Benchmark results were not posted (${error.message}). ` +
+                  'Fork pull_request tokens cannot be granted issues: write or pull-requests: write.'
+                );
+                const summary = process.env.GITHUB_STEP_SUMMARY;
+                if (summary) {
+                  fs.appendFileSync(summary, comment);
+                }
+                return;
+              }
+              throw error;
             }
 
       - name: Fail if gating regression found
@@ -366,6 +393,8 @@ jobs:
   profile:
     name: CPU Profiling
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_profiling == 'true'
     steps:
       - uses: actions/checkout@v5
@@ -400,6 +429,8 @@ jobs:
   memory-analysis:
     name: Memory Analysis
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_profiling == 'true'
     steps:
       - uses: actions/checkout@v5
@@ -445,6 +476,9 @@ jobs:
   benchmark-history:
     name: Track History
     runs-on: ubuntu-latest
+    # Pushes .benchmarks to the benchmark-history branch. No pull-request writes.
+    permissions:
+      contents: write
     # Allow this job to fail - benchmark history is optional and may fail on forks
     continue-on-error: true
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
