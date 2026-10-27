@@ -19,6 +19,11 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest
+    # id-token: write is what lets same-repository pull requests mint the OIDC
+    # token claude-code-action exchanges for a GitHub token. Fork pull_request
+    # runs never receive ACTIONS_ID_TOKEN_REQUEST_URL (run 40476288425), and
+    # secrets such as CLAUDE_CODE_OAUTH_TOKEN are withheld, so the action is
+    # not started for those. pull_request_target is not used.
     permissions:
       contents: read
       pull-requests: read
@@ -27,12 +32,14 @@ jobs:
 
     steps:
       - name: Checkout repository
+        if: github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
       - name: Run Claude Code Review
         id: claude-review
+        if: github.event.pull_request.head.repo.full_name == github.repository
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -42,3 +49,10 @@ jobs:
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
+
+      - name: Fork pull requests have no OIDC token
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Fork pull_request workflows do not receive ACTIONS_ID_TOKEN_REQUEST_URL or secrets."
+          echo "Claude review is skipped. This workflow does not use pull_request_target."
+          echo "::notice title=Claude review skipped::Fork pull requests cannot mint the OIDC token this action needs."
