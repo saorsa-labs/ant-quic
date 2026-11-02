@@ -79,7 +79,7 @@ jobs:
               {"os":"ubuntu-latest","rust":"1.88.0","target":"x86_64-unknown-linux-gnu"},
               {"os":"ubuntu-latest","rust":"stable","target":"aarch64-unknown-linux-gnu","cross":true},
               {"os":"macos-latest","rust":"stable","target":"x86_64-apple-darwin"},
-              {"os":"macos-14","rust":"stable","target":"aarch64-apple-darwin"},
+              {"os":"macos-15","rust":"stable","target":"aarch64-apple-darwin"},
               {"os":"windows-latest","rust":"stable","target":"x86_64-pc-windows-msvc"}
             ]}' | tr -d '\n' >> $GITHUB_OUTPUT
           fi
