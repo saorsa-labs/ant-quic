@@ -59,8 +59,11 @@ connection that carries it: `SendStream::connection_generation()` /
 value is stamped once, when the stream is opened or accepted, so it stays the
 provenance of the connection that really carried the stream even after a
 follow (ADR-017) keeps a superseded connection open and the live winner
-changes; `u64::MAX` marks streams that did not come from a lifecycle-tracked
-path, matching the `recv_with_generation` sentinel.
+changes. These methods are the only stamping paths: streams opened directly on
+a raw connection (`get_quic_connection`, the `LinkTransport` adapters) report
+the `u64::MAX` sentinel instead, matching `recv_with_generation`. Generations
+come from one process-wide counter, so a value identifies a single connection
+in this process.
 
 ## How app-vs-internal stream separation is guaranteed (requirement #1)
 

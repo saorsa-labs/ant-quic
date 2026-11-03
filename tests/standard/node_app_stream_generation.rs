@@ -173,7 +173,13 @@ async fn accepted_stream_reports_the_generation_of_the_connection_that_carried_i
     );
 
     // B still holds only C1, so this application stream travels on the
-    // superseded-but-open C1 and is forwarded by C1's reader at A.
+    // superseded-but-open C1 and is forwarded by C1's reader at A. Assert the
+    // precondition: B's winner — its only connection — is still C1.
+    assert_eq!(
+        b.current_connection_generation(&a_id),
+        Some(b_generation_c1),
+        "B must still hold only C1 when it opens the stream"
+    );
     let (mut send, recv) = timeout(TIMEOUT, b.open_bi(&a_id))
         .await
         .expect("open_bi timeout")
@@ -201,8 +207,8 @@ async fn accepted_stream_reports_the_generation_of_the_connection_that_carried_i
         "the stream must not report the winner's generation"
     );
 
-    // The opener's halves carry B's own generation for C1 (generations are
-    // per-endpoint, hence compared against B's Established event).
+    // The opener's halves carry B's own generation for C1 (each endpoint
+    // numbers its own connections, hence B's Established event, not A's).
     assert_eq!(send.connection_generation(), b_generation_c1);
     assert_eq!(recv.connection_generation(), b_generation_c1);
 
@@ -220,4 +226,127 @@ async fn accepted_stream_reports_the_generation_of_the_connection_that_carried_i
     accept_a.abort();
     accept_b.abort();
     accept_b2.abort();
+}
+
+/// An opened application stream keeps reporting the generation of the
+/// connection it was opened on, even after the opener's winner changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opened_stream_keeps_its_generation_across_opener_winner_changes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
+    // Mirror of the accepted-side test with the opener as the follower: A
+    // opens S1 on C1, then B' — a second endpoint with B's identity — dials A
+    // (C2), so at A the newer same-family C2 supersedes C1 (ADR-017).
+    let (b_keypair, a_keypair) = ordered_keypairs();
+    let a = make_node(a_keypair).await;
+    let b = make_node(b_keypair.clone()).await;
+    let a_addr = normalize(a.local_addr().expect("bound addr"));
+    let b_id = b.peer_id();
+    let mut a_events = a.subscribe_peer_events(&b_id);
+    let accept_a = spawn_accept_loop(Arc::clone(&a));
+    let accept_b = spawn_accept_loop(Arc::clone(&b));
+
+    // --- C1: B dials A ---
+    timeout(TIMEOUT, b.connect_addr(a_addr))
+        .await
+        .expect("C1 connect timeout")
+        .expect("C1 connect");
+    let a_generation_c1 = wait_for_established(&mut a_events).await;
+
+    // S1 is opened while C1 is A's winner, so it rides C1.
+    let (send1, recv1) = timeout(TIMEOUT, a.open_bi(&b_id))
+        .await
+        .expect("S1 open_bi timeout")
+        .expect("S1 open_bi");
+    assert_eq!(send1.connection_generation(), a_generation_c1);
+
+    // --- C2: B' (B's identity, fresh socket) dials A while C1 is live ---
+    let b2 = make_node(b_keypair).await;
+    let accept_b2 = spawn_accept_loop(Arc::clone(&b2));
+    timeout(TIMEOUT, b2.connect_addr(a_addr))
+        .await
+        .expect("C2 connect timeout")
+        .expect("C2 connect");
+    let a_generation_c2 = wait_for_replaced_after(&mut a_events, a_generation_c1).await;
+    assert_eq!(
+        a.current_connection_generation(&b_id),
+        Some(a_generation_c2),
+        "the winner at A must now be C2"
+    );
+
+    // The regression: S1 was opened on C1, so it keeps reporting C1's
+    // generation even though the winner is now C2 — never the winner's value.
+    assert_eq!(
+        send1.connection_generation(),
+        a_generation_c1,
+        "a stream opened before the winner change must not report the current winner"
+    );
+    assert_eq!(recv1.connection_generation(), a_generation_c1);
+
+    // A stream opened after the winner change rides the new winner C2 and
+    // reports C2's generation.
+    let (send2, recv2) = timeout(TIMEOUT, a.open_bi(&b_id))
+        .await
+        .expect("S2 open_bi timeout")
+        .expect("S2 open_bi");
+    assert_eq!(send2.connection_generation(), a_generation_c2);
+    assert_eq!(recv2.connection_generation(), a_generation_c2);
+
+    // Keep handles alive past the assertions (drop races the prefix read).
+    drop((send1, recv1, send2, recv2));
+
+    let _ = timeout(Duration::from_secs(2), a.shutdown()).await;
+    let _ = timeout(Duration::from_secs(2), b.shutdown()).await;
+    let _ = timeout(Duration::from_secs(2), b2.shutdown()).await;
+    accept_a.abort();
+    accept_b.abort();
+    accept_b2.abort();
+}
+
+/// A stream opened directly on a raw connection — not through the
+/// `open_bi`/`accept_bi` application paths — reports the `u64::MAX` sentinel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unstamped_raw_connection_stream_reports_sentinel_generation() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
+    let (b_keypair, a_keypair) = ordered_keypairs();
+    let a = make_node(a_keypair).await;
+    let b = make_node(b_keypair).await;
+    let a_addr = normalize(a.local_addr().expect("bound addr"));
+    let b_id = b.peer_id();
+    let mut a_events = a.subscribe_peer_events(&b_id);
+    let accept_a = spawn_accept_loop(Arc::clone(&a));
+    let accept_b = spawn_accept_loop(Arc::clone(&b));
+
+    timeout(TIMEOUT, b.connect_addr(a_addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+    let _ = wait_for_established(&mut a_events).await;
+
+    // `get_quic_connection` hands out the raw tracked connection, but only
+    // the application `open_bi`/`accept_bi` paths stamp a generation.
+    let connection = a
+        .get_quic_connection(&b_id)
+        .expect("get_quic_connection")
+        .expect("live connection");
+    let (send, recv) = timeout(TIMEOUT, connection.open_bi())
+        .await
+        .expect("raw open_bi timeout")
+        .expect("raw open_bi");
+    assert_eq!(send.connection_generation(), u64::MAX);
+    assert_eq!(recv.connection_generation(), u64::MAX);
+
+    drop((send, recv));
+
+    let _ = timeout(Duration::from_secs(2), a.shutdown()).await;
+    let _ = timeout(Duration::from_secs(2), b.shutdown()).await;
+    accept_a.abort();
+    accept_b.abort();
 }

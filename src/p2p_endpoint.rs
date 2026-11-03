@@ -12,7 +12,7 @@
 //!
 //! # Features
 //!
-//! - Configuration via [`P2pConfig`](crate::unified_config::P2pConfig)
+//! - Configuration via [`P2pConfig`]
 //! - Event subscription via broadcast channels
 //! - TLS-based peer authentication via ML-DSA-65 (v0.2+)
 //! - NAT traversal with automatic fallback
