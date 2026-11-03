@@ -53,6 +53,18 @@ and `HighLevelRecvStream` (`ant_quic::RecvStream`) implements
 adapters. `open_bi`/`accept_bi` are symmetric to the existing `send`/`recv`
 message API and live on the same handle.
 
+Every stream both methods return also carries the lifecycle generation of the
+connection that carries it: `SendStream::connection_generation()` /
+`RecvStream::connection_generation()` (added for #327, additive only). The
+value is stamped once, when the stream is opened or accepted, so it stays the
+provenance of the connection that really carried the stream even after a
+follow (ADR-017) keeps a superseded connection open and the live winner
+changes. These methods are the only stamping paths: streams opened directly on
+a raw connection (`get_quic_connection`, the `LinkTransport` adapters) report
+the `u64::MAX` sentinel instead, matching `recv_with_generation`. Generations
+come from one process-wide counter, so a value identifies a single connection
+in this process.
+
 ## How app-vs-internal stream separation is guaranteed (requirement #1)
 
 The per-connection reader task (`P2pEndpoint::spawn_reader_task`) already owns
@@ -132,3 +144,4 @@ loop competing with ant-quic's internal reader.
 Additive only. Two new `pub async fn`s on `Node` (and the corresponding
 `pub async fn`s on `P2pEndpoint`), plus a new `pub(crate)` wire constant. No
 existing signature changes. No new mandatory configuration. Minor version bump.
+`connection_generation()` on the stream types (#327) is additive the same way.

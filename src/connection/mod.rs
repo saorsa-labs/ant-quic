@@ -1762,8 +1762,6 @@ impl Connection {
     ///
     /// If [`Streams::send_streams`] returns 0, all outstanding stream data has been
     /// delivered. There may still be data from the peer that has not been received.
-    ///
-    /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
     pub fn close(&mut self, now: Instant, error_code: VarInt, reason: Bytes) {
         self.close_inner(
             now,
