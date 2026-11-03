@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.62] - 2026-11-03
+
+### Added
+
+- **`connection_generation()` on every accepted or opened app stream.**
+  `SendStream` and `RecvStream` each expose the generation of the connection
+  that carried them, stamped once when the stream is accepted or opened and
+  never changing, so an application with per-connection state can tell a
+  superseded connection's streams from the winner's while both connections
+  stay open after a follow (ADR-017). Streams not created through
+  `P2pEndpoint`/`Node` `open_bi`/`accept_bi` report the `u64::MAX` sentinel.
+  Additive only: no wire change and no existing signature changes.
+  Fixes #327, backport of #367.
+
 ## [0.27.61] - 2026-10-17
 
 ### Fixed
