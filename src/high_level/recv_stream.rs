@@ -76,6 +76,9 @@ pub struct RecvStream {
     conn: ConnectionRef,
     stream: StreamId,
     is_0rtt: bool,
+    /// Lifecycle generation of the connection this stream was accepted on,
+    /// stamped by the P2P layer. `u64::MAX` until stamped.
+    connection_generation: u64,
     all_data_read: bool,
     reset: Option<VarInt>,
 }
@@ -86,9 +89,14 @@ impl RecvStream {
             conn,
             stream,
             is_0rtt,
+            connection_generation: u64::MAX,
             all_data_read: false,
             reset: None,
         }
+    }
+
+    pub(crate) fn set_connection_generation(&mut self, generation: u64) {
+        self.connection_generation = generation;
     }
 
     /// Read data contiguously from the stream.
@@ -323,6 +331,32 @@ impl RecvStream {
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream
+    }
+
+    /// Lifecycle generation of the connection this stream was accepted or
+    /// opened on.
+    ///
+    /// The value is stamped when the stream is handed to the application by
+    /// [`P2pEndpoint::accept_bi`] or opened through [`P2pEndpoint::open_bi`],
+    /// and never changes afterwards, so it is provenance: after a follow
+    /// (ADR-017) a superseded connection stays open and keeps delivering
+    /// streams, and the live winner may change again while this stream is
+    /// being processed — this still reports the connection the stream
+    /// actually arrived on or was opened over. Generations are allocated
+    /// per endpoint; compare them only with values from the same endpoint
+    /// (for example [`P2pEndpoint::current_connection_generation`] or
+    /// [`P2pEndpoint::recv_with_generation`]).
+    ///
+    /// Returns `u64::MAX` when the stream was not accepted through a
+    /// lifecycle-tracked path — the same sentinel [`Node::recv_with_generation`]
+    /// uses for data that predates authentication.
+    ///
+    /// [`P2pEndpoint::accept_bi`]: crate::P2pEndpoint::accept_bi
+    /// [`P2pEndpoint::current_connection_generation`]: crate::P2pEndpoint::current_connection_generation
+    /// [`P2pEndpoint::recv_with_generation`]: crate::P2pEndpoint::recv_with_generation
+    /// [`Node::recv_with_generation`]: crate::Node::recv_with_generation
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     /// Completes when the stream has been reset by the peer or otherwise closed
