@@ -868,6 +868,12 @@ impl Node {
     /// / [`Self::recv`] and the peer's [`Self::accept_bi`] never sees internal
     /// streams. Byte-level backpressure is QUIC-native.
     ///
+    /// The returned streams carry the lifecycle generation of the connection
+    /// the stream was opened on
+    /// ([`crate::high_level::SendStream::connection_generation`]); the value
+    /// is provenance and does not change if that connection is later
+    /// superseded.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -907,6 +913,12 @@ impl Node {
     ///
     /// Like [`Self::open_bi`], the streams inherit the connection's ML-DSA-65
     /// peer auth and use QUIC-native backpressure.
+    ///
+    /// Each accepted stream carries the lifecycle generation of the
+    /// connection it arrived on
+    /// ([`crate::high_level::RecvStream::connection_generation`]), which
+    /// distinguishes a superseded connection's streams from the winner's
+    /// while both stay open (ADR-017).
     ///
     /// # Errors
     ///

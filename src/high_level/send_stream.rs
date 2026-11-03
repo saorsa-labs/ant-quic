@@ -55,6 +55,9 @@ pub struct SendStream {
     conn: ConnectionRef,
     stream: StreamId,
     is_0rtt: bool,
+    /// Lifecycle generation of the connection this stream was opened or
+    /// accepted on, stamped by the P2P layer. `u64::MAX` until stamped.
+    connection_generation: u64,
     /// Whether the application explicitly asked for a graceful close.
     ///
     /// `Drop` needs this to tell an intentional end-of-stream from an abandoned one. It cannot be
@@ -70,8 +73,13 @@ impl SendStream {
             conn,
             stream,
             is_0rtt,
+            connection_generation: u64::MAX,
             finished: false,
         }
+    }
+
+    pub(crate) fn set_connection_generation(&mut self, generation: u64) {
+        self.connection_generation = generation;
     }
 
     /// Write bytes to the stream
@@ -271,6 +279,40 @@ impl SendStream {
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream
+    }
+
+    /// Lifecycle generation of the connection this stream was opened or
+    /// accepted on.
+    ///
+    /// The value is stamped when the stream is opened through
+    /// [`P2pEndpoint::open_bi`] or [`Node::open_bi`], or handed to the
+    /// application by [`P2pEndpoint::accept_bi`] or [`Node::accept_bi`], and
+    /// never changes afterwards, so it is provenance: the live winner may be
+    /// superseded while the stream is still in use, and this still reports
+    /// the connection the stream was actually opened or accepted on.
+    /// Generations come from one counter shared by every endpoint in this
+    /// process, so a value identifies a single connection process-wide;
+    /// compare it only with values from the same process (for example
+    /// [`P2pEndpoint::current_connection_generation`] or
+    /// [`P2pEndpoint::recv_with_generation`]).
+    ///
+    /// Returns `u64::MAX` when the stream did not come from one of the
+    /// stamping paths above: streams opened directly on a connection from
+    /// [`P2pEndpoint::get_quic_connection`] — including through the
+    /// `LinkTransport` adapters — carry no generation and report `u64::MAX`,
+    /// the same sentinel [`Node::recv_with_generation`] uses for data that
+    /// predates authentication.
+    ///
+    /// [`P2pEndpoint::open_bi`]: crate::P2pEndpoint::open_bi
+    /// [`Node::open_bi`]: crate::Node::open_bi
+    /// [`P2pEndpoint::accept_bi`]: crate::P2pEndpoint::accept_bi
+    /// [`Node::accept_bi`]: crate::Node::accept_bi
+    /// [`P2pEndpoint::current_connection_generation`]: crate::P2pEndpoint::current_connection_generation
+    /// [`P2pEndpoint::get_quic_connection`]: crate::P2pEndpoint::get_quic_connection
+    /// [`P2pEndpoint::recv_with_generation`]: crate::P2pEndpoint::recv_with_generation
+    /// [`Node::recv_with_generation`]: crate::Node::recv_with_generation
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     /// Attempt to write bytes from buf into the stream.

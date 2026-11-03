@@ -12,7 +12,7 @@
 //!
 //! # Features
 //!
-//! - Configuration via [`P2pConfig`](crate::unified_config::P2pConfig)
+//! - Configuration via [`P2pConfig`]
 //! - Event subscription via broadcast channels
 //! - TLS-based peer authentication via ML-DSA-65 (v0.2+)
 //! - NAT traversal with automatic fallback
@@ -7400,7 +7400,6 @@ impl P2pEndpoint {
         max_read_bytes: usize,
         relay_streams: &Arc<RelayStreamCounts>,
     ) -> bool {
-        let _ = (&mut send, &mut recv);
         let accepted_at = Instant::now();
         let mut prefix = vec![0u8; ACK_BIDI_REQUEST_MAGIC.len()];
         match timeout(BIDI_PREFIX_READ_TIMEOUT, recv.read_exact(&mut prefix)).await {
@@ -7473,6 +7472,11 @@ impl P2pEndpoint {
         // been drained into `prefix`, so the forwarded
         // `RecvStream` starts cleanly at application byte 0.
         if prefix.as_slice() == &APP_BIDI_STREAM_MAGIC[..] {
+            // #327: stamp the generation of the connection whose reader
+            // forwarded this stream, so an acceptor can tell the superseded
+            // and winner connections apart while both stay open (ADR-017).
+            send.set_connection_generation(generation);
+            recv.set_connection_generation(generation);
             match app_bi_tx.try_send((peer_id, send, recv)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -9352,6 +9356,11 @@ impl P2pEndpoint {
     ///
     /// Works identically over direct and MASQUE-relayed connections.
     ///
+    /// The returned streams carry the lifecycle generation of the connection
+    /// the stream was opened on (see
+    /// [`crate::high_level::SendStream::connection_generation`]). The value is
+    /// provenance: it does not change if that connection is later superseded.
+    ///
     /// # Errors
     ///
     /// - [`EndpointError::ShuttingDown`] if the endpoint is shutting down.
@@ -9393,10 +9402,21 @@ impl P2pEndpoint {
             return Err(EndpointError::ConnectionClosed { reason });
         }
 
-        let (mut send_stream, recv_stream) = connection
+        let (mut send_stream, mut recv_stream) = connection
             .open_bi()
             .await
             .map_err(endpoint_error_from_connection_error)?;
+
+        // #327: stamp the generation of the connection this stream was opened
+        // on, so callers can pin per-connection state even if the winner
+        // changes before the peer accepts the stream.
+        let generation = self
+            .inner
+            .connection_snapshot_by_stable_id(peer_id, connection.stable_id())
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or(UNAUTHENTICATED_GENERATION);
+        send_stream.set_connection_generation(generation);
+        recv_stream.set_connection_generation(generation);
 
         // Tag the stream so the peer's reader task routes it to the application
         // channel. The peer consumes these 8 bytes and forwards the positioned
@@ -9422,6 +9442,14 @@ impl P2pEndpoint {
     /// traverse a bounded internal channel; if the application does not drain
     /// `accept_bi` fast enough, surplus inbound streams are reset and the opener
     /// may retry.
+    ///
+    /// Each accepted stream carries the lifecycle generation of the connection
+    /// it arrived on (see
+    /// [`crate::high_level::RecvStream::connection_generation`]). While a
+    /// superseded connection stays open after a follow (ADR-017) this is the
+    /// only way to tell its streams from the winner's:
+    /// [`Self::current_connection_generation`] reports the winner, which may
+    /// have changed since the stream was accepted.
     ///
     /// # Errors
     ///
