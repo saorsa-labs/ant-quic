@@ -289,8 +289,6 @@ impl<'a> SendStream<'a> {
     /// Finish a send stream, signalling that no more data will be sent.
     ///
     /// If this fails, no [`StreamEvent::Finished`] will be generated.
-    ///
-    /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
     pub fn finish(&mut self) -> Result<(), FinishError> {
         let max_send_data = self.state.max_send_data(self.id);
         let stream = self

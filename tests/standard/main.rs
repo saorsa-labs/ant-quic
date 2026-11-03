@@ -19,6 +19,7 @@ pub mod utils {
 // Test modules
 pub mod integration_tests;
 pub mod nat_basic_tests;
+pub mod node_app_stream_generation;
 pub mod protocol_tests;
 
 // Re-export test utilities
