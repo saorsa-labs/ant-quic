@@ -1830,6 +1830,10 @@ pub struct NatTraversalEndpoint {
     /// a hole-punch coordinator. Coordination stays on when relay serving
     /// is off; this counter makes that observable.
     coordination_requests_forwarded: Arc<AtomicU64>,
+    /// Test-only override of `RELAY_REFUSAL_REQUEST_TIMEOUT`, so the
+    /// stalled-request test does not wait the full production bound.
+    #[cfg(test)]
+    relay_refusal_timeout_override: ParkingMutex<Option<std::time::Duration>>,
     /// ADR-019: relays that refused us by policy, skipped until expiry.
     relay_refusals: Arc<RelayRefusalCache>,
     /// Successful candidate pairs discovered via hole punching
@@ -3255,6 +3259,8 @@ impl NatTraversalEndpoint {
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
             coordination_requests_forwarded: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            relay_refusal_timeout_override: ParkingMutex::new(None),
             relay_refusals: Arc::new(RelayRefusalCache::default()),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -3773,6 +3779,8 @@ impl NatTraversalEndpoint {
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
             coordination_requests_forwarded: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            relay_refusal_timeout_override: ParkingMutex::new(None),
             relay_refusals: Arc::new(RelayRefusalCache::default()),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -4500,8 +4508,26 @@ impl NatTraversalEndpoint {
         self.relay_requests_refused_disabled.load(Ordering::Relaxed)
     }
 
+    /// How long the serving-off refusal path waits for a complete request
+    /// and for its `403` write: `RELAY_REFUSAL_REQUEST_TIMEOUT`, or the
+    /// test override.
+    fn relay_refusal_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(timeout) = *self.relay_refusal_timeout_override.lock() {
+            return timeout;
+        }
+        RELAY_REFUSAL_REQUEST_TIMEOUT
+    }
+
+    /// Override the refusal-path timeout (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_relay_refusal_timeout_for_test(&self, timeout: std::time::Duration) {
+        *self.relay_refusal_timeout_override.lock() = Some(timeout);
+    }
+
     /// Coordination requests this node forwarded as a hole-punch
-    /// coordinator (accepted fast path or offer sent to the target).
+    /// coordinator: the accepted fast path once the target was sent the
+    /// acceptance, or the offer sent to the target.
     pub fn coordination_requests_forwarded(&self) -> u64 {
         self.coordination_requests_forwarded.load(Ordering::Relaxed)
     }
@@ -4564,6 +4590,7 @@ impl NatTraversalEndpoint {
         let Some(server) = self.relay_server.clone() else {
             Self::refuse_relay_bidi_stream_with_prefix(
                 &self.relay_requests_refused_disabled,
+                self.relay_refusal_timeout(),
                 connection.remote_address(),
                 send_stream,
                 recv_stream,
@@ -5330,11 +5357,15 @@ impl NatTraversalEndpoint {
                         .await
                         .is_ok()
                     {
-                        let _ = self
+                        // Count only a forward that reached the target.
+                        if self
                             .send_coordinator_control_on_connection(target_conn.clone(), accepted)
-                            .await;
-                        self.coordination_requests_forwarded
-                            .fetch_add(1, Ordering::Relaxed);
+                            .await
+                            .is_ok()
+                        {
+                            self.coordination_requests_forwarded
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         info!(
                             "coordinator control request fast-path handled request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
                             envelope.request_id, from_peer_id, initiator, target, round
@@ -7069,6 +7100,7 @@ impl NatTraversalEndpoint {
     /// decode is dropped with no answer, as on the serving path.
     async fn refuse_relay_bidi_stream_with_prefix(
         refused_counter: &AtomicU64,
+        request_timeout: std::time::Duration,
         client_addr: SocketAddr,
         mut send_stream: InnerSendStream,
         mut recv_stream: InnerRecvStream,
@@ -7078,7 +7110,7 @@ impl NatTraversalEndpoint {
         // not hold this task (and the reader's in-flight relay-stream count,
         // which blocks connection retirement) open indefinitely.
         match tokio::time::timeout(
-            RELAY_REFUSAL_REQUEST_TIMEOUT,
+            request_timeout,
             Self::read_relay_request(client_addr, &mut recv_stream, prefix),
         )
         .await
@@ -7088,7 +7120,7 @@ impl NatTraversalEndpoint {
             Err(_) => {
                 debug!(
                     "Relay request from {} not complete within {:?}; dropping stream",
-                    client_addr, RELAY_REFUSAL_REQUEST_TIMEOUT
+                    client_addr, request_timeout
                 );
                 return;
             }
@@ -7100,15 +7132,12 @@ impl NatTraversalEndpoint {
         );
         let response = ConnectUdpResponse::relay_service_disabled();
         let response_frame = encode_relay_response_frame(&response);
-        let written = tokio::time::timeout(
-            RELAY_REFUSAL_REQUEST_TIMEOUT,
-            send_stream.write_all(&response_frame),
-        )
-        .await;
+        let written =
+            tokio::time::timeout(request_timeout, send_stream.write_all(&response_frame)).await;
         let Ok(written) = written else {
             debug!(
                 "Relay refusal to {} not written within {:?}; dropping stream",
-                client_addr, RELAY_REFUSAL_REQUEST_TIMEOUT
+                client_addr, request_timeout
             );
             return;
         };
@@ -7700,11 +7729,9 @@ impl NatTraversalEndpoint {
         }))
     }
 
-    /// Connected peers usable as relays for a dial to `target`: live
-    /// connections other than the target, minus relays that refused us by
-    /// policy and whose refusal-cache entry has not expired (ADR-019).
     /// Whether any live connected peer (other than `target`) was left out of
-    /// [`Self::connected_relay_candidates`] because it refused us by policy.
+    /// [`Self::connected_relay_candidates`] because it refused us by policy
+    /// (ADR-019).
     fn connected_relay_candidates_refused(&self, target: SocketAddr) -> bool {
         self.connections.iter().any(|entry| {
             entry.value().close_reason().is_none()
@@ -7713,6 +7740,9 @@ impl NatTraversalEndpoint {
         })
     }
 
+    /// Connected peers usable as relays for a dial to `target`: live
+    /// connections other than the target, minus relays that refused us by
+    /// policy and whose refusal-cache entry has not expired (ADR-019).
     pub(crate) fn connected_relay_candidates(&self, target: SocketAddr) -> Vec<SocketAddr> {
         self.connections
             .iter()

@@ -12,8 +12,10 @@
 //! - Validation 5: a serving-off node still coordinates a peer-ID dial
 //!   between two peers that only know it: the dial is a hole punch and the
 //!   node's coordination counter moves.
-//! - Refusal read timeout: a stalled request to a serving-off node is
-//!   dropped after a bounded wait.
+//!
+//! The refusal-path read bound (a stalled request is dropped) is tested
+//! in-crate in `src/p2p_endpoint/relay_opt_out_tests.rs`, where the timeout
+//! can be shortened.
 //! - Validation 7: a garbage stream to a serving-off node is dropped with no
 //!   answer and no panic; the node keeps answering well-formed requests.
 //!
@@ -265,54 +267,6 @@ async fn adr019_garbage_stream_to_serving_off_node_is_dropped() {
     // B is still alive and still refuses a well-formed request.
     let response = send_bind_request(&a, &b).await;
     assert!(response.is_relay_service_disabled());
-
-    accept_b.abort();
-    a.shutdown().await;
-    b.shutdown().await;
-}
-
-/// ADR-019 refusal path read bound: a peer that sends a length prefix and
-/// then stalls mid-request does not hold the serving-off node's stream open.
-/// The node drops it after `RELAY_REFUSAL_REQUEST_TIMEOUT` (5 s) with no
-/// answer and no refusal counted.
-#[tokio::test]
-async fn adr019_stalled_request_to_serving_off_node_is_dropped_after_timeout() {
-    let b = node(false).await;
-    let a = node(true).await;
-    let accept_b = spawn_accept(&b);
-    timeout(Duration::from_secs(10), a.connect_addr(loopback(&b)))
-        .await
-        .expect("connect timed out")
-        .expect("connect");
-
-    let (mut send, mut recv) = raw_stream(&a, &b).await;
-    // Length 100, then only 4 of the 100 body bytes; the stream stays open.
-    send.write_all(&[0, 0, 0, 100, 1, 2, 3, 4])
-        .await
-        .expect("write partial request");
-    let started = tokio::time::Instant::now();
-    let read = timeout(Duration::from_secs(20), recv.read_to_end(4096))
-        .await
-        .expect("B must drop a stalled request stream within the bound");
-    let waited = started.elapsed();
-    if let Ok(bytes) = read {
-        assert!(
-            bytes.is_empty(),
-            "no response to a stalled request: {bytes:?}"
-        );
-    }
-    assert!(
-        waited >= Duration::from_secs(4),
-        "the stream is held until the timeout, not dropped early: {waited:?}"
-    );
-    assert_eq!(
-        b.inner_endpoint()
-            .stats()
-            .await
-            .relay_requests_refused_disabled,
-        0
-    );
-    drop(send);
 
     accept_b.abort();
     a.shutdown().await;

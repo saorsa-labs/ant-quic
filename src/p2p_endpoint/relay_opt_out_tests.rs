@@ -401,3 +401,51 @@ async fn adr019_all_relays_refused_fails_fast_without_reasking() {
     b.stop().await;
     t.stop().await;
 }
+
+/// ADR-019 refusal path read bound: a peer that sends a length prefix and
+/// part of the body, then stalls, does not hold the serving-off node's
+/// stream open. The node drops it after the refusal timeout (shortened to
+/// 200 ms here; production is `RELAY_REFUSAL_REQUEST_TIMEOUT`, 5 s) with no
+/// answer and no refusal counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr019_stalled_request_to_serving_off_node_is_dropped_after_timeout() {
+    let a = TestNode::start(true).await;
+    let b = TestNode::start(false).await;
+    let bound = Duration::from_millis(200);
+    b.endpoint.inner.set_relay_refusal_timeout_for_test(bound);
+    a.connect(&b).await;
+
+    let conn = a
+        .endpoint
+        .get_quic_connection(&b.peer())
+        .expect("lookup")
+        .expect("connection to B");
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .expect("open_bi does not time out")
+        .expect("open_bi");
+    // Length 100, then only 4 of the 100 body bytes; the stream stays open.
+    send.write_all(&[0, 0, 0, 100, 1, 2, 3, 4])
+        .await
+        .expect("write partial request");
+    let started = Instant::now();
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(4096))
+        .await
+        .expect("B drops the stalled request stream within the bound");
+    let waited = started.elapsed();
+    if let Ok(bytes) = read {
+        assert!(
+            bytes.is_empty(),
+            "no response to a stalled request: {bytes:?}"
+        );
+    }
+    assert!(
+        waited >= bound / 2,
+        "the stream is held until the timeout, not dropped at once: {waited:?}"
+    );
+    assert_eq!(b.endpoint.stats().await.relay_requests_refused_disabled, 0);
+    drop(send);
+
+    a.stop().await;
+    b.stop().await;
+}

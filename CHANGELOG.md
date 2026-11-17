@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `relay_refusals_forbidden`, `relay_refusals_capacity` and
   `relay_refusal_cache_size` (client).
 
+### Source compatibility
+
+These additions are source-breaking for some callers:
+
+- New variant `NatTraversalError::AllRelaysRefused`. The enum is not
+  `#[non_exhaustive]`, so an exhaustive `match` on it stops compiling.
+- New pub fields on `EndpointStats` (`coordination_requests_forwarded`,
+  `relay_requests_refused_disabled`, `relay_refusals_forbidden`,
+  `relay_refusals_capacity`, `relay_refusal_cache_size`) and
+  `NodeConfig.relay_service_enabled`. A struct literal of either type without
+  `..Default::default()` stops compiling.
+
 ### Fixed
 
 - **The Run Benchmarks PR gate no longer fails on false regressions (#291).**
