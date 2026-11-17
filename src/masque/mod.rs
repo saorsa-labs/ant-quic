@@ -96,6 +96,7 @@ pub mod context;
 pub mod datagram;
 pub mod integration;
 pub mod migration;
+pub(crate) mod refusal_cache;
 pub mod relay_client;
 pub mod relay_server;
 pub mod relay_session;

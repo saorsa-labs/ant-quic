@@ -161,10 +161,13 @@ pub struct NodeStatus {
     pub mdns_discovered_peers: usize,
 
     // --- Assist Services ---
-    /// Whether this node offers relay service as a capability hint to peers.
+    /// Whether this node serves relay sessions for peers.
     ///
-    /// This is a local policy/configuration signal. Remote peers still decide
-    /// whether this node is actually useful for relay service.
+    /// `false` when relay serving was turned off with
+    /// `NodeConfigBuilder::relay_service_enabled(false)` (ADR-019); the node
+    /// then refuses relay requests with `403 "relay service disabled"`.
+    /// Higher layers can use it to stop advertising relay capability. Remote
+    /// peers still decide whether a serving node is useful as a relay.
     pub relay_service_enabled: bool,
 
     /// Whether this node offers coordinator capability as a hint to peers.

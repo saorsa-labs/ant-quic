@@ -53,6 +53,8 @@
 mod direct_stage_budget_tests;
 #[cfg(all(test, feature = "network-discovery"))]
 mod late_direct_tests;
+#[cfg(test)]
+mod relay_opt_out_tests;
 mod socket_binding;
 
 use std::collections::hash_map::DefaultHasher;
@@ -130,6 +132,10 @@ enum ReaderOwnerCheck {
 
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// ADR-019: relay candidates taken from the bootstrap cache per dial, so one
+/// that refused us by policy can be skipped in favour of the next best.
+const RELAY_CACHE_SELECTION_CANDIDATES: usize = 4;
 /// Peer lifecycle event channel capacity.
 const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Maximum time an ACK-requested payload may wait for receiver queue admission.
@@ -2657,6 +2663,21 @@ pub struct EndpointStats {
     ///
     /// These are counted rather than logged per send; see x0x#1036.
     pub send_peer_not_found: u64,
+
+    /// ADR-019 (server): relay requests this node refused with
+    /// `403 "relay service disabled"` because relay serving is off.
+    pub relay_requests_refused_disabled: u64,
+
+    /// ADR-019 (client): relay answers `403 "relay service disabled"`
+    /// (policy refusals) received from relays.
+    pub relay_refusals_forbidden: u64,
+
+    /// ADR-019 (client): relay answers `503` (capacity refusals) received
+    /// from relays. These never enter the refusal cache.
+    pub relay_refusals_capacity: u64,
+
+    /// ADR-019 (client): live entries in the in-memory relay refusal cache.
+    pub relay_refusal_cache_size: usize,
 }
 
 impl Default for EndpointStats {
@@ -2679,6 +2700,10 @@ impl Default for EndpointStats {
             start_time: Instant::now(),
             average_coordination_time: Duration::ZERO,
             send_peer_not_found: 0,
+            relay_requests_refused_disabled: 0,
+            relay_refusals_forbidden: 0,
+            relay_refusals_capacity: 0,
+            relay_refusal_cache_size: 0,
         }
     }
 }
@@ -4296,12 +4321,14 @@ impl P2pEndpoint {
         self.direct_path_statuses.read().get(&peer_id).cloned()
     }
 
-    /// Returns whether this endpoint is willing to provide relay service for peers.
+    /// Returns whether this endpoint serves relay sessions for peers.
     ///
-    /// ant-quic uses an always-on symmetric assist plane, so this reports the
-    /// effective runtime behaviour rather than any legacy config flag.
+    /// Reports the effective runtime behaviour: `false` when relay serving
+    /// was turned off with `enable_relay_service = false` (ADR-019), in which
+    /// case no relay server exists and relay requests are refused with
+    /// `403 "relay service disabled"`.
     pub fn relay_service_enabled(&self) -> bool {
-        true
+        self.inner.relay_server_present()
     }
 
     /// Returns whether this endpoint advertises coordinator capability.
@@ -4653,9 +4680,14 @@ impl P2pEndpoint {
         let hints = self.peer_hint_records.read().await;
         let mut candidates = Vec::new();
 
-        for record in hints.values() {
-            let matches = (relay && record.capabilities.supports_relay)
-                || (coordination && record.capabilities.supports_coordination);
+        for (peer_id, record) in hints.iter() {
+            // ADR-019: a relay that refused us by policy is skipped as a
+            // relay until its refusal-cache entry expires; it can still
+            // coordinate.
+            let relay_ok = relay
+                && record.capabilities.supports_relay
+                && !self.inner.is_relay_refused(peer_id);
+            let matches = relay_ok || (coordination && record.capabilities.supports_coordination);
             if !matches {
                 continue;
             }
@@ -5768,6 +5800,102 @@ impl P2pEndpoint {
             .await
     }
 
+    /// Default relay candidates for a dial when the caller supplied no
+    /// strategy: bootstrap-cache selection, then hinted relay peers, then
+    /// live connected peers, then runtime known peers, then static config.
+    /// Relays in the ADR-019 refusal cache are skipped by the first three.
+    async fn default_relay_addrs(&self, target_addr: Option<SocketAddr>) -> Vec<SocketAddr> {
+        let mut relay_addrs: Vec<SocketAddr> = Vec::new();
+        // Optimization: Try to find a high-quality relay from our cache first
+        if let Some(addr) = target_addr {
+            // Select best relay for this target (preferring dual-stack)
+            // ADR-019: ask for a few candidates so a relay that
+            // refused us by policy can be skipped without losing the
+            // cache's choice altogether.
+            let relays = self
+                .bootstrap_cache
+                .select_relays_for_target(RELAY_CACHE_SELECTION_CANDIDATES, &addr, true)
+                .await;
+
+            if let Some(best_relay) = relays
+                .iter()
+                .find(|relay| !self.inner.is_relay_refused(&relay.peer_id))
+            {
+                // Use the first address of the best relay
+                // In a perfect world we'd check reachability of this address too,
+                // but for now we assume cached addresses are valid candidates.
+                if let Some(relay_addr) = best_relay.preferred_addresses().first().copied() {
+                    relay_addrs.push(relay_addr);
+                    debug!(
+                        "Selected optimized relay from cache: {:?} for target {}",
+                        relay_addr, addr
+                    );
+                }
+            }
+        }
+
+        // Next prefer externally hinted relay peers.
+        if relay_addrs.is_empty() {
+            for relay_addr in self.hinted_assist_addrs(true, false).await {
+                if Some(relay_addr) == target_addr {
+                    continue;
+                }
+                if let Some(target) = target_addr
+                    && relay_addr.is_ipv4() != target.is_ipv4()
+                {
+                    continue;
+                }
+                if !relay_addrs.contains(&relay_addr) {
+                    relay_addrs.push(relay_addr);
+                }
+            }
+        }
+
+        // Next prefer live connected UDP peers as relay candidates.
+        if relay_addrs.is_empty() {
+            let peers = self.connected_peers.read().await;
+            for (existing_peer_id, existing) in peers.iter() {
+                let Some(relay_addr) = existing.remote_addr.as_socket_addr() else {
+                    continue;
+                };
+                if Some(relay_addr) == target_addr {
+                    continue;
+                }
+                if !self.inner.is_peer_connected(existing_peer_id) {
+                    continue;
+                }
+                // ADR-019: skip relays that refused us by policy.
+                if self.inner.is_relay_refused(existing_peer_id) {
+                    continue;
+                }
+                if !relay_addrs.contains(&relay_addr) {
+                    relay_addrs.push(relay_addr);
+                }
+            }
+        }
+
+        // Then prefer remaining runtime known peer UDP addresses.
+        if relay_addrs.is_empty() {
+            for relay_addr in self.runtime_known_peer_udp_addrs() {
+                if Some(relay_addr) == target_addr {
+                    continue;
+                }
+                if !relay_addrs.contains(&relay_addr) {
+                    relay_addrs.push(relay_addr);
+                }
+            }
+        }
+
+        // Fallback to static config if cache, live peers, and runtime known peers gave nothing
+        if relay_addrs.is_empty() {
+            if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
+                relay_addrs.push(relay_addr);
+            }
+        }
+
+        relay_addrs
+    }
+
     /// [`Self::connect_with_fallback`] as one part of a larger dial whose
     /// budget ends at `caller_deadline` (#304). The ladder keeps its own
     /// deadline. The caller deadline caps both a no-coordinator direct-stage
@@ -5799,86 +5927,7 @@ impl P2pEndpoint {
             config.coordinator = self.coordinator_candidates().await.into_iter().next();
         }
         if !custom_strategy_supplied && config.relay_addrs.is_empty() {
-            // Optimization: Try to find a high-quality relay from our cache first
-            let target_addr = target_ipv4.or(target_ipv6);
-            if let Some(addr) = target_addr {
-                // Select best relay for this target (preferring dual-stack)
-                let relays = self
-                    .bootstrap_cache
-                    .select_relays_for_target(1, &addr, true)
-                    .await;
-
-                if let Some(best_relay) = relays.first() {
-                    // Use the first address of the best relay
-                    // In a perfect world we'd check reachability of this address too,
-                    // but for now we assume cached addresses are valid candidates.
-                    if let Some(relay_addr) = best_relay.preferred_addresses().first().copied() {
-                        config.relay_addrs.push(relay_addr);
-                        debug!(
-                            "Selected optimized relay from cache: {:?} for target {}",
-                            relay_addr, addr
-                        );
-                    }
-                }
-            }
-
-            // Next prefer externally hinted relay peers.
-            if config.relay_addrs.is_empty() {
-                let target_addr = target_ipv4.or(target_ipv6);
-                for relay_addr in self.hinted_assist_addrs(true, false).await {
-                    if Some(relay_addr) == target_addr {
-                        continue;
-                    }
-                    if let Some(target) = target_addr
-                        && relay_addr.is_ipv4() != target.is_ipv4()
-                    {
-                        continue;
-                    }
-                    if !config.relay_addrs.contains(&relay_addr) {
-                        config.relay_addrs.push(relay_addr);
-                    }
-                }
-            }
-
-            // Next prefer live connected UDP peers as relay candidates.
-            if config.relay_addrs.is_empty() {
-                let target_addr = target_ipv4.or(target_ipv6);
-                let peers = self.connected_peers.read().await;
-                for (existing_peer_id, existing) in peers.iter() {
-                    let Some(relay_addr) = existing.remote_addr.as_socket_addr() else {
-                        continue;
-                    };
-                    if Some(relay_addr) == target_addr {
-                        continue;
-                    }
-                    if !self.inner.is_peer_connected(existing_peer_id) {
-                        continue;
-                    }
-                    if !config.relay_addrs.contains(&relay_addr) {
-                        config.relay_addrs.push(relay_addr);
-                    }
-                }
-            }
-
-            // Then prefer remaining runtime known peer UDP addresses.
-            if config.relay_addrs.is_empty() {
-                let target_addr = target_ipv4.or(target_ipv6);
-                for relay_addr in self.runtime_known_peer_udp_addrs() {
-                    if Some(relay_addr) == target_addr {
-                        continue;
-                    }
-                    if !config.relay_addrs.contains(&relay_addr) {
-                        config.relay_addrs.push(relay_addr);
-                    }
-                }
-            }
-
-            // Fallback to static config if cache, live peers, and runtime known peers gave nothing
-            if config.relay_addrs.is_empty() {
-                if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
-                    config.relay_addrs.push(relay_addr);
-                }
-            }
+            config.relay_addrs = self.default_relay_addrs(target_ipv4.or(target_ipv6)).await;
         }
 
         if !custom_strategy_supplied {
@@ -7512,23 +7561,20 @@ impl P2pEndpoint {
         // REUSES the peer connection — awaiting that loop inline would pin
         // the sole accept consumer, so no further app/ACK-v2/gossip stream
         // from this peer would be accepted while the session lives.
-        if inner.relay_server_present() {
-            let inner = Arc::clone(inner);
-            let relay_connection = connection.clone();
-            let in_flight = RelayStreamInFlight::new(Arc::clone(relay_streams), conn_stable_id);
-            tokio::spawn(async move {
-                let _in_flight = in_flight;
-                inner
-                    .handle_relay_bidi_stream_from_app_reader(relay_connection, send, recv, prefix)
-                    .await;
-            });
-            return true;
-        }
-
-        debug!(
-            "Reader task for peer {:?} (conn stable_id={}): unknown bidi stream prefix",
-            peer_id, conn_stable_id
-        );
+        //
+        // ADR-019: with relay serving turned off there is no relay server,
+        // but the stream still goes to the relay handler so a well-formed
+        // CONNECT-UDP request gets an explicit `403 "relay service disabled"`
+        // instead of a reset. Garbage is dropped as before.
+        let inner = Arc::clone(inner);
+        let relay_connection = connection.clone();
+        let in_flight = RelayStreamInFlight::new(Arc::clone(relay_streams), conn_stable_id);
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            inner
+                .handle_relay_bidi_stream_from_app_reader(relay_connection, send, recv, prefix)
+                .await;
+        });
 
         true
     }
@@ -9515,6 +9561,11 @@ impl P2pEndpoint {
     pub async fn stats(&self) -> EndpointStats {
         let mut stats = self.stats.read().await.clone();
         stats.send_peer_not_found = self.send_failure_log.peer_not_found_total();
+        stats.relay_requests_refused_disabled = self.inner.relay_requests_refused_disabled();
+        let (forbidden, capacity, cache_size) = self.inner.relay_refusal_metrics();
+        stats.relay_refusals_forbidden = forbidden;
+        stats.relay_refusals_capacity = capacity;
+        stats.relay_refusal_cache_size = cache_size;
         stats
     }
 
@@ -16284,9 +16335,14 @@ mod tests {
         endpoint.shutdown().await;
     }
 
+    /// ADR-019 Validation 2 (replaces
+    /// `test_relay_service_enabled_reports_effective_runtime_when_legacy_flag_is_disabled`):
+    /// `enable_relay_service = false` is honoured. The endpoint reports
+    /// `relay_service_enabled() == false` and builds no relay server.
     #[tokio::test]
-    async fn test_relay_service_enabled_reports_effective_runtime_when_legacy_flag_is_disabled() {
+    async fn test_relay_service_disabled_reports_false_and_builds_no_relay_server() {
         let mut config = P2pConfig::builder()
+            .bind_addr(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
             .port_mapping_enabled(false)
             .build()
             .expect("valid config");
@@ -16296,10 +16352,28 @@ mod tests {
             .await
             .expect("endpoint should create");
         assert!(
-            endpoint.relay_service_enabled(),
-            "status should reflect the always-on relay runtime"
+            !endpoint.relay_service_enabled(),
+            "a node with relay serving off must report it"
         );
+        assert!(
+            !endpoint.inner.relay_server_present(),
+            "a node with relay serving off must build no relay server"
+        );
+        assert_eq!(endpoint.inner.relay_server_runtime_metrics(), (0, 0));
+        endpoint.shutdown().await;
 
+        // Default: serving on, relay server built.
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("valid config"),
+        )
+        .await
+        .expect("endpoint should create");
+        assert!(endpoint.relay_service_enabled());
+        assert!(endpoint.inner.relay_server_present());
         endpoint.shutdown().await;
     }
 

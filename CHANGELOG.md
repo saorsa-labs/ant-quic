@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`enable_relay_service` changes from ignored to honoured (ADR-019, #362).**
+  Before, `NatTraversalEndpoint::normalize_config` and
+  `P2pConfig::to_nat_config` forced the flag to `true`, so every node served
+  MASQUE CONNECT-UDP relay sessions. Now the flag is a runtime, node-level
+  setting; the default stays `true`. **Any caller that sets it to `false`
+  today will stop serving relay sessions after upgrade.** With `false` the
+  node builds no relay server and answers every relay request with
+  `403 "relay service disabled"`; it still uses relays, coordinates hole
+  punching and observes addresses. `P2pEndpoint::relay_service_enabled()` and
+  `NodeStatus.relay_service_enabled` now report the real value. No wire
+  change.
+
+### Added
+
+- `P2pConfigBuilder::relay_service_enabled(bool)`,
+  `NodeConfigBuilder::relay_service_enabled(bool)` and
+  `NodeConfig.relay_service_enabled` (ADR-019).
+- Client relay refusal cache (ADR-019): a relay that answers
+  `403 "relay service disabled"` is skipped by bootstrap-cache relay
+  selection, hinted relays and the connected-peer relay list for one hour.
+  In memory only, bounded, never persisted; a `503` never creates an entry.
+- `ConnectUdpResponse::relay_service_disabled()`,
+  `ConnectUdpResponse::is_relay_service_disabled()` and
+  `ConnectUdpResponse::REASON_RELAY_SERVICE_DISABLED`.
+- `EndpointStats` metrics: `relay_requests_refused_disabled` (server),
+  `relay_refusals_forbidden`, `relay_refusals_capacity` and
+  `relay_refusal_cache_size` (client).
+
 ### Fixed
 
 - **The Run Benchmarks PR gate no longer fails on false regressions (#291).**

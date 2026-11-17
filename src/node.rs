@@ -170,6 +170,10 @@ fn node_config_to_p2p_config(config: NodeConfig) -> Result<P2pConfig, NodeError>
     if let Some(enabled) = config.port_mapping_enabled {
         p2p_config.nat.port_mapping.enabled = enabled;
     }
+    // ADR-019: node-level relay-serving opt-out.
+    if let Some(enabled) = config.relay_service_enabled {
+        p2p_config.nat.enable_relay_service = enabled;
+    }
 
     // Issue #206: pipe NodeConfig's mDNS plane-isolation knobs into the
     // underlying P2pConfig discovery policy so embedders using the simple

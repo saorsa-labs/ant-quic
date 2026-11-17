@@ -306,9 +306,12 @@ pub struct NatConfig {
     /// Enable automatic relay fallback when direct connection fails (legacy flag, always true)
     pub enable_relay_fallback: bool,
 
-    /// Enable relay service for other peers (legacy flag, always true)
-    /// When true, this node will accept and forward CONNECT-UDP Bind requests from peers.
-    /// Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
+    /// Serve MASQUE CONNECT-UDP Bind relay sessions for other peers.
+    ///
+    /// Default `true`. When `false`, this node does not serve relay sessions
+    /// and answers relay requests with `403 "relay service disabled"`
+    /// (ADR-019). It still uses relays, coordinates hole punching and
+    /// observes addresses. See [`P2pConfigBuilder::relay_service_enabled`].
     pub enable_relay_service: bool,
 
     /// Known relay nodes for MASQUE CONNECT-UDP Bind fallback
@@ -354,7 +357,7 @@ impl Default for NatConfig {
             max_candidates: 10,
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
-            enable_relay_service: true, // Symmetric P2P: every node provides relay services
+            enable_relay_service: true, // Default on; node-level opt-out per ADR-019
             relay_nodes: Vec::new(),
             max_concurrent_attempts: 3,
             prefer_rfc_nat_traversal: true,
@@ -513,7 +516,7 @@ impl P2pConfig {
             coordination_timeout: self.timeouts.nat_traversal.coordination_timeout,
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
-            enable_relay_service: true,
+            enable_relay_service: self.nat.enable_relay_service,
             relay_nodes: self.nat.relay_nodes.clone(),
             max_concurrent_attempts: self.nat.max_concurrent_attempts,
             bind_addr: self
@@ -836,6 +839,19 @@ impl P2pConfigBuilder {
     pub fn port_mapping_enabled(mut self, enabled: bool) -> Self {
         let mut nat = self.nat.unwrap_or_default();
         nat.port_mapping.enabled = enabled;
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Enable or disable serving relay sessions for other peers (ADR-019).
+    ///
+    /// Default (when not called): `true`. With `false` the node builds no
+    /// relay server and answers relay requests with
+    /// `403 "relay service disabled"`. It still uses relays, coordinates hole
+    /// punching and observes addresses.
+    pub fn relay_service_enabled(mut self, enabled: bool) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.enable_relay_service = enabled;
         self.nat = Some(nat);
         self
     }
@@ -1306,6 +1322,29 @@ fn deserialize_keypair(data: &[u8]) -> Result<(MlDsaPublicKey, MlDsaSecretKey), 
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    /// ADR-019 Validation 1: relay serving defaults on, the builder sets it,
+    /// and `to_nat_config` keeps `false`.
+    #[test]
+    fn test_relay_service_enabled_default_builder_and_to_nat_config() {
+        let default = P2pConfig::builder().build().expect("valid config");
+        assert!(default.nat.enable_relay_service);
+        assert!(default.to_nat_config().enable_relay_service);
+
+        let off = P2pConfig::builder()
+            .relay_service_enabled(false)
+            .build()
+            .expect("valid config");
+        assert!(!off.nat.enable_relay_service);
+        assert!(!off.to_nat_config().enable_relay_service);
+
+        let on = P2pConfig::builder()
+            .relay_service_enabled(false)
+            .relay_service_enabled(true)
+            .build()
+            .expect("valid config");
+        assert!(on.to_nat_config().enable_relay_service);
+    }
 
     #[test]
     fn test_default_config() {
