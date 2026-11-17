@@ -27,13 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NodeConfigBuilder::relay_service_enabled(bool)` and
   `NodeConfig.relay_service_enabled` (ADR-019).
 - Client relay refusal cache (ADR-019): a relay that answers
-  `403 "relay service disabled"` is skipped by bootstrap-cache relay
-  selection, hinted relays and the connected-peer relay list for one hour.
+  `403 "relay service disabled"` is skipped for one hour by every relay
+  candidate source: bootstrap-cache selection (every non-refused candidate is
+  now offered, best first), hinted relays, connected peers, known peers,
+  static `relay_nodes`, the relay manager and the proactive relay loop.
+  Address-only relays are tried until their authenticated peer ID refuses.
   In memory only, bounded, never persisted; a `503` never creates an entry.
+  When every candidate has refused, the dial fails with the new
+  `NatTraversalError::AllRelaysRefused` instead of re-asking.
+- A node with relay serving off drops a relay request that is not complete
+  within 5 s (`RELAY_REFUSAL_REQUEST_TIMEOUT`).
 - `ConnectUdpResponse::relay_service_disabled()`,
   `ConnectUdpResponse::is_relay_service_disabled()` and
   `ConnectUdpResponse::REASON_RELAY_SERVICE_DISABLED`.
-- `EndpointStats` metrics: `relay_requests_refused_disabled` (server),
+- `EndpointStats` metrics: `coordination_requests_forwarded`,
+  `relay_requests_refused_disabled` (server),
   `relay_refusals_forbidden`, `relay_refusals_capacity` and
   `relay_refusal_cache_size` (client).
 

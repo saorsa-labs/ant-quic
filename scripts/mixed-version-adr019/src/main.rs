@@ -9,6 +9,15 @@
 //! bytes `establish_relay_session` sends, because that method is not public
 //! API in either version. All nodes bind loopback with ephemeral ports.
 //! Exit status 0 means every check passed.
+//!
+//! What this does NOT cover: the harness itself picks the next relay (C)
+//! after the 403. It does not drive the released client's own dial ladder
+//! (`connect_with_fallback`) to show that the old client moves on to the
+//! next relay by itself: on loopback the released client always connects
+//! directly and has no public way to force the relay stage. It proves the
+//! wire behaviour across versions (old client decodes the 403 as a
+//! non-success; a new client gets 200 from an old relay). No CI workflow runs
+//! this harness; run it by hand with `cargo run` in this directory.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;

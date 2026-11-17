@@ -133,9 +133,25 @@ enum ReaderOwnerCheck {
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// ADR-019: relay candidates taken from the bootstrap cache per dial, so one
-/// that refused us by policy can be skipped in favour of the next best.
+/// ADR-019: relay candidates taken from the bootstrap cache per dial. Every
+/// one that has not refused us is offered to the ladder, best first.
 const RELAY_CACHE_SELECTION_CANDIDATES: usize = 4;
+
+/// Default relay candidates for one dial (ADR-019).
+#[derive(Debug, Default)]
+struct RelaySelection {
+    addrs: Vec<SocketAddr>,
+    /// A candidate was skipped because it is in the relay refusal cache.
+    refused_any: bool,
+}
+
+impl RelaySelection {
+    fn push(&mut self, addr: SocketAddr) {
+        if !self.addrs.contains(&addr) {
+            self.addrs.push(addr);
+        }
+    }
+}
 /// Peer lifecycle event channel capacity.
 const PEER_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Maximum time an ACK-requested payload may wait for receiver queue admission.
@@ -1562,6 +1578,11 @@ fn is_synthetic_peer_id(peer_id: &PeerId) -> bool {
 pub struct P2pEndpoint {
     #[cfg(all(test, feature = "network-discovery"))]
     late_direct_gate: Arc<ParkingMutex<Option<Arc<late_direct_tests::DialGate>>>>,
+    /// Test-only: make the dial ladder skip its direct and hole-punch stages
+    /// and go straight to relay, as if a NAT blocked every direct path.
+    /// Loopback otherwise always connects directly (ADR-019 tests).
+    #[cfg(test)]
+    force_relay_stage: Arc<std::sync::atomic::AtomicBool>,
 
     /// Internal NAT traversal endpoint
     inner: Arc<NatTraversalEndpoint>,
@@ -2664,6 +2685,11 @@ pub struct EndpointStats {
     /// These are counted rather than logged per send; see x0x#1036.
     pub send_peer_not_found: u64,
 
+    /// Coordination requests this node forwarded as a hole-punch
+    /// coordinator (ADR-019 keeps coordination on when relay serving is
+    /// off).
+    pub coordination_requests_forwarded: u64,
+
     /// ADR-019 (server): relay requests this node refused with
     /// `403 "relay service disabled"` because relay serving is off.
     pub relay_requests_refused_disabled: u64,
@@ -2700,6 +2726,7 @@ impl Default for EndpointStats {
             start_time: Instant::now(),
             average_coordination_time: Duration::ZERO,
             send_peer_not_found: 0,
+            coordination_requests_forwarded: 0,
             relay_requests_refused_disabled: 0,
             relay_refusals_forbidden: 0,
             relay_refusals_capacity: 0,
@@ -4161,6 +4188,8 @@ impl P2pEndpoint {
         let endpoint = Self {
             #[cfg(all(test, feature = "network-discovery"))]
             late_direct_gate: Arc::default(),
+            #[cfg(test)]
+            force_relay_stage: Arc::default(),
             inner: inner_arc,
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -5802,32 +5831,39 @@ impl P2pEndpoint {
 
     /// Default relay candidates for a dial when the caller supplied no
     /// strategy: bootstrap-cache selection, then hinted relay peers, then
-    /// live connected peers, then runtime known peers, then static config.
-    /// Relays in the ADR-019 refusal cache are skipped by the first three.
-    async fn default_relay_addrs(&self, target_addr: Option<SocketAddr>) -> Vec<SocketAddr> {
-        let mut relay_addrs: Vec<SocketAddr> = Vec::new();
-        // Optimization: Try to find a high-quality relay from our cache first
+    /// live connected peers, then runtime known peers, then static
+    /// `relay_nodes`. The first source that yields a candidate wins.
+    ///
+    /// ADR-019: every source skips relays in the refusal cache. Sources that
+    /// know the peer ID (bootstrap cache, hints, connected peers) skip by
+    /// peer ID; address-only sources (known peers, static `relay_nodes`) skip
+    /// an address once a refusal was recorded from it or its live connection
+    /// belongs to a refusing peer. An address-only relay whose peer ID is not
+    /// known yet is tried as before and cached by its authenticated peer ID
+    /// when it refuses. `refused_any` reports whether a candidate was left
+    /// out, so a dial left with no relay fails with
+    /// `NatTraversalError::AllRelaysRefused` instead of re-asking.
+    async fn default_relay_addrs(&self, target_addr: Option<SocketAddr>) -> RelaySelection {
+        let mut selection = RelaySelection::default();
+        // Bootstrap-cache selection: every candidate that has not refused
+        // us, best first, so the ladder moves to the next one at once when
+        // a relay refuses on first contact.
         if let Some(addr) = target_addr {
-            // Select best relay for this target (preferring dual-stack)
-            // ADR-019: ask for a few candidates so a relay that
-            // refused us by policy can be skipped without losing the
-            // cache's choice altogether.
             let relays = self
                 .bootstrap_cache
                 .select_relays_for_target(RELAY_CACHE_SELECTION_CANDIDATES, &addr, true)
                 .await;
-
-            if let Some(best_relay) = relays
-                .iter()
-                .find(|relay| !self.inner.is_relay_refused(&relay.peer_id))
-            {
-                // Use the first address of the best relay
-                // In a perfect world we'd check reachability of this address too,
-                // but for now we assume cached addresses are valid candidates.
-                if let Some(relay_addr) = best_relay.preferred_addresses().first().copied() {
-                    relay_addrs.push(relay_addr);
+            for relay in &relays {
+                if self.inner.is_relay_refused(&relay.peer_id) {
+                    selection.refused_any = true;
+                    continue;
+                }
+                // Use the first address of each relay. Cached addresses are
+                // assumed to be valid candidates.
+                if let Some(relay_addr) = relay.preferred_addresses().first().copied() {
+                    selection.push(relay_addr);
                     debug!(
-                        "Selected optimized relay from cache: {:?} for target {}",
+                        "Selected relay from cache: {:?} for target {}",
                         relay_addr, addr
                     );
                 }
@@ -5835,7 +5871,10 @@ impl P2pEndpoint {
         }
 
         // Next prefer externally hinted relay peers.
-        if relay_addrs.is_empty() {
+        if selection.addrs.is_empty() {
+            if self.hinted_relays_refused().await {
+                selection.refused_any = true;
+            }
             for relay_addr in self.hinted_assist_addrs(true, false).await {
                 if Some(relay_addr) == target_addr {
                     continue;
@@ -5845,55 +5884,68 @@ impl P2pEndpoint {
                 {
                     continue;
                 }
-                if !relay_addrs.contains(&relay_addr) {
-                    relay_addrs.push(relay_addr);
-                }
+                selection.push(relay_addr);
             }
         }
 
         // Next prefer live connected UDP peers as relay candidates.
-        if relay_addrs.is_empty() {
+        if selection.addrs.is_empty() {
             let peers = self.connected_peers.read().await;
             for (existing_peer_id, existing) in peers.iter() {
                 let Some(relay_addr) = existing.remote_addr.as_socket_addr() else {
                     continue;
                 };
-                if Some(relay_addr) == target_addr {
+                if Some(relay_addr) == target_addr
+                    || !self.inner.is_peer_connected(existing_peer_id)
+                {
                     continue;
                 }
-                if !self.inner.is_peer_connected(existing_peer_id) {
-                    continue;
-                }
-                // ADR-019: skip relays that refused us by policy.
                 if self.inner.is_relay_refused(existing_peer_id) {
+                    selection.refused_any = true;
                     continue;
                 }
-                if !relay_addrs.contains(&relay_addr) {
-                    relay_addrs.push(relay_addr);
-                }
+                selection.push(relay_addr);
             }
         }
 
         // Then prefer remaining runtime known peer UDP addresses.
-        if relay_addrs.is_empty() {
+        if selection.addrs.is_empty() {
             for relay_addr in self.runtime_known_peer_udp_addrs() {
                 if Some(relay_addr) == target_addr {
                     continue;
                 }
-                if !relay_addrs.contains(&relay_addr) {
-                    relay_addrs.push(relay_addr);
+                if self.inner.is_relay_addr_refused(relay_addr) {
+                    selection.refused_any = true;
+                    continue;
                 }
+                selection.push(relay_addr);
             }
         }
 
-        // Fallback to static config if cache, live peers, and runtime known peers gave nothing
-        if relay_addrs.is_empty() {
-            if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
-                relay_addrs.push(relay_addr);
+        // Fallback to static config if nothing else gave a candidate.
+        if selection.addrs.is_empty() {
+            for relay_addr in self.config.nat.relay_nodes.iter().copied() {
+                if self.inner.is_relay_addr_refused(relay_addr) {
+                    selection.refused_any = true;
+                    continue;
+                }
+                selection.push(relay_addr);
+                break;
             }
         }
 
-        relay_addrs
+        selection
+    }
+
+    /// Whether a hinted relay peer is currently in the refusal cache.
+    async fn hinted_relays_refused(&self) -> bool {
+        self.peer_hint_records
+            .read()
+            .await
+            .iter()
+            .any(|(peer_id, record)| {
+                record.capabilities.supports_relay && self.inner.is_relay_refused(peer_id)
+            })
     }
 
     /// [`Self::connect_with_fallback`] as one part of a larger dial whose
@@ -5926,8 +5978,13 @@ impl P2pEndpoint {
         if !custom_strategy_supplied && config.coordinator.is_none() {
             config.coordinator = self.coordinator_candidates().await.into_iter().next();
         }
+        // ADR-019: set when every default relay candidate was skipped because
+        // it refused us by policy; the dial then fails with a typed error.
+        let mut all_relays_refused = false;
         if !custom_strategy_supplied && config.relay_addrs.is_empty() {
-            config.relay_addrs = self.default_relay_addrs(target_ipv4.or(target_ipv6)).await;
+            let selection = self.default_relay_addrs(target_ipv4.or(target_ipv6)).await;
+            all_relays_refused = selection.refused_any && selection.addrs.is_empty();
+            config.relay_addrs = selection.addrs;
         }
 
         if !custom_strategy_supplied {
@@ -5961,6 +6018,7 @@ impl P2pEndpoint {
         let relay_reserve = (config.relay_enabled && !config.relay_addrs.is_empty())
             .then_some(config.relay_timeout);
         let mut strategy = ConnectionStrategy::new(config);
+        strategy.set_all_relays_refused(all_relays_refused);
         let connection_establishment_timeout = self
             .config
             .timeouts
@@ -5983,6 +6041,18 @@ impl P2pEndpoint {
         }
 
         loop {
+            #[cfg(test)]
+            if self.force_relay_stage.load(Ordering::Relaxed)
+                && matches!(
+                    strategy.current_stage(),
+                    ConnectionStage::DirectIPv4 { .. }
+                        | ConnectionStage::DirectIPv6 { .. }
+                        | ConnectionStage::HolePunching { .. }
+                )
+            {
+                strategy.transition_to_relay("test: direct and hole-punch paths blocked");
+                continue;
+            }
             match strategy.current_stage().clone() {
                 ConnectionStage::DirectIPv4 { .. } => {
                     // Use Happy Eyeballs (RFC 8305) to race all direct addresses (IPv4 + IPv6)
@@ -6508,6 +6578,11 @@ impl P2pEndpoint {
                 }
 
                 ConnectionStage::Failed { errors } => {
+                    if strategy.all_relays_refused() {
+                        return Err(EndpointError::NatTraversal(
+                            NatTraversalError::AllRelaysRefused,
+                        ));
+                    }
                     let error_summary = errors
                         .iter()
                         .map(|e| format!("{:?}: {}", e.method, e.error))
@@ -9562,6 +9637,7 @@ impl P2pEndpoint {
         let mut stats = self.stats.read().await.clone();
         stats.send_peer_not_found = self.send_failure_log.peer_not_found_total();
         stats.relay_requests_refused_disabled = self.inner.relay_requests_refused_disabled();
+        stats.coordination_requests_forwarded = self.inner.coordination_requests_forwarded();
         let (forbidden, capacity, cache_size) = self.inner.relay_refusal_metrics();
         stats.relay_refusals_forbidden = forbidden;
         stats.relay_refusals_capacity = capacity;
@@ -11244,9 +11320,25 @@ impl P2pEndpoint {
                     continue;
                 }
 
-                let relay_candidates = endpoint.runtime_known_peer_udp_addrs();
+                // ADR-019: never re-ask a relay that refused us by policy on
+                // each reset; skip it until its refusal-cache entry expires.
+                let known = endpoint.runtime_known_peer_udp_addrs();
+                let known_count = known.len();
+                let relay_candidates: Vec<SocketAddr> = known
+                    .into_iter()
+                    .filter(|addr| !endpoint.inner.is_relay_addr_refused(*addr))
+                    .collect();
                 if relay_candidates.is_empty() {
-                    debug!("Symmetric NAT detected but no relay candidates are currently known");
+                    if known_count > 0 {
+                        debug!(
+                            "Symmetric NAT detected but {}",
+                            NatTraversalError::AllRelaysRefused
+                        );
+                    } else {
+                        debug!(
+                            "Symmetric NAT detected but no relay candidates are currently known"
+                        );
+                    }
                     continue;
                 }
 
@@ -13043,6 +13135,8 @@ impl Clone for P2pEndpoint {
         Self {
             #[cfg(all(test, feature = "network-discovery"))]
             late_direct_gate: Arc::clone(&self.late_direct_gate),
+            #[cfg(test)]
+            force_relay_stage: Arc::clone(&self.force_relay_stage),
             inner: Arc::clone(&self.inner),
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),

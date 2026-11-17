@@ -1,15 +1,22 @@
 //! ADR-019 relay-serving opt-out: endpoint-level tests.
 //!
-//! Three loopback nodes: A (client), B (relay serving off), C (relay serving
-//! on). These tests cover ADR-019 § Validation 3, 4 and 6 at the level where
-//! relay selection and the CONNECT-UDP handshake live. The raw wire answer
-//! (Validation 3, 7) and coordination (Validation 5) are also covered from the
-//! public API in `tests/relay_serving_opt_out.rs`.
+//! Loopback nodes: A (client), B (relay serving off), C (relay serving on)
+//! and T (dial target). On loopback a direct dial always succeeds, so the
+//! dials below set the test-only `force_relay_stage` switch on the dialer:
+//! the ladder skips its direct and hole-punch stages as if a NAT blocked
+//! every direct path, and the real relay stage runs with the real default
+//! relay selection (`default_relay_addrs`), CONNECT-UDP handshake and
+//! relayed QUIC connection. The raw wire answer (Validation 3, 7) and
+//! coordination (Validation 5) are covered from the public API in
+//! `tests/relay_serving_opt_out.rs`.
 
 #![allow(clippy::expect_used)]
 
 use super::*;
 use crate::bootstrap_cache::BootstrapCacheConfig;
+
+const DIAL_BUDGET: Duration = Duration::from_secs(30);
+const RECV_WINDOW: Duration = Duration::from_secs(10);
 
 struct TestNode {
     endpoint: P2pEndpoint,
@@ -20,10 +27,15 @@ struct TestNode {
 
 impl TestNode {
     async fn start(relay_serving: bool) -> Self {
+        Self::start_with(relay_serving, |_| {}).await
+    }
+
+    async fn start_with(relay_serving: bool, configure: impl FnOnce(&mut P2pConfig)) -> Self {
         let cache_dir = tempfile::tempdir().expect("temp dir");
-        let config = P2pConfig::builder()
+        let mut config = P2pConfig::builder()
             .bind_addr(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
             .port_mapping_enabled(false)
+            .mdns_enabled(false)
             .relay_service_enabled(relay_serving)
             .bootstrap_cache(
                 BootstrapCacheConfig::builder()
@@ -33,14 +45,11 @@ impl TestNode {
             )
             .build()
             .expect("valid config");
+        configure(&mut config);
         let endpoint = P2pEndpoint::new(config).await.expect("endpoint starts");
         let local = endpoint.local_addr().expect("local addr");
-        let addr = if local.ip().is_unspecified() {
-            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, local.port()))
-        } else {
-            local
-        };
-        assert!(addr.ip().is_loopback(), "tests bind loopback only");
+        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, local.port()));
+        assert!(local.ip().is_loopback() || local.ip().is_unspecified());
         // Relay streams are served on connections the application accepts.
         let accept = tokio::spawn({
             let endpoint = endpoint.clone();
@@ -54,6 +63,10 @@ impl TestNode {
         }
     }
 
+    fn peer(&self) -> PeerId {
+        self.endpoint.peer_id()
+    }
+
     async fn connect(&self, other: &TestNode) {
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -64,153 +77,201 @@ impl TestNode {
         .expect("connect succeeds");
     }
 
+    /// Hint `relay` as a relay-capable peer, so it enters the bootstrap
+    /// cache's relay selection.
+    async fn hint_relay(&self, relay: &TestNode) {
+        self.endpoint
+            .upsert_peer_hints(
+                relay.peer(),
+                vec![relay.addr],
+                Some(PeerCapabilities {
+                    supports_relay: true,
+                    supports_coordination: true,
+                    ..PeerCapabilities::default()
+                }),
+            )
+            .await;
+    }
+
+    /// Dial `target` through the normal connect path with direct and
+    /// hole-punch stages blocked, so the relay stage runs.
+    async fn dial_via_relay(
+        &self,
+        target: &TestNode,
+    ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
+        self.endpoint
+            .force_relay_stage
+            .store(true, Ordering::Relaxed);
+        tokio::time::timeout(
+            DIAL_BUDGET,
+            self.endpoint
+                .connect_with_fallback(Some(target.addr), None, None, Some(target.peer())),
+        )
+        .await
+        .expect("dial does not time out")
+    }
+
+    async fn relay_sessions(&self) -> (usize, u64) {
+        let snapshot = self.endpoint.runtime_assist_snapshot().await;
+        (
+            snapshot.active_relay_sessions,
+            snapshot.relay_bytes_forwarded,
+        )
+    }
+
     async fn stop(self) {
         self.endpoint.shutdown().await;
         self.accept.abort();
     }
 }
 
-async fn establish(
-    client: &TestNode,
-    relay: &TestNode,
-) -> Result<
-    (
-        Option<SocketAddr>,
-        Option<Arc<crate::masque::MasqueRelaySocket>>,
-    ),
-    crate::nat_traversal_api::NatTraversalError,
-> {
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        client.endpoint.inner.establish_relay_session(relay.addr),
-    )
-    .await
-    .expect("relay handshake does not time out")
+async fn recv_within(node: &TestNode, from: PeerId, payload: &[u8]) -> bool {
+    let deadline = tokio::time::Instant::now() + RECV_WINDOW;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, node.endpoint.recv()).await {
+            Ok(Ok((peer, data))) if peer == from && data == payload => return true,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
 }
 
-/// ADR-019 Validation 3: A asks B (serving off) for a Bind session and gets
-/// 403 with the reason; B has no relay session; A falls back to C (serving
-/// on) and gets a session there.
-#[tokio::test]
-async fn adr019_refused_by_serving_off_relay_then_falls_back_to_serving_relay() {
+/// Rank B above C in A's bootstrap cache: B with successes, C with
+/// failures, so relay selection orders them B, C.
+async fn rank_b_before_c(a: &TestNode, b: &TestNode, c: &TestNode) {
+    a.hint_relay(b).await;
+    a.hint_relay(c).await;
+    for _ in 0..5 {
+        a.endpoint
+            .bootstrap_cache
+            .record_success(&b.peer(), 5)
+            .await;
+        a.endpoint.bootstrap_cache.record_failure(&c.peer()).await;
+    }
+}
+
+/// ADR-019 Validation 3: one real dial from A to T. B (serving off) is the
+/// first relay candidate and C (serving on) the second. B answers 403 and
+/// keeps no session; the same dial moves on to C and connects through C's
+/// relay, and data flows A -> T through C.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr019_dial_falls_back_from_refusing_relay_to_serving_relay() {
     let a = TestNode::start(true).await;
     let b = TestNode::start(false).await;
     let c = TestNode::start(true).await;
-    a.connect(&b).await;
-    a.connect(&c).await;
-    let b_peer = b.endpoint.peer_id();
-    let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
-
-    let err = establish(&a, &b)
-        .await
-        .expect_err("a serving-off relay must refuse");
-    let message = err.to_string();
-    assert!(
-        message.contains("relay service disabled") && message.contains("403"),
-        "the refusal carries status 403 and the reason: {message}"
-    );
+    let t = TestNode::start(true).await;
+    rank_b_before_c(&a, &b, &c).await;
+    let selection = a.endpoint.default_relay_addrs(Some(t.addr)).await;
     assert_eq!(
-        b.endpoint
-            .runtime_assist_snapshot()
-            .await
-            .active_relay_sessions,
-        0,
-        "B serves no relay session"
+        selection.addrs.first(),
+        Some(&b.addr),
+        "precondition: B is the first relay candidate: {selection:?}"
     );
+
+    let (conn, method) = a
+        .dial_via_relay(&t)
+        .await
+        .expect("the dial falls back from B to C and connects");
+    assert_eq!(conn.peer_id, t.peer());
+    assert_eq!(
+        method,
+        ConnectionMethod::Relayed { relay: c.addr },
+        "the connection goes through C's relay, not direct"
+    );
+    assert_eq!(conn.traversal_method, TraversalMethod::Relay);
+
+    // B answered 403 and serves nothing.
     assert_eq!(b.endpoint.stats().await.relay_requests_refused_disabled, 1);
+    assert_eq!(b.relay_sessions().await, (0, 0));
     let a_stats = a.endpoint.stats().await;
     assert_eq!(a_stats.relay_refusals_forbidden, 1);
-    assert_eq!(a_stats.relay_refusals_capacity, 0);
     assert_eq!(a_stats.relay_refusal_cache_size, 1);
-    assert!(a.endpoint.inner.is_relay_refused(&b_peer));
+    assert!(a.endpoint.inner.is_relay_refused(&b.peer()));
 
-    // The fallback relay list no longer offers B; C is next.
-    let candidates = a.endpoint.inner.connected_relay_candidates(target);
-    assert!(
-        !candidates.contains(&b.addr),
-        "B must be skipped after its 403: {candidates:?}"
-    );
-    assert!(candidates.contains(&c.addr), "C stays a candidate");
-    for relay_addr in candidates {
-        assert_ne!(relay_addr, b.addr);
-    }
-    let (public_addr, _socket) = establish(&a, &c)
+    // Data path is C's relay.
+    let (sessions, bytes_before) = c.relay_sessions().await;
+    assert_eq!(sessions, 1, "C serves A's relay session");
+    let payload = b"adr-019 via C";
+    a.endpoint
+        .send(&t.peer(), payload)
         .await
-        .expect("the serving relay C grants a Bind session");
-    assert!(public_addr.is_some(), "C allocates a public address");
-    assert_eq!(
-        c.endpoint
-            .runtime_assist_snapshot()
-            .await
-            .active_relay_sessions,
-        1,
-        "C serves the session A fell back to"
+        .expect("A sends to T over the relayed connection");
+    assert!(
+        recv_within(&t, a.peer(), payload).await,
+        "T receives A's data"
+    );
+    let (_, bytes_after) = c.relay_sessions().await;
+    assert!(
+        bytes_after > bytes_before && bytes_after > 0,
+        "C forwarded the data: {bytes_before} -> {bytes_after}"
     );
 
     a.stop().await;
     b.stop().await;
     c.stop().await;
+    t.stop().await;
 }
 
-/// ADR-019 Validation 4: B (serving off) still uses relays: it opens a Bind
-/// session on C's relay. (Reaching a NATed peer end to end needs NAT
-/// simulation, which this repository has no in-process harness for.)
-#[tokio::test]
+/// ADR-019 Validation 4: B (serving off) still uses relays. B dials T
+/// through C's relay with direct paths blocked, sends data, and T receives
+/// it; C forwarded the bytes. (T is on loopback, not behind a real NAT: the
+/// test proves B's client relay path end to end, not NAT behaviour.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adr019_serving_off_node_still_uses_a_relay() {
     let b = TestNode::start(false).await;
     let c = TestNode::start(true).await;
-    b.connect(&c).await;
+    let t = TestNode::start(true).await;
+    b.hint_relay(&c).await;
 
-    let (public_addr, socket) = establish(&b, &c)
+    let (conn, method) = b
+        .dial_via_relay(&t)
         .await
-        .expect("B can still use C as its relay");
-    assert!(public_addr.is_some(), "C allocates B a public address");
-    assert!(socket.is_some(), "B gets a relay socket");
-    assert_eq!(b.endpoint.inner.relay_sessions().len(), 1);
-    assert_eq!(
-        c.endpoint
-            .runtime_assist_snapshot()
-            .await
-            .active_relay_sessions,
-        1
-    );
+        .expect("B reaches T through C's relay");
+    assert_eq!(conn.peer_id, t.peer());
+    assert_eq!(method, ConnectionMethod::Relayed { relay: c.addr });
     assert!(!b.endpoint.relay_service_enabled());
+
+    let payload = b"adr-019 leaf uses a relay";
+    b.endpoint
+        .send(&t.peer(), payload)
+        .await
+        .expect("B sends to T");
+    assert!(
+        recv_within(&t, b.peer(), payload).await,
+        "T receives B's data"
+    );
+    let (sessions, bytes) = c.relay_sessions().await;
+    assert_eq!(sessions, 1);
+    assert!(bytes > 0, "C forwarded B's traffic");
 
     b.stop().await;
     c.stop().await;
+    t.stop().await;
 }
 
 /// ADR-019 Validation 6: after the 403, A does not pick B as a relay before
 /// the refusal-cache entry expires (bootstrap-cache selection, hinted relays
-/// and connected peers), and does pick it again after expiry. A 503 never
-/// creates an entry.
-#[tokio::test]
+/// and connected peers), and does pick it again after expiry. Expiry uses
+/// the cache's injected clock, not a real-time sleep. A 503 never creates an
+/// entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adr019_refusal_cache_skips_refusing_relay_until_expiry() {
     let a = TestNode::start(true).await;
     let b = TestNode::start(false).await;
     let c = TestNode::start(true).await;
     a.connect(&b).await;
     a.connect(&c).await;
-    let b_peer = b.endpoint.peer_id();
     let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+    a.hint_relay(&b).await;
 
-    // B is hinted as a relay (and coordinator), so it enters the bootstrap
-    // cache's relay selection and the hinted relay list.
-    a.endpoint
-        .upsert_peer_hints(
-            b_peer,
-            vec![b.addr],
-            Some(PeerCapabilities {
-                supports_relay: true,
-                supports_coordination: true,
-                ..PeerCapabilities::default()
-            }),
-        )
-        .await;
-    assert_eq!(
-        a.endpoint.default_relay_addrs(Some(target)).await,
-        vec![b.addr],
-        "before any refusal, the bootstrap cache picks B"
+    let before = a.endpoint.default_relay_addrs(Some(target)).await;
+    assert!(
+        before.addrs.contains(&b.addr) && !before.refused_any,
+        "before any refusal B is a candidate: {before:?}"
     );
     assert!(
         a.endpoint
@@ -219,24 +280,25 @@ async fn adr019_refusal_cache_skips_refusing_relay_until_expiry() {
             .contains(&b.addr)
     );
 
-    let ttl = Duration::from_secs(2);
-    a.endpoint.inner.relay_refusal_cache().set_ttl(ttl);
-    establish(&a, &b).await.expect_err("B refuses with 403");
-    let refused_at = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        a.endpoint.inner.establish_relay_session(b.addr),
+    )
+    .await
+    .expect("handshake does not time out")
+    .expect_err("B refuses with 403");
 
-    assert!(a.endpoint.inner.is_relay_refused(&b_peer));
-    let relays = a.endpoint.default_relay_addrs(Some(target)).await;
+    let during = a.endpoint.default_relay_addrs(Some(target)).await;
     assert!(
-        !relays.contains(&b.addr),
-        "before expiry B is not picked: {relays:?}"
+        !during.addrs.contains(&b.addr) && during.refused_any,
+        "before expiry B is not picked: {during:?}"
     );
-    assert_eq!(relays, vec![c.addr], "the connected serving peer C is next");
+    assert!(during.addrs.contains(&c.addr), "C is still offered");
     assert!(
         !a.endpoint
             .hinted_assist_addrs(true, false)
             .await
-            .contains(&b.addr),
-        "B is not a hinted relay before expiry"
+            .contains(&b.addr)
     );
     assert!(
         a.endpoint
@@ -251,16 +313,17 @@ async fn adr019_refusal_cache_skips_refusing_relay_until_expiry() {
             .connected_relay_candidates(target)
             .contains(&b.addr)
     );
+    assert!(a.endpoint.inner.is_relay_addr_refused(b.addr));
 
-    let wait =
-        (refused_at + ttl + Duration::from_millis(200)).saturating_duration_since(Instant::now());
-    tokio::time::sleep(wait).await;
+    let cache = a.endpoint.inner.relay_refusal_cache();
+    cache.advance_clock(cache.ttl() + Duration::from_secs(1));
 
-    assert!(!a.endpoint.inner.is_relay_refused(&b_peer));
-    assert_eq!(
-        a.endpoint.default_relay_addrs(Some(target)).await,
-        vec![b.addr],
-        "after expiry B is picked again"
+    assert!(!a.endpoint.inner.is_relay_refused(&b.peer()));
+    assert!(!a.endpoint.inner.is_relay_addr_refused(b.addr));
+    let after = a.endpoint.default_relay_addrs(Some(target)).await;
+    assert!(
+        after.addrs.contains(&b.addr),
+        "after expiry B is picked again: {after:?}"
     );
     assert!(
         a.endpoint
@@ -277,16 +340,64 @@ async fn adr019_refusal_cache_skips_refusing_relay_until_expiry() {
     assert_eq!(a.endpoint.stats().await.relay_refusal_cache_size, 0);
 
     // A 503 (capacity) is counted but never cached.
-    let cache = a.endpoint.inner.relay_refusal_cache();
     assert!(!cache.observe_response(
-        Some(c.endpoint.peer_id()),
+        Some(c.peer()),
+        Some(c.addr),
         &crate::masque::ConnectUdpResponse::error(503, "Server at capacity"),
-        Instant::now(),
+        cache.now(),
     ));
-    assert!(!a.endpoint.inner.is_relay_refused(&c.endpoint.peer_id()));
+    assert!(!a.endpoint.inner.is_relay_refused(&c.peer()));
     assert_eq!(a.endpoint.stats().await.relay_refusals_capacity, 1);
 
     a.stop().await;
     b.stop().await;
     c.stop().await;
+}
+
+/// ADR-019 cache bypass: an address-only relay source (static
+/// `relay_nodes`) skips a relay once it refused us, and a dial whose every
+/// relay candidate refused fails fast with `AllRelaysRefused` instead of
+/// re-asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr019_all_relays_refused_fails_fast_without_reasking() {
+    let b = TestNode::start(false).await;
+    let t = TestNode::start(true).await;
+    let b_addr = b.addr;
+    let a = TestNode::start_with(true, |config| {
+        config.nat.relay_nodes = vec![b_addr];
+    })
+    .await;
+
+    // First dial: B is tried (its peer ID is not known yet) and refuses.
+    let first = a.dial_via_relay(&t).await;
+    assert!(first.is_err(), "B is the only relay and refuses");
+    assert_eq!(b.endpoint.stats().await.relay_requests_refused_disabled, 1);
+    assert!(a.endpoint.inner.is_relay_refused(&b.peer()));
+
+    // Second dial: no relay is asked again; the dial fails with the typed
+    // error.
+    let selection = a.endpoint.default_relay_addrs(Some(t.addr)).await;
+    assert!(
+        selection.addrs.is_empty() && selection.refused_any,
+        "{selection:?}"
+    );
+    let second = a.dial_via_relay(&t).await;
+    assert!(
+        matches!(
+            second,
+            Err(EndpointError::NatTraversal(
+                NatTraversalError::AllRelaysRefused
+            ))
+        ),
+        "{second:?}"
+    );
+    assert_eq!(
+        b.endpoint.stats().await.relay_requests_refused_disabled,
+        1,
+        "B is not re-asked before expiry"
+    );
+
+    a.stop().await;
+    b.stop().await;
+    t.stop().await;
 }

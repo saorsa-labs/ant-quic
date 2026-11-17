@@ -51,6 +51,12 @@ pub(crate) const SHUTDOWN_LISTENER_TIMEOUT_PREFIX: &str =
 pub(crate) const UNAUTHENTICATED_GENERATION: u64 = u64::MAX;
 
 // Shared by every endpoint in this process, including endpoints created after shutdown.
+/// ADR-019: how long a node with relay serving off waits for a complete
+/// CONNECT-UDP request (and for its `403` answer to be written) before it
+/// drops the stream. The serving path has no such bound today.
+pub(crate) const RELAY_REFUSAL_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 static CONNECTION_GENERATIONS: std::sync::LazyLock<Arc<AtomicU64>> =
     std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(1)));
 
@@ -1820,6 +1826,10 @@ pub struct NatTraversalEndpoint {
     relay_server: Option<Arc<MasqueRelayServer>>,
     /// ADR-019: count of relay requests refused because serving is off.
     relay_requests_refused_disabled: Arc<AtomicU64>,
+    /// ADR-019 (Validation 5): coordination requests this node forwarded as
+    /// a hole-punch coordinator. Coordination stays on when relay serving
+    /// is off; this counter makes that observable.
+    coordination_requests_forwarded: Arc<AtomicU64>,
     /// ADR-019: relays that refused us by policy, skipped until expiry.
     relay_refusals: Arc<RelayRefusalCache>,
     /// Successful candidate pairs discovered via hole punching
@@ -2224,9 +2234,9 @@ impl TraversalFailureReason {
                 TraversalPhase::Validation => Self::ValidationTimedOut,
                 _ => Self::NetworkError("Traversal timed out".to_string()),
             },
-            NatTraversalError::ConnectionFailed(_) | NatTraversalError::PeerNotConnected => {
-                Self::ConnectionFailed
-            }
+            NatTraversalError::ConnectionFailed(_)
+            | NatTraversalError::PeerNotConnected
+            | NatTraversalError::AllRelaysRefused => Self::ConnectionFailed,
             NatTraversalError::ProtocolError(message)
             | NatTraversalError::ConfigError(message)
             | NatTraversalError::TraversalFailed(message) => {
@@ -2261,9 +2271,9 @@ impl TraversalFailureReason {
             NatTraversalError::Timeout => Some(Self::NetworkError(
                 "overall hole-punch deadline expired".to_string(),
             )),
-            NatTraversalError::ConnectionFailed(_) | NatTraversalError::PeerNotConnected => {
-                Some(Self::ConnectionFailed)
-            }
+            NatTraversalError::ConnectionFailed(_)
+            | NatTraversalError::PeerNotConnected
+            | NatTraversalError::AllRelaysRefused => Some(Self::ConnectionFailed),
             NatTraversalError::ProtocolError(message)
             | NatTraversalError::ConfigError(message)
             | NatTraversalError::TraversalFailed(message) => {
@@ -2879,6 +2889,10 @@ pub enum NatTraversalError {
     PeerNotConnected,
     /// Too many concurrent NAT traversal sessions (session budget exhausted)
     TooManySessions,
+    /// ADR-019: every relay candidate is in the relay refusal cache (each
+    /// answered `403 "relay service disabled"` and has not expired). No
+    /// relay is re-asked before its entry expires.
+    AllRelaysRefused,
 }
 
 impl Default for NatTraversalConfig {
@@ -3240,6 +3254,7 @@ impl NatTraversalEndpoint {
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
+            coordination_requests_forwarded: Arc::new(AtomicU64::new(0)),
             relay_refusals: Arc::new(RelayRefusalCache::default()),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -3757,6 +3772,7 @@ impl NatTraversalEndpoint {
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
+            coordination_requests_forwarded: Arc::new(AtomicU64::new(0)),
             relay_refusals: Arc::new(RelayRefusalCache::default()),
             successful_candidates: Arc::new(dashmap::DashMap::new()),
             transport_candidates: Arc::new(dashmap::DashMap::new()),
@@ -4484,10 +4500,36 @@ impl NatTraversalEndpoint {
         self.relay_requests_refused_disabled.load(Ordering::Relaxed)
     }
 
+    /// Coordination requests this node forwarded as a hole-punch
+    /// coordinator (accepted fast path or offer sent to the target).
+    pub fn coordination_requests_forwarded(&self) -> u64 {
+        self.coordination_requests_forwarded.load(Ordering::Relaxed)
+    }
+
     /// ADR-019: whether `relay` refused us by policy and is still skipped as
     /// a relay candidate (in-memory refusal cache, not persisted).
     pub fn is_relay_refused(&self, relay: &PeerId) -> bool {
-        self.relay_refusals.is_refused(relay, Instant::now())
+        self.relay_refusals
+            .is_refused(relay, self.relay_refusals.now())
+    }
+
+    /// ADR-019: whether the relay at `addr` refused us by policy and is still
+    /// skipped. Used by relay sources that know only an address (known
+    /// peers, static `relay_nodes`, the relay manager): the address is
+    /// skipped when a live refusal was recorded from it, or when a live
+    /// connection to it belongs to a peer that refused us. An address whose
+    /// peer ID is not known yet is tried as before; its refusal is cached by
+    /// the authenticated peer ID once it answers.
+    pub fn is_relay_addr_refused(&self, addr: SocketAddr) -> bool {
+        let now = self.relay_refusals.now();
+        if self.relay_refusals.is_addr_refused(addr, now) {
+            return true;
+        }
+        let addr = normalize_socket_addr(addr);
+        self.connections.iter().any(|entry| {
+            normalize_socket_addr(entry.value().remote_address()) == addr
+                && self.relay_refusals.is_refused(entry.key(), now)
+        })
     }
 
     /// ADR-019 client metrics: `(403 policy refusals, 503 capacity
@@ -4496,7 +4538,7 @@ impl NatTraversalEndpoint {
         (
             self.relay_refusals.refusals_forbidden(),
             self.relay_refusals.refusals_capacity(),
-            self.relay_refusals.len(Instant::now()),
+            self.relay_refusals.len(self.relay_refusals.now()),
         )
     }
 
@@ -5291,6 +5333,8 @@ impl NatTraversalEndpoint {
                         let _ = self
                             .send_coordinator_control_on_connection(target_conn.clone(), accepted)
                             .await;
+                        self.coordination_requests_forwarded
+                            .fetch_add(1, Ordering::Relaxed);
                         info!(
                             "coordinator control request fast-path handled request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
                             envelope.request_id, from_peer_id, initiator, target, round
@@ -5326,6 +5370,8 @@ impl NatTraversalEndpoint {
 
                 self.send_coordinator_control_on_connection(target_conn, offer)
                     .await?;
+                self.coordination_requests_forwarded
+                    .fetch_add(1, Ordering::Relaxed);
                 info!(
                     "coordinator control request handled request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
                     envelope.request_id, from_peer_id, initiator, target, round
@@ -7028,11 +7074,24 @@ impl NatTraversalEndpoint {
         mut recv_stream: InnerRecvStream,
         prefix: Vec<u8>,
     ) {
-        if Self::read_relay_request(client_addr, &mut recv_stream, prefix)
-            .await
-            .is_none()
+        // Bound the whole request read: a peer that stalls mid-request must
+        // not hold this task (and the reader's in-flight relay-stream count,
+        // which blocks connection retirement) open indefinitely.
+        match tokio::time::timeout(
+            RELAY_REFUSAL_REQUEST_TIMEOUT,
+            Self::read_relay_request(client_addr, &mut recv_stream, prefix),
+        )
+        .await
         {
-            return;
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(_) => {
+                debug!(
+                    "Relay request from {} not complete within {:?}; dropping stream",
+                    client_addr, RELAY_REFUSAL_REQUEST_TIMEOUT
+                );
+                return;
+            }
         }
         refused_counter.fetch_add(1, Ordering::Relaxed);
         debug!(
@@ -7041,7 +7100,19 @@ impl NatTraversalEndpoint {
         );
         let response = ConnectUdpResponse::relay_service_disabled();
         let response_frame = encode_relay_response_frame(&response);
-        if let Err(e) = send_stream.write_all(&response_frame).await {
+        let written = tokio::time::timeout(
+            RELAY_REFUSAL_REQUEST_TIMEOUT,
+            send_stream.write_all(&response_frame),
+        )
+        .await;
+        let Ok(written) = written else {
+            debug!(
+                "Relay refusal to {} not written within {:?}; dropping stream",
+                client_addr, RELAY_REFUSAL_REQUEST_TIMEOUT
+            );
+            return;
+        };
+        if let Err(e) = written {
             debug!("Failed to send relay refusal to {}: {}", client_addr, e);
             return;
         }
@@ -7548,11 +7619,17 @@ impl NatTraversalEndpoint {
             connected_peers.len()
         );
 
-        // Also add configured relay nodes as fallback (for bootstrapping)
+        // Also add configured relay nodes as fallback (for bootstrapping).
+        // ADR-019: skip relays that refused us by policy until expiry.
+        let mut refused_any = self.connected_relay_candidates_refused(remote_addr);
         let mut relay_candidates: Vec<SocketAddr> = connected_peers;
         if let Some(ref manager) = self.relay_manager {
             let configured_relays = manager.available_relays().await;
             for relay in configured_relays {
+                if self.is_relay_addr_refused(relay) {
+                    refused_any = true;
+                    continue;
+                }
                 if !relay_candidates.contains(&relay) {
                     relay_candidates.push(relay);
                 }
@@ -7560,6 +7637,10 @@ impl NatTraversalEndpoint {
         }
 
         if relay_candidates.is_empty() {
+            if refused_any {
+                // ADR-019: fail fast; do not re-ask a refusing relay.
+                return Err(NatTraversalError::AllRelaysRefused);
+            }
             return Err(NatTraversalError::ConnectionFailed(
                 "No connected peers or relay nodes available".to_string(),
             ));
@@ -7622,6 +7703,16 @@ impl NatTraversalEndpoint {
     /// Connected peers usable as relays for a dial to `target`: live
     /// connections other than the target, minus relays that refused us by
     /// policy and whose refusal-cache entry has not expired (ADR-019).
+    /// Whether any live connected peer (other than `target`) was left out of
+    /// [`Self::connected_relay_candidates`] because it refused us by policy.
+    fn connected_relay_candidates_refused(&self, target: SocketAddr) -> bool {
+        self.connections.iter().any(|entry| {
+            entry.value().close_reason().is_none()
+                && entry.value().remote_address() != target
+                && self.is_relay_refused(entry.key())
+        })
+    }
+
     pub(crate) fn connected_relay_candidates(&self, target: SocketAddr) -> Vec<SocketAddr> {
         self.connections
             .iter()
@@ -7894,15 +7985,17 @@ impl NatTraversalEndpoint {
                     })
                     .map(|entry| *entry.key())
             });
-            if self
-                .relay_refusals
-                .observe_response(relay_peer, &response, Instant::now())
-            {
+            if self.relay_refusals.observe_response(
+                relay_peer,
+                Some(relay_addr),
+                &response,
+                self.relay_refusals.now(),
+            ) {
                 info!(
                     "Relay {} ({:?}) refused: relay service disabled; skipping it as a relay for {:?}",
                     relay_addr,
                     relay_peer,
-                    crate::masque::refusal_cache::RELAY_REFUSAL_CACHE_TTL
+                    self.relay_refusals.ttl()
                 );
             }
             let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
@@ -14302,6 +14395,7 @@ impl fmt::Display for NatTraversalError {
             Self::TraversalFailed(msg) => write!(f, "traversal failed: {msg}"),
             Self::PeerNotConnected => write!(f, "peer not connected"),
             Self::TooManySessions => write!(f, "too many concurrent NAT traversal sessions"),
+            Self::AllRelaysRefused => write!(f, "all relay candidates refuse relaying"),
         }
     }
 }

@@ -333,6 +333,9 @@ pub struct ConnectionStrategy {
     stage: ConnectionStage,
     config: StrategyConfig,
     errors: Vec<ConnectionAttemptError>,
+    /// ADR-019: every default relay candidate was skipped because it is in
+    /// the relay refusal cache.
+    all_relays_refused: bool,
 }
 
 impl ConnectionStrategy {
@@ -344,7 +347,20 @@ impl ConnectionStrategy {
             },
             config,
             errors: Vec::new(),
+            all_relays_refused: false,
         }
+    }
+
+    /// ADR-019: mark that every default relay candidate was skipped because
+    /// it refused relaying, so a ladder that fails reports
+    /// `NatTraversalError::AllRelaysRefused`.
+    pub(crate) fn set_all_relays_refused(&mut self, refused: bool) {
+        self.all_relays_refused = refused;
+    }
+
+    /// Whether every default relay candidate refused relaying (ADR-019).
+    pub(crate) fn all_relays_refused(&self) -> bool {
+        self.all_relays_refused
     }
 
     /// Get the current stage
