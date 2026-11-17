@@ -1,6 +1,6 @@
 # ADR-019: Relay-Serving Opt-Out for Leaf Nodes
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-17). Accepted by David Irvine on 2026-11-17. The tests in § Validation stay the ship requirement for the implementation PR.
 - **Date:** 2026-11-15
 - **Decision owners:** David Irvine
 - **Reviewers:** to be assigned
