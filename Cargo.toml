@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "ant-quic"
-version = "0.27.53"
+version = "0.28.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,8 @@ exclude = [
     ".githooks/",
     ".serena/",
     ".codecov.yml",
+    # Dangling symlink to CLAUDE.md (removed in #302); packaging it fails.
+    ".cursorrules",
     ".DS_Store",
     "*.DS_Store",
     "agents_to_run.sh",
