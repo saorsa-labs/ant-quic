@@ -7497,7 +7497,6 @@ impl P2pEndpoint {
     /// Returns `false` when the reader must exit (channel-closed while
     /// handling).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn handle_bidi_stream_inline(
         ack_bidi_serialization: &Arc<tokio::sync::Mutex<()>>,
         inner: &Arc<NatTraversalEndpoint>,
