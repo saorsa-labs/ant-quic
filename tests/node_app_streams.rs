@@ -21,8 +21,8 @@
 //!
 //! # Relay coverage
 //!
-//! `enable_relay_service` is forced `true` by default (ADR-004: every node
-//! provides relay services), so the accepting node in every test below has a
+//! `enable_relay_service` defaults to `true` (ADR-004; ADR-019 makes it a
+//! node-level opt-out), so the accepting node in every test below has a
 //! live `MasqueRelayServer`. The echo tests therefore exercise the
 //! **app-before-relay demux ordering** on a real connection: an app stream
 //! (`ANQAppB1`) is routed to `accept_bi` rather than being consumed by the

@@ -109,6 +109,12 @@ pub struct NodeConfig {
     /// default applies (currently enabled).
     pub port_mapping_enabled: Option<bool>,
 
+    /// ADR-019: serve relay sessions for other peers. When `Some(false)`,
+    /// the node builds no relay server and answers relay requests with
+    /// `403 "relay service disabled"`; it still uses relays and coordinates
+    /// hole punching. When `None`, the ant-quic default applies (`true`).
+    pub relay_service_enabled: Option<bool>,
+
     /// Enable or disable first-party mDNS discovery for this node.
     ///
     /// When `Some(false)`, mDNS browsing and advertising are disabled so
@@ -200,6 +206,7 @@ pub struct NodeConfigBuilder {
     max_concurrent_uni_streams: Option<u32>,
     max_message_size: Option<usize>,
     port_mapping_enabled: Option<bool>,
+    relay_service_enabled: Option<bool>,
     mdns_enabled: Option<bool>,
     mdns_namespace: Option<String>,
     bootstrap_cache: Option<BootstrapCacheConfig>,
@@ -407,6 +414,15 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// ADR-019: enable or disable serving relay sessions for other peers
+    /// (see [`NodeConfig::relay_service_enabled`]). Default (when not
+    /// called): `true`. Use `false` on leaf nodes (phones, metered or
+    /// policy-restricted hosts) that should not carry third-party traffic.
+    pub fn relay_service_enabled(mut self, enabled: bool) -> Self {
+        self.relay_service_enabled = Some(enabled);
+        self
+    }
+
     /// Enable or disable first-party mDNS discovery (see
     /// [`NodeConfig::mdns_enabled`]). Use `false` to keep co-located
     /// daemons on other planes from discovering this node via mDNS.
@@ -441,6 +457,7 @@ impl NodeConfigBuilder {
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
             max_message_size: self.max_message_size,
             port_mapping_enabled: self.port_mapping_enabled,
+            relay_service_enabled: self.relay_service_enabled,
             mdns_enabled: self.mdns_enabled,
             mdns_namespace: self.mdns_namespace,
             bootstrap_cache: self.bootstrap_cache,
@@ -475,6 +492,17 @@ impl NodeConfig {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    /// ADR-019 Validation 1: the Node builder sets the relay-serving flag;
+    /// when not called the ant-quic default (`true`) applies.
+    #[test]
+    fn test_relay_service_enabled_builder() {
+        assert_eq!(NodeConfig::default().relay_service_enabled, None);
+        let off = NodeConfig::builder().relay_service_enabled(false).build();
+        assert_eq!(off.relay_service_enabled, Some(false));
+        let on = NodeConfig::builder().relay_service_enabled(true).build();
+        assert_eq!(on.relay_service_enabled, Some(true));
+    }
 
     #[test]
     fn test_default_config() {

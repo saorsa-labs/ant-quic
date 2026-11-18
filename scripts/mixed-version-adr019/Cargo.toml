@@ -1,0 +1,20 @@
+[package]
+name = "mixed-version-adr019"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# ADR-019 Validation 8 mixed-version check: the last released ant-quic
+# (0.27.62, "old") against this tree ("new"), in one process, on loopback.
+#
+#   cargo run --
+#
+# Same layout as scripts/mixed-version-f4. Not part of the ant-quic workspace
+# and not packaged with the crate.
+[dependencies]
+old = { package = "ant-quic", version = "=0.27.62" }
+new = { package = "ant-quic", path = "../.." }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+[workspace]

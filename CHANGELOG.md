@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`enable_relay_service` changes from ignored to honoured (ADR-019, #362).**
+  Before, `NatTraversalEndpoint::normalize_config` and
+  `P2pConfig::to_nat_config` forced the flag to `true`, so every node served
+  MASQUE CONNECT-UDP relay sessions. Now the flag is a runtime, node-level
+  setting; the default stays `true`. **Any caller that sets it to `false`
+  today will stop serving relay sessions after upgrade.** With `false` the
+  node builds no relay server and answers every relay request with
+  `403 "relay service disabled"`; it still uses relays, coordinates hole
+  punching and observes addresses. `P2pEndpoint::relay_service_enabled()` and
+  `NodeStatus.relay_service_enabled` now report the real value. No wire
+  change.
+
+### Added
+
+- `P2pConfigBuilder::relay_service_enabled(bool)`,
+  `NodeConfigBuilder::relay_service_enabled(bool)` and
+  `NodeConfig.relay_service_enabled` (ADR-019).
+- Client relay refusal cache (ADR-019): a relay that answers
+  `403 "relay service disabled"` is skipped for one hour by every relay
+  candidate source: bootstrap-cache selection (every non-refused candidate is
+  now offered, best first), hinted relays, connected peers, known peers,
+  static `relay_nodes`, the relay manager and the proactive relay loop.
+  Address-only relays are tried until their authenticated peer ID refuses.
+  In memory only, bounded, never persisted; a `503` never creates an entry.
+  When every candidate has refused, the dial fails with the new
+  `NatTraversalError::AllRelaysRefused` instead of re-asking.
+- A node with relay serving off drops a relay request that is not complete
+  within 5 s (`RELAY_REFUSAL_REQUEST_TIMEOUT`).
+- `ConnectUdpResponse::relay_service_disabled()`,
+  `ConnectUdpResponse::is_relay_service_disabled()` and
+  `ConnectUdpResponse::REASON_RELAY_SERVICE_DISABLED`.
+- `EndpointStats` metrics: `coordination_requests_forwarded`,
+  `relay_requests_refused_disabled` (server),
+  `relay_refusals_forbidden`, `relay_refusals_capacity` and
+  `relay_refusal_cache_size` (client).
+
+### Source compatibility
+
+These additions are source-breaking for some callers:
+
+- New variant `NatTraversalError::AllRelaysRefused`. The enum is not
+  `#[non_exhaustive]`, so an exhaustive `match` on it stops compiling.
+- New pub fields on `EndpointStats` (`coordination_requests_forwarded`,
+  `relay_requests_refused_disabled`, `relay_refusals_forbidden`,
+  `relay_refusals_capacity`, `relay_refusal_cache_size`) and
+  `NodeConfig.relay_service_enabled`. A struct literal of either type without
+  `..Default::default()` stops compiling.
+
 ### Fixed
 
 - **The Run Benchmarks PR gate no longer fails on false regressions (#291).**

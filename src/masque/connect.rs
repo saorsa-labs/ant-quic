@@ -322,6 +322,24 @@ impl ConnectUdpResponse {
         Self::error(Self::STATUS_UNAVAILABLE, reason)
     }
 
+    /// Reason phrase a node with relay serving turned off sends with its
+    /// `403` answer (ADR-019).
+    pub const REASON_RELAY_SERVICE_DISABLED: &'static str = "relay service disabled";
+
+    /// The answer of a node whose relay serving is turned off (ADR-019):
+    /// status `403` with reason [`Self::REASON_RELAY_SERVICE_DISABLED`].
+    pub fn relay_service_disabled() -> Self {
+        Self::forbidden(Self::REASON_RELAY_SERVICE_DISABLED)
+    }
+
+    /// Whether this is the ADR-019 policy refusal: status `403` AND reason
+    /// [`Self::REASON_RELAY_SERVICE_DISABLED`]. Other `403` answers (for
+    /// example `"Authentication required"`) do not match.
+    pub fn is_relay_service_disabled(&self) -> bool {
+        self.status == Self::STATUS_FORBIDDEN
+            && self.reason.as_deref() == Some(Self::REASON_RELAY_SERVICE_DISABLED)
+    }
+
     /// Check if this is a successful response
     pub fn is_success(&self) -> bool {
         self.status >= 200 && self.status < 300

@@ -284,6 +284,31 @@ compatible local gateways:
 Treat UPnP IGD as a router-local reachability assist layer, not as the primary
 NAT traversal protocol.
 
+### Relay Serving (ADR-019)
+
+Every node serves MASQUE CONNECT-UDP relay sessions for other peers by
+default. A node can turn serving off at runtime:
+
+- `P2pConfigBuilder::relay_service_enabled(false)` or
+  `NodeConfigBuilder::relay_service_enabled(false)` (field
+  `NatConfig::enable_relay_service`). Default: `true`.
+- With serving off, the node builds no relay server and answers every relay
+  request with `403 "relay service disabled"`. It still uses other relays,
+  coordinates hole punching and observes addresses.
+  `NodeStatus.relay_service_enabled` reports `false`.
+- Peers that receive the 403 skip the node as a relay for one hour (an
+  in-memory refusal cache; not persisted). A `503` (relay at capacity) is not
+  cached.
+
+Use `false` only on leaf nodes that should not carry other people's traffic:
+phones, metered or capped links, and hosts whose policy forbids forwarding.
+
+**Seed, known-peer and backbone operators keep the default (`true`).** These
+nodes are the relays most peers can reach. Turning serving off on them
+reduces the relay capacity of the whole network, and the network has no other
+way to replace it. Watch `EndpointStats::relay_requests_refused_disabled` on
+nodes with serving off, and the 503 rate on nodes that serve.
+
 ### Scoped mDNS Discovery
 
 ant-quic supports first-party scoped mDNS out of the box, with zero-config
