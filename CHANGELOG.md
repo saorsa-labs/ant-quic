@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-18
+
+0.28.0 is cut from master; 0.27.54–0.27.62 were cut from release/0.27.x branches whose fixes are all on master.
+
 ### Changed
 
-- **`enable_relay_service` changes from ignored to honoured (ADR-019, #362).**
+- **`enable_relay_service` changes from ignored to honoured (ADR-019, #362, #370).**
   Before, `NatTraversalEndpoint::normalize_config` and
   `P2pConfig::to_nat_config` forced the flag to `true`, so every node served
   MASQUE CONNECT-UDP relay sessions. Now the flag is a runtime, node-level
@@ -76,28 +80,27 @@ These additions are source-breaking for some callers:
 - **Peer lifecycle streams agree on event order.** Each lifecycle event is now
   sent to the all-peer and per-peer streams under one lock, so concurrent
   emitters can no longer interleave the two sends and leave the streams showing
-  one peer's events in different orders (#322).
-- **Out-of-order `read_to_end` stays within the caller's size limit.** Delivered
-  chunks are kept in offset order and merged into every neighbour they touch,
-  so a reordered contiguous stream is one entry. The 4096-entry cap is applied
-  after that merge.
-- **A datagram at the advertised maximum no longer closes the connection.**
-  The protocol check compares the payload with the advertised
-  `max_datagram_frame_size`. Per-datagram overhead is charged only when
-  choosing which queued datagrams to evict. The advertised limit is unchanged.
-- **Contiguous stream data is no longer rejected as too many chunks.** When
-  compaction still leaves more than 1024 chunks, a second pass merges every
-  contiguous run, including chunks above the retention cutoff. A stream is
-  rejected only when it still exceeds the cap after that pass.
-- **DATAGRAM frames are checked as encoded frames (RFC 9221 §3).** The
-  receive check uses the `max_datagram_frame_size` we advertise (the receive
-  buffer size, capped at 65535) and compares it with the whole frame: type,
-  length and payload, rather than the payload alone. A limit of 0 rejects
-  every DATAGRAM frame. We no longer send a DATAGRAM to a peer whose limit is
-  0 or 1.
+  one peer's events in different orders (#322, #340).
+- The 0.27.61 fixes (#331, #335) and the 0.27.62 `connection_generation()`
+  API (#367) are on master; see those sections below.
+- Direct handshakes are kept across the hole-punch cutoff (#352).
+- `NatTraversalEvent`s that nobody polls are no longer queued (#255, #353).
+- Relay reuses live IPv4 peers on dual-stack sockets (#349).
+- No #277 promotion is signalled for a winner that is already in place (#350).
+- Relay connection attempts are counted in metrics (#262, #347).
+- Dual-stack sockets share an OS-assigned port without network discovery
+  (#246, #339).
+- NAT traversal allows QUIC service ports and expires address verdicts (#342).
+- Accepting a connection reads the current peer identity (#338).
+- `CLOSE_CODE_NO_READER` is mapped in `from_app_error_code` (#337).
 
 ### Security
 
+- **Oversized Retry/Initial tokens are rejected (GHSA-wppq-2f6r-wfvm, #359).**
+  Port of the quinn-proto 0.11.19 check: an Initial whose peer-provided token
+  leaves too little space for frames is dropped and the connection is closed
+  with PROTOCOL_VIOLATION. Impact on ant-quic was not confirmed before the
+  port.
 - **Regression tests for GHSA-5xgh-3jqx-h4c6 are public.** The advisory is
   published, and 0.27.60 has the fix. The tests that the 0.27.59 and 0.27.60
   releases held back are now on master: RUSTSEC-2026-0338, -0339, -0340, -0341
@@ -105,14 +108,18 @@ These additions are source-breaking for some callers:
   `read_to_end` buffering, and datagrams after a path change. One refactor,
   with the same behaviour, moves the NEW_CONNECTION_ID step into
   `apply_new_connection_id()`, so that the connection-ID test can call it.
-- **Master has the 0.27.59 and 0.27.60 fixes** (sections below). The crate
-  version on master does not change.
+- **Master has the 0.27.59 and 0.27.60 fixes** (sections below, #329).
 
 ### Dependencies
 
-- rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349). The
+- rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349, #336). The
   `Cargo.toml` requirement is now `0.23.46`, so a fresh resolve cannot select
   an affected version; `Cargo.lock` already had 0.23.46.
+- Lockfile: rustls-webpki 0.103.16 and webpki roots 1.0.10
+  (RUSTSEC-2026-0381, -0382, -0383, #358).
+- Lockfile: saorsa-pqc 0.5.2, which drops the unused hpke dependency and with
+  it crypto-bigint 0.5.5 (RUSTSEC-2026-0387), and tokio 1.53.3
+  (RUSTSEC-2026-0386) (#363).
 
 ### Tests
 
@@ -145,6 +152,54 @@ These additions are source-breaking for some callers:
   checks from the lifecycle trace and the winner map that it keeps the greater
   lifecycle connection id. Each order is repeated until both outcomes occur, so
   a decision biased to one side or to registration order fails.
+- Supersede close coverage is deterministic (#355); further lifecycle, NAT and
+  P2P tests are hardened or added (#333, #343, #344, #345, #351, #354, #356).
+
+### Docs and CI
+
+- The shutdown docs no longer overstate the bounded worker join (#341).
+- CI moves off the retired macos-14 runner image (#366) and no longer fails
+  fork PRs when GitHub withholds tokens (#365).
+
+## [0.27.62] - 2026-11-03
+
+### Added
+
+- **`connection_generation()` on every accepted or opened app stream.**
+  `SendStream` and `RecvStream` each expose the generation of the connection
+  that carried them, stamped once when the stream is accepted or opened and
+  never changing, so an application with per-connection state can tell a
+  superseded connection's streams from the winner's while both connections
+  stay open after a follow (ADR-017). Streams not created through
+  `P2pEndpoint`/`Node` `open_bi`/`accept_bi` report the `u64::MAX` sentinel.
+  Additive only: no wire change and no existing signature changes.
+  Fixes #327, backport of #367.
+
+## [0.27.61] - 2026-10-17
+
+### Fixed
+
+- **Out-of-order `read_to_end` stays within the caller's size limit.** Delivered
+  chunks are kept in offset order and merged into every neighbour they touch,
+  so a reordered contiguous stream is one entry. The 4096-entry cap is applied
+  after that merge.
+  Merging grows the stored run at either end and moves the smaller run into
+  the larger, so descending or reverse-pairwise arrival does not recopy the
+  bytes already buffered.
+- **A datagram at the advertised maximum no longer closes the connection.**
+  The protocol check compares the payload with the advertised
+  `max_datagram_frame_size`. Per-datagram overhead is charged only when
+  choosing which queued datagrams to evict. The advertised limit is unchanged.
+- **Contiguous stream data is no longer rejected as too many chunks.** When
+  compaction still leaves more than 1024 chunks, a second pass merges every
+  contiguous run, including chunks above the retention cutoff. A stream is
+  rejected only when it still exceeds the cap after that pass.
+- **DATAGRAM frames are checked as encoded frames (RFC 9221 §3).** The
+  receive check uses the `max_datagram_frame_size` we advertise (the receive
+  buffer size, capped at 65535) and compares it with the whole frame: type,
+  length and payload, rather than the payload alone. A limit of 0 rejects
+  every DATAGRAM frame. We no longer send a DATAGRAM to a peer whose limit is
+  0 or 1.
 
 ## [0.27.60] - 2026-10-13
 
