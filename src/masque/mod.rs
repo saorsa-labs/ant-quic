@@ -125,4 +125,9 @@ pub use relay_server::{
     SessionInfo,
 };
 pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats};
-pub use relay_socket::MasqueRelaySocket;
+pub use relay_socket::{
+    DEFAULT_RELAY_RECV_QUEUE_CAPACITY, DEFAULT_RELAY_SEND_QUEUE_CAPACITY, MasqueRelaySocket,
+    MasqueRelaySocketStats, QUIC_INITIAL_MIN_SIZE, RelayForwardMode, RelayLane,
+    compute_datagram_payload_budget, is_quic_initial_packet, select_relay_lane,
+    uncompressed_datagram_header_overhead,
+};

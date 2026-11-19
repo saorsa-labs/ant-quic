@@ -44,8 +44,9 @@ use tokio::sync::RwLock;
 use crate::VarInt;
 use crate::high_level::Connection as QuicConnection;
 use crate::masque::{
-    Capsule, CompressedDatagram, ConnectUdpRequest, ConnectUdpResponse, Datagram, RelaySession,
-    RelaySessionConfig, RelaySessionState, UncompressedDatagram,
+    Capsule, CompressedDatagram, ConnectUdpRequest, ConnectUdpResponse, Datagram, RelayForwardMode,
+    RelayLane, RelaySession, RelaySessionConfig, RelaySessionState, UncompressedDatagram,
+    select_relay_lane,
 };
 use crate::relay::error::{RelayError, RelayResult, SessionErrorKind};
 
@@ -62,6 +63,8 @@ pub struct MasqueRelayConfig {
     pub global_bandwidth_limit: u64,
     /// Enable authentication requirement
     pub require_authentication: bool,
+    /// Relay data-plane forwarding mode (ADR-016). Default: `Stream`.
+    pub forward_mode: RelayForwardMode,
 }
 
 impl Default for MasqueRelayConfig {
@@ -72,6 +75,7 @@ impl Default for MasqueRelayConfig {
             cleanup_interval: Duration::from_secs(60),
             global_bandwidth_limit: 100 * 1024 * 1024, // 100 MB/s
             require_authentication: true,
+            forward_mode: RelayForwardMode::default(),
         }
     }
 }
@@ -1146,6 +1150,231 @@ impl MasqueRelayServer {
         }
     }
 
+    /// Configured forwarding mode for this relay server (ADR-016).
+    #[must_use]
+    pub fn forward_mode(&self) -> RelayForwardMode {
+        self.config.forward_mode
+    }
+
+    /// Hybrid datagram/stream relay forwarding loop (ADR-016).
+    ///
+    /// When [`MasqueRelayConfig::forward_mode`] is [`RelayForwardMode::Stream`],
+    /// delegates directly to [`Self::run_stream_forwarding_loop`].
+    ///
+    /// When [`RelayForwardMode::Hybrid`] is active:
+    /// - Target UDP → Client: packets selected for [`RelayLane::Datagram`] are
+    ///   sent as unreliable QUIC `DATAGRAM` frames on `connection`, falling back
+    ///   to the length-prefixed stream lane for Initial packets, oversized
+    ///   packets, or peers that have not negotiated QUIC datagrams.
+    /// - Client → Target UDP: accepts packets concurrently from both
+    ///   `recv_stream` and `connection.read_datagram()`, so a hybrid-capable
+    ///   server serves both hybrid and stream-only clients without protocol
+    ///   rupture (ADR-016 §Decision 6).
+    pub async fn run_hybrid_forwarding_loop(
+        self: &Arc<Self>,
+        session_id: u64,
+        connection: QuicConnection,
+        mut send_stream: crate::high_level::SendStream,
+        mut recv_stream: crate::high_level::RecvStream,
+    ) {
+        if self.config.forward_mode == RelayForwardMode::Stream {
+            self.run_stream_forwarding_loop(session_id, send_stream, recv_stream)
+                .await;
+            return;
+        }
+
+        let udp_socket = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session_id) {
+                Some(s) => s.udp_socket().cloned(),
+                None => {
+                    tracing::warn!(
+                        session_id,
+                        "Cannot start hybrid forwarding: session not found"
+                    );
+                    return;
+                }
+            }
+        };
+
+        let socket = match udp_socket {
+            Some(s) => s,
+            None => {
+                tracing::warn!(session_id, "Cannot start hybrid forwarding: no UDP socket");
+                return;
+            }
+        };
+
+        tracing::info!(
+            session_id,
+            bound_addr = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            "Starting hybrid datagram/stream relay forwarding loop (ADR-016)"
+        );
+
+        let socket_stream = Arc::clone(&socket);
+        let socket_dgram = Arc::clone(&socket);
+        let conn_out = connection.clone();
+        let conn_in = connection;
+        let stats_out = self.stats();
+        let stats_stream_in = self.stats();
+        let stats_dgram_in = self.stats();
+        let mid_frame = std::sync::atomic::AtomicBool::new(false);
+
+        let send_stream_intact = tokio::select! {
+            // Direction 1: UDP → Client (datagram lane for <= P_max short-header, stream lane otherwise)
+            intact = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, source)) => {
+                            let payload = Bytes::copy_from_slice(&buf[..len]);
+                            let datagram = UncompressedDatagram::new(
+                                VarInt::from_u32(0),
+                                source,
+                                payload.clone(),
+                            );
+                            let encoded = datagram.encode();
+
+                            let lane = select_relay_lane(
+                                &payload,
+                                source,
+                                conn_out.max_datagram_size(),
+                                RelayForwardMode::Hybrid,
+                            );
+
+                            let mut sent_via_datagram = false;
+                            if lane == RelayLane::Datagram {
+                                match conn_out.send_datagram(encoded.clone()) {
+                                    Ok(()) => {
+                                        sent_via_datagram = true;
+                                    }
+                                    Err(
+                                        crate::high_level::SendDatagramError::TooLarge
+                                        | crate::high_level::SendDatagramError::UnsupportedByPeer
+                                        | crate::high_level::SendDatagramError::Disabled,
+                                    ) => {
+                                        // Fall back to stream lane for this packet.
+                                    }
+                                    Err(crate::high_level::SendDatagramError::ConnectionLost(e)) => {
+                                        tracing::debug!(
+                                            session_id,
+                                            error = %e,
+                                            "Hybrid relay: outer connection lost on datagram send"
+                                        );
+                                        break true;
+                                    }
+                                }
+                            }
+
+                            if !sent_via_datagram {
+                                let frame_len = encoded.len() as u32;
+                                mid_frame.store(true, Ordering::Relaxed);
+                                if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
+                                    tracing::debug!(session_id, error = %e, "Hybrid stream write error (length)");
+                                    break false;
+                                }
+                                if let Err(e) = send_stream.write_all(&encoded).await {
+                                    tracing::debug!(session_id, error = %e, "Hybrid stream write error (data)");
+                                    break false;
+                                }
+                                mid_frame.store(false, Ordering::Relaxed);
+                            }
+
+                            stats_out.record_bytes(encoded.len() as u64);
+                            stats_out.record_datagram();
+                        }
+                        Err(e) => {
+                            tracing::debug!(session_id, error = %e, "Hybrid relay UDP recv error");
+                            break true;
+                        }
+                    }
+                }
+            } => intact,
+
+            // Direction 2a: Stream → UDP (Initials, oversized frames, and stream-only clients)
+            read_clean = async {
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    match recv_stream.read_exact(&mut len_buf).await {
+                        Ok(()) => {}
+                        Err(crate::high_level::ReadExactError::FinishedEarly(0)) => {
+                            tracing::debug!(
+                                session_id,
+                                "Hybrid relay: client half-closed stream at frame boundary"
+                            );
+                            break true;
+                        }
+                        Err(e) => {
+                            tracing::debug!(session_id, error = %e, "Hybrid stream read error (length)");
+                            break false;
+                        }
+                    }
+                    let frame_len = u32::from_be_bytes(len_buf) as usize;
+                    if frame_len > 65536 {
+                        tracing::warn!(session_id, frame_len, "Hybrid relay: oversized stream frame, dropping");
+                        break false;
+                    }
+                    let mut frame_buf = vec![0u8; frame_len];
+                    if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
+                        tracing::debug!(session_id, error = %e, "Hybrid stream read error (data)");
+                        break false;
+                    }
+                    let mut cursor = Bytes::from(frame_buf);
+                    if let Ok(datagram) = UncompressedDatagram::decode(&mut cursor) {
+                        stats_stream_in.record_bytes(datagram.payload.len() as u64);
+                        stats_stream_in.record_datagram();
+                        if let Err(e) = socket_stream.send_to(&datagram.payload, datagram.target).await {
+                            tracing::warn!(
+                                session_id, target = %datagram.target, error = %e,
+                                "Hybrid relay: failed to send stream-lane UDP to target"
+                            );
+                        }
+                    }
+                }
+            } => read_clean && !mid_frame.load(Ordering::Relaxed),
+
+            // Direction 2b: Datagram → UDP (regular short-header packets from hybrid clients)
+            _ = async {
+                loop {
+                    match conn_in.read_datagram().await {
+                        Ok(data) => {
+                            let mut cursor = data;
+                            if let Ok(datagram) = UncompressedDatagram::decode(&mut cursor) {
+                                stats_dgram_in.record_bytes(datagram.payload.len() as u64);
+                                stats_dgram_in.record_datagram();
+                                if let Err(e) = socket_dgram.send_to(&datagram.payload, datagram.target).await {
+                                    tracing::warn!(
+                                        session_id, target = %datagram.target, error = %e,
+                                        "Hybrid relay: failed to send datagram-lane UDP to target"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                session_id,
+                                error = %e,
+                                "Hybrid relay: outer connection closed on datagram read"
+                            );
+                            break;
+                        }
+                    }
+                }
+            } => !mid_frame.load(Ordering::Relaxed),
+        };
+
+        if send_stream_intact {
+            if let Err(e) = send_stream.finish() {
+                tracing::debug!(session_id, error = %e, "Error finishing hybrid relay send stream");
+            }
+        }
+
+        tracing::info!(session_id, "Hybrid relay forwarding loop ended");
+        if let Err(e) = self.close_session(session_id).await {
+            tracing::debug!(session_id, error = %e, "Error closing session");
+        }
+    }
+
     /// Close a specific session
     pub async fn close_session(&self, session_id: u64) -> RelayResult<()> {
         let mut sessions = self.sessions.write().await;
@@ -2062,6 +2291,247 @@ mod tests {
         assert!(
             tail.is_err(),
             "torn half-close must reset the relay stream, got {tail:?}"
+        );
+    }
+
+    /// ADR-016 validation: in `RelayForwardMode::Hybrid`, regular short-header
+    /// packets `<= P_max` traverse the unreliable QUIC `DATAGRAM` lane in both
+    /// directions, while 1200-byte QUIC Initial packets traverse the reliable
+    /// length-prefixed stream lane intact.
+    #[tokio::test]
+    async fn hybrid_relay_routes_short_header_via_datagram_and_initial_via_stream() {
+        let server_cfg = MasqueRelayConfig {
+            forward_mode: RelayForwardMode::Hybrid,
+            ..MasqueRelayConfig::default()
+        };
+        let server = Arc::new(MasqueRelayServer::new(server_cfg, test_addr(9000)));
+        let (session_id, session_local) = live_session_with_socket(&server).await;
+
+        let (client_conn, relay_conn) = relay_loopback_pair().await;
+        let (mut client_send, client_recv) = client_conn.open_bi().await.unwrap();
+        client_send.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let (relay_send, relay_recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), relay_conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let loop_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop_server
+                .run_hybrid_forwarding_loop(session_id, relay_conn, relay_send, relay_recv)
+                .await;
+        });
+
+        let relay_socket = crate::masque::MasqueRelaySocket::new_with_mode(
+            Some(client_conn),
+            client_send,
+            client_recv,
+            session_local,
+            RelayForwardMode::Hybrid,
+        );
+
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        // 1. Outbound (client -> relay -> target): short-header packet uses Datagram lane
+        let mut short_out = vec![0x40u8; 64];
+        short_out[1..5].copy_from_slice(b"dgrm");
+        let mut sender = crate::high_level::AsyncUdpSocket::create_sender(relay_socket.as_ref());
+        std::future::poll_fn(|cx| {
+            sender.as_mut().poll_send(
+                &quinn_udp::Transmit {
+                    destination: target_addr,
+                    ecn: None,
+                    contents: &short_out,
+                    segment_size: None,
+                    src_ip: None,
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("send short packet");
+
+        let mut udp_buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            target.recv_from(&mut udp_buf),
+        )
+        .await
+        .expect("target recv short packet bounded")
+        .expect("target recv short packet");
+        assert_eq!(&udp_buf[..n], short_out.as_slice());
+        assert_eq!(
+            relay_socket.stats().datagrams_sent.load(Ordering::Relaxed),
+            1,
+            "short-header outbound packet must take the datagram lane"
+        );
+
+        // 2. Outbound (client -> relay -> target): 1200-byte QUIC Initial uses Stream lane
+        let mut initial_out = vec![0x00u8; 1200];
+        initial_out[0] = 0xc0; // QUIC v1 Initial long header
+        initial_out[4] = 0x01;
+        initial_out[5..9].copy_from_slice(b"init");
+        std::future::poll_fn(|cx| {
+            sender.as_mut().poll_send(
+                &quinn_udp::Transmit {
+                    destination: target_addr,
+                    ecn: None,
+                    contents: &initial_out,
+                    segment_size: None,
+                    src_ip: None,
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("send Initial packet");
+
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            target.recv_from(&mut udp_buf),
+        )
+        .await
+        .expect("target recv Initial packet bounded")
+        .expect("target recv Initial packet");
+        assert_eq!(&udp_buf[..n], initial_out.as_slice());
+        assert_eq!(
+            relay_socket
+                .stats()
+                .stream_frames_sent
+                .load(Ordering::Relaxed),
+            1,
+            "1200-byte Initial outbound packet must take the stream lane"
+        );
+
+        // 3. Inbound (target -> relay -> client): short-header via Datagram, Initial via Stream
+        let mut short_in = vec![0x40u8; 48];
+        short_in[1..5].copy_from_slice(b"back");
+        target.send_to(&short_in, session_local).await.unwrap();
+
+        let mut initial_in = vec![0x00u8; 1200];
+        initial_in[0] = 0xc0;
+        initial_in[4] = 0x01;
+        initial_in[5..9].copy_from_slice(b"resp");
+        target.send_to(&initial_in, session_local).await.unwrap();
+
+        let mut received = Vec::new();
+        while received.len() < 2 {
+            let mut b0 = vec![0u8; 2048];
+            let mut b1 = vec![0u8; 2048];
+            let mut meta = [quinn_udp::RecvMeta::default(); 2];
+            let count = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                std::future::poll_fn(|cx| {
+                    let mut slices = [
+                        std::io::IoSliceMut::new(&mut b0),
+                        std::io::IoSliceMut::new(&mut b1),
+                    ];
+                    crate::high_level::AsyncUdpSocket::poll_recv(
+                        relay_socket.as_ref(),
+                        cx,
+                        &mut slices,
+                        &mut meta,
+                    )
+                }),
+            )
+            .await
+            .expect("client recv bounded")
+            .expect("client recv");
+            if count >= 1 {
+                received.push(b0[..meta[0].len].to_vec());
+            }
+            if count >= 2 {
+                received.push(b1[..meta[1].len].to_vec());
+            }
+        }
+        assert!(received.contains(&short_in));
+        assert!(received.contains(&initial_in));
+        assert_eq!(
+            relay_socket
+                .stats()
+                .datagrams_received
+                .load(Ordering::Relaxed),
+            1,
+            "short-header inbound packet must arrive on the datagram lane"
+        );
+        assert_eq!(
+            relay_socket
+                .stats()
+                .stream_frames_received
+                .load(Ordering::Relaxed),
+            1,
+            "1200-byte Initial inbound packet must arrive on the stream lane"
+        );
+    }
+
+    /// ADR-016 Decision 6 compatibility: a `Hybrid`-configured relay server
+    /// must seamlessly serve a legacy `Stream`-only client over the stream lane.
+    #[tokio::test]
+    async fn hybrid_relay_server_serves_stream_only_client_without_error() {
+        let server_cfg = MasqueRelayConfig {
+            forward_mode: RelayForwardMode::Hybrid,
+            ..MasqueRelayConfig::default()
+        };
+        let server = Arc::new(MasqueRelayServer::new(server_cfg, test_addr(9000)));
+        let (session_id, session_local) = live_session_with_socket(&server).await;
+
+        let (client_conn, relay_conn) = relay_loopback_pair().await;
+        let (mut client_send, client_recv) = client_conn.open_bi().await.unwrap();
+        client_send.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let (relay_send, relay_recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), relay_conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let loop_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop_server
+                .run_hybrid_forwarding_loop(session_id, relay_conn, relay_send, relay_recv)
+                .await;
+        });
+
+        // Legacy stream-only client (`MasqueRelaySocket::new`)
+        let stream_client =
+            crate::masque::MasqueRelaySocket::new(client_send, client_recv, session_local);
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        let mut payload = vec![0x40u8; 80];
+        payload[1..7].copy_from_slice(b"legacy");
+        let mut sender = crate::high_level::AsyncUdpSocket::create_sender(stream_client.as_ref());
+        std::future::poll_fn(|cx| {
+            sender.as_mut().poll_send(
+                &quinn_udp::Transmit {
+                    destination: target_addr,
+                    ecn: None,
+                    contents: &payload,
+                    segment_size: None,
+                    src_ip: None,
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("stream-only send");
+
+        let mut udp_buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            target.recv_from(&mut udp_buf),
+        )
+        .await
+        .expect("target recv bounded")
+        .expect("target recv");
+        assert_eq!(&udp_buf[..n], payload.as_slice());
+        assert_eq!(
+            stream_client
+                .stats()
+                .stream_frames_sent
+                .load(Ordering::Relaxed),
+            1
         );
     }
 }

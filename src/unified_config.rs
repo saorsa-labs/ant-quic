@@ -33,6 +33,7 @@ use crate::config::nat_timeouts::TimeoutConfig;
 use crate::crypto::pqc::PqcConfig;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::host_identity::HostIdentity;
+use crate::masque::{MigrationConfig, RelayForwardMode};
 use crate::nat_traversal_api::PeerId;
 use crate::transport::{TransportAddr, TransportProvider, TransportRegistry};
 
@@ -285,6 +286,13 @@ pub struct P2pConfig {
     /// STOP_SENDING, so a genuinely wedged sender observes the stop rather
     /// than retransmitting into a dead lane.
     pub stream_read_deadline: Duration,
+
+    /// Relay-to-direct automatic migration configuration.
+    ///
+    /// When `auto_migrate` is enabled (the default), connections that fall back
+    /// to a MASQUE relay periodically probe direct candidates and upgrade off
+    /// the relay once a direct path validates.
+    pub migration: MigrationConfig,
 }
 // v0.13.0: enable_coordinator removed - all nodes are coordinators
 
@@ -313,6 +321,14 @@ pub struct NatConfig {
     /// (ADR-019). It still uses relays, coordinates hole punching and
     /// observes addresses. See [`P2pConfigBuilder::relay_service_enabled`].
     pub enable_relay_service: bool,
+
+    /// Relay data-plane forwarding mode (ADR-016).
+    ///
+    /// Default: [`RelayForwardMode::Stream`]. Set to [`RelayForwardMode::Hybrid`]
+    /// to offload regular short-header relayed packets onto unreliable QUIC
+    /// `DATAGRAM` frames while keeping Initial and oversized packets on the
+    /// length-prefixed stream lane.
+    pub relay_forward_mode: RelayForwardMode,
 
     /// Known relay nodes for MASQUE CONNECT-UDP Bind fallback
     pub relay_nodes: Vec<std::net::SocketAddr>,
@@ -358,6 +374,7 @@ impl Default for NatConfig {
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
             enable_relay_service: true, // Default on; node-level opt-out per ADR-019
+            relay_forward_mode: RelayForwardMode::default(),
             relay_nodes: Vec::new(),
             max_concurrent_attempts: 3,
             prefer_rfc_nat_traversal: true,
@@ -475,6 +492,7 @@ impl Default for P2pConfig {
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
             stream_read_deadline: Duration::from_secs(60),
+            migration: MigrationConfig::default(),
         }
     }
 }
@@ -517,6 +535,7 @@ impl P2pConfig {
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
             enable_relay_service: self.nat.enable_relay_service,
+            relay_forward_mode: self.nat.relay_forward_mode,
             relay_nodes: self.nat.relay_nodes.clone(),
             max_concurrent_attempts: self.nat.max_concurrent_attempts,
             bind_addr: self
@@ -571,6 +590,7 @@ pub struct P2pConfigBuilder {
     max_message_size: Option<usize>,
     max_concurrent_uni_streams: Option<u32>,
     stream_read_deadline: Option<Duration>,
+    migration: Option<MigrationConfig>,
 }
 
 /// Error type for configuration validation
@@ -856,6 +876,22 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Set the MASQUE relay data-plane forwarding mode (ADR-016).
+    ///
+    /// Default: [`RelayForwardMode::Stream`].
+    pub fn relay_forward_mode(mut self, mode: RelayForwardMode) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.relay_forward_mode = mode;
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Set the relay-to-direct automatic migration configuration.
+    pub fn migration(mut self, config: MigrationConfig) -> Self {
+        self.migration = Some(config);
+        self
+    }
+
     /// Set the requested router port-mapping lease duration in seconds.
     pub fn port_mapping_lease_duration_secs(mut self, lease_duration_secs: u32) -> Self {
         let mut nat = self.nat.unwrap_or_default();
@@ -1110,6 +1146,7 @@ impl P2pConfigBuilder {
             stream_read_deadline: self
                 .stream_read_deadline
                 .unwrap_or_else(|| Duration::from_secs(60)),
+            migration: self.migration.unwrap_or_default(),
             data_channel_capacity: self
                 .data_channel_capacity
                 .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY),
@@ -1344,6 +1381,37 @@ mod tests {
             .build()
             .expect("valid config");
         assert!(on.to_nat_config().enable_relay_service);
+    }
+
+    /// ADR-016 validation: relay forward mode defaults to `Stream`, builder sets
+    /// `Hybrid`, and `to_nat_config` preserves the configured mode; migration
+    /// config propagates through `P2pConfigBuilder`.
+    #[test]
+    fn test_relay_forward_mode_and_migration_builder_propagate() {
+        let default = P2pConfig::builder().build().expect("valid config");
+        assert_eq!(default.nat.relay_forward_mode, RelayForwardMode::Stream);
+        assert_eq!(
+            default.to_nat_config().relay_forward_mode,
+            RelayForwardMode::Stream
+        );
+        assert!(default.migration.auto_migrate);
+
+        let hybrid = P2pConfig::builder()
+            .relay_forward_mode(RelayForwardMode::Hybrid)
+            .migration(MigrationConfig {
+                auto_migrate: false,
+                max_attempts: 3,
+                ..MigrationConfig::default()
+            })
+            .build()
+            .expect("valid config");
+        assert_eq!(hybrid.nat.relay_forward_mode, RelayForwardMode::Hybrid);
+        assert_eq!(
+            hybrid.to_nat_config().relay_forward_mode,
+            RelayForwardMode::Hybrid
+        );
+        assert!(!hybrid.migration.auto_migrate);
+        assert_eq!(hybrid.migration.max_attempts, 3);
     }
 
     #[test]

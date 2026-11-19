@@ -2008,6 +2008,13 @@ pub struct NatTraversalConfig {
     /// (ADR-019). Using relays, hole-punch coordination and address
     /// observation are not affected.
     pub enable_relay_service: bool,
+    /// Relay data-plane forwarding mode (ADR-016).
+    ///
+    /// Default: [`crate::masque::RelayForwardMode::Stream`]. Setting
+    /// [`crate::masque::RelayForwardMode::Hybrid`] enables the two-lane
+    /// datagram/stream data plane for both client and server relay hops.
+    #[serde(default)]
+    pub relay_forward_mode: crate::masque::RelayForwardMode,
     /// Known relay nodes for MASQUE CONNECT-UDP Bind fallback
     /// When direct NAT traversal fails, connections can be relayed through these nodes
     /// NOTE: In symmetric P2P, connected peers are used as relays automatically.
@@ -2908,6 +2915,7 @@ impl Default for NatTraversalConfig {
             enable_symmetric_nat: true,
             enable_relay_fallback: true,
             enable_relay_service: true, // Default on; node-level opt-out per ADR-019
+            relay_forward_mode: crate::masque::RelayForwardMode::default(),
             relay_nodes: Vec::new(),
             max_concurrent_attempts: 3,
             bind_addr: None,
@@ -3008,6 +3016,7 @@ impl NatTraversalEndpoint {
         let relay_config = MasqueRelayConfig {
             max_sessions: 100, // Reasonable limit for resource budget
             require_authentication: true,
+            forward_mode: config.relay_forward_mode,
             ..MasqueRelayConfig::default()
         };
         // Use the local address as the public address (will be updated when external address is discovered)
@@ -4601,7 +4610,7 @@ impl NatTraversalEndpoint {
         };
         Self::handle_relay_bidi_stream_with_prefix(
             server,
-            connection.remote_address(),
+            connection,
             send_stream,
             recv_stream,
             prefix,
@@ -7155,11 +7164,12 @@ impl NatTraversalEndpoint {
 
     async fn handle_relay_bidi_stream_with_prefix(
         relay_server: Arc<MasqueRelayServer>,
-        client_addr: SocketAddr,
+        connection: InnerConnection,
         mut send_stream: InnerSendStream,
         mut recv_stream: InnerRecvStream,
         prefix: Vec<u8>,
     ) {
+        let client_addr = connection.remote_address();
         let Some(request) = Self::read_relay_request(client_addr, &mut recv_stream, prefix).await
         else {
             return;
@@ -7189,19 +7199,23 @@ impl NatTraversalEndpoint {
 
                 // Do NOT call finish() on the success path — the response is
                 // only a preamble and the stream stays open for forwarding.
-                // `run_stream_forwarding_loop` takes ownership and decides how
-                // to tear the stream down.
+                // `run_hybrid_forwarding_loop` takes ownership and decides how
+                // to tear the stream down (delegating to stream-only in default
+                // `RelayForwardMode::Stream`).
                 if is_success
                     && let Some(session_info) =
                         relay_server.get_session_for_client(client_addr).await
                 {
                     info!(
-                        "Starting stream-based relay forwarding for session {} (client: {})",
-                        session_info.session_id, client_addr
+                        "Starting {:?} relay forwarding for session {} (client: {})",
+                        relay_server.forward_mode(),
+                        session_info.session_id,
+                        client_addr
                     );
                     relay_server
-                        .run_stream_forwarding_loop(
+                        .run_hybrid_forwarding_loop(
                             session_info.session_id,
+                            connection,
                             send_stream,
                             recv_stream,
                         )
@@ -8046,10 +8060,12 @@ impl NatTraversalEndpoint {
         // ownership of both halves and keeps them open for data forwarding, which
         // is why the handshake above deliberately does not finish the send half.
         let relay_socket = match public_address {
-            Some(addr) => Some(crate::masque::MasqueRelaySocket::new(
+            Some(addr) => Some(crate::masque::MasqueRelaySocket::new_with_mode(
+                Some(connection.clone()),
                 send_stream,
                 recv_stream,
                 addr,
+                self.config.relay_forward_mode,
             )),
             None => {
                 // No public address means there is no socket to hand the streams

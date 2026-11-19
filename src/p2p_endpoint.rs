@@ -60,7 +60,9 @@ mod socket_binding;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1257,6 +1259,7 @@ fn extend_unique_socket_addrs(
     }
 }
 
+#[cfg(test)]
 async fn try_addrs_with_shared_stage_budget<T, E, F, Fut>(
     addresses: &[SocketAddr],
     family_name: &str,
@@ -1593,6 +1596,9 @@ pub struct P2pEndpoint {
 
     /// Endpoint statistics
     stats: Arc<RwLock<EndpointStats>>,
+
+    /// Relay-to-direct automatic migration coordinator
+    migration_coordinator: Arc<crate::masque::MigrationCoordinator>,
 
     /// Configuration
     config: P2pConfig,
@@ -4194,6 +4200,9 @@ impl P2pEndpoint {
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
             stats,
+            migration_coordinator: Arc::new(crate::masque::MigrationCoordinator::new(
+                config.migration.clone(),
+            )),
             config,
             event_tx,
             peer_id,
@@ -5196,11 +5205,9 @@ impl P2pEndpoint {
     /// * `peer_id` - Optional peer ID (for token persistence and 0-RTT/Fast Reconnect)
     ///
     /// # Returns
-    /// Primary connection (IPv6 preferred if both succeed)
-    ///
-    /// # Dual-Connection Behavior
-    /// When both IPv4 AND IPv6 succeed, BOTH connections are stored in `connected_peers`.
-    /// The system maintains redundant connections for maximum reliability.
+    /// The first direct connection to complete under RFC 8305 Happy Eyeballs
+    /// (IPv6 preferred with a 250 ms stagger before launching IPv4, cancelling
+    /// losing attempts immediately on first win to avoid duplicate PQC handshakes).
     pub async fn connect_dual_stack(
         &self,
         addresses: &[SocketAddr],
@@ -5210,103 +5217,226 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Separate addresses by family
-        let ipv4_addrs: Vec<SocketAddr> = addresses
-            .iter()
-            .filter(|addr| matches!(addr.ip(), IpAddr::V4(_)))
-            .copied()
-            .collect();
-
-        let ipv6_addrs: Vec<SocketAddr> = addresses
-            .iter()
-            .filter(|addr| matches!(addr.ip(), IpAddr::V6(_)))
-            .copied()
-            .collect();
+        if addresses.is_empty() {
+            return Err(EndpointError::NoAddress);
+        }
 
         let mut direct_candidate_addrs = Vec::new();
-        extend_unique_socket_addrs(&mut direct_candidate_addrs, ipv4_addrs.iter().copied());
-        extend_unique_socket_addrs(&mut direct_candidate_addrs, ipv6_addrs.iter().copied());
+        extend_unique_socket_addrs(&mut direct_candidate_addrs, addresses.iter().copied());
         let (direct_strategy, rtt_hint) = self
             .adaptive_strategy_config_for_candidates(peer_id, &direct_candidate_addrs, None, &[])
             .await;
 
+        let v4_count = direct_candidate_addrs
+            .iter()
+            .filter(|a| a.is_ipv4())
+            .count();
+        let v6_count = direct_candidate_addrs
+            .iter()
+            .filter(|a| a.is_ipv6())
+            .count();
+        let stage_budget = direct_strategy
+            .ipv4_timeout
+            .max(direct_strategy.ipv6_timeout);
+
         info!(
-            "Dual-stack connect: {} IPv4, {} IPv6 addresses (PeerId: {:?}, direct budgets: v4={:?}, v6={:?}, rtt_hint={:?})",
-            ipv4_addrs.len(),
-            ipv6_addrs.len(),
-            peer_id,
-            direct_strategy.ipv4_timeout,
-            direct_strategy.ipv6_timeout,
-            rtt_hint,
+            "Dual-stack Happy Eyeballs connect: {} IPv6, {} IPv4 addresses (PeerId: {:?}, budget: {:?}, rtt_hint: {:?})",
+            v6_count, v4_count, peer_id, stage_budget, rtt_hint,
         );
 
-        // Use "peer" as SNI for all P2P connections
-        // Raw Public Key authentication validates the peer's public key directly,
-        // so we don't need/use SNI for authentication. A fixed SNI avoids
-        // "invalid server name" errors from hex peer IDs being too long.
-        let (ipv4_result, ipv6_result) = tokio::join!(
-            self.try_connect_family(&ipv4_addrs, "IPv4", direct_strategy.ipv4_timeout, peer_id,),
-            self.try_connect_family(&ipv6_addrs, "IPv6", direct_strategy.ipv6_timeout, peer_id,),
-        );
-
-        // Handle all possible outcomes
-        match (ipv4_result, ipv6_result) {
-            (Some(v4_conn), Some(v6_conn)) => {
-                // 🎉 BEST CASE: Both IPv4 AND IPv6 work - keep both!
+        let he_config = HappyEyeballsConfig::default();
+        let endpoint = self.clone();
+        match timeout(
+            stage_budget,
+            happy_eyeballs::race_connect(&direct_candidate_addrs, &he_config, move |addr| {
+                let endpoint = endpoint.clone();
+                async move {
+                    endpoint
+                        .connect_direct_addr_with_hint(addr, peer_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }),
+        )
+        .await
+        {
+            Ok(Ok((conn, winning_addr))) => {
                 info!(
-                    "✓✓ Dual-stack success! IPv4: {}, IPv6: {} (maintaining both connections)",
-                    v4_conn.remote_addr, v6_conn.remote_addr
+                    "Dual-stack Happy Eyeballs connected to {} ({})",
+                    winning_addr,
+                    if winning_addr.is_ipv6() {
+                        "IPv6"
+                    } else {
+                        "IPv4"
+                    }
                 );
-
-                // Both connections already stored by try_connect_family
-                // Return IPv6 as primary (modern internet best practice)
-                Ok(v6_conn)
+                Ok(conn)
             }
-
-            (Some(v4_conn), None) => {
-                // IPv4-only network (v6 unavailable or failed)
-                info!(
-                    "IPv4-only connection established to {}",
-                    v4_conn.remote_addr
+            Ok(Err(e)) => {
+                warn!(
+                    "Dual-stack Happy Eyeballs failed across all families: {}",
+                    e
                 );
-                Ok(v4_conn)
+                Err(EndpointError::Connection(format!(
+                    "Dual-stack connection failed: {e}"
+                )))
             }
-
-            (None, Some(v6_conn)) => {
-                // IPv6-only network (v4 unavailable or failed)
-                info!(
-                    "IPv6-only connection established to {}",
-                    v6_conn.remote_addr
+            Err(_) => {
+                warn!(
+                    "Dual-stack Happy Eyeballs timed out after {:?}",
+                    stage_budget
                 );
-                Ok(v6_conn)
-            }
-
-            (None, None) => {
-                // Neither direct connection works - try NAT traversal next
-                warn!("Both IPv4 and IPv6 direct connections failed");
-                Err(EndpointError::Connection(
-                    "Dual-stack connection failed for both address families".to_string(),
-                ))
+                Err(EndpointError::Timeout)
             }
         }
     }
 
-    /// Try to connect using addresses from one family (IPv4 or IPv6)
+    /// Access the endpoint's relay-to-direct migration coordinator.
+    #[must_use]
+    pub fn migration_coordinator(&self) -> &Arc<crate::masque::MigrationCoordinator> {
+        &self.migration_coordinator
+    }
+
+    /// Snapshot statistics for relay-to-direct migration attempts.
+    #[must_use]
+    pub fn migration_stats(&self) -> Arc<crate::masque::MigrationStats> {
+        self.migration_coordinator.stats()
+    }
+
+    /// Schedule background direct-path upgrade probes for a relayed peer.
     ///
-    async fn try_connect_family(
+    /// Uses [`crate::masque::MigrationCoordinator`] so connections that fell
+    /// back to a MASQUE relay do not remain pinned to the relay indefinitely
+    /// once direct reachability returns. Exits immediately on peer disconnect,
+    /// direct upgrade, max-attempt exhaustion, or endpoint shutdown.
+    async fn spawn_relay_direct_migration(
         &self,
-        addresses: &[SocketAddr],
-        family_name: &str,
-        stage_budget: Duration,
-        hint_peer_id: Option<PeerId>,
-    ) -> Option<PeerConnection> {
-        try_addrs_with_shared_stage_budget(
-            addresses,
-            family_name,
-            stage_budget,
-            |addr| async move { self.connect_direct_addr_with_hint(addr, hint_peer_id).await },
-        )
-        .await
+        peer_id: PeerId,
+        relay_addr: SocketAddr,
+        mut direct_candidates: Vec<SocketAddr>,
+    ) {
+        if !self.config.migration.auto_migrate || self.shutdown.is_cancelled() {
+            return;
+        }
+
+        // Enrich with any directory addresses known for this peer.
+        let directory = self.peer_directory_snapshot().await;
+        for addr in directory.candidate_addrs_for_peer(peer_id) {
+            if addr != relay_addr && !direct_candidates.contains(&addr) {
+                direct_candidates.push(addr);
+            }
+        }
+        direct_candidates.retain(|addr| *addr != relay_addr);
+        if direct_candidates.is_empty() {
+            return;
+        }
+
+        // Prefer IPv6 candidates first (RFC 8305 / bypasses IPv4 CGNAT).
+        direct_candidates.sort_by_key(|addr| if addr.is_ipv6() { 0u8 } else { 1u8 });
+
+        let peer_key = direct_candidates[0];
+        let coordinator = Arc::clone(&self.migration_coordinator);
+        coordinator.set_relay(relay_addr).await;
+        coordinator
+            .add_candidates(peer_key, direct_candidates.clone())
+            .await;
+
+        // Avoid launching duplicate probe tasks if migration is already active.
+        if coordinator.state(peer_key).await.is_migrating() {
+            return;
+        }
+        coordinator.start_migration(peer_key).await;
+
+        let endpoint = self.clone();
+        let probe_interval = self
+            .config
+            .migration
+            .probe_interval
+            .max(Duration::from_millis(50));
+        let probe_timeout = self
+            .config
+            .migration
+            .validation_timeout
+            .max(Duration::from_millis(100));
+        let max_attempts = self.config.migration.max_attempts.max(1);
+
+        tokio::spawn(async move {
+            for attempt in 1..=max_attempts {
+                tokio::select! {
+                    _ = endpoint.shutdown.cancelled() => {
+                        coordinator.reset(peer_key).await;
+                        return;
+                    }
+                    _ = tokio::time::sleep(probe_interval) => {}
+                }
+
+                if endpoint.shutdown.is_cancelled() || !endpoint.inner.is_peer_connected(&peer_id) {
+                    coordinator.reset(peer_key).await;
+                    return;
+                }
+
+                // Stop early if another path already upgraded this peer to direct.
+                if let Some(existing) = endpoint.connected_peers.read().await.get(&peer_id)
+                    && matches!(
+                        existing.traversal_method,
+                        TraversalMethod::Direct | TraversalMethod::HolePunch
+                    )
+                {
+                    if let Some(addr) = existing.remote_addr.as_socket_addr() {
+                        coordinator
+                            .report_validated_path(peer_key, addr, Duration::from_millis(1))
+                            .await;
+                        coordinator.complete_migration(peer_key).await;
+                    }
+                    return;
+                }
+
+                let _ = coordinator.poll(peer_key).await;
+                let candidates = coordinator.get_all_candidates(peer_key).await;
+                for candidate in candidates {
+                    if endpoint.shutdown.is_cancelled() {
+                        coordinator.reset(peer_key).await;
+                        return;
+                    }
+                    let probe_start = Instant::now();
+                    match timeout(
+                        probe_timeout,
+                        endpoint.connect_direct_addr_with_hint(candidate, Some(peer_id)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(upgraded)) => {
+                            let rtt = probe_start.elapsed();
+                            coordinator
+                                .report_validated_path(peer_key, candidate, rtt)
+                                .await;
+                            coordinator.complete_migration(peer_key).await;
+                            info!(
+                                "Migrated peer {:?} from relay {} to direct {} on attempt {} ({:?})",
+                                upgraded.peer_id, relay_addr, candidate, attempt, rtt
+                            );
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            debug!(
+                                "Relay→direct migration probe {}/{} to {} for peer {:?} failed: {}",
+                                attempt, max_attempts, candidate, peer_id, e
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                "Relay→direct migration probe {}/{} to {} for peer {:?} timed out",
+                                attempt, max_attempts, candidate, peer_id
+                            );
+                        }
+                    }
+                }
+            }
+
+            coordinator
+                .fallback_to_relay(peer_key, "direct upgrade probes exhausted")
+                .await;
+        });
     }
 
     /// Connect to a peer using cached information (addresses, tokens).
@@ -6564,6 +6694,14 @@ impl P2pEndpoint {
                                     reason: DirectPathUnavailableReason::RelayRequired,
                                 },
                             );
+                            let direct_candidates: Vec<SocketAddr> =
+                                [target_ipv6, target_ipv4].into_iter().flatten().collect();
+                            self.spawn_relay_direct_migration(
+                                conn.peer_id,
+                                relay_addr,
+                                direct_candidates,
+                            )
+                            .await;
                             return Ok((conn, ConnectionMethod::Relayed { relay: relay_addr }));
                         }
                         Ok(Err(e)) => {
@@ -13140,6 +13278,7 @@ impl Clone for P2pEndpoint {
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),
             stats: Arc::clone(&self.stats),
+            migration_coordinator: Arc::clone(&self.migration_coordinator),
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
             peer_id: self.peer_id,
