@@ -75,6 +75,31 @@ pub const BIND_ANY_HOST: &str = "::";
 /// Bind-any port (indicates relay should choose)
 pub const BIND_ANY_PORT: u16 = 0;
 
+/// Request flag bit: this is a CONNECT-UDP Bind request.
+pub const REQUEST_FLAG_BIND: u8 = 0x01;
+
+/// Request flag bit (ADR-016 hybrid signal): the client reads the QUIC
+/// `DATAGRAM` lane for this relay session and asks the relay to use it.
+///
+/// Decoders before 0.29.0 ignore unknown flag bits, so an old relay treats
+/// the request as stream-only and never sets
+/// [`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`] in its answer.
+pub const REQUEST_FLAG_HYBRID_DATAGRAM_LANE: u8 = 0x02;
+
+/// Response flag bit: a public address follows.
+pub const RESPONSE_FLAG_HAS_ADDRESS: u8 = 0x01;
+
+/// Response flag bit: a reason phrase follows.
+pub const RESPONSE_FLAG_HAS_REASON: u8 = 0x02;
+
+/// Response flag bit (ADR-016 hybrid signal): the relay accepted the
+/// client's [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`] for this session. Both
+/// ends then read and may send on the QUIC `DATAGRAM` lane.
+///
+/// A relay sets it only in answer to a request that carried the request
+/// bit, so a client before 0.29.0 never receives it.
+pub const RESPONSE_FLAG_HYBRID_DATAGRAM_LANE: u8 = 0x04;
+
 /// Errors that can occur during CONNECT-UDP processing
 #[derive(Debug, Error)]
 pub enum ConnectError {
@@ -117,6 +142,12 @@ pub struct ConnectUdpRequest {
     pub target_port: u16,
     /// Whether this is a bind request (vs. targeted proxy)
     pub connect_udp_bind: bool,
+    /// ADR-016 per-session hybrid signal: the client reads the QUIC
+    /// `DATAGRAM` lane for this session and asks the relay to use it.
+    ///
+    /// Encoded as request flag bit [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`].
+    /// Peers before 0.29.0 never set it, and their decoders ignore it.
+    pub hybrid_datagram_lane: bool,
 }
 
 impl ConnectUdpRequest {
@@ -129,6 +160,7 @@ impl ConnectUdpRequest {
             target_host: BIND_ANY_HOST.to_string(),
             target_port: BIND_ANY_PORT,
             connect_udp_bind: true,
+            hybrid_datagram_lane: false,
         }
     }
 
@@ -141,6 +173,7 @@ impl ConnectUdpRequest {
             target_host: BIND_ANY_HOST.to_string(),
             target_port: port,
             connect_udp_bind: true,
+            hybrid_datagram_lane: false,
         }
     }
 
@@ -153,7 +186,16 @@ impl ConnectUdpRequest {
             target_host: addr.ip().to_string(),
             target_port: addr.port(),
             connect_udp_bind: false,
+            hybrid_datagram_lane: false,
         }
+    }
+
+    /// Set the ADR-016 hybrid signal on this request (see
+    /// [`Self::hybrid_datagram_lane`]).
+    #[must_use]
+    pub fn with_hybrid_datagram_lane(mut self, hybrid: bool) -> Self {
+        self.hybrid_datagram_lane = hybrid;
+        self
     }
 
     /// Check if this is a bind request
@@ -198,8 +240,14 @@ impl ConnectUdpRequest {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
-        // Flags byte: bit 0 = connect_udp_bind
-        let flags: u8 = if self.connect_udp_bind { 0x01 } else { 0x00 };
+        // Flags byte: bit 0 = connect_udp_bind, bit 1 = ADR-016 hybrid signal
+        let mut flags: u8 = 0;
+        if self.connect_udp_bind {
+            flags |= REQUEST_FLAG_BIND;
+        }
+        if self.hybrid_datagram_lane {
+            flags |= REQUEST_FLAG_HYBRID_DATAGRAM_LANE;
+        }
         buf.put_u8(flags);
 
         // Host length and host
@@ -222,7 +270,8 @@ impl ConnectUdpRequest {
         }
 
         let flags = buf.get_u8();
-        let connect_udp_bind = (flags & 0x01) != 0;
+        let connect_udp_bind = (flags & REQUEST_FLAG_BIND) != 0;
+        let hybrid_datagram_lane = (flags & REQUEST_FLAG_HYBRID_DATAGRAM_LANE) != 0;
 
         let host_len = VarInt::decode(buf)
             .map_err(|_| ConnectError::InvalidRequest("invalid host length".into()))?;
@@ -245,6 +294,7 @@ impl ConnectUdpRequest {
             target_host,
             target_port,
             connect_udp_bind,
+            hybrid_datagram_lane,
         })
     }
 }
@@ -275,6 +325,11 @@ pub struct ConnectUdpResponse {
     pub proxy_public_address: Option<SocketAddr>,
     /// Human-readable reason phrase
     pub reason: Option<String>,
+    /// ADR-016 per-session hybrid signal: the relay accepted the client's
+    /// request to use the QUIC `DATAGRAM` lane for this session.
+    ///
+    /// Encoded as response flag bit [`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`].
+    pub hybrid_datagram_lane: bool,
 }
 
 impl ConnectUdpResponse {
@@ -295,7 +350,16 @@ impl ConnectUdpResponse {
             status: Self::STATUS_OK,
             proxy_public_address: public_addr,
             reason: None,
+            hybrid_datagram_lane: false,
         }
+    }
+
+    /// Set the ADR-016 hybrid signal on this response (see
+    /// [`Self::hybrid_datagram_lane`]).
+    #[must_use]
+    pub fn with_hybrid_datagram_lane(mut self, hybrid: bool) -> Self {
+        self.hybrid_datagram_lane = hybrid;
+        self
     }
 
     /// Create an error response
@@ -304,6 +368,7 @@ impl ConnectUdpResponse {
             status,
             proxy_public_address: None,
             reason: Some(reason.into()),
+            hybrid_datagram_lane: false,
         }
     }
 
@@ -371,13 +436,17 @@ impl ConnectUdpResponse {
         // Status code
         buf.put_u16(self.status);
 
-        // Flags: bit 0 = has address, bit 1 = has reason
+        // Flags: bit 0 = has address, bit 1 = has reason,
+        // bit 2 = ADR-016 hybrid signal accepted
         let mut flags: u8 = 0;
         if self.proxy_public_address.is_some() {
-            flags |= 0x01;
+            flags |= RESPONSE_FLAG_HAS_ADDRESS;
         }
         if self.reason.is_some() {
-            flags |= 0x02;
+            flags |= RESPONSE_FLAG_HAS_REASON;
+        }
+        if self.hybrid_datagram_lane {
+            flags |= RESPONSE_FLAG_HYBRID_DATAGRAM_LANE;
         }
         buf.put_u8(flags);
 
@@ -416,8 +485,9 @@ impl ConnectUdpResponse {
 
         let status = buf.get_u16();
         let flags = buf.get_u8();
-        let has_addr = (flags & 0x01) != 0;
-        let has_reason = (flags & 0x02) != 0;
+        let has_addr = (flags & RESPONSE_FLAG_HAS_ADDRESS) != 0;
+        let has_reason = (flags & RESPONSE_FLAG_HAS_REASON) != 0;
+        let hybrid_datagram_lane = (flags & RESPONSE_FLAG_HYBRID_DATAGRAM_LANE) != 0;
 
         let proxy_public_address = if has_addr {
             if buf.remaining() < 1 {
@@ -472,6 +542,7 @@ impl ConnectUdpResponse {
             status,
             proxy_public_address,
             reason,
+            hybrid_datagram_lane,
         })
     }
 }
@@ -642,5 +713,57 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("403"));
         assert!(display.contains("rate limit exceeded"));
+    }
+
+    /// ADR-016 hybrid signal: a request without the signal encodes to the
+    /// exact bytes a 0.28.0 client sends, and the signal only adds flag bit
+    /// 0x02, which a 0.28.0 relay's decoder ignores (it reads bit 0 only).
+    #[test]
+    fn hybrid_request_signal_is_one_flag_bit_and_backward_compatible() {
+        let legacy = ConnectUdpRequest::bind_any();
+        assert!(!legacy.hybrid_datagram_lane);
+        let legacy_bytes = legacy.encode();
+        // 0.28.0 wire bytes: flags 0x01, varint host len 2, "::", port 0.
+        assert_eq!(legacy_bytes.as_ref(), &[0x01, 0x02, b':', b':', 0x00, 0x00]);
+
+        let hybrid = ConnectUdpRequest::bind_any().with_hybrid_datagram_lane(true);
+        let hybrid_bytes = hybrid.encode();
+        assert_eq!(
+            hybrid_bytes[0],
+            REQUEST_FLAG_BIND | REQUEST_FLAG_HYBRID_DATAGRAM_LANE
+        );
+        assert_eq!(&hybrid_bytes[1..], &legacy_bytes[1..]);
+
+        let decoded = ConnectUdpRequest::decode(&mut hybrid_bytes.clone()).unwrap();
+        assert_eq!(decoded, hybrid);
+        assert!(decoded.is_bind_any());
+        let decoded_legacy = ConnectUdpRequest::decode(&mut legacy_bytes.clone()).unwrap();
+        assert!(!decoded_legacy.hybrid_datagram_lane);
+    }
+
+    /// ADR-016 hybrid signal on the response: bit 0x04, independent of the
+    /// address and reason bits, so a 0.28.0 client decoding it still reads
+    /// the address and reason correctly.
+    #[test]
+    fn hybrid_response_signal_roundtrips_and_keeps_layout() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 4433);
+        let legacy = ConnectUdpResponse::success(Some(addr));
+        let accepted = ConnectUdpResponse::success(Some(addr)).with_hybrid_datagram_lane(true);
+        let legacy_bytes = legacy.encode();
+        let accepted_bytes = accepted.encode();
+        assert_eq!(legacy_bytes[2], RESPONSE_FLAG_HAS_ADDRESS);
+        assert_eq!(
+            accepted_bytes[2],
+            RESPONSE_FLAG_HAS_ADDRESS | RESPONSE_FLAG_HYBRID_DATAGRAM_LANE
+        );
+        assert_eq!(&accepted_bytes[..2], &legacy_bytes[..2]);
+        assert_eq!(&accepted_bytes[3..], &legacy_bytes[3..]);
+
+        let decoded = ConnectUdpResponse::decode(&mut accepted_bytes.clone()).unwrap();
+        assert_eq!(decoded, accepted);
+        assert!(decoded.hybrid_datagram_lane);
+        assert_eq!(decoded.proxy_public_address, Some(addr));
+        let decoded_legacy = ConnectUdpResponse::decode(&mut legacy_bytes.clone()).unwrap();
+        assert!(!decoded_legacy.hybrid_datagram_lane);
     }
 }

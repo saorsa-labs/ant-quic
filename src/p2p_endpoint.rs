@@ -216,6 +216,87 @@ const RETIREMENT_TICK: Duration = Duration::from_secs(5);
 const RETIREMENT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// #313 R2: how long a readiness or follow probe waits for its answer.
 const RETIREMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A direct QUIC connection whose handshake finished but which is not yet
+/// registered. Dropping it closes the connection, so a Happy Eyeballs loser
+/// that completed its handshake is closed instead of lingering or being
+/// registered over the winner.
+pub(crate) struct PendingDirectConnection(Option<crate::high_level::Connection>);
+
+impl PendingDirectConnection {
+    fn new(connection: crate::high_level::Connection) -> Self {
+        Self(Some(connection))
+    }
+
+    /// Take the connection for registration; the drop then closes nothing.
+    fn into_connection(mut self) -> Option<crate::high_level::Connection> {
+        self.0.take()
+    }
+}
+
+impl Drop for PendingDirectConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take()
+            && connection.close_reason().is_none()
+        {
+            connection.close(crate::VarInt::from_u32(0), b"happy eyeballs loser");
+        }
+    }
+}
+
+/// Upper bound on concurrent relay-to-direct migration tasks per endpoint.
+pub const MAX_RELAY_MIGRATION_TASKS: usize = 1024;
+/// Upper bound on direct candidates one relay-to-direct migration probes.
+const MAX_RELAY_MIGRATION_CANDIDATES: usize = 8;
+/// Smallest wait for the peer's probe answer on a new direct connection.
+const MIN_RELAY_MIGRATION_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Relay-to-direct migration tasks, keyed by `PeerId` (at most one per peer,
+/// at most [`MAX_RELAY_MIGRATION_TASKS`] in all).
+#[derive(Debug, Default)]
+struct RelayMigrationTasks {
+    next_id: AtomicU64,
+    active: parking_lot::Mutex<HashMap<PeerId, u64>>,
+}
+
+impl RelayMigrationTasks {
+    /// Atomically register a task for `peer_id`. `None` when one already runs
+    /// for this peer or the limit is reached.
+    fn try_register(self: &Arc<Self>, peer_id: PeerId) -> Option<RelayMigrationTaskGuard> {
+        let mut active = self.active.lock();
+        if active.contains_key(&peer_id) || active.len() >= MAX_RELAY_MIGRATION_TASKS {
+            return None;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        active.insert(peer_id, id);
+        Some(RelayMigrationTaskGuard {
+            tasks: Arc::clone(self),
+            peer_id,
+            id,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.active.lock().len()
+    }
+}
+
+/// Removes its task's entry when the task ends, however it ends.
+#[derive(Debug)]
+struct RelayMigrationTaskGuard {
+    tasks: Arc<RelayMigrationTasks>,
+    peer_id: PeerId,
+    id: u64,
+}
+
+impl Drop for RelayMigrationTaskGuard {
+    fn drop(&mut self) {
+        let mut active = self.tasks.active.lock();
+        if active.get(&self.peer_id) == Some(&self.id) {
+            active.remove(&self.peer_id);
+        }
+    }
+}
 /// #313 R2 (ADR-017 A6): the shortest interval between two follow probes the
 /// follower sends on one connection.
 const FOLLOW_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -1597,8 +1678,11 @@ pub struct P2pEndpoint {
     /// Endpoint statistics
     stats: Arc<RwLock<EndpointStats>>,
 
-    /// Relay-to-direct automatic migration coordinator
-    migration_coordinator: Arc<crate::masque::MigrationCoordinator>,
+    /// Relay-to-direct migration tasks, at most one per peer
+    relay_migrations: Arc<RelayMigrationTasks>,
+
+    /// Relay-to-direct migration statistics
+    migration_stats: Arc<crate::masque::MigrationStats>,
 
     /// Configuration
     config: P2pConfig,
@@ -4200,9 +4284,8 @@ impl P2pEndpoint {
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
             stats,
-            migration_coordinator: Arc::new(crate::masque::MigrationCoordinator::new(
-                config.migration.clone(),
-            )),
+            relay_migrations: Arc::new(RelayMigrationTasks::default()),
+            migration_stats: Arc::new(crate::masque::MigrationStats::new()),
             config,
             event_tx,
             peer_id,
@@ -5244,23 +5327,59 @@ impl P2pEndpoint {
             v6_count, v4_count, peer_id, stage_budget, rtt_hint,
         );
 
-        let he_config = HappyEyeballsConfig::default();
+        // Reuse a live connection to any candidate, as each per-address dial
+        // did before the race.
+        for addr in &direct_candidate_addrs {
+            if let Some(existing) = self.prepare_direct_addr_attempt(*addr).await? {
+                return Ok(existing);
+            }
+        }
+
         let endpoint = self.clone();
-        match timeout(
+        self.race_dual_stack_and_finalize(
+            &direct_candidate_addrs,
+            &HappyEyeballsConfig::default(),
             stage_budget,
-            happy_eyeballs::race_connect(&direct_candidate_addrs, &he_config, move |addr| {
+            peer_id,
+            move |addr| {
                 let endpoint = endpoint.clone();
                 async move {
                     endpoint
-                        .connect_direct_addr_with_hint(addr, peer_id)
+                        .attempt_direct_handshake(addr)
                         .await
+                        .map(PendingDirectConnection::new)
                         .map_err(|e| e.to_string())
                 }
-            }),
+            },
+        )
+        .await
+    }
+
+    /// Race QUIC handshakes only (RFC 8305), then register ONLY the winner.
+    ///
+    /// A losing attempt never reaches `finalize_direct_connection`, so it can
+    /// never replace the winner's entry or generation in the connection table,
+    /// even when its handshake completed before the race noticed the winner.
+    /// Losing connections are closed by [`PendingDirectConnection`]'s drop.
+    async fn race_dual_stack_and_finalize<F, Fut>(
+        &self,
+        candidates: &[SocketAddr],
+        he_config: &HappyEyeballsConfig,
+        stage_budget: Duration,
+        peer_id: Option<PeerId>,
+        dial: F,
+    ) -> Result<PeerConnection, EndpointError>
+    where
+        F: Fn(SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = Result<PendingDirectConnection, String>> + Send + 'static,
+    {
+        match timeout(
+            stage_budget,
+            happy_eyeballs::race_connect(candidates, he_config, dial),
         )
         .await
         {
-            Ok(Ok((conn, winning_addr))) => {
+            Ok(Ok((pending, winning_addr))) => {
                 info!(
                     "Dual-stack Happy Eyeballs connected to {} ({})",
                     winning_addr,
@@ -5270,7 +5389,11 @@ impl P2pEndpoint {
                         "IPv4"
                     }
                 );
-                Ok(conn)
+                let connection = pending.into_connection().ok_or_else(|| {
+                    EndpointError::Connection("Happy Eyeballs winner had no connection".into())
+                })?;
+                self.finalize_direct_connection(connection, winning_addr, peer_id)
+                    .await
             }
             Ok(Err(e)) => {
                 warn!(
@@ -5286,157 +5409,291 @@ impl P2pEndpoint {
                     "Dual-stack Happy Eyeballs timed out after {:?}",
                     stage_budget
                 );
-                Err(EndpointError::Timeout)
+                // Same error class as the pre-race dual-stack path, so callers
+                // that fall through to NAT traversal on `Connection` still do.
+                Err(EndpointError::Connection(format!(
+                    "Dual-stack connection timed out after {stage_budget:?}"
+                )))
             }
         }
     }
 
-    /// Access the endpoint's relay-to-direct migration coordinator.
-    #[must_use]
-    pub fn migration_coordinator(&self) -> &Arc<crate::masque::MigrationCoordinator> {
-        &self.migration_coordinator
-    }
-
-    /// Snapshot statistics for relay-to-direct migration attempts.
+    /// Statistics for relay-to-direct migration attempts.
     #[must_use]
     pub fn migration_stats(&self) -> Arc<crate::masque::MigrationStats> {
-        self.migration_coordinator.stats()
+        Arc::clone(&self.migration_stats)
     }
 
-    /// Schedule background direct-path upgrade probes for a relayed peer.
+    /// Number of relay-to-direct migration tasks running now (at most one
+    /// per peer, at most [`MAX_RELAY_MIGRATION_TASKS`] in all).
+    #[must_use]
+    pub fn active_relay_migrations(&self) -> usize {
+        self.relay_migrations.len()
+    }
+
+    /// Schedule a background direct-path upgrade for a peer reached through a
+    /// MASQUE relay (opt-in: `P2pConfig::migration.auto_migrate`).
     ///
-    /// Uses [`crate::masque::MigrationCoordinator`] so connections that fell
-    /// back to a MASQUE relay do not remain pinned to the relay indefinitely
-    /// once direct reachability returns. Exits immediately on peer disconnect,
-    /// direct upgrade, max-attempt exhaustion, or endpoint shutdown.
+    /// At most one task runs per peer: the registration is atomic and keyed
+    /// by `PeerId`, and its entry is removed when the task ends. The task
+    /// ends when the upgrade succeeds, the attempts are used up, the relayed
+    /// connection closes or stops being the peer's live connection, or the
+    /// endpoint shuts down.
+    ///
+    /// Success means a NEW direct QUIC connection to the same authenticated
+    /// `PeerId` became the peer's live connection and the peer answered a
+    /// probe on it. The relayed connection is then Superseded and the
+    /// ADR-017 retirement executor closes it once it is quiet, so in-flight
+    /// streams on it are not cut and no second path edits the connection
+    /// table. Returns `true` when a task was started.
     async fn spawn_relay_direct_migration(
         &self,
-        peer_id: PeerId,
+        relayed_peer: &PeerConnection,
         relay_addr: SocketAddr,
         mut direct_candidates: Vec<SocketAddr>,
-    ) {
+    ) -> bool {
         if !self.config.migration.auto_migrate || self.shutdown.is_cancelled() {
-            return;
+            return false;
         }
+        let peer_id = relayed_peer.peer_id;
+        if !matches!(relayed_peer.traversal_method, TraversalMethod::Relay) {
+            return false;
+        }
+        // The connection to upgrade: the peer's live connection right now,
+        // which the relay path just registered.
+        let Some(relayed) = self.inner.get_connection(&peer_id).ok().flatten() else {
+            return false;
+        };
 
         // Enrich with any directory addresses known for this peer.
         let directory = self.peer_directory_snapshot().await;
         for addr in directory.candidate_addrs_for_peer(peer_id) {
-            if addr != relay_addr && !direct_candidates.contains(&addr) {
+            if !direct_candidates.contains(&addr) {
                 direct_candidates.push(addr);
             }
         }
         direct_candidates.retain(|addr| *addr != relay_addr);
-        if direct_candidates.is_empty() {
-            return;
-        }
-
+        let mut unique = Vec::with_capacity(direct_candidates.len());
+        extend_unique_socket_addrs(&mut unique, direct_candidates);
+        let mut direct_candidates = unique;
         // Prefer IPv6 candidates first (RFC 8305 / bypasses IPv4 CGNAT).
         direct_candidates.sort_by_key(|addr| if addr.is_ipv6() { 0u8 } else { 1u8 });
-
-        let peer_key = direct_candidates[0];
-        let coordinator = Arc::clone(&self.migration_coordinator);
-        coordinator.set_relay(relay_addr).await;
-        coordinator
-            .add_candidates(peer_key, direct_candidates.clone())
-            .await;
-
-        // Avoid launching duplicate probe tasks if migration is already active.
-        if coordinator.state(peer_key).await.is_migrating() {
-            return;
+        direct_candidates.truncate(MAX_RELAY_MIGRATION_CANDIDATES);
+        if direct_candidates.is_empty() {
+            return false;
         }
-        coordinator.start_migration(peer_key).await;
+
+        let Some(guard) = self.relay_migrations.try_register(peer_id) else {
+            debug!(
+                "Relay→direct migration for peer {:?} not started: a task already runs or the task limit is reached",
+                peer_id
+            );
+            return false;
+        };
 
         let endpoint = self.clone();
-        let probe_interval = self
-            .config
-            .migration
-            .probe_interval
-            .max(Duration::from_millis(50));
-        let probe_timeout = self
-            .config
-            .migration
-            .validation_timeout
-            .max(Duration::from_millis(100));
-        let max_attempts = self.config.migration.max_attempts.max(1);
-
+        let relayed_peer = relayed_peer.clone();
         tokio::spawn(async move {
-            for attempt in 1..=max_attempts {
-                tokio::select! {
-                    _ = endpoint.shutdown.cancelled() => {
-                        coordinator.reset(peer_key).await;
-                        return;
-                    }
-                    _ = tokio::time::sleep(probe_interval) => {}
-                }
+            endpoint
+                .run_relay_direct_migration(
+                    guard,
+                    relayed_peer,
+                    relay_addr,
+                    relayed,
+                    direct_candidates,
+                )
+                .await;
+        });
+        true
+    }
 
-                if endpoint.shutdown.is_cancelled() || !endpoint.inner.is_peer_connected(&peer_id) {
-                    coordinator.reset(peer_key).await;
+    /// Sleep for `delay` unless the endpoint shuts down or `relayed` closes
+    /// first. Returns `true` when the full delay elapsed.
+    async fn relay_migration_wait(
+        &self,
+        delay: Duration,
+        relayed: &crate::high_level::Connection,
+    ) -> bool {
+        tokio::select! {
+            _ = self.shutdown.cancelled() => false,
+            _ = relayed.closed() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
+    }
+
+    fn relay_is_live_connection(
+        &self,
+        peer_id: &PeerId,
+        relayed: &crate::high_level::Connection,
+    ) -> bool {
+        relayed.close_reason().is_none()
+            && self
+                .inner
+                .get_connection(peer_id)
+                .ok()
+                .flatten()
+                .is_some_and(|live| live.stable_id() == relayed.stable_id())
+    }
+
+    async fn run_relay_direct_migration(
+        self,
+        _guard: RelayMigrationTaskGuard,
+        relayed_peer: PeerConnection,
+        relay_addr: SocketAddr,
+        relayed: crate::high_level::Connection,
+        candidates: Vec<SocketAddr>,
+    ) {
+        let peer_id = relayed_peer.peer_id;
+        let config = self.config.migration.clone();
+        let probe_interval = config.probe_interval.max(Duration::from_millis(50));
+        let probe_timeout = config.validation_timeout.max(Duration::from_millis(100));
+        let max_attempts = config.max_attempts.max(1);
+        let started = Instant::now();
+
+        if !self
+            .relay_migration_wait(config.initial_delay, &relayed)
+            .await
+        {
+            return;
+        }
+        for attempt in 1..=max_attempts {
+            if attempt > 1 && !self.relay_migration_wait(probe_interval, &relayed).await {
+                return;
+            }
+            if !self.relay_is_live_connection(&peer_id, &relayed) {
+                debug!(
+                    "Relay→direct migration for peer {:?} stops: the relayed connection is no longer live",
+                    peer_id
+                );
+                return;
+            }
+            for candidate in &candidates {
+                if self.shutdown.is_cancelled() || relayed.close_reason().is_some() {
                     return;
                 }
-
-                // Stop early if another path already upgraded this peer to direct.
-                if let Some(existing) = endpoint.connected_peers.read().await.get(&peer_id)
-                    && matches!(
-                        existing.traversal_method,
-                        TraversalMethod::Direct | TraversalMethod::HolePunch
-                    )
-                {
-                    if let Some(addr) = existing.remote_addr.as_socket_addr() {
-                        coordinator
-                            .report_validated_path(peer_key, addr, Duration::from_millis(1))
-                            .await;
-                        coordinator.complete_migration(peer_key).await;
-                    }
-                    return;
-                }
-
-                let _ = coordinator.poll(peer_key).await;
-                let candidates = coordinator.get_all_candidates(peer_key).await;
-                for candidate in candidates {
-                    if endpoint.shutdown.is_cancelled() {
-                        coordinator.reset(peer_key).await;
-                        return;
-                    }
-                    let probe_start = Instant::now();
-                    match timeout(
-                        probe_timeout,
-                        endpoint.connect_direct_addr_with_hint(candidate, Some(peer_id)),
-                    )
+                self.migration_stats.record_probe();
+                match self
+                    .probe_direct_upgrade(&relayed_peer, *candidate, &relayed, probe_timeout)
                     .await
-                    {
-                        Ok(Ok(upgraded)) => {
-                            let rtt = probe_start.elapsed();
-                            coordinator
-                                .report_validated_path(peer_key, candidate, rtt)
-                                .await;
-                            coordinator.complete_migration(peer_key).await;
-                            info!(
-                                "Migrated peer {:?} from relay {} to direct {} on attempt {} ({:?})",
-                                upgraded.peer_id, relay_addr, candidate, attempt, rtt
-                            );
-                            return;
-                        }
-                        Ok(Err(e)) => {
-                            debug!(
-                                "Relay→direct migration probe {}/{} to {} for peer {:?} failed: {}",
-                                attempt, max_attempts, candidate, peer_id, e
-                            );
-                        }
-                        Err(_) => {
-                            debug!(
-                                "Relay→direct migration probe {}/{} to {} for peer {:?} timed out",
-                                attempt, max_attempts, candidate, peer_id
-                            );
-                        }
+                {
+                    Ok(_) => {
+                        let elapsed = started.elapsed();
+                        self.migration_stats.record_attempt(true, elapsed);
+                        info!(
+                            "Migrated peer {:?} from relay {} to direct {} on attempt {} ({:?})",
+                            peer_id, relay_addr, candidate, attempt, elapsed
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Relay→direct migration probe {}/{} to {} for peer {:?} failed: {}",
+                            attempt, max_attempts, candidate, peer_id, e
+                        );
                     }
                 }
             }
+        }
+        self.migration_stats
+            .record_attempt(false, started.elapsed());
+        debug!(
+            "Relay→direct migration for peer {:?} gave up after {} attempts; staying on relay {}",
+            peer_id, max_attempts, relay_addr
+        );
+    }
 
-            coordinator
-                .fallback_to_relay(peer_key, "direct upgrade probes exhausted")
-                .await;
-        });
+    /// One direct-path probe for a relayed peer.
+    ///
+    /// It never reuses an existing connection: the relayed peer is stored
+    /// with `remote_addr == target`, so an address lookup would return the
+    /// relayed connection itself. It dials `candidate` with a fresh QUIC
+    /// handshake on the endpoint's own socket and succeeds only when:
+    /// 1. the handshake authenticates the same `PeerId`;
+    /// 2. the new connection becomes the peer's live connection; and
+    /// 3. the peer answers a probe on the new connection (when the peer
+    ///    supports probes; otherwise the connection must still be open).
+    ///
+    /// If 2 or 3 fail after registration, the new connection is closed and
+    /// the relayed entry is restored, so traffic stays on the relay.
+    async fn probe_direct_upgrade(
+        &self,
+        relayed_peer: &PeerConnection,
+        candidate: SocketAddr,
+        relayed: &crate::high_level::Connection,
+        budget: Duration,
+    ) -> Result<PeerConnection, EndpointError> {
+        let peer_id = relayed_peer.peer_id;
+        let deadline = Instant::now() + budget;
+        let connection = timeout(budget, self.attempt_direct_handshake(candidate))
+            .await
+            .map_err(|_| EndpointError::Timeout)??;
+        if connection.stable_id() == relayed.stable_id() {
+            return Err(EndpointError::Connection(
+                "direct probe returned the relayed connection".to_string(),
+            ));
+        }
+        let authenticated = self
+            .inner
+            .extract_peer_id_from_connection(&connection)
+            .await;
+        if authenticated != Some(peer_id) {
+            connection.close(
+                crate::VarInt::from_u32(0),
+                b"relay migration: unexpected peer",
+            );
+            return Err(EndpointError::Connection(format!(
+                "direct candidate {candidate} authenticated {authenticated:?}, expected {peer_id:?}"
+            )));
+        }
+
+        let upgraded = self
+            .finalize_direct_connection(connection.clone(), candidate, Some(peer_id))
+            .await?;
+        let registered = self
+            .inner
+            .get_connection(&peer_id)
+            .ok()
+            .flatten()
+            .is_some_and(|live| live.stable_id() == connection.stable_id());
+        let verified = if registered && matches!(upgraded.traversal_method, TraversalMethod::Direct)
+        {
+            let probe_budget = deadline
+                .saturating_duration_since(Instant::now())
+                .max(MIN_RELAY_MIGRATION_PROBE_BUDGET);
+            match self
+                .probe_connection(&peer_id, &connection, probe_budget)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(EndpointError::NotSupported) if connection.close_reason().is_none() => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else {
+            Err(EndpointError::Connection(
+                "direct connection did not become the live connection".to_string(),
+            ))
+        };
+
+        match verified {
+            Ok(()) if connection.close_reason().is_none() => Ok(upgraded),
+            outcome => {
+                if connection.close_reason().is_none() {
+                    connection.close(crate::VarInt::from_u32(0), b"relay migration unverified");
+                }
+                // The lifecycle re-promotes the surviving relayed connection
+                // once the direct one is dead; restore the outer entry to it.
+                if self.inner.is_peer_connected(&peer_id)
+                    && self.relay_is_live_connection(&peer_id, relayed)
+                {
+                    self.register_connected_peer(relayed_peer.clone()).await;
+                }
+                Err(outcome.err().unwrap_or_else(|| {
+                    EndpointError::Connection(
+                        "direct connection closed during verification".to_string(),
+                    )
+                }))
+            }
+        }
     }
 
     /// Connect to a peer using cached information (addresses, tokens).
@@ -6696,12 +6953,8 @@ impl P2pEndpoint {
                             );
                             let direct_candidates: Vec<SocketAddr> =
                                 [target_ipv6, target_ipv4].into_iter().flatten().collect();
-                            self.spawn_relay_direct_migration(
-                                conn.peer_id,
-                                relay_addr,
-                                direct_candidates,
-                            )
-                            .await;
+                            self.spawn_relay_direct_migration(&conn, relay_addr, direct_candidates)
+                                .await;
                             return Ok((conn, ConnectionMethod::Relayed { relay: relay_addr }));
                         }
                         Ok(Err(e)) => {
@@ -13278,7 +13531,8 @@ impl Clone for P2pEndpoint {
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),
             stats: Arc::clone(&self.stats),
-            migration_coordinator: Arc::clone(&self.migration_coordinator),
+            relay_migrations: Arc::clone(&self.relay_migrations),
+            migration_stats: Arc::clone(&self.migration_stats),
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
             peer_id: self.peer_id,
@@ -17616,6 +17870,457 @@ mod tests {
         endpoint_a.shutdown().await;
         endpoint_b.shutdown().await;
         endpoint_relay.shutdown().await;
+    }
+
+    /// Relay→direct migration (PR #372 review, blocking fix 2) and the Happy
+    /// Eyeballs loser rule. Three loopback nodes: A (client), R (relay),
+    /// B (target). Every socket is on 127.0.0.1 / ::1.
+    #[cfg(all(unix, feature = "platform-verifier", feature = "network-discovery"))]
+    mod relay_migration_372 {
+        use super::*;
+        use crate::masque::MigrationConfig;
+
+        const WITHIN: Duration = Duration::from_secs(20);
+
+        fn fast_migration(max_attempts: u32) -> MigrationConfig {
+            MigrationConfig {
+                auto_migrate: true,
+                initial_delay: Duration::from_millis(300),
+                probe_interval: Duration::from_millis(200),
+                validation_timeout: Duration::from_millis(1500),
+                max_attempts,
+                ..MigrationConfig::default()
+            }
+        }
+
+        async fn node(bind: SocketAddr, migration: Option<MigrationConfig>) -> P2pEndpoint {
+            let mut builder = P2pConfig::builder()
+                .bind_addr(bind)
+                .port_mapping_enabled(false);
+            if let Some(migration) = migration {
+                builder = builder.migration(migration);
+            }
+            let node = P2pEndpoint::new(builder.build().expect("config"))
+                .await
+                .expect("endpoint binds");
+            *retirement_test_hooks::hooks(node.reader_hooks_key())
+                .timing
+                .lock() = Some(retirement_test_hooks::Timing::fast());
+            node
+        }
+
+        fn v4_loopback() -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+        }
+
+        fn accept_pump(endpoint: &P2pEndpoint) -> tokio::task::JoinHandle<()> {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint.accept().await {} })
+        }
+
+        fn relay_only(relay_addr: SocketAddr) -> StrategyConfig {
+            let mut strategy = StrategyConfig::default();
+            strategy.ipv4_timeout = Duration::ZERO;
+            strategy.ipv6_timeout = Duration::ZERO;
+            strategy.ipv6_enabled = false;
+            strategy.holepunch_timeout = Duration::ZERO;
+            strategy.max_holepunch_rounds = 0;
+            strategy.coordinator = None;
+            strategy.relay_enabled = true;
+            strategy.relay_addrs = vec![relay_addr];
+            strategy.relay_timeout = Duration::from_secs(10);
+            strategy
+        }
+
+        /// A UDP forwarder to `upstream` that drops every packet from
+        /// `blocked` (A's own socket) and forwards everything else, with one
+        /// upstream socket per source. The relay reaches B through it; A's
+        /// direct dials to it go nowhere: a relay-only path.
+        async fn filtering_proxy(
+            upstream: SocketAddr,
+            blocked: SocketAddr,
+        ) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+            let front = Arc::new(
+                tokio::net::UdpSocket::bind(v4_loopback())
+                    .await
+                    .expect("proxy binds"),
+            );
+            let front_addr = front.local_addr().expect("proxy addr");
+            let dropped = Arc::new(AtomicU64::new(0));
+            let dropped_task = Arc::clone(&dropped);
+            let task = tokio::spawn(async move {
+                let mut routes: HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> = HashMap::new();
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let Ok((n, src)) = front.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    if src == blocked {
+                        dropped_task.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let up = match routes.get(&src) {
+                        Some(up) => Arc::clone(up),
+                        None => {
+                            let Ok(up) = tokio::net::UdpSocket::bind(v4_loopback()).await else {
+                                return;
+                            };
+                            let up = Arc::new(up);
+                            let back = Arc::clone(&front);
+                            let reader = Arc::clone(&up);
+                            tokio::spawn(async move {
+                                let mut rbuf = vec![0u8; 65536];
+                                while let Ok((m, _)) = reader.recv_from(&mut rbuf).await {
+                                    let _ = back.send_to(&rbuf[..m], src).await;
+                                }
+                            });
+                            routes.insert(src, Arc::clone(&up));
+                            up
+                        }
+                    };
+                    let _ = up.send_to(&buf[..n], upstream).await;
+                }
+            });
+            (front_addr, dropped, task)
+        }
+
+        async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+            let deadline = tokio::time::Instant::now() + WITHIN;
+            while !check() {
+                assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Duplicate guard: atomic, keyed by PeerId, bounded, and the entry
+        /// leaves with its task.
+        #[test]
+        fn migration_task_registry_is_atomic_keyed_and_bounded() {
+            let tasks = Arc::new(RelayMigrationTasks::default());
+            let peer = PeerId([7; 32]);
+            let first = tasks.try_register(peer).expect("first task");
+            assert!(
+                tasks.try_register(peer).is_none(),
+                "second task for one peer"
+            );
+            assert_eq!(tasks.len(), 1);
+            drop(first);
+            assert_eq!(tasks.len(), 0, "entry removed when the task ends");
+            let again = tasks.try_register(peer).expect("task after release");
+
+            let mut guards = vec![again];
+            for i in 1..MAX_RELAY_MIGRATION_TASKS {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                id[31] = 1;
+                guards.push(tasks.try_register(PeerId(id)).expect("under the limit"));
+            }
+            assert_eq!(tasks.len(), MAX_RELAY_MIGRATION_TASKS);
+            assert!(tasks.try_register(PeerId([9; 32])).is_none(), "limit holds");
+            drop(guards);
+            assert_eq!(tasks.len(), 0);
+        }
+
+        /// Relay-only path: the direct candidate is the relayed peer's own
+        /// target address (the stored `remote_addr`), but A cannot reach it
+        /// directly. The probe must not count the relayed connection as
+        /// "direct": no success, peer stays Relay, no second task, the task
+        /// ends after its attempts.
+        #[tokio::test]
+        async fn migration_probe_never_reports_success_on_relay_only_path() {
+            let relay = node(v4_loopback(), None).await;
+            let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+            let b = node(v4_loopback(), None).await;
+            let b_addr = localhost_addr(b.local_addr().expect("b addr"));
+            let b_id = b.peer_id();
+            let a = node(v4_loopback(), Some(fast_migration(2))).await;
+            let a_addr = localhost_addr(a.local_addr().expect("a addr"));
+            let (target, dropped, proxy) = filtering_proxy(b_addr, a_addr).await;
+            let pumps = [accept_pump(&b), accept_pump(&relay)];
+
+            let (conn, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                a.connect_with_fallback(
+                    Some(target),
+                    None,
+                    Some(relay_only(relay_addr)),
+                    Some(b_id),
+                ),
+            )
+            .await
+            .expect("relay connect bounded")
+            .expect("relay connect");
+            assert!(matches!(conn.traversal_method, TraversalMethod::Relay));
+            assert_eq!(conn.remote_addr, TransportAddr::Udp(target));
+            let relayed = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("relayed connection live");
+
+            // The migration task is running (initial delay): a second spawn
+            // for the same peer is refused.
+            assert_eq!(a.active_relay_migrations(), 1);
+            assert!(
+                !a.spawn_relay_direct_migration(&conn, relay_addr, vec![target])
+                    .await
+            );
+            assert_eq!(a.active_relay_migrations(), 1);
+
+            let stats = a.migration_stats();
+            eventually("migration task gives up", || {
+                stats.failed.load(Ordering::Relaxed) == 1
+            })
+            .await;
+            assert_eq!(
+                stats.successful.load(Ordering::Relaxed),
+                0,
+                "no false success"
+            );
+            assert!(stats.paths_probed.load(Ordering::Relaxed) >= 2);
+            assert!(
+                dropped.load(Ordering::Relaxed) > 0,
+                "A's direct dials were dropped"
+            );
+            eventually("task entry removed", || a.active_relay_migrations() == 0).await;
+
+            let peer = a
+                .connected_peers
+                .read()
+                .await
+                .get(&b_id)
+                .cloned()
+                .expect("peer");
+            assert!(matches!(peer.traversal_method, TraversalMethod::Relay));
+            let live = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("live");
+            assert_eq!(live.stable_id(), relayed.stable_id(), "still on the relay");
+            assert!(relayed.close_reason().is_none());
+
+            proxy.abort();
+            for pump in pumps {
+                pump.abort();
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+            relay.shutdown().await;
+        }
+
+        /// The task ends when the relayed connection ends (peer disconnect),
+        /// and its entry is removed.
+        #[tokio::test]
+        async fn migration_task_ends_when_relayed_connection_closes() {
+            let relay = node(v4_loopback(), None).await;
+            let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+            let b = node(v4_loopback(), None).await;
+            let b_addr = localhost_addr(b.local_addr().expect("b addr"));
+            let b_id = b.peer_id();
+            let a = node(v4_loopback(), Some(fast_migration(10_000))).await;
+            let a_addr = localhost_addr(a.local_addr().expect("a addr"));
+            let (target, _dropped, proxy) = filtering_proxy(b_addr, a_addr).await;
+            let pumps = [accept_pump(&b), accept_pump(&relay)];
+
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                a.connect_with_fallback(
+                    Some(target),
+                    None,
+                    Some(relay_only(relay_addr)),
+                    Some(b_id),
+                ),
+            )
+            .await
+            .expect("relay connect bounded")
+            .expect("relay connect");
+            assert_eq!(a.active_relay_migrations(), 1);
+
+            a.disconnect(&b_id).await.expect("disconnect");
+            eventually("task ends with the relayed connection", || {
+                a.active_relay_migrations() == 0
+            })
+            .await;
+            assert_eq!(a.migration_stats().successful.load(Ordering::Relaxed), 0);
+
+            proxy.abort();
+            for pump in pumps {
+                pump.abort();
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+            relay.shutdown().await;
+        }
+
+        /// Success path: a NEW direct connection to the same PeerId becomes
+        /// the live connection, the peer entry turns Direct, application
+        /// traffic flows on it, and the relayed connection is retired.
+        #[tokio::test]
+        async fn migration_switches_to_new_direct_connection_and_retires_relay() {
+            let relay = node(v4_loopback(), None).await;
+            let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+            let b = node(v4_loopback(), None).await;
+            let b_addr = localhost_addr(b.local_addr().expect("b addr"));
+            let b_id = b.peer_id();
+            let a = node(v4_loopback(), Some(fast_migration(3))).await;
+            let pumps = [accept_pump(&b), accept_pump(&relay)];
+
+            let (conn, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                a.connect_with_fallback(
+                    Some(b_addr),
+                    None,
+                    Some(relay_only(relay_addr)),
+                    Some(b_id),
+                ),
+            )
+            .await
+            .expect("relay connect bounded")
+            .expect("relay connect");
+            assert!(matches!(conn.traversal_method, TraversalMethod::Relay));
+            let relayed = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("relayed connection live");
+
+            let stats = a.migration_stats();
+            eventually("migration succeeds", || {
+                stats.successful.load(Ordering::Relaxed) == 1
+            })
+            .await;
+            assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+
+            let live = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("live");
+            assert_ne!(live.stable_id(), relayed.stable_id(), "a NEW connection");
+            assert_eq!(
+                crate::shared::normalize_socket_addr(live.remote_address()),
+                b_addr
+            );
+            let peer = a
+                .connected_peers
+                .read()
+                .await
+                .get(&b_id)
+                .cloned()
+                .expect("peer");
+            assert!(matches!(peer.traversal_method, TraversalMethod::Direct));
+            eventually("task entry removed", || a.active_relay_migrations() == 0).await;
+
+            a.send(&b_id, b"after-migration").await.expect("send");
+            let (from, data) = tokio::time::timeout(WITHIN, b.recv())
+                .await
+                .expect("recv bounded")
+                .expect("recv");
+            assert_eq!(from, a.peer_id());
+            assert_eq!(data, b"after-migration".to_vec());
+
+            eventually("relayed connection retired", || {
+                relayed.close_reason().is_some()
+            })
+            .await;
+            let live = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("live");
+            assert_ne!(live.stable_id(), relayed.stable_id());
+
+            for pump in pumps {
+                pump.abort();
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+            relay.shutdown().await;
+        }
+
+        /// Happy Eyeballs: both handshakes complete (a barrier holds each
+        /// attempt until the other has finished), yet only the winner is
+        /// registered; the loser never touches the connection table and is
+        /// closed.
+        #[tokio::test]
+        async fn happy_eyeballs_completed_loser_never_replaces_winner() {
+            let dual = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
+            let b = node(dual, None).await;
+            let b_port = b.local_addr().expect("b addr").port();
+            let b_id = b.peer_id();
+            let a = node(dual, None).await;
+            let pump = accept_pump(&b);
+
+            let v6 = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), b_port);
+            let v4 = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), b_port);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let handshakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let he_config = HappyEyeballsConfig {
+                connection_attempt_delay: Duration::ZERO,
+                ..HappyEyeballsConfig::default()
+            };
+
+            let dialer = a.clone();
+            let dial_barrier = Arc::clone(&barrier);
+            let dial_log = Arc::clone(&handshakes);
+            let winner = a
+                .race_dual_stack_and_finalize(
+                    &[v6, v4],
+                    &he_config,
+                    Duration::from_secs(20),
+                    Some(b_id),
+                    move |addr| {
+                        let dialer = dialer.clone();
+                        let barrier = Arc::clone(&dial_barrier);
+                        let log = Arc::clone(&dial_log);
+                        async move {
+                            let conn = dialer
+                                .attempt_direct_handshake(addr)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            log.lock().push(conn.clone());
+                            let pending = PendingDirectConnection::new(conn);
+                            tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+                                .await
+                                .map_err(|_| "peer attempt never completed".to_string())?;
+                            Ok(pending)
+                        }
+                    },
+                )
+                .await
+                .expect("race succeeds");
+
+            let completed: Vec<crate::high_level::Connection> = handshakes.lock().clone();
+            assert_eq!(completed.len(), 2, "both handshakes completed");
+            let live = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("live");
+            let loser = completed
+                .iter()
+                .find(|c| c.stable_id() != live.stable_id())
+                .expect("one loser")
+                .clone();
+            assert!(completed.iter().any(|c| c.stable_id() == live.stable_id()));
+            assert!(matches!(winner.traversal_method, TraversalMethod::Direct));
+
+            let entries = a.inner.lifecycle_entries_for_test(&b_id);
+            assert_eq!(entries.len(), 1, "only the winner registered: {entries:?}");
+            assert_eq!(entries[0].0, live.stable_id());
+            eventually("loser closed", || loser.close_reason().is_some()).await;
+            let live_after = a
+                .inner
+                .get_connection(&b_id)
+                .expect("lookup")
+                .expect("live");
+            assert_eq!(live_after.stable_id(), live.stable_id(), "winner kept");
+
+            pump.abort();
+            a.shutdown().await;
+            b.shutdown().await;
+        }
     }
 
     #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]

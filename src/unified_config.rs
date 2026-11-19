@@ -289,9 +289,11 @@ pub struct P2pConfig {
 
     /// Relay-to-direct automatic migration configuration.
     ///
-    /// When `auto_migrate` is enabled (the default), connections that fall back
-    /// to a MASQUE relay periodically probe direct candidates and upgrade off
-    /// the relay once a direct path validates.
+    /// Opt-in: [`P2pConfig::default_migration_config`] has `auto_migrate`
+    /// OFF until a fleet soak proves the upgrade path. When enabled,
+    /// connections that fall back to a MASQUE relay probe direct candidates
+    /// and move to a new direct connection to the same peer once the peer
+    /// answers on it.
     pub migration: MigrationConfig,
 }
 // v0.13.0: enable_coordinator removed - all nodes are coordinators
@@ -492,12 +494,23 @@ impl Default for P2pConfig {
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
             stream_read_deadline: Duration::from_secs(60),
-            migration: MigrationConfig::default(),
+            migration: Self::default_migration_config(),
         }
     }
 }
 
 impl P2pConfig {
+    /// Default relay-to-direct migration configuration: the
+    /// [`MigrationConfig`] defaults with `auto_migrate` OFF (opt-in until a
+    /// fleet soak proves the upgrade path).
+    #[must_use]
+    pub fn default_migration_config() -> MigrationConfig {
+        MigrationConfig {
+            auto_migrate: false,
+            ..MigrationConfig::default()
+        }
+    }
+
     /// Default capacity of the data channel between reader tasks and `recv()`.
     ///
     /// Bumped 256 → 8192 in X0X-0039 (SOTA-Borrow Phase A) to match
@@ -1146,7 +1159,9 @@ impl P2pConfigBuilder {
             stream_read_deadline: self
                 .stream_read_deadline
                 .unwrap_or_else(|| Duration::from_secs(60)),
-            migration: self.migration.unwrap_or_default(),
+            migration: self
+                .migration
+                .unwrap_or_else(P2pConfig::default_migration_config),
             data_channel_capacity: self
                 .data_channel_capacity
                 .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY),
@@ -1394,7 +1409,11 @@ mod tests {
             default.to_nat_config().relay_forward_mode,
             RelayForwardMode::Stream
         );
-        assert!(default.migration.auto_migrate);
+        assert!(
+            !default.migration.auto_migrate,
+            "relay-to-direct migration is opt-in until a soak proves it"
+        );
+        assert!(!P2pConfig::default().migration.auto_migrate);
 
         let hybrid = P2pConfig::builder()
             .relay_forward_mode(RelayForwardMode::Hybrid)

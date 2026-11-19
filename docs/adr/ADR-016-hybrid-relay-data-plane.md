@@ -120,3 +120,34 @@ Two-lane relay forwarding, selected per packet:
 ## Notes for AI-assisted work
 
 Drafted with AI assistance; reviewed and accepted by the project owner on 2026-08-26. Accepted ADRs are immutable: create a new superseding ADR rather than editing this one.
+
+## Amendment 19 Nov 2026 (Proposed, pending David)
+
+Added by the PR #372 takeover. It does not change the decision text or the status above; it states
+three rules that the implementation needs and that the decision leaves open. Until David accepts it,
+it is a proposal.
+
+1. **Per-session hybrid signal (refines Decisions 2 and 6).** A session uses the datagram lane only
+   when both ends signal it in the CONNECT-UDP exchange of that session:
+   - The client sets request flag bit `0x02` (`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`) only when it runs
+     `hybrid` and holds the datagram lane of the outer connection (rule 2).
+   - The relay sets response flag bit `0x04` (`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`) only when it runs
+     `hybrid`, the request carried bit `0x02`, and it holds the datagram lane of that connection.
+   - Without both bits, the session is stream-only in both directions.
+   - QUIC `DATAGRAM` support in transport parameters is not a signal: every peer advertises it,
+     also peers that never read the relay datagram lane.
+   - Compatibility: decoders up to 0.28.0 read only flag bits `0x01` (request) and `0x01`/`0x02`
+     (response), so an old relay ignores bit `0x02` and never answers `0x04`, and an old client
+     never sends `0x02`. Old peers therefore always get the stream lane. A request or response
+     without the new bit is byte-identical to the 0.28.0 encoding.
+2. **One datagram reader per connection (datagram demultiplexing).** Relay datagrams use Context ID
+   `0` and carry no session identifier. So one outer connection has at most one hybrid relay
+   session, and no other datagram reader while that session runs. A second hybrid session, or a
+   `LinkConn::recv_datagrams` reader, is refused, and the relay serves that session on the stream
+   lane. A real demultiplexer (per-session context IDs) is follow-up work.
+3. **`P_max` floor (makes Decision 3 exact).** `P_max = max_datagram_size(outer) - encapsulation
+   header`. If `P_max < 1200 B + 32 B margin` (`MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET` = 1232 B), the
+   datagram lane is not used and every packet takes the stream lane. When `P_max` is at or above
+   the floor, every non-Initial packet of up to `P_max` bytes (also a full 1200 B short-header
+   packet) takes the datagram lane, and every Initial takes the stream lane. A datagram that the
+   outer connection refuses (too large, disabled) falls back to the stream lane.
