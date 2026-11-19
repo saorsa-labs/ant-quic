@@ -135,14 +135,31 @@ impl LinkConn for P2pLinkConn {
     }
 
     fn recv_datagrams(&self) -> BoxStream<'_, Bytes> {
-        // Create a stream that polls for datagrams
-        let conn = self.inner.clone();
-        Box::pin(futures_util::stream::unfold(conn, |conn| async move {
-            match conn.read_datagram().await {
-                Ok(data) => Some((data, conn)),
-                Err(_) => None,
+        // QUIC datagrams carry no demultiplexer: a hybrid MASQUE relay session
+        // (ADR-016) on this connection reads them all. Refuse to compete with
+        // it; the registration is held for the life of the stream and keeps a
+        // later hybrid session off this connection.
+        let guard = match crate::masque::relay_socket::register_other_datagram_reader(&self.inner) {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(
+                    peer = ?self.peer_id,
+                    error = %e,
+                    "recv_datagrams: datagram lane owned by a hybrid relay session; no datagrams"
+                );
+                return Box::pin(futures_util::stream::empty());
             }
-        }))
+        };
+        let conn = self.inner.clone();
+        Box::pin(futures_util::stream::unfold(
+            (conn, guard),
+            |(conn, guard)| async move {
+                match conn.read_datagram().await {
+                    Ok(data) => Some((data, (conn, guard))),
+                    Err(_) => None,
+                }
+            },
+        ))
     }
 
     fn close(&self, error_code: u64, reason: &str) {

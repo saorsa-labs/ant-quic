@@ -16,7 +16,7 @@
 use std::{
     fmt,
     io::{self, IoSliceMut},
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
     pin::Pin,
     sync::{
         Arc,
@@ -25,8 +25,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use quinn_udp::{RecvMeta, Transmit};
-use tokio::io::ReadBuf;
+use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
+use tokio::io::Interest;
 use tracing::debug;
 
 use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller, UdpSender};
@@ -36,6 +36,10 @@ use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller, UdpSender};
 /// Routes outgoing traffic to the appropriate socket based on the destination address family.
 /// Multiplexes incoming traffic from both sockets with fair polling.
 ///
+/// Each underlying socket is paired with a [`quinn_udp::UdpSocketState`] to enable
+/// kernel UDP batching (`recvmmsg` / GRO), segmentation offload (GSO), ECN
+/// codepoints, and don't-fragment (`may_fragment`) reporting across both families.
+///
 /// When both sockets are present, `local_addr()` returns the IPv6 address so that the
 /// QUIC endpoint sets `ipv6 = true`. The endpoint then converts all outgoing IPv4
 /// destinations to IPv4-mapped IPv6 addresses (e.g. `::ffff:1.2.3.4`), which this
@@ -43,6 +47,8 @@ use super::{AsyncUdpSocket, UdpPollHelper, UdpPoller, UdpSender};
 pub struct DualStackSocket {
     v4: Option<Arc<tokio::net::UdpSocket>>,
     v6: Option<Arc<tokio::net::UdpSocket>>,
+    v4_state: Option<Arc<UdpSocketState>>,
+    v6_state: Option<Arc<UdpSocketState>>,
     /// Cached IPv4 `local_addr()` captured at construction so hot paths
     /// (quinn's `ConnectionDriver::poll` calls `AsyncUdpSocket::local_addr`
     /// on every iteration) avoid a `getsockname(2)` syscall per poll.
@@ -79,9 +85,19 @@ impl DualStackSocket {
         }
         let v4_addr = v4.as_ref().map(|socket| socket.local_addr()).transpose()?;
         let v6_addr = v6.as_ref().map(|socket| socket.local_addr()).transpose()?;
+        let v4_state = v4
+            .as_ref()
+            .map(|socket| UdpSocketState::new(UdpSockRef::from(socket)).map(Arc::new))
+            .transpose()?;
+        let v6_state = v6
+            .as_ref()
+            .map(|socket| UdpSocketState::new(UdpSockRef::from(socket)).map(Arc::new))
+            .transpose()?;
         Ok(Self {
             v4: v4.map(Arc::new),
             v6: v6.map(Arc::new),
+            v4_state,
+            v6_state,
             v4_addr,
             v6_addr,
             poll_v4_first: AtomicBool::new(false),
@@ -137,43 +153,53 @@ impl DualStackSocket {
         }
     }
 
-    /// Poll a single socket for incoming datagrams.
-    fn poll_recv_one(
+    /// Convert an optional source IP hint to match the selected socket family.
+    fn convert_src_ip(src_ip: Option<IpAddr>, socket_is_v6: bool) -> Option<IpAddr> {
+        match (src_ip?, socket_is_v6) {
+            (IpAddr::V4(v4), true) => Some(IpAddr::V6(v4.to_ipv6_mapped())),
+            (IpAddr::V6(v6), false) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            (other, _) => Some(other),
+        }
+    }
+
+    /// Poll a single socket for a batch of incoming datagrams via `quinn_udp`.
+    fn poll_recv_batch(
         socket: &tokio::net::UdpSocket,
+        state: &UdpSocketState,
         socket_is_v4: bool,
         cx: &mut Context<'_>,
-        buf: &mut IoSliceMut<'_>,
-        meta: &mut RecvMeta,
-    ) -> Poll<io::Result<()>> {
-        let mut read_buf = ReadBuf::new(buf);
-        let addr = match socket.poll_recv_from(cx, &mut read_buf) {
-            Poll::Ready(Ok(addr)) => addr,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        };
-
-        let len = read_buf.filled().len();
-
-        // If received on the v4 socket, convert source address to IPv4-mapped IPv6
-        // so the Endpoint (which thinks it has an IPv6 socket) can handle it.
-        let mapped_addr = if socket_is_v4 {
-            match addr {
-                SocketAddr::V4(v4) => SocketAddr::V6(to_mapped_v6(v4)),
-                other => other,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match socket.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-        } else {
-            addr
-        };
 
-        *meta = RecvMeta {
-            len,
-            stride: len,
-            addr: mapped_addr,
-            ecn: None,
-            dst_ip: None,
-        };
+            let res = socket.try_io(Interest::READABLE, || {
+                state.recv(UdpSockRef::from(socket), bufs, meta)
+            });
 
-        Poll::Ready(Ok(()))
+            match res {
+                Ok(count) => {
+                    if socket_is_v4 {
+                        for m in &mut meta[..count] {
+                            if let SocketAddr::V4(v4) = m.addr {
+                                m.addr = SocketAddr::V6(to_mapped_v6(v4));
+                            }
+                            if let Some(IpAddr::V4(v4)) = m.dst_ip {
+                                m.dst_ip = Some(IpAddr::V6(v4.to_ipv6_mapped()));
+                            }
+                        }
+                    }
+                    return Poll::Ready(Ok(count));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
     }
 }
 
@@ -182,6 +208,8 @@ impl AsyncUdpSocket for DualStackSocket {
         Box::pin(DualStackUdpSender {
             v4: self.v4.clone(),
             v6: self.v6.clone(),
+            v4_state: self.v4_state.clone(),
+            v6_state: self.v6_state.clone(),
             v4_writable: self.v4.as_ref().map(make_socket_poller),
             v6_writable: self.v6.as_ref().map(make_socket_poller),
         })
@@ -200,16 +228,31 @@ impl AsyncUdpSocket for DualStackSocket {
         // Alternate poll order for fairness
         let v4_first = self.poll_v4_first.fetch_xor(true, Ordering::Relaxed);
 
-        let (first_socket, first_is_v4, second_socket, second_is_v4) = if v4_first {
-            (&self.v4, true, &self.v6, false)
-        } else {
-            (&self.v6, false, &self.v4, true)
-        };
+        let (first_socket, first_state, first_is_v4, second_socket, second_state, second_is_v4) =
+            if v4_first {
+                (
+                    &self.v4,
+                    &self.v4_state,
+                    true,
+                    &self.v6,
+                    &self.v6_state,
+                    false,
+                )
+            } else {
+                (
+                    &self.v6,
+                    &self.v6_state,
+                    false,
+                    &self.v4,
+                    &self.v4_state,
+                    true,
+                )
+            };
 
         // Poll first socket
-        if let Some(socket) = first_socket {
-            match Self::poll_recv_one(socket, first_is_v4, cx, &mut bufs[0], &mut meta[0]) {
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok(1)),
+        if let (Some(socket), Some(state)) = (first_socket, first_state) {
+            match Self::poll_recv_batch(socket, state, first_is_v4, cx, bufs, meta) {
+                Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
                 Poll::Ready(Err(e)) => {
                     // Log but continue to try second socket
                     debug!(
@@ -223,9 +266,9 @@ impl AsyncUdpSocket for DualStackSocket {
         }
 
         // Poll second socket
-        if let Some(socket) = second_socket {
-            match Self::poll_recv_one(socket, second_is_v4, cx, &mut bufs[0], &mut meta[0]) {
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok(1)),
+        if let (Some(socket), Some(state)) = (second_socket, second_state) {
+            match Self::poll_recv_batch(socket, state, second_is_v4, cx, bufs, meta) {
+                Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {} // Both pending
             }
@@ -264,14 +307,15 @@ impl AsyncUdpSocket for DualStackSocket {
         Ok(addresses)
     }
 
+    fn max_receive_segments(&self) -> usize {
+        let v4_gro = self.v4_state.as_ref().map_or(1, |s| s.gro_segments());
+        let v6_gro = self.v6_state.as_ref().map_or(1, |s| s.gro_segments());
+        v4_gro.max(v6_gro).max(1)
+    }
+
     fn may_fragment(&self) -> bool {
-        // Conservative: if either socket may fragment, report true
-        let v4_frag = self
-            .v4
-            .as_ref()
-            .map(|_| true) // default for tokio sockets
-            .unwrap_or(true);
-        let v6_frag = self.v6.as_ref().map(|_| true).unwrap_or(true);
+        let v4_frag = self.v4_state.as_ref().is_some_and(|s| s.may_fragment());
+        let v6_frag = self.v6_state.as_ref().is_some_and(|s| s.may_fragment());
         v4_frag || v6_frag
     }
 }
@@ -288,6 +332,8 @@ fn make_socket_poller(socket: &Arc<tokio::net::UdpSocket>) -> Pin<Box<dyn UdpPol
 struct DualStackUdpSender {
     v4: Option<Arc<tokio::net::UdpSocket>>,
     v6: Option<Arc<tokio::net::UdpSocket>>,
+    v4_state: Option<Arc<UdpSocketState>>,
+    v6_state: Option<Arc<UdpSocketState>>,
     v4_writable: Option<Pin<Box<dyn UdpPoller>>>,
     v6_writable: Option<Pin<Box<dyn UdpPoller>>>,
 }
@@ -336,10 +382,13 @@ impl UdpSender for DualStackUdpSender {
         })?;
 
         loop {
-            let (socket, poller) = if socket_is_v6 {
+            let (socket, state, poller) = if socket_is_v6 {
                 (
                     self.v6.as_ref().cloned().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv6 socket unavailable")
+                    })?,
+                    self.v6_state.as_ref().cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv6 state unavailable")
                     })?,
                     self.v6_writable.as_mut().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv6 poller unavailable")
@@ -349,6 +398,9 @@ impl UdpSender for DualStackUdpSender {
                 (
                     self.v4.as_ref().cloned().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 socket unavailable")
+                    })?,
+                    self.v4_state.as_ref().cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 state unavailable")
                     })?,
                     self.v4_writable.as_mut().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 poller unavailable")
@@ -363,11 +415,30 @@ impl UdpSender for DualStackUdpSender {
             }
 
             let dest = DualStackSocket::convert_dest(transmit.destination, socket_is_v6)?;
-            match socket.try_send_to(transmit.contents, dest) {
-                Ok(_) => return Poll::Ready(Ok(())),
+            let converted = Transmit {
+                destination: dest,
+                ecn: transmit.ecn,
+                contents: transmit.contents,
+                segment_size: transmit.segment_size,
+                src_ip: DualStackSocket::convert_src_ip(transmit.src_ip, socket_is_v6),
+            };
+            let res = socket.try_io(Interest::WRITABLE, || {
+                state.send(UdpSockRef::from(&*socket), &converted)
+            });
+            match res {
+                Ok(()) => return Poll::Ready(Ok(())),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Poll::Ready(Err(e)),
             }
+        }
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        match (&self.v4_state, &self.v6_state) {
+            (Some(v4), Some(v6)) => v4.max_gso_segments().min(v6.max_gso_segments()).max(1),
+            (Some(v4), None) => v4.max_gso_segments().max(1),
+            (None, Some(v6)) => v6.max_gso_segments().max(1),
+            (None, None) => 1,
         }
     }
 }
