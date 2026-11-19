@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-20
+
+### Added
+
+- **Hybrid MASQUE relay data plane (ADR-016, ADR-020 Proposed; #372).**
+  `RelayForwardMode` (`Stream` default, `Hybrid`). In Hybrid, short-header
+  packets that fit go over QUIC DATAGRAM frames; QUIC Initial and large packets
+  stay on the length-prefixed stream. Hybrid is negotiated per relay session
+  (request flag bit 0x02, response flag bit 0x04); without both bits the session
+  uses the stream lane both ways. A message without the bits is byte-identical
+  to 0.28.0, and 0.28.0 peers ignore the bits. One datagram reader per
+  connection: while a hybrid session holds the lane, other `recv_datagrams`
+  readers on that connection get an error. No datagram lane below a payload
+  budget of 1200 + 32 B. Relay send and receive queues are bounded at 256
+  packets and drop like UDP.
+- **Relay to direct migration (`P2pConfig.migration`, `migration_coordinator()`,
+  `migration_stats()`).** `auto_migrate` defaults to **false**. A migration
+  succeeds only when a new direct connection to the same authenticated peer
+  becomes the live connection and the peer answers a probe on it.
+
+### Changed
+
+- **`connect_dual_stack` uses RFC 8305 Happy Eyeballs** (IPv6 first, 250 ms
+  stagger, the losing family is cancelled and closed). It returns one
+  connection; a timeout is now `EndpointError::Timeout`.
+- **`DualStackSocket` uses `quinn_udp::UdpSocketState`.** Wire-visible in the
+  default mode: real `may_fragment()` enables path-MTU probes above 1200 B, and
+  ECN and GSO/GRO are on. Standard QUIC; soak before fleet rollout.
+- **Breaking for struct-literal users:** new public fields on
+  `MasqueRelayConfig`, `NatTraversalConfig`, `NatConfig`, `P2pConfig`,
+  `ConnectUdpRequest` and `ConnectUdpResponse`.
+
 ## [0.28.0] - 2026-11-18
 
 0.28.0 is cut from master; 0.27.54–0.27.62 were cut from release/0.27.x branches whose fixes are all on master.
