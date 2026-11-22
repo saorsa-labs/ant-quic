@@ -8133,8 +8133,7 @@ impl NatTraversalEndpoint {
                 return None;
             }
             if response.datagram_mux_v1 {
-                claim.activate_mux_v1();
-                Some(claim)
+                claim.activate_mux_v1().then_some(claim)
             } else if claim.activate_legacy_hybrid() {
                 Some(claim)
             } else {

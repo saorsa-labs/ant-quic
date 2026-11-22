@@ -1226,13 +1226,35 @@ impl MasqueRelayServer {
         }
     }
 
-    /// Receive one UDP datagram from `socket`, capturing the OS ECN codepoint
-    /// via `quinn_udp::UdpSocketState` when available.
+    /// Split a received UDP buffer by Linux `UDP_GRO` `stride` so every
+    /// coalesced inner datagram is forwarded independently.
+    ///
+    /// When GRO is inactive (`stride == 0` or `stride >= total_len`), returns
+    /// a single datagram of length `total_len`.
+    pub(crate) fn split_gro_datagrams(buf: &[u8], total_len: usize, stride: usize) -> Vec<Bytes> {
+        let len = total_len.min(buf.len());
+        if len == 0 {
+            return Vec::new();
+        }
+        let step = if stride == 0 || stride >= len {
+            len
+        } else {
+            stride
+        };
+        buf[..len]
+            .chunks(step)
+            .map(Bytes::copy_from_slice)
+            .collect()
+    }
+
+    /// Receive one or more (when Linux `UDP_GRO` coalesces a burst) UDP
+    /// datagrams from `socket`, capturing the OS ECN codepoint via
+    /// `quinn_udp::UdpSocketState` when available and splitting by `stride`.
     async fn udp_recv_with_ecn(
         socket: &UdpSocket,
         udp_state: Option<&quinn_udp::UdpSocketState>,
         buf: &mut [u8],
-    ) -> std::io::Result<(usize, SocketAddr, Option<quinn_udp::EcnCodepoint>)> {
+    ) -> std::io::Result<Vec<(Bytes, SocketAddr, Option<quinn_udp::EcnCodepoint>)>> {
         if let Some(state) = udp_state {
             loop {
                 socket.readable().await?;
@@ -1243,11 +1265,13 @@ impl MasqueRelayServer {
                 });
                 match res {
                     Ok(n) if n > 0 => {
-                        return Ok((
-                            meta[0].len,
-                            normalize_socket_addr(meta[0].addr),
-                            meta[0].ecn,
-                        ));
+                        let source = normalize_socket_addr(meta[0].addr);
+                        let ecn = meta[0].ecn;
+                        let packets = Self::split_gro_datagrams(buf, meta[0].len, meta[0].stride)
+                            .into_iter()
+                            .map(|payload| (payload, source, ecn))
+                            .collect();
+                        return Ok(packets);
                     }
                     Ok(_) => continue,
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -1256,7 +1280,8 @@ impl MasqueRelayServer {
             }
         }
         let (len, source) = socket.recv_from(buf).await?;
-        Ok((len, normalize_socket_addr(source), None))
+        let source = normalize_socket_addr(source);
+        Ok(vec![(Bytes::copy_from_slice(&buf[..len]), source, None)])
     }
 
     /// Forward one UDP datagram to `target`, setting the OS IP ECN codepoint
@@ -1332,8 +1357,11 @@ impl MasqueRelayServer {
         let connection = lane.connection().clone();
         let mux_v1 = lane.is_mux_v1();
         let mut mux_rx = lane.take_datagram_rx();
-        let uncompressed_ctx =
-            Arc::new(AtomicU64::new(lane.uncompressed_context_id().into_inner()));
+        // Sentinel `u64::MAX` means client has not yet assigned an uncompressed
+        // Context ID via `CompressionAssign::uncompressed` (`mux_v1` client-only
+        // allocation rule; legacy 0.29.0 uses Context ID 0 immediately).
+        const UNASSIGNED_CTX: u64 = u64::MAX;
+        let uncompressed_ctx = Arc::new(AtomicU64::new(if mux_v1 { UNASSIGNED_CTX } else { 0 }));
         let lane = Arc::new(lane);
 
         let udp_socket = {
@@ -1398,129 +1426,139 @@ impl MasqueRelayServer {
             // Direction 1: UDP → Client (datagram lane for <= P_max short-header, stream lane otherwise)
             intact = async {
                 let mut buf = vec![0u8; 65536];
-                loop {
+                'recv_loop: loop {
                     match Self::udp_recv_with_ecn(&socket, udp_state_out.as_deref(), &mut buf).await {
-                        Ok((len, source, ecn)) => {
-                            let payload = Bytes::copy_from_slice(&buf[..len]);
-                            let mut sent_via_datagram = false;
-                            let mut sent_bytes = 0usize;
+                        Ok(packets) => {
+                            for (payload, source, ecn) in packets {
+                                let mut sent_via_datagram = false;
+                                let mut sent_bytes = 0usize;
 
-                            let active_comp = if mux_v1 {
-                                table_out.read().active_for_target(source)
-                            } else {
-                                None
-                            };
-                            if let Some((base_ctx, ecn_quad)) = active_comp {
-                                let ctx_id = if ecn_quad {
-                                    ecn_context_id(base_ctx, ecn)
+                                let active_comp = if mux_v1 {
+                                    table_out.read().active_for_target(source)
                                 } else {
-                                    base_ctx
+                                    None
                                 };
-                                let selected = select_relay_lane_with_overhead(
-                                    &payload,
-                                    ctx_id.size(),
-                                    conn_out.max_datagram_size(),
-                                    RelayForwardMode::Hybrid,
-                                );
-                                if selected == RelayLane::Datagram {
-                                    let encoded =
-                                        CompressedDatagram::new(ctx_id, payload.clone()).encode();
-                                    match conn_out.send_datagram(encoded.clone()) {
-                                        Ok(()) => {
-                                            sent_via_datagram = true;
-                                            sent_bytes = encoded.len();
+                                if let Some((base_ctx, ecn_quad)) = active_comp {
+                                    let ctx_id = if ecn_quad {
+                                        ecn_context_id(base_ctx, ecn)
+                                    } else {
+                                        base_ctx
+                                    };
+                                    let selected = select_relay_lane_with_overhead(
+                                        &payload,
+                                        ctx_id.size(),
+                                        conn_out.max_datagram_size(),
+                                        RelayForwardMode::Hybrid,
+                                    );
+                                    if selected == RelayLane::Datagram {
+                                        let encoded =
+                                            CompressedDatagram::new(ctx_id, payload.clone())
+                                                .encode();
+                                        match conn_out.send_datagram(encoded.clone()) {
+                                            Ok(()) => {
+                                                sent_via_datagram = true;
+                                                sent_bytes = encoded.len();
+                                            }
+                                            Err(
+                                                crate::high_level::SendDatagramError::TooLarge
+                                                | crate::high_level::SendDatagramError::UnsupportedByPeer
+                                                | crate::high_level::SendDatagramError::Disabled,
+                                            ) => {}
+                                            Err(
+                                                crate::high_level::SendDatagramError::ConnectionLost(
+                                                    e,
+                                                ),
+                                            ) => {
+                                                tracing::debug!(
+                                                    session_id,
+                                                    error = %e,
+                                                    "Hybrid relay: outer connection lost on compressed datagram send"
+                                                );
+                                                break 'recv_loop true;
+                                            }
                                         }
-                                        Err(
-                                            crate::high_level::SendDatagramError::TooLarge
-                                            | crate::high_level::SendDatagramError::UnsupportedByPeer
-                                            | crate::high_level::SendDatagramError::Disabled,
-                                        ) => {}
-                                        Err(crate::high_level::SendDatagramError::ConnectionLost(
-                                            e,
-                                        )) => {
-                                            tracing::debug!(
-                                                session_id,
-                                                error = %e,
-                                                "Hybrid relay: outer connection lost on compressed datagram send"
+                                    }
+                                } else {
+                                    let raw_u_ctx =
+                                        uncompressed_ctx_out.load(Ordering::Acquire);
+                                    if raw_u_ctx != UNASSIGNED_CTX
+                                        && let Ok(u_ctx) = VarInt::from_u64(raw_u_ctx)
+                                    {
+                                        let overhead =
+                                            uncompressed_datagram_header_overhead_for_ctx(
+                                                u_ctx, source,
                                             );
-                                            break true;
+                                        let selected = select_relay_lane_with_overhead(
+                                            &payload,
+                                            overhead,
+                                            conn_out.max_datagram_size(),
+                                            RelayForwardMode::Hybrid,
+                                        );
+                                        if selected == RelayLane::Datagram {
+                                            let encoded = UncompressedDatagram::new(
+                                                u_ctx,
+                                                source,
+                                                payload.clone(),
+                                            )
+                                            .encode();
+                                            match conn_out.send_datagram(encoded.clone()) {
+                                                Ok(()) => {
+                                                    sent_via_datagram = true;
+                                                    sent_bytes = encoded.len();
+                                                }
+                                                Err(
+                                                    crate::high_level::SendDatagramError::TooLarge
+                                                    | crate::high_level::SendDatagramError::UnsupportedByPeer
+                                                    | crate::high_level::SendDatagramError::Disabled,
+                                                ) => {}
+                                                Err(
+                                                    crate::high_level::SendDatagramError::ConnectionLost(
+                                                        e,
+                                                    ),
+                                                ) => {
+                                                    tracing::debug!(
+                                                        session_id,
+                                                        error = %e,
+                                                        "Hybrid relay: outer connection lost on datagram send"
+                                                    );
+                                                    break 'recv_loop true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            } else {
-                                let u_ctx = VarInt::from_u64(
-                                    uncompressed_ctx_out.load(Ordering::Relaxed),
-                                )
-                                .unwrap_or(VarInt::from_u32(0));
-                                let overhead =
-                                    uncompressed_datagram_header_overhead_for_ctx(u_ctx, source);
-                                let selected = select_relay_lane_with_overhead(
-                                    &payload,
-                                    overhead,
-                                    conn_out.max_datagram_size(),
-                                    RelayForwardMode::Hybrid,
-                                );
-                                if selected == RelayLane::Datagram {
+
+                                if !sent_via_datagram {
                                     let encoded = UncompressedDatagram::new(
-                                        u_ctx,
+                                        VarInt::from_u32(0),
                                         source,
-                                        payload.clone(),
+                                        payload,
                                     )
                                     .encode();
-                                    match conn_out.send_datagram(encoded.clone()) {
-                                        Ok(()) => {
-                                            sent_via_datagram = true;
-                                            sent_bytes = encoded.len();
-                                        }
-                                        Err(
-                                            crate::high_level::SendDatagramError::TooLarge
-                                            | crate::high_level::SendDatagramError::UnsupportedByPeer
-                                            | crate::high_level::SendDatagramError::Disabled,
-                                        ) => {}
-                                        Err(crate::high_level::SendDatagramError::ConnectionLost(
-                                            e,
-                                        )) => {
-                                            tracing::debug!(
-                                                session_id,
-                                                error = %e,
-                                                "Hybrid relay: outer connection lost on datagram send"
-                                            );
-                                            break true;
-                                        }
+                                    sent_bytes = encoded.len();
+                                    if let Err(e) = Self::write_stream_frame(
+                                        &send_stream_out,
+                                        &mid_frame_out,
+                                        &encoded,
+                                    )
+                                    .await
+                                    {
+                                        tracing::debug!(
+                                            session_id,
+                                            error = %e,
+                                            "Hybrid stream write error"
+                                        );
+                                        break 'recv_loop false;
                                     }
                                 }
-                            }
 
-                            if !sent_via_datagram {
-                                let encoded = UncompressedDatagram::new(
-                                    VarInt::from_u32(0),
-                                    source,
-                                    payload,
-                                )
-                                .encode();
-                                sent_bytes = encoded.len();
-                                if let Err(e) = Self::write_stream_frame(
-                                    &send_stream_out,
-                                    &mid_frame_out,
-                                    &encoded,
-                                )
-                                .await
-                                {
-                                    tracing::debug!(
-                                        session_id,
-                                        error = %e,
-                                        "Hybrid stream write error"
-                                    );
-                                    break false;
-                                }
+                                stats_out.record_bytes(sent_bytes as u64);
+                                stats_out.record_datagram();
                             }
-
-                            stats_out.record_bytes(sent_bytes as u64);
-                            stats_out.record_datagram();
                         }
                         Err(e) => {
                             tracing::debug!(session_id, error = %e, "Hybrid relay UDP recv error");
-                            break true;
+                            break 'recv_loop true;
                         }
                     }
                 }
@@ -1561,6 +1599,9 @@ impl MasqueRelayServer {
                     {
                         let reply = match capsule_res {
                             Ok(Capsule::EcnCompressionAssign(assign)) => {
+                                // T2 symmetric barrier: client sent a mux_v1 capsule
+                                // after receiving 0x08.
+                                lane_stream.confirm_peer_mux_v1_ready();
                                 let base = assign.context_id;
                                 let accepted = assign
                                     .target()
@@ -1583,11 +1624,16 @@ impl MasqueRelayServer {
                                 })
                             }
                             Ok(Capsule::CompressionAssign(assign)) => {
+                                // T2 symmetric barrier: client confirmed 0x08.
+                                lane_stream.confirm_peer_mux_v1_ready();
                                 let ctx = assign.context_id;
                                 let accepted = if assign.is_uncompressed() {
-                                    if lane_stream.register_remote_context(ctx) {
+                                    // Strictly at most ONE uncompressed ctx per session
+                                    // (replaces any previous registration; rejects odd/<2
+                                    // and enforces per-connection cap).
+                                    if lane_stream.register_remote_uncompressed_context(ctx) {
                                         uncompressed_ctx_stream
-                                            .store(ctx.into_inner(), Ordering::Relaxed);
+                                            .store(ctx.into_inner(), Ordering::Release);
                                         true
                                     } else {
                                         false
@@ -1624,6 +1670,14 @@ impl MasqueRelayServer {
                                     } else {
                                         lane_stream.unregister_context(close.context_id);
                                     }
+                                } else {
+                                    lane_stream.unregister_context(close.context_id);
+                                    let _ = uncompressed_ctx_stream.compare_exchange(
+                                        close.context_id.into_inner(),
+                                        UNASSIGNED_CTX,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    );
                                 }
                                 None
                             }
@@ -3009,7 +3063,7 @@ mod tests {
     /// while 1,200 B Initials and oversized packets (`> P_max`) still ride the
     /// stream lane.
     #[tokio::test]
-    async fn hybrid_session_over_budget_floor_falls_back_to_stream_lane() {
+    async fn hybrid_1200b_outer_mtu_uses_datagram_lane_and_spills_oversize_to_stream() {
         let relay =
             negotiated_relay(RelayForwardMode::Hybrid, RelayForwardMode::Hybrid, 1200).await;
         assert_eq!(relay.socket.forward_mode(), RelayForwardMode::Hybrid);
@@ -3041,8 +3095,84 @@ mod tests {
         assert_eq!(lane_counts(&relay.socket), (1, 1, 1, 1));
     }
 
+    /// ADR-020: when an outer path's datagram budget is strictly below the
+    /// `900 B` floor (e.g. a virtual outer path clamped at 900 B whose QUIC
+    /// `max_datagram_size` is ~850 B), hybrid falls back cleanly to the
+    /// reliable stream lane in both directions and still delivers every packet.
+    #[tokio::test]
+    async fn hybrid_session_below_900b_floor_falls_back_to_stream_lane() {
+        let mut transport = crate::config::TransportConfig::default();
+        transport.virtual_path_max_udp_payload_size(Some(900));
+        let transport = Arc::new(transport);
+
+        let (chain, key) = gen_self_signed_cert();
+        let mut server_cfg =
+            crate::config::ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
+        server_cfg.transport_config(Arc::clone(&transport));
+        let server_ep = crate::high_level::Endpoint::server(server_cfg, ([127, 0, 0, 1], 0).into())
+            .expect("server ep");
+        let addr = server_ep.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let inc = tokio::time::timeout(HYBRID_TEST_TIMEOUT, server_ep.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(HYBRID_TEST_TIMEOUT, inc)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        for c in chain {
+            roots.add(c).unwrap();
+        }
+        let mut client_cfg =
+            crate::config::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        client_cfg.transport_config(transport);
+        let mut client_ep =
+            crate::high_level::Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client ep");
+        client_ep.set_default_client_config(client_cfg);
+        let client_conn = tokio::time::timeout(
+            HYBRID_TEST_TIMEOUT,
+            client_ep.connect(addr, "localhost").expect("start"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let relay_conn = accept.await.unwrap();
+
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9000),
+        ));
+        let (socket, session_local) =
+            open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 19).await;
+        assert!(
+            crate::masque::compute_datagram_payload_budget_with_overhead(
+                client_conn.max_datagram_size(),
+                1
+            )
+            .is_none(),
+            "900 B outer MTU yields max_datagram_size < 900 B (below floor)"
+        );
+
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t_addr = target.local_addr().unwrap();
+        let out_pkt = short_header_packet(400, b"sub900-o");
+        let in_pkt = short_header_packet(400, b"sub900-i");
+        relay_send_to(&socket, t_addr, &out_pkt).await;
+        assert_eq!(target_recv_one(&target).await, out_pkt);
+        target.send_to(&in_pkt, session_local).await.unwrap();
+        assert_eq!(relay_recv_one(&socket).await, in_pkt);
+        assert_eq!(lane_counts(&socket), (0, 0, 1, 1));
+    }
+
     /// Helper: negotiate a `0.30.0+` `datagram_mux_v1` hybrid session over an
-    /// existing `(client_conn, relay_conn)` pair.
+    /// existing `(client_conn, relay_conn)` pair and let its initial
+    /// `CompressionAssign::uncompressed` handshake settle.
     async fn open_muxed_hybrid_session_for(
         server: &Arc<MasqueRelayServer>,
         client_conn: &crate::high_level::Connection,
@@ -3082,13 +3212,16 @@ mod tests {
 
         let answer = ConnectUdpResponse::decode(&mut read_frame(&mut client_recv).await).unwrap();
         assert!(answer.hybrid_datagram_lane && answer.datagram_mux_v1);
-        claim.activate_mux_v1();
+        assert!(claim.activate_mux_v1());
         let socket = crate::masque::MasqueRelaySocket::new_hybrid(
             claim,
             client_send,
             client_recv,
             session_local,
         );
+        // Allow the client's initial `CompressionAssign::uncompressed(u_ctx)` ->
+        // `CompressionAck` (T2 symmetric barrier) to complete on loopback.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         (socket, session_local)
     }
 
@@ -3460,5 +3593,266 @@ mod tests {
                 .negotiate_datagram_lane(&request, &relay_conn)
                 .is_some()
         );
+    }
+
+    /// Linux UDP_GRO regression guard: a coalesced buffer with `stride < total_len`
+    /// must be split into every constituent UDP datagram instead of forwarding
+    /// one fused blob.
+    #[test]
+    fn split_gro_datagram_chunks_preserves_every_coalesced_packet() {
+        let mut buf = Vec::with_capacity(2500);
+        buf.extend_from_slice(&vec![0x11u8; 1000]);
+        buf.extend_from_slice(&vec![0x22u8; 1000]);
+        buf.extend_from_slice(&vec![0x33u8; 500]);
+
+        let chunks = MasqueRelayServer::split_gro_datagrams(&buf, 2500, 1000);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 1000);
+        assert!(chunks[0].iter().all(|&b| b == 0x11));
+        assert_eq!(chunks[1].len(), 1000);
+        assert!(chunks[1].iter().all(|&b| b == 0x22));
+        assert_eq!(chunks[2].len(), 500);
+        assert!(chunks[2].iter().all(|&b| b == 0x33));
+
+        // Non-GRO (stride == 0 or stride >= total_len) yields one packet.
+        let single = MasqueRelayServer::split_gro_datagrams(&buf, 500, 0);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].len(), 500);
+    }
+
+    /// ADR-020 Blocker 1 regression guard: mutual relaying on ONE outer QUIC
+    /// connection (Peer A relays through Peer B AND Peer B relays through Peer A
+    /// simultaneously) uses disjoint side-partitioned Context IDs with zero
+    /// ctx-0 split-brain or cross-session injection.
+    #[tokio::test]
+    async fn mutual_relaying_on_one_connection_has_disjoint_contexts() {
+        let server_on_b = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9001),
+        ));
+        let server_on_a = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9002),
+        ));
+
+        let (conn_a, conn_b) = relay_loopback_pair_mtu(1452).await;
+
+        // Direction 1: A is relay client, B is relay server.
+        let (sock_a, local_b) =
+            open_muxed_hybrid_session_for(&server_on_b, &conn_a, &conn_b, 21).await;
+        // Direction 2 (on the EXACT SAME connection!): B is relay client, A is relay server.
+        let (sock_b, local_a) =
+            open_muxed_hybrid_session_for(&server_on_a, &conn_b, &conn_a, 22).await;
+
+        let target_for_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_for_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ta = target_for_a.local_addr().unwrap();
+        let tb = target_for_b.local_addr().unwrap();
+
+        let p_a_out = short_header_packet(96, b"fromA");
+        let p_b_out = short_header_packet(96, b"fromB");
+        relay_send_to(&sock_a, ta, &p_a_out).await;
+        relay_send_to(&sock_b, tb, &p_b_out).await;
+        assert_eq!(target_recv_one(&target_for_a).await, p_a_out);
+        assert_eq!(target_recv_one(&target_for_b).await, p_b_out);
+
+        let p_a_in = short_header_packet(80, b"to--A");
+        let p_b_in = short_header_packet(80, b"to--B");
+        target_for_a.send_to(&p_a_in, local_b).await.unwrap();
+        target_for_b.send_to(&p_b_in, local_a).await.unwrap();
+        assert_eq!(relay_recv_one(&sock_a).await, p_a_in);
+        assert_eq!(relay_recv_one(&sock_b).await, p_b_in);
+
+        assert!(sock_a.stats().datagrams_sent.load(Ordering::Relaxed) >= 1);
+        assert!(sock_b.stats().datagrams_sent.load(Ordering::Relaxed) >= 1);
+        assert!(sock_a.stats().datagrams_received.load(Ordering::Relaxed) >= 1);
+        assert!(sock_b.stats().datagrams_received.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// ADR-020 Blocker 1 regression guard: closing a mux_v1 session and
+    /// immediately opening a new session on the SAME outer connection routes
+    /// cleanly with zero stale Context ID mismatch, and recycles freed IDs.
+    #[tokio::test]
+    async fn session_reuse_after_close_uses_clean_explicit_context() {
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9000),
+        ));
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+
+        // Session 1: open, traffic both ways, then drop/close.
+        let (sock1, local1) =
+            open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 31).await;
+        let t1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pkt1 = short_header_packet(72, b"sess1");
+        relay_send_to(&sock1, t1.local_addr().unwrap(), &pkt1).await;
+        assert_eq!(target_recv_one(&t1).await, pkt1);
+        t1.send_to(&pkt1, local1).await.unwrap();
+        assert_eq!(relay_recv_one(&sock1).await, pkt1);
+        drop(sock1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Session 2 on the exact same outer connection: works cleanly on datagrams.
+        let (sock2, local2) =
+            open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 32).await;
+        let t2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pkt2 = short_header_packet(72, b"sess2");
+        relay_send_to(&sock2, t2.local_addr().unwrap(), &pkt2).await;
+        assert_eq!(target_recv_one(&t2).await, pkt2);
+        t2.send_to(&pkt2, local2).await.unwrap();
+        assert_eq!(relay_recv_one(&sock2).await, pkt2);
+        assert!(sock2.stats().datagrams_sent.load(Ordering::Relaxed) >= 1);
+        assert!(sock2.stats().datagrams_received.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// ADR-020 Blocker 4 + Should-fix (a): spamming uncompressed
+    /// `COMPRESSION_ASSIGN` capsules replaces the single per-session
+    /// uncompressed route (keeping `masque_routes` strictly bounded to 1), and
+    /// odd Context IDs (e.g. `3`) are rejected with `CompressionClose`.
+    #[tokio::test]
+    async fn uncompressed_compression_assign_spam_is_bounded_and_odd_ctx_rejected() {
+        use crate::masque::capsule::CompressionAssign;
+        use crate::masque::mux_registered_route_count;
+
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9000),
+        ));
+        let (session_id, session_local) = live_session_with_socket_for(&server, 41).await;
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+
+        let request = ConnectUdpRequest::bind_any()
+            .with_hybrid_datagram_lane(true)
+            .with_datagram_mux_v1(true);
+        let (mut client_send, mut client_recv) = client_conn.open_bi().await.unwrap();
+        write_frame(&mut client_send, &request.encode()).await;
+
+        let (mut relay_send, mut relay_recv) =
+            tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let received = ConnectUdpRequest::decode(&mut read_frame(&mut relay_recv).await).unwrap();
+        let lane = server
+            .negotiate_datagram_lane(&received, &relay_conn)
+            .expect("mux_v1 lane");
+        let response = ConnectUdpResponse::success(Some(session_local))
+            .with_hybrid_datagram_lane(true)
+            .with_datagram_mux_v1(true);
+        write_frame(&mut relay_send, &response.encode()).await;
+        let loop_server = Arc::clone(&server);
+        let relay_conn_check = relay_conn.clone();
+        tokio::spawn(async move {
+            loop_server
+                .run_negotiated_forwarding_loop(session_id, Some(lane), relay_send, relay_recv)
+                .await;
+        });
+        let _answer = ConnectUdpResponse::decode(&mut read_frame(&mut client_recv).await).unwrap();
+
+        // 1. Spam 50 distinct even uncompressed COMPRESSION_ASSIGN capsules.
+        for i in 1u32..=50 {
+            let ctx = VarInt::from_u32(i * 2);
+            let frame = Capsule::CompressionAssign(CompressionAssign::uncompressed(ctx))
+                .encode_stream_frame();
+            write_frame(&mut client_send, &frame).await;
+            let reply_bytes = read_frame(&mut client_recv).await;
+            let reply = Capsule::decode_stream_frame(&reply_bytes)
+                .expect("capsule reply")
+                .expect("valid decode");
+            assert!(
+                matches!(reply, Capsule::CompressionAck(ref ack) if ack.context_id == ctx),
+                "expected CompressionAck({ctx}), got {reply:?}"
+            );
+        }
+        assert_eq!(
+            mux_registered_route_count(&relay_conn_check),
+            1,
+            "relay must keep strictly ONE uncompressed route per session"
+        );
+
+        // 2. Odd Context ID (3) must be rejected with CompressionClose.
+        let odd_ctx = VarInt::from_u32(3);
+        let odd_frame = Capsule::CompressionAssign(CompressionAssign::uncompressed(odd_ctx))
+            .encode_stream_frame();
+        write_frame(&mut client_send, &odd_frame).await;
+        let odd_reply_bytes = read_frame(&mut client_recv).await;
+        let odd_reply = Capsule::decode_stream_frame(&odd_reply_bytes)
+            .expect("capsule reply")
+            .expect("valid decode");
+        assert!(
+            matches!(odd_reply, Capsule::CompressionClose(ref c) if c.context_id == odd_ctx),
+            "odd Context ID must be rejected with CompressionClose, got {odd_reply:?}"
+        );
+        assert_eq!(mux_registered_route_count(&relay_conn_check), 1);
+    }
+
+    /// ADR-020 Blocker 3 regression guard: once hard mux_v1 is active on a
+    /// connection, unknown/closed Context ID frames are dropped and counted in
+    /// `mux_unknown_ctx_dropped` and NEVER leak raw into `LinkConn` app
+    /// subscribers; app datagrams continue arriving cleanly even after the
+    /// relay session closes (sticky mux_v1 eliminates teardown asymmetry).
+    #[tokio::test]
+    async fn hard_mux_drops_unknown_ctx_without_leaking_to_app_subscribers() {
+        use crate::masque::mux_unknown_ctx_dropped;
+        use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
+
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9000),
+        ));
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+
+        let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
+        let mut relay_app_rx = open_app_datagram_channel(&relay_conn).expect("relay app rx");
+
+        let (sock, _local) =
+            open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 51).await;
+
+        // Inject a raw QUIC datagram carrying an unknown/unregistered Context ID (62).
+        let before_drops = mux_unknown_ctx_dropped(&relay_conn);
+        client_conn
+            .send_datagram(Bytes::from_static(&[62u8, b's', b't', b'a', b'l', b'e']))
+            .expect("send unknown ctx");
+
+        // Follow with a legitimate app datagram: the app subscriber must receive
+        // ONLY the app datagram (not the unknown ctx frame!).
+        let app_msg = Bytes::from_static(&[0x00, 0x04, b'v', b'o', b'i', b'c', b'e']);
+        send_app_datagram(&client_conn, app_msg.clone()).expect("send app");
+        let got = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
+            .await
+            .expect("app recv timeout")
+            .expect("app msg");
+        assert_eq!(got, app_msg, "unknown ctx must never leak into app channel");
+        assert!(
+            mux_unknown_ctx_dropped(&relay_conn) > before_drops,
+            "unknown ctx drop must be counted"
+        );
+
+        // Close the relay session and confirm app datagrams STILL stay symmetric
+        // both ways (sticky mux_v1 prevents teardown corruption!).
+        drop(sock);
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let after_close = Bytes::from_static(b"post-teardown-voice");
+        send_app_datagram(&relay_conn, after_close.clone()).expect("relay -> client post-close");
+        let got_client = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("client app recv timeout")
+            .expect("client app msg");
+        assert_eq!(got_client, after_close);
     }
 }

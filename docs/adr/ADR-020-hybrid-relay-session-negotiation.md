@@ -68,55 +68,83 @@ the "direct" result, and migration reported success without migrating.
    when `DATAGRAM_MUX_V1` is negotiated).**
    - A single per-connection `DatagramMux` reader task owns `Connection::read_datagram()` and
      dispatches frames by leading QUIC `VarInt` Context ID:
-     - **Context ID `0` (even):** legacy uncompressed MASQUE datagrams (primary session, 0.29.0
-       compat).
-     - **Even Context IDs `>= 2`:** allocated disjointly per connection by `DatagramMux` for
-       compressed MASQUE target contexts (and dedicated uncompressed contexts via
-       `CompressionAssign::uncompressed` for additional hybrid sessions on the same connection).
+     - **Context ID `0` (even):** reserved exclusively for legacy `0.29.0` non-muxed hybrid
+       sessions (`0x02` without `0x04`); NEVER used by `DATAGRAM_MUX_V1` sessions.
+     - **Client-allocated even Context IDs `>= 2` (disjoint per QUIC side):** ONLY the relay
+       client allocates Context IDs (the relay server never self-allocates). To keep mutual
+       relaying on one outer connection collision-free, `Side::Client` allocates 8-ID blocks
+       `{2..=8, 18..=24, ...}` and `Side::Server` allocates `{10..=16, 26..=32, ...}`, recycling
+       freed blocks on session/target close so wire IDs stay `1–2 B`. Each `mux_v1` session
+       registers strictly **one** uncompressed Context ID via `CompressionAssign::uncompressed`
+       (re-assigning replaces and unregisters the previous one), plus up to `max_targets` (256)
+       compressed 4-context ECN quads; total routes per connection are hard-capped at
+       `MAX_MUX_ROUTES_PER_CONNECTION = 2048` and odd Context IDs are rejected with
+       `CompressionClose`.
      - **Odd Context ID `1` (`APP_DATAGRAM_CONTEXT_ID`):** multiplexed application datagrams
        (`LinkConn::send_datagram` / `LinkConn::recv_datagrams`, such as x0x voice), disjoint from
-       RFC 9298 even MASQUE Context IDs.
+       even MASQUE Context IDs.
+   - **Symmetric sticky activation (T0→T1→T2) & hard unknown-ctx drop:**
+     - T0 (relay accepts `0x04`): relay arms `mux_v1_rx_ready` (does not prefix outbound app
+       datagrams yet).
+     - T1 (client receives `0x08`): client arms `mux_v1_rx_ready` and `mux_v1_tx_prefix`, and
+       sends `CompressionAssign::uncompressed(u_ctx)` on the stream.
+     - T2 (relay receives client's `CompressionAssign`): relay arms `mux_v1_tx_prefix` and
+       replies `CompressionAck(u_ctx)`.
+     - Once armed, `mux_v1_rx_ready`/`mux_v1_tx_prefix` are sticky for the remainder of the outer
+       connection's lifetime (eliminating teardown asymmetry). In confirmed hard-mux mode, any
+       frame with an unknown or closed Context ID is dropped and counted (`mux_unknown_ctx_dropped`)
+       and never passed raw to app subscribers.
    - When `DATAGRAM_MUX_V1` is NOT active on a connection (direct peer connections, 0.28.0/0.29.0
      peers), `LinkConn::send_datagram` and `recv_datagrams` carry raw unprefixed bytes (100%
-     backward compatible).
+     backward compatible). Note: raw `Connection::send_datagram` remains a low-level transport
+     primitive and bypasses `APP_DATAGRAM_CONTEXT_ID` framing; callers sharing a connection with
+     `DATAGRAM_MUX_V1` should send application datagrams via `LinkConn::send_datagram`.
    - For legacy 0.29.0 hybrid sessions (`0x02` without `0x04`), the exclusive single-reader claim
      is retained so a 0.29.0 peer cannot suffer packet theft with `LinkConn::recv_datagrams`.
 3. **`COMPRESSION_ASSIGN` socket data plane & `draft-seemann-masque-connect-udp-ecn-01` ECN
    propagation (when `DATAGRAM_MUX_V1` is negotiated).**
    - On the relay bidirectional stream, data frames remain `[4 B BE len][UncompressedDatagram]`
      (starting with Context ID `0x00`), while control capsules are framed as
-     `[4 B BE len][0xFF][Capsule]` (never sent to 0.28.0/0.29.0 peers).
-   - On first outbound packet to a target, the client allocates 4 consecutive even Context IDs
-     `{base, base+2, base+4, base+6}` from `DatagramMux` and sends
-     `Capsule::EcnCompressionAssign (0x14)` on the stream while forwarding the first packet
-     uncompressed (zero head-of-line stall). Once `Capsule::CompressionAck(base)` arrives, both
-     sides switch that target to `CompressedDatagram` (`[Context ID (1–2 B)][Payload]`):
+     `[4 B BE len][0xFF][Capsule]` with exact body consumption (trailing bytes rejected; never
+     sent to 0.28.0/0.29.0 peers).
+   - At session start, the client sends `CompressionAssign::uncompressed(u_ctx)` and waits for
+     `CompressionAck(u_ctx)` before sending uncompressed datagrams (packets sent pre-ACK ride the
+     stream lane with zero loss). On first outbound packet to a target, the client allocates 4
+     consecutive even Context IDs `{base, base+2, base+4, base+6}` from its side's disjoint pool
+     and sends `Capsule::EcnCompressionAssign (0x14)` on the stream. Once
+     `Capsule::CompressionAck(base)` arrives, both sides switch that target to
+     `CompressedDatagram` (`[Context ID (1–2 B)][Payload]`):
      - `base + 0`: `Not-ECT`
      - `base + 2`: `ECT(0)`
      - `base + 4`: `ECT(1)`
      - `base + 6`: `CE`
-   - Per-packet relay overhead drops from `8 B` (IPv4) / `20 B` (IPv6) to `1 B` (first 7 targets,
-     IDs `2..=62`) or `2 B` (up to 2,047 targets, IDs `64..=16382`), while propagating inner ECN
-     (`Transmit.ecn` / `RecvMeta.ecn`) end-to-end with **0 extra bytes** per packet.
+   - Per-packet relay overhead drops from `8 B` (IPv4) / `20 B` (IPv6) to `1–2 B`, while
+     propagating inner ECN (`Transmit.ecn` / `RecvMeta.ecn`) end-to-end via
+     `quinn_udp::UdpSocketState` (splitting Linux `UDP_GRO` `stride`-coalesced bursts into
+     individual datagrams) at **0 extra bytes** per packet.
 4. **Supersedes ADR-016 Decision 3 — `900 B` `P_max` floor, transport-layer sub-1200 virtual-path
    MTU clamp, locked DPLPMTUD, and inner `PATH_CHALLENGE` rule.**
    - **Floor lowered from `1,232 B` to `900 B`:** `MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET = 900`.
      `P_max = max_datagram_size(outer) - active_encapsulation_header_len` (`1–2 B` compressed,
      `8 B` v4 / `20 B` v6 uncompressed). On a 1,280 B IPv6 / WireGuard / Cloudflare WARP path
-     (`max_datagram_size(outer) ≈ 1,180–1,192 B`), `P_max` is ~1,178–1,191 B (compressed) or
-     ~1,160–1,184 B (uncompressed), clearing `900 B` so hybrid uses the datagram lane instead of
-     silently degrading to stream-only TCP-over-TCP.
+     (`max_datagram_size(outer) ≈ 1,180–1,192 B`), `P_max` clears `900 B` so hybrid uses the
+     datagram lane instead of silently degrading to stream-only TCP-over-TCP.
    - **Transport-layer virtual-path sub-1200 MTU floor exemption:** Standard physical paths keep
      the `INITIAL_MTU = 1200` hard floor in `TransportConfig::initial_mtu` / `min_mtu`. Relayed
      virtual paths opt into `TransportConfig::virtual_path_max_udp_payload_size(Some(clamped))`
-     (floor `MIN_VIRTUAL_PATH_MTU = 900`), where `clamped = min(P_max, 1380)`:
+     (floor `MIN_VIRTUAL_PATH_MTU = 900`), where `clamped = min(P_max, 1380)` is computed from
+     the outer connection's datagram budget at shared relay endpoint creation (static clamp for
+     `0.30.0`; if outer MTU shrinks mid-session, live per-packet `conn.max_datagram_size()` checks
+     fall back safely to the stream lane; dynamic mid-session inner re-clamping is deferred to
+     Wave 4's unified socket ADR):
      1. Inner Initial packets (`SpaceId::Initial`) still pad to `MIN_INITIAL_SIZE = 1200 B` per
         RFC 9000 §14.1 (and remote endpoints accept them) because MASQUE routes all Initials on the
         reliable stream lane.
      2. Once Initial keys are discarded, all post-handshake 1-RTT (`SpaceId::Data`) packets are
         clamped to `clamped` and inner DPLPMTUD is locked at `clamped` (never probing above the
-        outer datagram budget). Result: **0% steady-state stream-lane spill** and no steady-state
-        cross-lane packet reordering; RFC 9002 handles the Initial→1-RTT transition natively.
+        outer datagram budget). Result: **0% steady-state stream-lane spill** at the creation-time
+        outer MTU and no steady-state cross-lane packet reordering; RFC 9002 handles the
+        Initial→1-RTT transition natively.
      3. **Inner `PATH_CHALLENGE` / `PATH_RESPONSE` rule (RFC 9000 §8.2.1):** Datagrams carrying
         `PATH_CHALLENGE` or `PATH_RESPONSE` retain their `1200 B` RFC 9000 §8.2.1 padding. When
         `1200 > P_max` on a sub-1200 virtual MASQUE path, `select_relay_lane` routes them over the
@@ -175,12 +203,17 @@ the "direct" result, and migration reported success without migrating.
 - `src/masque/relay_server.rs`: `hybrid_server_stream_client_uses_stream_lane_both_directions`,
   `hybrid_server_hybrid_client_uses_datagram_lane_both_directions`,
   `stream_server_hybrid_client_uses_stream_lane_both_directions`,
+  `hybrid_1200b_outer_mtu_uses_datagram_lane_and_spills_oversize_to_stream`,
   `hybrid_session_below_900b_floor_falls_back_to_stream_lane`,
   `hybrid_1280b_outer_mtu_uses_datagram_lane_with_compression_and_ecn`,
   `muxed_hybrid_and_link_datagrams_coexist_on_same_connection`,
+  `virtual_path_sub_1200_mtu_clamps_1rtt_while_preserving_1200b_initial`,
+  `split_gro_datagram_chunks_preserves_every_coalesced_packet`,
+  `mutual_relaying_on_one_connection_has_disjoint_contexts`,
+  `session_reuse_after_close_uses_clean_explicit_context`,
+  `uncompressed_compression_assign_spam_is_bounded_and_odd_ctx_rejected`,
+  `hard_mux_drops_unknown_ctx_without_leaking_to_app_subscribers`,
   `one_hybrid_session_per_connection_is_enforced` (legacy 0.29.0 compat).
-- `src/config/transport.rs` / `src/connection/mod.rs`:
-  `virtual_path_sub_1200_mtu_clamps_1rtt_while_preserving_1200b_initial`.
 - `src/p2p_endpoint.rs` (`relay_migration_372`):
   `migration_probe_never_reports_success_on_relay_only_path`,
   `migration_switches_to_new_direct_connection_and_retires_relay`,

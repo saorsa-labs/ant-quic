@@ -282,29 +282,41 @@ impl Capsule {
             return Err(coding::UnexpectedEnd);
         }
 
-        match capsule_type.into_inner() {
+        let mut body = vec![0u8; length_usize];
+        buf.copy_to_slice(&mut body);
+        let mut body_slice = body.as_slice();
+
+        let decoded = match capsule_type.into_inner() {
             CAPSULE_COMPRESSION_ASSIGN => {
-                let capsule = CompressionAssign::decode(buf)?;
-                Ok(Capsule::CompressionAssign(capsule))
+                let capsule = CompressionAssign::decode(&mut body_slice)?;
+                Capsule::CompressionAssign(capsule)
             }
             CAPSULE_COMPRESSION_ACK => {
-                let capsule = CompressionAck::decode(buf)?;
-                Ok(Capsule::CompressionAck(capsule))
+                let capsule = CompressionAck::decode(&mut body_slice)?;
+                Capsule::CompressionAck(capsule)
             }
             CAPSULE_COMPRESSION_CLOSE => {
-                let capsule = CompressionClose::decode(buf)?;
-                Ok(Capsule::CompressionClose(capsule))
+                let capsule = CompressionClose::decode(&mut body_slice)?;
+                Capsule::CompressionClose(capsule)
             }
             CAPSULE_ECN_COMPRESSION_ASSIGN => {
-                let capsule = CompressionAssign::decode(buf)?;
-                Ok(Capsule::EcnCompressionAssign(capsule))
+                let capsule = CompressionAssign::decode(&mut body_slice)?;
+                Capsule::EcnCompressionAssign(capsule)
             }
             _ => {
-                let mut data = vec![0u8; length_usize];
-                buf.copy_to_slice(&mut data);
-                Ok(Capsule::Unknown { capsule_type, data })
+                return Ok(Capsule::Unknown {
+                    capsule_type,
+                    data: body,
+                });
             }
+        };
+
+        // Exact body consumption: reject capsules whose declared length leaves
+        // unconsumed trailing bytes.
+        if !body_slice.is_empty() {
+            return Err(coding::UnexpectedEnd);
         }
+        Ok(decoded)
     }
 
     /// Encode a capsule to a buffer
@@ -378,13 +390,20 @@ impl Capsule {
     /// Decode a relay-stream frame body if it begins with [`STREAM_CAPSULE_MARKER`].
     ///
     /// Returns `None` if the frame does not start with `STREAM_CAPSULE_MARKER`
-    /// (i.e. it is a regular data frame).
+    /// (i.e. it is a regular data frame). Rejects trailing bytes after the
+    /// capsule body (exact frame consumption).
     pub fn decode_stream_frame(frame: &[u8]) -> Option<coding::Result<Self>> {
         if frame.first() != Some(&STREAM_CAPSULE_MARKER) {
             return None;
         }
         let mut slice = &frame[1..];
-        Some(Self::decode(&mut slice))
+        Some(Self::decode(&mut slice).and_then(|capsule| {
+            if slice.is_empty() {
+                Ok(capsule)
+            } else {
+                Err(coding::UnexpectedEnd)
+            }
+        }))
     }
 }
 
@@ -527,5 +546,15 @@ mod tests {
 
         // Legacy UncompressedDatagram starts with 0x00, not STREAM_CAPSULE_MARKER.
         assert!(Capsule::decode_stream_frame(&[0x00, 0x04, 127, 0, 0, 1, 0, 80]).is_none());
+
+        // Exact body consumption: trailing garbage bytes after the capsule are rejected.
+        let mut trailing = framed_v4.to_vec();
+        trailing.push(0xAA);
+        assert!(
+            Capsule::decode_stream_frame(&trailing)
+                .expect("marker present")
+                .is_err(),
+            "stream capsule with trailing bytes must fail closed"
+        );
     }
 }

@@ -131,10 +131,12 @@ pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, Rel
 pub use relay_socket::{
     APP_DATAGRAM_CONTEXT_ID, DEFAULT_MAX_COMPRESSED_TARGETS, DEFAULT_RELAY_RECV_QUEUE_CAPACITY,
     DEFAULT_RELAY_SEND_QUEUE_CAPACITY, DatagramLaneClaim, DatagramLaneError, ECN_CONTEXT_STRIDE,
-    MAX_INNER_RELAY_UDP_PAYLOAD_SIZE, MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET, MasqueRelaySocket,
-    MasqueRelaySocketStats, QUIC_INITIAL_MIN_SIZE, RELAY_DATAGRAM_BUDGET_MARGIN, RelayForwardMode,
-    RelayLane, compute_datagram_payload_budget, compute_datagram_payload_budget_with_overhead,
-    compute_inner_virtual_path_mtu, decode_ecn_offset, ecn_context_id, is_quic_initial_packet,
-    select_relay_lane, select_relay_lane_with_overhead, uncompressed_datagram_header_overhead,
-    uncompressed_datagram_header_overhead_for_ctx,
+    MAX_INNER_RELAY_UDP_PAYLOAD_SIZE, MAX_MUX_ROUTES_PER_CONNECTION,
+    MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET, MasqueRelaySocket, MasqueRelaySocketStats,
+    QUIC_INITIAL_MIN_SIZE, RELAY_DATAGRAM_BUDGET_MARGIN, RelayForwardMode, RelayLane,
+    SIDE_BLOCK_STRIDE, compute_datagram_payload_budget,
+    compute_datagram_payload_budget_with_overhead, compute_inner_virtual_path_mtu,
+    decode_ecn_offset, ecn_context_id, is_quic_initial_packet, mux_registered_route_count,
+    mux_unknown_ctx_dropped, select_relay_lane, select_relay_lane_with_overhead,
+    uncompressed_datagram_header_overhead, uncompressed_datagram_header_overhead_for_ctx,
 };
