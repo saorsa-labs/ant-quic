@@ -346,7 +346,9 @@ impl RelaySession {
         self.stats.record_capsule();
 
         match capsule {
-            Capsule::CompressionAssign(assign) => self.handle_compression_assign(assign),
+            Capsule::CompressionAssign(assign) | Capsule::EcnCompressionAssign(assign) => {
+                self.handle_compression_assign(assign)
+            }
             Capsule::CompressionAck(ack) => self.handle_compression_ack(ack),
             Capsule::CompressionClose(close) => self.handle_compression_close(close),
             Capsule::Unknown { capsule_type, .. } => {

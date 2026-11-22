@@ -639,7 +639,14 @@ impl Connection {
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
         // packets, this can be earlier than the start of the current QUIC packet.
         let mut datagram_start = 0;
+        // ADR-020: on a sub-1200 virtual path (e.g. hybrid MASQUE over a 1,280 B outer link),
+        // Initial datagrams must still be able to pad to MIN_INITIAL_SIZE (1200 B, RFC 9000 §14.1)
+        // — MASQUE routes Initials on its reliable stream lane. Once Initial keys are discarded,
+        // 1-RTT packets use the clamped `self.path.current_mtu()` so they stay on the datagram lane.
         let mut segment_size = usize::from(self.path.current_mtu());
+        if self.spaces[SpaceId::Initial].crypto.is_some() {
+            segment_size = segment_size.max(usize::from(MIN_INITIAL_SIZE));
+        }
 
         // Check for NAT traversal coordination timeouts
         if let Some(nat_traversal) = &mut self.nat_traversal {
@@ -1154,7 +1161,7 @@ impl Connection {
                 !(sent.is_ack_only(&self.streams)
                     && !can_send.acks
                     && can_send.other
-                    && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
+                    && (buf_capacity - builder.datagram_start) == segment_size
                     && self.datagrams.outgoing.is_empty()),
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );

@@ -28,7 +28,9 @@ use crate::{
 };
 
 mod transport;
-pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+pub use transport::{
+    AckFrequencyConfig, IdleTimeout, MIN_VIRTUAL_PATH_MTU, MtuDiscoveryConfig, TransportConfig,
+};
 
 pub mod nat_timeouts;
 

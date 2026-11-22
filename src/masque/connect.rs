@@ -86,6 +86,18 @@ pub const REQUEST_FLAG_BIND: u8 = 0x01;
 /// [`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`] in its answer.
 pub const REQUEST_FLAG_HYBRID_DATAGRAM_LANE: u8 = 0x02;
 
+/// Request flag bit (ADR-020 / ant-quic 0.30.0): the client supports RFC 9297
+/// Context-ID datagram demultiplexing (`DatagramMux`), stream-carried
+/// `COMPRESSION_ASSIGN` / `ECN_COMPRESSION_ASSIGN` capsules, and 4-context ECN
+/// mapping (`draft-seemann-masque-connect-udp-ecn-01`).
+///
+/// Decoders before 0.30.0 ignore this bit. When another datagram reader (e.g.
+/// `LinkConn::recv_datagrams`) is already active on the outer connection, a
+/// 0.30.0+ client sets this bit WITHOUT [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`]
+/// so a 0.29.0 relay falls back cleanly to stream-only while a 0.30.0+ relay
+/// accepts muxed hybrid.
+pub const REQUEST_FLAG_DATAGRAM_MUX_V1: u8 = 0x04;
+
 /// Response flag bit: a public address follows.
 pub const RESPONSE_FLAG_HAS_ADDRESS: u8 = 0x01;
 
@@ -93,12 +105,20 @@ pub const RESPONSE_FLAG_HAS_ADDRESS: u8 = 0x01;
 pub const RESPONSE_FLAG_HAS_REASON: u8 = 0x02;
 
 /// Response flag bit (ADR-016 hybrid signal): the relay accepted the
-/// client's [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`] for this session. Both
-/// ends then read and may send on the QUIC `DATAGRAM` lane.
+/// client's [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`] (or
+/// [`REQUEST_FLAG_DATAGRAM_MUX_V1`]) for this session. Both ends then read and
+/// may send on the QUIC `DATAGRAM` lane.
 ///
-/// A relay sets it only in answer to a request that carried the request
-/// bit, so a client before 0.29.0 never receives it.
+/// A relay sets it only in answer to a request that carried a hybrid bit, so a
+/// client before 0.29.0 never receives it.
 pub const RESPONSE_FLAG_HYBRID_DATAGRAM_LANE: u8 = 0x04;
+
+/// Response flag bit (ADR-020 / ant-quic 0.30.0): the relay accepted
+/// [`REQUEST_FLAG_DATAGRAM_MUX_V1`] for this session (RFC 9297 Context-ID
+/// demultiplexing, compressed datagrams, and ECN propagation).
+///
+/// Only set in answer to a request carrying [`REQUEST_FLAG_DATAGRAM_MUX_V1`].
+pub const RESPONSE_FLAG_DATAGRAM_MUX_V1: u8 = 0x08;
 
 /// Errors that can occur during CONNECT-UDP processing
 #[derive(Debug, Error)]
@@ -148,6 +168,12 @@ pub struct ConnectUdpRequest {
     /// Encoded as request flag bit [`REQUEST_FLAG_HYBRID_DATAGRAM_LANE`].
     /// Peers before 0.29.0 never set it, and their decoders ignore it.
     pub hybrid_datagram_lane: bool,
+    /// ADR-020 per-session RFC 9297 Context-ID `DatagramMux` + compression +
+    /// ECN signal (ant-quic 0.30.0+).
+    ///
+    /// Encoded as request flag bit [`REQUEST_FLAG_DATAGRAM_MUX_V1`].
+    /// Peers before 0.30.0 never set it, and their decoders ignore it.
+    pub datagram_mux_v1: bool,
 }
 
 impl ConnectUdpRequest {
@@ -161,6 +187,7 @@ impl ConnectUdpRequest {
             target_port: BIND_ANY_PORT,
             connect_udp_bind: true,
             hybrid_datagram_lane: false,
+            datagram_mux_v1: false,
         }
     }
 
@@ -174,6 +201,7 @@ impl ConnectUdpRequest {
             target_port: port,
             connect_udp_bind: true,
             hybrid_datagram_lane: false,
+            datagram_mux_v1: false,
         }
     }
 
@@ -187,6 +215,7 @@ impl ConnectUdpRequest {
             target_port: addr.port(),
             connect_udp_bind: false,
             hybrid_datagram_lane: false,
+            datagram_mux_v1: false,
         }
     }
 
@@ -195,6 +224,14 @@ impl ConnectUdpRequest {
     #[must_use]
     pub fn with_hybrid_datagram_lane(mut self, hybrid: bool) -> Self {
         self.hybrid_datagram_lane = hybrid;
+        self
+    }
+
+    /// Set the ADR-020 Context-ID `DatagramMux` + compression + ECN signal on
+    /// this request (see [`Self::datagram_mux_v1`]).
+    #[must_use]
+    pub fn with_datagram_mux_v1(mut self, mux_v1: bool) -> Self {
+        self.datagram_mux_v1 = mux_v1;
         self
     }
 
@@ -240,13 +277,17 @@ impl ConnectUdpRequest {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
-        // Flags byte: bit 0 = connect_udp_bind, bit 1 = ADR-016 hybrid signal
+        // Flags byte: bit 0 = connect_udp_bind, bit 1 = ADR-016 hybrid signal,
+        // bit 2 = ADR-020 datagram_mux_v1
         let mut flags: u8 = 0;
         if self.connect_udp_bind {
             flags |= REQUEST_FLAG_BIND;
         }
         if self.hybrid_datagram_lane {
             flags |= REQUEST_FLAG_HYBRID_DATAGRAM_LANE;
+        }
+        if self.datagram_mux_v1 {
+            flags |= REQUEST_FLAG_DATAGRAM_MUX_V1;
         }
         buf.put_u8(flags);
 
@@ -272,6 +313,7 @@ impl ConnectUdpRequest {
         let flags = buf.get_u8();
         let connect_udp_bind = (flags & REQUEST_FLAG_BIND) != 0;
         let hybrid_datagram_lane = (flags & REQUEST_FLAG_HYBRID_DATAGRAM_LANE) != 0;
+        let datagram_mux_v1 = (flags & REQUEST_FLAG_DATAGRAM_MUX_V1) != 0;
 
         let host_len = VarInt::decode(buf)
             .map_err(|_| ConnectError::InvalidRequest("invalid host length".into()))?;
@@ -295,6 +337,7 @@ impl ConnectUdpRequest {
             target_port,
             connect_udp_bind,
             hybrid_datagram_lane,
+            datagram_mux_v1,
         })
     }
 }
@@ -330,6 +373,11 @@ pub struct ConnectUdpResponse {
     ///
     /// Encoded as response flag bit [`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`].
     pub hybrid_datagram_lane: bool,
+    /// ADR-020 per-session RFC 9297 Context-ID `DatagramMux` + compression +
+    /// ECN acceptance (ant-quic 0.30.0+).
+    ///
+    /// Encoded as response flag bit [`RESPONSE_FLAG_DATAGRAM_MUX_V1`].
+    pub datagram_mux_v1: bool,
 }
 
 impl ConnectUdpResponse {
@@ -351,6 +399,7 @@ impl ConnectUdpResponse {
             proxy_public_address: public_addr,
             reason: None,
             hybrid_datagram_lane: false,
+            datagram_mux_v1: false,
         }
     }
 
@@ -362,6 +411,14 @@ impl ConnectUdpResponse {
         self
     }
 
+    /// Set the ADR-020 Context-ID `DatagramMux` + compression + ECN acceptance
+    /// on this response (see [`Self::datagram_mux_v1`]).
+    #[must_use]
+    pub fn with_datagram_mux_v1(mut self, mux_v1: bool) -> Self {
+        self.datagram_mux_v1 = mux_v1;
+        self
+    }
+
     /// Create an error response
     pub fn error(status: u16, reason: impl Into<String>) -> Self {
         Self {
@@ -369,6 +426,7 @@ impl ConnectUdpResponse {
             proxy_public_address: None,
             reason: Some(reason.into()),
             hybrid_datagram_lane: false,
+            datagram_mux_v1: false,
         }
     }
 
@@ -437,7 +495,8 @@ impl ConnectUdpResponse {
         buf.put_u16(self.status);
 
         // Flags: bit 0 = has address, bit 1 = has reason,
-        // bit 2 = ADR-016 hybrid signal accepted
+        // bit 2 = ADR-016 hybrid signal accepted,
+        // bit 3 = ADR-020 datagram_mux_v1 accepted
         let mut flags: u8 = 0;
         if self.proxy_public_address.is_some() {
             flags |= RESPONSE_FLAG_HAS_ADDRESS;
@@ -447,6 +506,9 @@ impl ConnectUdpResponse {
         }
         if self.hybrid_datagram_lane {
             flags |= RESPONSE_FLAG_HYBRID_DATAGRAM_LANE;
+        }
+        if self.datagram_mux_v1 {
+            flags |= RESPONSE_FLAG_DATAGRAM_MUX_V1;
         }
         buf.put_u8(flags);
 
@@ -488,6 +550,7 @@ impl ConnectUdpResponse {
         let has_addr = (flags & RESPONSE_FLAG_HAS_ADDRESS) != 0;
         let has_reason = (flags & RESPONSE_FLAG_HAS_REASON) != 0;
         let hybrid_datagram_lane = (flags & RESPONSE_FLAG_HYBRID_DATAGRAM_LANE) != 0;
+        let datagram_mux_v1 = (flags & RESPONSE_FLAG_DATAGRAM_MUX_V1) != 0;
 
         let proxy_public_address = if has_addr {
             if buf.remaining() < 1 {
@@ -543,6 +606,7 @@ impl ConnectUdpResponse {
             proxy_public_address,
             reason,
             hybrid_datagram_lane,
+            datagram_mux_v1,
         })
     }
 }
@@ -765,5 +829,60 @@ mod tests {
         assert_eq!(decoded.proxy_public_address, Some(addr));
         let decoded_legacy = ConnectUdpResponse::decode(&mut legacy_bytes.clone()).unwrap();
         assert!(!decoded_legacy.hybrid_datagram_lane);
+        assert!(!decoded_legacy.datagram_mux_v1);
+    }
+
+    /// ADR-020 `datagram_mux_v1` flag bits (request 0x04, response 0x08) keep
+    /// layout identical to 0.28.0/0.29.0 and can be set independently of 0x02.
+    #[test]
+    fn datagram_mux_v1_flag_bits_roundtrip_and_stay_backward_compatible() {
+        let base_req = ConnectUdpRequest::bind_any();
+        let mux_only = ConnectUdpRequest::bind_any().with_datagram_mux_v1(true);
+        let both = ConnectUdpRequest::bind_any()
+            .with_hybrid_datagram_lane(true)
+            .with_datagram_mux_v1(true);
+
+        let base_bytes = base_req.encode();
+        let mux_only_bytes = mux_only.encode();
+        let both_bytes = both.encode();
+
+        assert_eq!(
+            mux_only_bytes[0],
+            REQUEST_FLAG_BIND | REQUEST_FLAG_DATAGRAM_MUX_V1
+        );
+        assert_eq!(
+            both_bytes[0],
+            REQUEST_FLAG_BIND | REQUEST_FLAG_HYBRID_DATAGRAM_LANE | REQUEST_FLAG_DATAGRAM_MUX_V1
+        );
+        assert_eq!(&mux_only_bytes[1..], &base_bytes[1..]);
+        assert_eq!(&both_bytes[1..], &base_bytes[1..]);
+
+        let dec_mux_only = ConnectUdpRequest::decode(&mut mux_only_bytes.clone()).unwrap();
+        assert!(!dec_mux_only.hybrid_datagram_lane);
+        assert!(dec_mux_only.datagram_mux_v1);
+        let dec_both = ConnectUdpRequest::decode(&mut both_bytes.clone()).unwrap();
+        assert!(dec_both.hybrid_datagram_lane);
+        assert!(dec_both.datagram_mux_v1);
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 4433);
+        let base_resp = ConnectUdpResponse::success(Some(addr));
+        let mux_resp = ConnectUdpResponse::success(Some(addr))
+            .with_hybrid_datagram_lane(true)
+            .with_datagram_mux_v1(true);
+        let base_resp_bytes = base_resp.encode();
+        let mux_resp_bytes = mux_resp.encode();
+        assert_eq!(
+            mux_resp_bytes[2],
+            RESPONSE_FLAG_HAS_ADDRESS
+                | RESPONSE_FLAG_HYBRID_DATAGRAM_LANE
+                | RESPONSE_FLAG_DATAGRAM_MUX_V1
+        );
+        assert_eq!(&mux_resp_bytes[..2], &base_resp_bytes[..2]);
+        assert_eq!(&mux_resp_bytes[3..], &base_resp_bytes[3..]);
+
+        let dec_resp = ConnectUdpResponse::decode(&mut mux_resp_bytes.clone()).unwrap();
+        assert_eq!(dec_resp, mux_resp);
+        assert!(dec_resp.hybrid_datagram_lane);
+        assert!(dec_resp.datagram_mux_v1);
     }
 }

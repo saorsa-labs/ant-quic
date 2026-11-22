@@ -7192,7 +7192,12 @@ impl NatTraversalEndpoint {
                 } else {
                     None
                 };
-                let response = response.with_hybrid_datagram_lane(lane.is_some());
+                let response = response
+                    .with_hybrid_datagram_lane(lane.is_some())
+                    .with_datagram_mux_v1(
+                        lane.as_ref()
+                            .is_some_and(crate::masque::DatagramLaneClaim::is_mux_v1),
+                    );
                 debug!(
                     "Sending CONNECT-UDP response to {}: {:?}",
                     client_addr, response
@@ -7878,9 +7883,24 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("No async runtime for relay endpoint".to_string())
         })?;
 
+        // ADR-020: when hybrid is negotiated, clamp the inner relayed QUIC
+        // endpoint's post-handshake 1-RTT MTU to `min(outer_max_dgram - hdr, 1380)`
+        // and lock inner DPLPMTUD to that clamp so steady-state packets ride
+        // the outer datagram lane with zero stream-lane spill (while Initials
+        // keep RFC 9000 §14.1 1200 B padding on the stream lane).
+        let recommended_inner_mtu = relay_socket.recommended_inner_mtu();
+        let relay_server_config = self.server_config.clone().map(|mut cfg| {
+            if let Some(vp_mtu) = recommended_inner_mtu {
+                let mut transport = (*cfg.transport).clone();
+                transport.virtual_path_max_udp_payload_size(Some(vp_mtu));
+                cfg.transport_config(Arc::new(transport));
+            }
+            cfg
+        });
+
         let mut relay_endpoint = InnerEndpoint::new_with_abstract_socket(
             crate::EndpointConfig::default(),
-            self.server_config.clone(),
+            relay_server_config,
             relay_socket,
             runtime,
         )
@@ -7888,11 +7908,16 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConnectionFailed(format!("Failed to create relay endpoint: {}", e))
         })?;
 
-        if let Some(client_config) = self
+        if let Some(mut client_config) = self
             .inner_endpoint
             .as_ref()
             .and_then(|endpoint| endpoint.default_client_config.clone())
         {
+            if let Some(vp_mtu) = recommended_inner_mtu {
+                let mut transport = (*client_config.transport).clone();
+                transport.virtual_path_max_udp_payload_size(Some(vp_mtu));
+                client_config.transport_config(Arc::new(transport));
+            }
             relay_endpoint.set_default_client_config(client_config);
         }
 
@@ -7983,13 +8008,15 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConnectionFailed(format!("Failed to open relay stream: {}", e))
         })?;
 
-        // ADR-016 Decision 6: ask for the hybrid lane only when configured and
-        // the datagram lane of this connection is ours. Claiming it BEFORE
-        // the request means the socket built below can read every datagram the
-        // relay sends once it accepts.
+        // ADR-016 Decision 6 / ADR-020: reserve a client datagram claim before
+        // sending CONNECT-UDP. When another datagram reader (e.g., voice) is
+        // already active on `connection`, the claim requests `DATAGRAM_MUX_V1`
+        // (0x04) WITHOUT legacy `HYBRID_DATAGRAM_LANE` (0x02), so a 0.29.0
+        // relay cleanly stays stream-only while a 0.30.0+ relay accepts muxed
+        // hybrid.
         let datagram_lane =
             if self.config.relay_forward_mode == crate::masque::RelayForwardMode::Hybrid {
-                match crate::masque::DatagramLaneClaim::try_claim(&connection) {
+                match crate::masque::DatagramLaneClaim::try_claim_for_client(&connection) {
                     Ok(claim) => Some(claim),
                     Err(e) => {
                         info!(
@@ -8004,8 +8031,17 @@ impl NatTraversalEndpoint {
             };
 
         // Send CONNECT-UDP Bind request with length prefix (stream stays open for data)
-        let request =
-            ConnectUdpRequest::bind_any().with_hybrid_datagram_lane(datagram_lane.is_some());
+        let request = ConnectUdpRequest::bind_any()
+            .with_hybrid_datagram_lane(
+                datagram_lane
+                    .as_ref()
+                    .is_some_and(crate::masque::DatagramLaneClaim::should_request_legacy_hybrid),
+            )
+            .with_datagram_mux_v1(
+                datagram_lane
+                    .as_ref()
+                    .is_some_and(crate::masque::DatagramLaneClaim::should_request_mux_v1),
+            );
         let request_bytes = request.encode();
 
         debug!("Sending CONNECT-UDP Bind request to relay: {:?}", request);
@@ -8090,9 +8126,21 @@ impl NatTraversalEndpoint {
         // Create the MasqueRelaySocket from the open streams. The socket takes
         // ownership of both halves and keeps them open for data forwarding, which
         // is why the handshake above deliberately does not finish the send half.
-        // Hybrid only when we asked AND the relay accepted; a relay before
-        // 0.29.0 (or one running Stream) never sets the answer bit.
-        let datagram_lane = datagram_lane.filter(|_| response.hybrid_datagram_lane);
+        // Hybrid only when we asked AND the relay accepted; finalize either
+        // 0.30.0+ `datagram_mux_v1` or 0.29.0 legacy exclusive mode.
+        let datagram_lane = datagram_lane.and_then(|mut claim| {
+            if !response.hybrid_datagram_lane {
+                return None;
+            }
+            if response.datagram_mux_v1 {
+                claim.activate_mux_v1();
+                Some(claim)
+            } else if claim.activate_legacy_hybrid() {
+                Some(claim)
+            } else {
+                None
+            }
+        });
         let relay_socket = match public_address {
             Some(addr) => Some(match datagram_lane {
                 Some(lane) => crate::masque::MasqueRelaySocket::new_hybrid(
