@@ -1597,25 +1597,43 @@ impl MasqueRelayServer {
                     if mux_v1
                         && let Some(capsule_res) = Capsule::decode_stream_frame(&frame_buf)
                     {
+                        enum PendingTxActivation {
+                            None,
+                            Uncompressed(u64),
+                            Compressed {
+                                target: SocketAddr,
+                                base: VarInt,
+                                ecn_quad: bool,
+                            },
+                        }
+
+                        let mut is_t2_assign = false;
+                        let mut pending_tx = PendingTxActivation::None;
                         let reply = match capsule_res {
                             Ok(Capsule::EcnCompressionAssign(assign)) => {
-                                // T2 symmetric barrier: client sent a mux_v1 capsule
-                                // after receiving 0x08.
-                                lane_stream.confirm_peer_mux_v1_ready();
+                                is_t2_assign = true;
+                                // T2a barrier: arm RX readiness before writing reply
+                                // (does NOT arm tx_prefix until reply write succeeds).
+                                lane_stream.arm_relay_rx_ready();
                                 let base = assign.context_id;
                                 let accepted = assign
                                     .target()
                                     .map(normalize_socket_addr)
                                     .is_some_and(|target| {
-                                        if !lane_stream.register_remote_ecn_quad(base) {
+                                        let can_insert = {
+                                            let tbl = table_stream.read();
+                                            !tbl.has_target(target) && tbl.can_add_target()
+                                        };
+                                        if !can_insert || !lane_stream.register_remote_ecn_quad(base)
+                                        {
                                             return false;
                                         }
-                                        if table_stream.write().insert_active(target, base, true) {
-                                            true
-                                        } else {
-                                            lane_stream.unregister_ecn_quad(base);
-                                            false
-                                        }
+                                        pending_tx = PendingTxActivation::Compressed {
+                                            target,
+                                            base,
+                                            ecn_quad: true,
+                                        };
+                                        true
                                     });
                                 Some(if accepted {
                                     Capsule::CompressionAck(CompressionAck::new(base))
@@ -1624,16 +1642,17 @@ impl MasqueRelayServer {
                                 })
                             }
                             Ok(Capsule::CompressionAssign(assign)) => {
-                                // T2 symmetric barrier: client confirmed 0x08.
-                                lane_stream.confirm_peer_mux_v1_ready();
+                                is_t2_assign = true;
+                                // T2a barrier: arm RX readiness before writing reply.
+                                lane_stream.arm_relay_rx_ready();
                                 let ctx = assign.context_id;
                                 let accepted = if assign.is_uncompressed() {
                                     // Strictly at most ONE uncompressed ctx per session
                                     // (replaces any previous registration; rejects odd/<2
                                     // and enforces per-connection cap).
                                     if lane_stream.register_remote_uncompressed_context(ctx) {
-                                        uncompressed_ctx_stream
-                                            .store(ctx.into_inner(), Ordering::Release);
+                                        pending_tx =
+                                            PendingTxActivation::Uncompressed(ctx.into_inner());
                                         true
                                     } else {
                                         false
@@ -1643,16 +1662,21 @@ impl MasqueRelayServer {
                                         .target()
                                         .map(normalize_socket_addr)
                                         .is_some_and(|target| {
-                                            if !lane_stream.register_remote_context(ctx) {
+                                            let can_insert = {
+                                                let tbl = table_stream.read();
+                                                !tbl.has_target(target) && tbl.can_add_target()
+                                            };
+                                            if !can_insert
+                                                || !lane_stream.register_remote_context(ctx)
+                                            {
                                                 return false;
                                             }
-                                            if table_stream.write().insert_active(target, ctx, false)
-                                            {
-                                                true
-                                            } else {
-                                                lane_stream.unregister_context(ctx);
-                                                false
-                                            }
+                                            pending_tx = PendingTxActivation::Compressed {
+                                                target,
+                                                base: ctx,
+                                                ecn_quad: false,
+                                            };
+                                            true
                                         })
                                 };
                                 Some(if accepted {
@@ -1699,6 +1723,32 @@ impl MasqueRelayServer {
                                     "Hybrid relay: failed to write capsule reply"
                                 );
                                 break false;
+                            }
+                        }
+
+                        // T2b barrier: reply capsule has been queued on the stream
+                        // ahead of any subsequent 0x01-prefixed app datagrams or
+                        // MASQUE datagrams on the newly registered context.
+                        if is_t2_assign {
+                            lane_stream.confirm_relay_tx_prefix();
+                        }
+                        match pending_tx {
+                            PendingTxActivation::None => {}
+                            PendingTxActivation::Uncompressed(ctx) => {
+                                uncompressed_ctx_stream.store(ctx, Ordering::Release);
+                            }
+                            PendingTxActivation::Compressed {
+                                target,
+                                base,
+                                ecn_quad,
+                            } => {
+                                if !table_stream.write().insert_active(target, base, ecn_quad) {
+                                    if ecn_quad {
+                                        lane_stream.unregister_ecn_quad(base);
+                                    } else {
+                                        lane_stream.unregister_context(base);
+                                    }
+                                }
                             }
                         }
                         continue;
@@ -3823,7 +3873,39 @@ mod tests {
         let (sock, _local) =
             open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 51).await;
 
-        // Inject a raw QUIC datagram carrying an unknown/unregistered Context ID (62).
+        // 1) Client RX is ALREADY in hard-mux mode at T3 (CompressionAck received):
+        // an unknown/unregistered Context ID (62) sent by the relay must be dropped
+        // and counted, NEVER leaked into `client_app_rx`.
+        let client_before = mux_unknown_ctx_dropped(&client_conn);
+        relay_conn
+            .send_datagram(Bytes::from_static(&[62u8, b's', b't', b'a', b'l', b'e']))
+            .expect("relay send unknown ctx");
+        let relay_app_msg = Bytes::from_static(&[0x00, 0x04, b'r', b'2', b'c']);
+        send_app_datagram(&relay_conn, relay_app_msg.clone()).expect("relay send app");
+        let got_from_relay = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("client app recv timeout")
+            .expect("client app msg");
+        assert_eq!(
+            got_from_relay, relay_app_msg,
+            "client must drop unknown ctx without leaking into app channel"
+        );
+        assert!(
+            mux_unknown_ctx_dropped(&client_conn) > client_before,
+            "client unknown ctx drop must be counted"
+        );
+
+        // 2) Client sends a legitimate app datagram (completing Relay T4 -> relay
+        // confirms client is prefixing), then injects an unknown Context ID (62):
+        // relay must drop + count it without leaking into `relay_app_rx`.
+        let warmup_app = Bytes::from_static(b"t4-warmup");
+        send_app_datagram(&client_conn, warmup_app.clone()).expect("send t4 warmup");
+        let got_warmup = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
+            .await
+            .expect("relay warmup timeout")
+            .expect("relay warmup msg");
+        assert_eq!(got_warmup, warmup_app);
+
         let before_drops = mux_unknown_ctx_dropped(&relay_conn);
         client_conn
             .send_datagram(Bytes::from_static(&[62u8, b's', b't', b'a', b'l', b'e']))
@@ -3854,5 +3936,271 @@ mod tests {
             .expect("client app recv timeout")
             .expect("client app msg");
         assert_eq!(got_client, after_close);
+    }
+
+    /// N1 regression test: between Client T1 (`activate_mux_v1` after `0x08`)
+    /// and Relay T2 (`CompressionAssign` -> `CompressionAck`), the relay is
+    /// still sending RAW app datagrams. Client MUST deliver every raw relay
+    /// app datagram intact — including payloads starting with `0x01` or an
+    /// arbitrary non-registered byte — with zero drops and zero first-byte
+    /// stripping.
+    #[tokio::test]
+    async fn t1_to_t2_window_preserves_raw_relay_app_datagrams_including_0x01_prefix() {
+        use crate::masque::mux_unknown_ctx_dropped;
+        use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
+
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
+        let mut relay_app_rx = open_app_datagram_channel(&relay_conn).expect("relay app rx");
+
+        // Relay claims T0 (`try_claim_muxed`) and client activates T1 (`activate_mux_v1`),
+        // simulating the 1-RTT window BEFORE `CompressionAssign`/`CompressionAck` (T2/T3).
+        let _relay_claim = DatagramLaneClaim::try_claim_muxed(&relay_conn).expect("relay T0 claim");
+        let mut client_claim =
+            DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client provisional");
+        assert!(client_claim.activate_mux_v1(), "client T1 activate");
+
+        // Raw app datagrams from relay -> client starting with 0x01 AND 0x42 must
+        // arrive byte-for-byte intact (neither stripped nor dropped!).
+        let raw_01 = Bytes::from_static(&[0x01, 0xAA, 0xBB, 0xCC]);
+        let raw_42 = Bytes::from_static(&[0x42, 0x10, 0x20, 0x30]);
+        send_app_datagram(&relay_conn, raw_01.clone()).expect("relay raw 0x01");
+        send_app_datagram(&relay_conn, raw_42.clone()).expect("relay raw 0x42");
+
+        let got_1 = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("client recv 1 timeout")
+            .expect("client recv 1");
+        let got_2 = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("client recv 2 timeout")
+            .expect("client recv 2");
+        assert_eq!(
+            got_1, raw_01,
+            "0x01-leading raw voice must NOT be stripped in T1->T2"
+        );
+        assert_eq!(
+            got_2, raw_42,
+            "arbitrary raw voice must NOT be dropped in T1->T2"
+        );
+        assert_eq!(mux_unknown_ctx_dropped(&client_conn), 0);
+
+        // And raw app datagrams client -> relay in the same T0->T2 window must
+        // also arrive byte-for-byte intact (N2: relay has not armed stripping at T0).
+        let c2r_01 = Bytes::from_static(&[0x01, 0xDE, 0xAD, 0xBE, 0xEF]);
+        send_app_datagram(&client_conn, c2r_01.clone()).expect("client raw 0x01");
+        let got_r = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
+            .await
+            .expect("relay recv timeout")
+            .expect("relay recv");
+        assert_eq!(
+            got_r, c2r_01,
+            "client->relay raw voice must NOT be stripped before T2"
+        );
+        assert_eq!(mux_unknown_ctx_dropped(&relay_conn), 0);
+    }
+
+    /// N1 + N2 regression test: if a hybrid session aborts after T0/T1 and T2
+    /// NEVER happens (for example: missing `public_address`, stream reset, or
+    /// relay T2a reply write failure), dropping the claims leaves BOTH sides
+    /// cleanly un-muxed so voice continues working in both directions with zero
+    /// permanent blackout.
+    #[tokio::test]
+    async fn t2_never_happens_abort_leaves_voice_intact_no_blackout() {
+        use crate::masque::mux_unknown_ctx_dropped;
+        use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
+
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
+        let mut relay_app_rx = open_app_datagram_channel(&relay_conn).expect("relay app rx");
+
+        {
+            // Simulate relay T0 + even T2a (`arm_relay_rx_ready` before failed
+            // reply write) AND client T1 (`activate_mux_v1`) — then BOTH abort
+            // without T2b/T3 ever completing!
+            let relay_claim =
+                DatagramLaneClaim::try_claim_muxed(&relay_conn).expect("relay T0 claim");
+            relay_claim.arm_relay_rx_ready();
+            let mut client_claim =
+                DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client prov");
+            assert!(client_claim.activate_mux_v1());
+            // Claims drop here without confirm_relay_tx_prefix / confirm_client_mux_v1_confirmed.
+        }
+
+        // After abort, BOTH directions must deliver raw voice (including leading
+        // 0x01 and arbitrary bytes) cleanly with zero drops and zero stripping.
+        for payload in [
+            Bytes::from_static(&[0x01, b'v', b'o', b'i', b'c', b'e']),
+            Bytes::from_static(&[0x77, b'p', b'c', b'm', b'1', b'2']),
+        ] {
+            send_app_datagram(&relay_conn, payload.clone()).expect("relay -> client");
+            let got_c = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+                .await
+                .expect("client recv timeout")
+                .expect("client recv");
+            assert_eq!(
+                got_c, payload,
+                "relay->client voice must survive T2-never-happens abort"
+            );
+
+            send_app_datagram(&client_conn, payload.clone()).expect("client -> relay");
+            let got_r = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
+                .await
+                .expect("relay recv timeout")
+                .expect("relay recv");
+            assert_eq!(
+                got_r, payload,
+                "client->relay voice must survive T2a-abort rollback"
+            );
+        }
+        assert_eq!(mux_unknown_ctx_dropped(&client_conn), 0);
+        assert_eq!(mux_unknown_ctx_dropped(&relay_conn), 0);
+    }
+
+    /// N4 regression test (suspenders): if the relay rejects the client's first
+    /// `CompressionAssign::uncompressed(u_ctx)` with `CompressionClose(u_ctx)`
+    /// (for example due to a lingering prior-session route), the client MUST
+    /// allocate a fresh disjoint block, send a retry `CompressionAssign`, and
+    /// reach the datagram lane once the relay ACKs the fresh context.
+    #[tokio::test]
+    async fn uncompressed_ctx_close_retries_fresh_block_and_reaches_datagram_lane() {
+        use crate::masque::capsule::{Capsule, CompressionAck, CompressionClose};
+
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        let (client_send, client_recv) = client_conn.open_bi().await.expect("open_bi");
+
+        let mut claim = DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client prov");
+        assert!(claim.activate_mux_v1());
+        let first_ctx = claim.uncompressed_context_id().expect("initial u_ctx");
+
+        // Construct `MasqueRelaySocket::new_hybrid` BEFORE `relay_conn.accept_bi()`:
+        // QUIC streams are lazy and only materialize on the peer once the first
+        // byte (`CompressionAssign::uncompressed(first_ctx)`) is written.
+        let socket = crate::masque::MasqueRelaySocket::new_hybrid(
+            claim,
+            client_send,
+            client_recv,
+            test_addr(9400),
+        );
+        let (mut relay_send, mut relay_recv) =
+            tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_conn.accept_bi())
+                .await
+                .expect("accept_bi timeout")
+                .expect("accept_bi");
+
+        // 1) Relay reads the first CompressionAssign(first_ctx) and replies CompressionClose!
+        let f1 = read_frame(&mut relay_recv).await;
+        let cap1 = Capsule::decode_stream_frame(&f1)
+            .expect("capsule frame 1")
+            .expect("decode capsule 1");
+        assert!(matches!(
+            cap1,
+            Capsule::CompressionAssign(ref a) if a.is_uncompressed() && a.context_id == first_ctx
+        ));
+        write_frame(
+            &mut relay_send,
+            &Capsule::CompressionClose(CompressionClose::new(first_ctx)).encode_stream_frame(),
+        )
+        .await;
+
+        // 2) Client MUST automatically retry with a fresh disjoint even ctx != first_ctx.
+        let f2 = tokio::time::timeout(HYBRID_TEST_TIMEOUT, read_frame(&mut relay_recv))
+            .await
+            .expect("retry CompressionAssign timeout");
+        let cap2 = Capsule::decode_stream_frame(&f2)
+            .expect("capsule frame 2")
+            .expect("decode capsule 2");
+        let second_ctx = match cap2 {
+            Capsule::CompressionAssign(a) if a.is_uncompressed() => a.context_id,
+            other => panic!("expected retry uncompressed CompressionAssign, got {other:?}"),
+        };
+        assert_ne!(
+            second_ctx, first_ctx,
+            "retry must allocate a fresh block (first block is quarantined)"
+        );
+        assert!(second_ctx.into_inner() >= 2 && second_ctx.into_inner() % 2 == 0);
+
+        // 3) Relay ACKs `second_ctx` -> client transitions onto the datagram lane!
+        write_frame(
+            &mut relay_send,
+            &Capsule::CompressionAck(CompressionAck::new(second_ctx)).encode_stream_frame(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let target: SocketAddr = "198.51.100.77:4433".parse().unwrap();
+        relay_send_to_with_ecn(&socket, target, b"retry-datagram-ok", None).await;
+        let dgram = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_conn.read_datagram())
+            .await
+            .expect("relay read_datagram timeout")
+            .expect("relay read_datagram");
+        let mut cur = dgram;
+        let decoded = UncompressedDatagram::decode(&mut cur).expect("decode uncompressed");
+        assert_eq!(decoded.context_id, second_ctx);
+        assert_eq!(decoded.payload.as_ref(), b"retry-datagram-ok");
+    }
+
+    /// N4 regression test (belt): dropping a `mux_v1` session places its
+    /// allocated block in a 30-second reuse quarantine (`CTX_BLOCK_REUSE_COOLDOWN`)
+    /// so an immediate next session on the same connection receives a fresh
+    /// disjoint Context ID instead of colliding with an in-flight relay close.
+    #[tokio::test]
+    async fn quarantined_freed_block_is_not_immediately_reused() {
+        let (client_conn, _relay_conn) = relay_loopback_pair_mtu(1452).await;
+
+        let ctx1 = {
+            let mut c1 = DatagramLaneClaim::try_claim_for_client(&client_conn).expect("c1");
+            assert!(c1.activate_mux_v1());
+            c1.uncompressed_context_id().expect("ctx1")
+        };
+        // Immediate reopen (< 30 s cooldown) must NOT reuse ctx1!
+        let mut c2 = DatagramLaneClaim::try_claim_for_client(&client_conn).expect("c2");
+        assert!(c2.activate_mux_v1());
+        let ctx2 = c2.uncompressed_context_id().expect("ctx2");
+        assert_ne!(
+            ctx1, ctx2,
+            "freed block must remain quarantined across immediate reopen"
+        );
+    }
+
+    /// N3 regression test: `DATAGRAM_MUXES` stores only a `WeakConnectionHandle`
+    /// so sticky `mux_v1` state never prevents an idle/dropped outer `Connection`
+    /// from closing and being pruned from the global registry.
+    #[tokio::test]
+    async fn dropped_connection_does_not_leak_in_datagram_muxes() {
+        use crate::masque::relay_socket::{mux_entry_present_for_test, prune_dead_muxes_for_test};
+
+        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        let client_id = client_conn.stable_id();
+        let client_weak = client_conn.weak_handle();
+
+        {
+            let mut claim = DatagramLaneClaim::try_claim_for_client(&client_conn).expect("claim");
+            assert!(claim.activate_mux_v1());
+            // Simulate T3 committed sticky state so the entry remains in
+            // DATAGRAM_MUXES while `client_conn` is alive.
+            claim.confirm_client_mux_v1_confirmed();
+        }
+        assert!(
+            mux_entry_present_for_test(client_id),
+            "sticky mux_v1 entry stays present while outer connection is alive"
+        );
+
+        // Close/drop the outer connections; DATAGRAM_MUXES must NOT keep
+        // `client_conn` alive as a zombie!
+        client_conn.close(VarInt::from_u32(0), b"done");
+        drop(client_conn);
+        drop(relay_conn);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            !client_weak.is_alive(),
+            "DATAGRAM_MUXES must not hold a strong Connection clone"
+        );
+        let _ = prune_dead_muxes_for_test();
+        assert!(
+            !mux_entry_present_for_test(client_id),
+            "dead connection's sticky mux entry must be pruned cleanly"
+        );
     }
 }

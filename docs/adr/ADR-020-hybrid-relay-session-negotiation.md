@@ -74,26 +74,43 @@ the "direct" result, and migration reported success without migrating.
        client allocates Context IDs (the relay server never self-allocates). To keep mutual
        relaying on one outer connection collision-free, `Side::Client` allocates 8-ID blocks
        `{2..=8, 18..=24, ...}` and `Side::Server` allocates `{10..=16, 26..=32, ...}`, recycling
-       freed blocks on session/target close so wire IDs stay `1–2 B`. Each `mux_v1` session
+       freed blocks after a 30-second quarantine (`CTX_BLOCK_REUSE_COOLDOWN`) so wire IDs stay
+       `1–2 B` under churn without colliding with in-flight relay stream teardowns or stale
+       in-flight datagrams (and any stale datagram that ever arrived on a recycled ctx after
+       quarantine is still bounded to a single inner AEAD failure). Each `mux_v1` session
        registers strictly **one** uncompressed Context ID via `CompressionAssign::uncompressed`
-       (re-assigning replaces and unregisters the previous one), plus up to `max_targets` (256)
-       compressed 4-context ECN quads; total routes per connection are hard-capped at
-       `MAX_MUX_ROUTES_PER_CONNECTION = 2048` and odd Context IDs are rejected with
-       `CompressionClose`.
+       (re-assigning replaces and unregisters the previous one; if the relay replies
+       `CompressionClose`, the client performs up to 3 bounded retries with fresh disjoint blocks),
+       plus up to `max_targets` (256) compressed 4-context ECN quads; total routes per connection
+       are hard-capped at `MAX_MUX_ROUTES_PER_CONNECTION = 2048` and odd Context IDs are rejected
+       with `CompressionClose`.
      - **Odd Context ID `1` (`APP_DATAGRAM_CONTEXT_ID`):** multiplexed application datagrams
        (`LinkConn::send_datagram` / `LinkConn::recv_datagrams`, such as x0x voice), disjoint from
        even MASQUE Context IDs.
-   - **Symmetric sticky activation (T0→T1→T2) & hard unknown-ctx drop:**
-     - T0 (relay accepts `0x04`): relay arms `mux_v1_rx_ready` (does not prefix outbound app
-       datagrams yet).
-     - T1 (client receives `0x08`): client arms `mux_v1_rx_ready` and `mux_v1_tx_prefix`, and
-       sends `CompressionAssign::uncompressed(u_ctx)` on the stream.
-     - T2 (relay receives client's `CompressionAssign`): relay arms `mux_v1_tx_prefix` and
-       replies `CompressionAck(u_ctx)`.
-     - Once armed, `mux_v1_rx_ready`/`mux_v1_tx_prefix` are sticky for the remainder of the outer
-       connection's lifetime (eliminating teardown asymmetry). In confirmed hard-mux mode, any
-       frame with an unknown or closed Context ID is dropped and counted (`mux_unknown_ctx_dropped`)
-       and never passed raw to app subscribers.
+   - **Causal sticky activation (T0→T1→T2a/T2b→T3→T4) & hard unknown-ctx drop:**
+     - T0 (relay accepts `0x04` and writes `0x08`) & T1 (client receives `0x08`, allocates `u_ctx`,
+       and sends `CompressionAssign::uncompressed(u_ctx)` on the stream): neither side arms
+       `mux_v1_rx_ready`, `mux_v1_tx_prefix`, or `peer_tx_prefix_confirmed` yet. All app datagrams
+       stay 100% raw with zero stripping and zero drops; any pre-T2 abort (missing session, missing
+       `public_address`, stream reset) leaves both sides untouched with zero voice blackout.
+     - T2a (relay receives client's first `CompressionAssign`/`EcnCompressionAssign`): relay arms
+       `mux_v1_rx_ready` and writes `CompressionAck`/`CompressionClose` on the stream. If writing
+       the reply fails and the claim drops before T2b, `mux_v1_rx_ready` rolls back to `false`.
+     - T2b (relay reply write succeeds): relay commits sticky `mux_v1_tx_prefix = true` (ordered
+       strictly after the reply capsule on the stream) and activates TX datagram routing on the
+       registered context.
+     - T3 (client receives relay's first `CompressionAck` or `CompressionClose`): causally proves
+       relay reached T2; client commits sticky `mux_v1_rx_ready = true`, `mux_v1_tx_prefix = true`,
+       and hard-mux RX `peer_tx_prefix_confirmed = true`.
+     - T4 (relay receives client's first `0x01`-prefixed app datagram or registered-ctx MASQUE
+       datagram after T2a): causally proves client reached T3; relay commits sticky
+       `peer_tx_prefix_confirmed = true`.
+     - Once committed, `mux_v1_tx_prefix` and `peer_tx_prefix_confirmed` stay sticky for the
+       outer connection's lifetime (retained in `DATAGRAM_MUXES` via a `WeakConnectionHandle` with
+       amortized O(1) dead-entry pruning so idle connections never become zombies). In confirmed
+       hard-mux RX mode (`peer_tx_prefix_confirmed == true`), any frame with an unknown or closed
+       Context ID is dropped and counted (`mux_unknown_ctx_dropped`) and never passed raw to app
+       subscribers.
    - When `DATAGRAM_MUX_V1` is NOT active on a connection (direct peer connections, 0.28.0/0.29.0
      peers), `LinkConn::send_datagram` and `recv_datagrams` carry raw unprefixed bytes (100%
      backward compatible). Note: raw `Connection::send_datagram` remains a low-level transport
@@ -213,6 +230,11 @@ the "direct" result, and migration reported success without migrating.
   `session_reuse_after_close_uses_clean_explicit_context`,
   `uncompressed_compression_assign_spam_is_bounded_and_odd_ctx_rejected`,
   `hard_mux_drops_unknown_ctx_without_leaking_to_app_subscribers`,
+  `t1_to_t2_window_preserves_raw_relay_app_datagrams_including_0x01_prefix`,
+  `t2_never_happens_abort_leaves_voice_intact_no_blackout`,
+  `uncompressed_ctx_close_retries_fresh_block_and_reaches_datagram_lane`,
+  `quarantined_freed_block_is_not_immediately_reused`,
+  `dropped_connection_does_not_leak_in_datagram_muxes`,
   `one_hybrid_session_per_connection_is_enforced` (legacy 0.29.0 compat).
 - `src/p2p_endpoint.rs` (`relay_migration_372`):
   `migration_probe_never_reports_success_on_relay_only_path`,

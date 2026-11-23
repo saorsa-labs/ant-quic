@@ -7183,11 +7183,20 @@ impl NatTraversalEndpoint {
         {
             Ok(response) => {
                 let is_success = response.is_success();
+                // Resolve the relay session BEFORE claiming the datagram lane
+                // or advertising `0x08` (`datagram_mux_v1`), so a missing
+                // session never advertises hybrid/mux_v1 without entering the
+                // forwarding loop.
+                let session_info = if is_success {
+                    relay_server.get_session_for_client(client_addr).await
+                } else {
+                    None
+                };
                 // ADR-016 Decision 6: hybrid only when this relay runs Hybrid
                 // AND the client signalled, in this request, that it reads the
                 // datagram lane. The answer echoes the decision so the client
                 // never sends datagrams this relay does not read.
-                let lane = if is_success {
+                let lane = if session_info.is_some() {
                     relay_server.negotiate_datagram_lane(&request, &connection)
                 } else {
                     None
@@ -7217,10 +7226,7 @@ impl NatTraversalEndpoint {
                 // `run_negotiated_forwarding_loop` takes ownership and decides how to
                 // tear the stream down; it runs hybrid only for a negotiated
                 // lane and stream-only otherwise.
-                if is_success
-                    && let Some(session_info) =
-                        relay_server.get_session_for_client(client_addr).await
-                {
+                if let Some(session_info) = session_info {
                     info!(
                         "Starting {} relay forwarding for session {} (client: {})",
                         if lane.is_some() { "hybrid" } else { "stream" },
@@ -8123,38 +8129,40 @@ impl NatTraversalEndpoint {
             public_address
         );
 
-        // Create the MasqueRelaySocket from the open streams. The socket takes
-        // ownership of both halves and keeps them open for data forwarding, which
-        // is why the handshake above deliberately does not finish the send half.
-        // Hybrid only when we asked AND the relay accepted; finalize either
-        // 0.30.0+ `datagram_mux_v1` or 0.29.0 legacy exclusive mode.
-        let datagram_lane = datagram_lane.and_then(|mut claim| {
-            if !response.hybrid_datagram_lane {
-                return None;
-            }
-            if response.datagram_mux_v1 {
-                claim.activate_mux_v1().then_some(claim)
-            } else if claim.activate_legacy_hybrid() {
-                Some(claim)
-            } else {
-                None
-            }
-        });
+        // Create the MasqueRelaySocket from the open streams. Only finalize
+        // the datagram lane claim when we actually have a `public_address` to
+        // construct `MasqueRelaySocket`; otherwise drop the provisional claim
+        // cleanly without registering routes or mutating mux state.
         let relay_socket = match public_address {
-            Some(addr) => Some(match datagram_lane {
-                Some(lane) => crate::masque::MasqueRelaySocket::new_hybrid(
-                    lane,
-                    send_stream,
-                    recv_stream,
-                    addr,
-                ),
-                None => crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr),
-            }),
+            Some(addr) => {
+                let datagram_lane = datagram_lane.and_then(|mut claim| {
+                    if !response.hybrid_datagram_lane {
+                        return None;
+                    }
+                    if response.datagram_mux_v1 {
+                        claim.activate_mux_v1().then_some(claim)
+                    } else if claim.activate_legacy_hybrid() {
+                        Some(claim)
+                    } else {
+                        None
+                    }
+                });
+                Some(match datagram_lane {
+                    Some(lane) => crate::masque::MasqueRelaySocket::new_hybrid(
+                        lane,
+                        send_stream,
+                        recv_stream,
+                        addr,
+                    ),
+                    None => crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr),
+                })
+            }
             None => {
                 // No public address means there is no socket to hand the streams
                 // to, so they end here. Finish explicitly rather than letting the
                 // drop reset them: the CONNECT-UDP exchange itself succeeded, so
                 // the relay should see a clean end-of-stream, not a protocol error.
+                drop(datagram_lane);
                 let _ = send_stream.finish();
                 None
             }
