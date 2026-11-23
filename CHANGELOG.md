@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-23
+
+### Added
+
+- **MASQUE datagram multiplexing (ADR-020 Proposed, #374 Part B1, #376).**
+  Hybrid MASQUE relay sessions and application datagrams (`LinkConn`, for
+  example x0x voice) can now share one QUIC connection. Before, a hybrid relay
+  session took the connection's datagrams for itself. Now one reader per
+  connection sorts each datagram by a leading RFC 9297 Context ID: ID `1` is
+  application data, even IDs `>= 2` are relay sessions, and unknown IDs are
+  dropped and counted (`mux_unknown_ctx_dropped`). Several hybrid sessions can
+  share one connection. Only the relay client allocates Context IDs; the two
+  QUIC sides use disjoint ranges, and a freed range waits 30 s before reuse.
+- **New QUIC transport parameter `DatagramMuxV1` (`0x50C4`, empty).** On by
+  default (`TransportConfig::datagram_mux_v1`). The multiplexed framing is used
+  only when both ends send it, and it is fixed for the whole connection
+  (`Connection::supports_datagram_mux_v1()`). On such a connection
+  `LinkConn::send_datagram` adds a 1-byte prefix to every datagram, also on
+  direct (non-relayed) links. A 0-RTT resumption whose setting differs is
+  rejected.
+- **Relay header compression and ECN.** New CONNECT-UDP flag bits (request
+  `0x04`, response `0x08`), a `0xFF` control-capsule frame on the relay stream
+  and the `ECN_COMPRESSION_ASSIGN` (`0x14`) capsule. Per-packet relay overhead
+  drops from 8 B (IPv4) / 20 B (IPv6) to 1-2 B, and inner ECN marks cross the
+  relay. Linux `UDP_GRO` bursts are split into single datagrams on the relay.
+- **Relayed paths below 1200 B.** The hybrid datagram floor drops from 1232 B
+  to 900 B (`MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET`), so 1280 B IPv6, WireGuard
+  and similar paths can use the datagram lane. New
+  `TransportConfig::virtual_path_max_udp_payload_size` (floor
+  `MIN_VIRTUAL_PATH_MTU = 900`) clamps the inner connection of a relayed path
+  to `min(P_max, 1380)` after the handshake, and path-MTU discovery does not
+  probe above it. Inner Initial packets and `PATH_CHALLENGE` /
+  `PATH_RESPONSE` keep their 1200 B padding and go over the relay stream.
+  The clamp is set when the relay endpoint is created; if the outer path
+  shrinks later, packets that do not fit go over the stream. Physical paths
+  keep the 1200 B minimum.
+
+### Compatibility
+
+- **0.30.0 with 0.28.0 / 0.29.0 peers works in both directions.** An old peer
+  does not send `0x50C4` and skips it as an unknown transport parameter, so
+  the connection stays unprefixed: application datagrams are the same bytes as
+  before, and no capsule or flag bit an old peer does not know is sent to it.
+  A 0.28.0 relay ignores the new flag bits and the session is stream-only. A
+  0.29.0 relay gets only the legacy `0x02` request (never `0x04`) and runs
+  0.29.0 exclusive hybrid; the 0.30.0 client asks for it only when no
+  application datagram reader is active on that connection, otherwise it asks
+  for stream-only.
+- Hybrid mode (`RelayForwardMode::Hybrid`) and `auto_migrate` stay off by
+  default.
+
+### Upgrade notes
+
+- **Callers that share a connection with MASQUE must use `LinkConn`.** On a
+  connection where both ends are 0.30.0+, raw `Connection::send_datagram` /
+  `read_datagram` bypass the Context-ID prefix, and a raw `read_datagram`
+  competes with the multiplexer, which loses datagrams in both directions.
+  Use `LinkConn::send_datagram` / `LinkConn::recv_datagrams`. For x0x, the
+  move to ant-quic 0.30 must switch voice to `LinkConn` in the same release
+  (x0x#2188).
+- **0.30.0 client with a 0.29.0 relay.** If an application datagram reader
+  starts during the CONNECT round trip of a hybrid request, the client now
+  closes that relay session and returns an error, and the next attempt asks
+  for stream-only. This costs one failed session setup; it is not retried in
+  the same call. Allow for this before 0.29.0 relays and 0.30.0 clients mix
+  in a fleet.
+- Turn on `RelayForwardMode::Hybrid` in a fleet only after the 1280 B MTU
+  netem soak named in ADR-020 passes.
+
+### Changed
+
+- **Breaking for exhaustive matches and struct literals:** new
+  `Capsule::EcnCompressionAssign` variant; new public field
+  `datagram_mux_v1` on `ConnectUdpRequest` and `ConnectUdpResponse`; new public
+  counters on `MasqueRelaySocketStats`.
+  `MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET` changes from 1232 to 900.
+
+### Security
+
+- Lock file updates for four RustSec advisories (#377): `url` 2.5.9,
+  `form_urlencoded` 1.2.3, `quinn-udp` 0.5.16, `quinn-proto` 0.11.19.
+
 ## [0.29.0] - 2026-11-20
 
 ### Added
