@@ -124,6 +124,13 @@ macro_rules! make_struct {
             /// Optional ACK-v2 receive-pipeline support.
             pub(crate) ack_receive_v2: bool,
 
+            /// Connection-level RFC 9297 Context-ID datagram multiplexing
+            /// (`DatagramMuxV1 = 0x50C4`, ADR-020). When both peers advertise
+            /// this empty parameter during the QUIC handshake, every `LinkConn`
+            /// app datagram carries odd Context ID `1` from datagram #1 and
+            /// MASQUE hybrid sessions use even Context IDs `>= 2`.
+            pub(crate) datagram_mux_v1: bool,
+
             /// Post-Quantum Cryptography algorithms supported by this endpoint
             ///
             /// When present, indicates support for PQC algorithms
@@ -170,6 +177,7 @@ macro_rules! make_struct {
                     rfc_nat_traversal: false,
                     address_discovery: None,
                     ack_receive_v2: false,
+                    datagram_mux_v1: false,
                     pqc_algorithms: None,
 
                     original_dst_cid: None,
@@ -235,6 +243,7 @@ impl TransportParameters {
             rfc_nat_traversal: config.nat_traversal_config.is_some(), // Enable RFC format when NAT traversal is enabled
             address_discovery: config.address_discovery_config,
             ack_receive_v2: true,
+            datagram_mux_v1: config.datagram_mux_v1,
             pqc_algorithms: config.pqc_algorithms.clone(),
             ..Self::default()
         })
@@ -253,6 +262,7 @@ impl TransportParameters {
             || cached.max_datagram_frame_size > self.max_datagram_frame_size
             || cached.grease_quic_bit && !self.grease_quic_bit
             || cached.ack_receive_v2 && !self.ack_receive_v2
+            || cached.datagram_mux_v1 != self.datagram_mux_v1
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "0-RTT accepted with incompatible transport parameters",
@@ -621,6 +631,12 @@ impl TransportParameters {
                         write_var!(0);
                     }
                 }
+                TransportParameterId::DatagramMuxV1 => {
+                    if self.datagram_mux_v1 {
+                        write_var!(id as u64);
+                        write_var!(0);
+                    }
+                }
                 TransportParameterId::PqcAlgorithms => {
                     if let Some(ref algorithms) = self.pqc_algorithms {
                         write_var!(id as u64);
@@ -797,6 +813,12 @@ impl TransportParameters {
                         return Err(Error::Malformed);
                     }
                     params.ack_receive_v2 = true;
+                }
+                TransportParameterId::DatagramMuxV1 => {
+                    if params.datagram_mux_v1 || len != 0 {
+                        return Err(Error::Malformed);
+                    }
+                    params.datagram_mux_v1 = true;
                 }
                 TransportParameterId::PqcAlgorithms => {
                     if params.pqc_algorithms.is_some() {
@@ -1141,11 +1163,13 @@ pub(crate) enum TransportParameterId {
     PqcAlgorithms = 0x50C0,
     // Optional ACK-v2 receive-pipeline support
     AckReceiveV2 = 0x50C2,
+    // Connection-level RFC 9297 Context-ID datagram multiplexing (ADR-020)
+    DatagramMuxV1 = 0x50C4,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 26] = [
+    const SUPPORTED: [Self; 27] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -1172,6 +1196,7 @@ impl TransportParameterId {
         Self::AddressDiscovery,
         Self::PqcAlgorithms,
         Self::AckReceiveV2,
+        Self::DatagramMuxV1,
     ];
 }
 
@@ -1216,6 +1241,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::AddressDiscovery == id => Self::AddressDiscovery,
             id if Self::PqcAlgorithms == id => Self::PqcAlgorithms,
             id if Self::AckReceiveV2 == id => Self::AckReceiveV2,
+            id if Self::DatagramMuxV1 == id => Self::DatagramMuxV1,
             _ => return Err(()),
         };
         Ok(param)
@@ -2325,6 +2351,35 @@ mod test {
         let decoded = TransportParameters::read(Side::Client, &mut encoded.as_slice())
             .expect("decode transport params");
         assert!(decoded.ack_receive_v2);
+    }
+
+    #[test]
+    fn test_datagram_mux_v1_roundtrip_and_validation() {
+        let mut params = TransportParameters::default();
+        params.datagram_mux_v1 = true;
+
+        let mut encoded = Vec::new();
+        params.write(&mut encoded).expect("encode transport params");
+
+        let decoded = TransportParameters::read(Side::Client, &mut encoded.as_slice())
+            .expect("decode transport params");
+        assert!(decoded.datagram_mux_v1);
+
+        // Non-empty payload must be rejected as Malformed.
+        let mut bad = Vec::new();
+        bad.write_var_or_debug_assert(TransportParameterId::DatagramMuxV1 as u64);
+        bad.write_var_or_debug_assert(1u64);
+        bad.write(0x01u8);
+        assert!(matches!(
+            TransportParameters::read(Side::Client, &mut bad.as_slice()),
+            Err(Error::Malformed)
+        ));
+
+        // 0-RTT resumption mismatch in either direction must fail closed.
+        let without = TransportParameters::default();
+        assert!(without.validate_resumption_from(&params).is_err());
+        assert!(params.validate_resumption_from(&without).is_err());
+        assert!(params.validate_resumption_from(&params).is_ok());
     }
 
     // Include comprehensive tests module

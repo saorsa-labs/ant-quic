@@ -1185,9 +1185,9 @@ impl MasqueRelayServer {
         if self.config.forward_mode != RelayForwardMode::Hybrid {
             return None;
         }
-        let claim_result = if request.datagram_mux_v1 {
+        let claim_result = if request.datagram_mux_v1 && connection.supports_datagram_mux_v1() {
             DatagramLaneClaim::try_claim_muxed(connection)
-        } else if request.hybrid_datagram_lane {
+        } else if request.hybrid_datagram_lane && !request.datagram_mux_v1 {
             DatagramLaneClaim::try_claim(connection)
         } else {
             return None;
@@ -1607,14 +1607,9 @@ impl MasqueRelayServer {
                             },
                         }
 
-                        let mut is_t2_assign = false;
                         let mut pending_tx = PendingTxActivation::None;
                         let reply = match capsule_res {
                             Ok(Capsule::EcnCompressionAssign(assign)) => {
-                                is_t2_assign = true;
-                                // T2a barrier: arm RX readiness before writing reply
-                                // (does NOT arm tx_prefix until reply write succeeds).
-                                lane_stream.arm_relay_rx_ready();
                                 let base = assign.context_id;
                                 let accepted = assign
                                     .target()
@@ -1642,9 +1637,6 @@ impl MasqueRelayServer {
                                 })
                             }
                             Ok(Capsule::CompressionAssign(assign)) => {
-                                is_t2_assign = true;
-                                // T2a barrier: arm RX readiness before writing reply.
-                                lane_stream.arm_relay_rx_ready();
                                 let ctx = assign.context_id;
                                 let accepted = if assign.is_uncompressed() {
                                     // Strictly at most ONE uncompressed ctx per session
@@ -1726,12 +1718,8 @@ impl MasqueRelayServer {
                             }
                         }
 
-                        // T2b barrier: reply capsule has been queued on the stream
-                        // ahead of any subsequent 0x01-prefixed app datagrams or
-                        // MASQUE datagrams on the newly registered context.
-                        if is_t2_assign {
-                            lane_stream.confirm_relay_tx_prefix();
-                        }
+                        // Activate TX datagram routing after queueing the reply
+                        // capsule so CompressionAck precedes the first datagram.
                         match pending_tx {
                             PendingTxActivation::None => {}
                             PendingTxActivation::Uncompressed(ctx) => {
@@ -2796,14 +2784,27 @@ mod tests {
     async fn relay_loopback_pair_mtu(
         initial_mtu: u16,
     ) -> (crate::high_level::Connection, crate::high_level::Connection) {
-        let mut transport = crate::config::TransportConfig::default();
-        transport.initial_mtu(initial_mtu);
-        let transport = Arc::new(transport);
+        relay_loopback_pair_with_mux(initial_mtu, true, true).await
+    }
+
+    async fn relay_loopback_pair_with_mux(
+        initial_mtu: u16,
+        client_mux: bool,
+        server_mux: bool,
+    ) -> (crate::high_level::Connection, crate::high_level::Connection) {
+        let mut server_transport = crate::config::TransportConfig::default();
+        server_transport
+            .initial_mtu(initial_mtu)
+            .datagram_mux_v1(server_mux);
+        let mut client_transport = crate::config::TransportConfig::default();
+        client_transport
+            .initial_mtu(initial_mtu)
+            .datagram_mux_v1(client_mux);
 
         let (chain, key) = gen_self_signed_cert();
         let mut server_cfg =
             crate::config::ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
-        server_cfg.transport_config(Arc::clone(&transport));
+        server_cfg.transport_config(Arc::new(server_transport));
         let server = crate::high_level::Endpoint::server(server_cfg, ([127, 0, 0, 1], 0).into())
             .expect("server ep");
         let addr: SocketAddr = server.local_addr().unwrap();
@@ -2823,7 +2824,7 @@ mod tests {
         }
         let mut client_cfg =
             crate::config::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
-        client_cfg.transport_config(transport);
+        client_cfg.transport_config(Arc::new(client_transport));
         let mut client =
             crate::high_level::Endpoint::client(([127, 0, 0, 1], 0).into()).expect("client ep");
         client.set_default_client_config(client_cfg);
@@ -3873,9 +3874,9 @@ mod tests {
         let (sock, _local) =
             open_muxed_hybrid_session_for(&server, &client_conn, &relay_conn, 51).await;
 
-        // 1) Client RX is ALREADY in hard-mux mode at T3 (CompressionAck received):
-        // an unknown/unregistered Context ID (62) sent by the relay must be dropped
-        // and counted, NEVER leaked into `client_app_rx`.
+        // Both sides negotiated `DatagramMuxV1 (0x50C4)` in the QUIC handshake,
+        // so unknown/unregistered Context IDs (62) are dropped and counted in
+        // BOTH directions immediately with zero warmup or transition window!
         let client_before = mux_unknown_ctx_dropped(&client_conn);
         relay_conn
             .send_datagram(Bytes::from_static(&[62u8, b's', b't', b'a', b'l', b'e']))
@@ -3894,17 +3895,6 @@ mod tests {
             mux_unknown_ctx_dropped(&client_conn) > client_before,
             "client unknown ctx drop must be counted"
         );
-
-        // 2) Client sends a legitimate app datagram (completing Relay T4 -> relay
-        // confirms client is prefixing), then injects an unknown Context ID (62):
-        // relay must drop + count it without leaking into `relay_app_rx`.
-        let warmup_app = Bytes::from_static(b"t4-warmup");
-        send_app_datagram(&client_conn, warmup_app.clone()).expect("send t4 warmup");
-        let got_warmup = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
-            .await
-            .expect("relay warmup timeout")
-            .expect("relay warmup msg");
-        assert_eq!(got_warmup, warmup_app);
 
         let before_drops = mux_unknown_ctx_dropped(&relay_conn);
         client_conn
@@ -3926,7 +3916,7 @@ mod tests {
         );
 
         // Close the relay session and confirm app datagrams STILL stay symmetric
-        // both ways (sticky mux_v1 prevents teardown corruption!).
+        // both ways (connection-level framing is static for the connection life).
         drop(sock);
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let after_close = Bytes::from_static(b"post-teardown-voice");
@@ -3938,123 +3928,142 @@ mod tests {
         assert_eq!(got_client, after_close);
     }
 
-    /// N1 regression test: between Client T1 (`activate_mux_v1` after `0x08`)
-    /// and Relay T2 (`CompressionAssign` -> `CompressionAck`), the relay is
-    /// still sending RAW app datagrams. Client MUST deliver every raw relay
-    /// app datagram intact — including payloads starting with `0x01` or an
-    /// arbitrary non-registered byte — with zero drops and zero first-byte
-    /// stripping.
+    /// Connection-level `DatagramMuxV1 (0x50C4)` test: both 0.30+ endpoints
+    /// negotiate the transport parameter during the QUIC handshake, prefix all
+    /// `LinkConn` app datagrams with `0x01` from datagram #1 (before ANY relay
+    /// session opens), drop unknown contexts from datagram #1, and survive
+    /// aborted relay sessions with zero voice stripping or blackout.
     #[tokio::test]
-    async fn t1_to_t2_window_preserves_raw_relay_app_datagrams_including_0x01_prefix() {
+    async fn datagram_mux_v1_transport_param_prefixes_from_packet_one_and_survives_aborts() {
         use crate::masque::mux_unknown_ctx_dropped;
         use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
 
         let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        assert!(client_conn.supports_datagram_mux_v1());
+        assert!(relay_conn.supports_datagram_mux_v1());
+
         let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
         let mut relay_app_rx = open_app_datagram_channel(&relay_conn).expect("relay app rx");
 
-        // Relay claims T0 (`try_claim_muxed`) and client activates T1 (`activate_mux_v1`),
-        // simulating the 1-RTT window BEFORE `CompressionAssign`/`CompressionAck` (T2/T3).
-        let _relay_claim = DatagramLaneClaim::try_claim_muxed(&relay_conn).expect("relay T0 claim");
-        let mut client_claim =
-            DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client provisional");
-        assert!(client_claim.activate_mux_v1(), "client T1 activate");
-
-        // Raw app datagrams from relay -> client starting with 0x01 AND 0x42 must
-        // arrive byte-for-byte intact (neither stripped nor dropped!).
-        let raw_01 = Bytes::from_static(&[0x01, 0xAA, 0xBB, 0xCC]);
-        let raw_42 = Bytes::from_static(&[0x42, 0x10, 0x20, 0x30]);
-        send_app_datagram(&relay_conn, raw_01.clone()).expect("relay raw 0x01");
-        send_app_datagram(&relay_conn, raw_42.clone()).expect("relay raw 0x42");
-
-        let got_1 = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
-            .await
-            .expect("client recv 1 timeout")
-            .expect("client recv 1");
-        let got_2 = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
-            .await
-            .expect("client recv 2 timeout")
-            .expect("client recv 2");
-        assert_eq!(
-            got_1, raw_01,
-            "0x01-leading raw voice must NOT be stripped in T1->T2"
-        );
-        assert_eq!(
-            got_2, raw_42,
-            "arbitrary raw voice must NOT be dropped in T1->T2"
-        );
-        assert_eq!(mux_unknown_ctx_dropped(&client_conn), 0);
-
-        // And raw app datagrams client -> relay in the same T0->T2 window must
-        // also arrive byte-for-byte intact (N2: relay has not armed stripping at T0).
-        let c2r_01 = Bytes::from_static(&[0x01, 0xDE, 0xAD, 0xBE, 0xEF]);
-        send_app_datagram(&client_conn, c2r_01.clone()).expect("client raw 0x01");
-        let got_r = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
-            .await
-            .expect("relay recv timeout")
-            .expect("relay recv");
-        assert_eq!(
-            got_r, c2r_01,
-            "client->relay raw voice must NOT be stripped before T2"
-        );
-        assert_eq!(mux_unknown_ctx_dropped(&relay_conn), 0);
-    }
-
-    /// N1 + N2 regression test: if a hybrid session aborts after T0/T1 and T2
-    /// NEVER happens (for example: missing `public_address`, stream reset, or
-    /// relay T2a reply write failure), dropping the claims leaves BOTH sides
-    /// cleanly un-muxed so voice continues working in both directions with zero
-    /// permanent blackout.
-    #[tokio::test]
-    async fn t2_never_happens_abort_leaves_voice_intact_no_blackout() {
-        use crate::masque::mux_unknown_ctx_dropped;
-        use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
-
-        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
-        let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
-        let mut relay_app_rx = open_app_datagram_channel(&relay_conn).expect("relay app rx");
-
-        {
-            // Simulate relay T0 + even T2a (`arm_relay_rx_ready` before failed
-            // reply write) AND client T1 (`activate_mux_v1`) — then BOTH abort
-            // without T2b/T3 ever completing!
-            let relay_claim =
-                DatagramLaneClaim::try_claim_muxed(&relay_conn).expect("relay T0 claim");
-            relay_claim.arm_relay_rx_ready();
-            let mut client_claim =
-                DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client prov");
-            assert!(client_claim.activate_mux_v1());
-            // Claims drop here without confirm_relay_tx_prefix / confirm_client_mux_v1_confirmed.
-        }
-
-        // After abort, BOTH directions must deliver raw voice (including leading
-        // 0x01 and arbitrary bytes) cleanly with zero drops and zero stripping.
+        // 1) Before ANY relay session opens, payloads starting with 0x01, 0x00,
+        // or 0x42 cross cleanly in both directions without stripping or loss.
         for payload in [
-            Bytes::from_static(&[0x01, b'v', b'o', b'i', b'c', b'e']),
-            Bytes::from_static(&[0x77, b'p', b'c', b'm', b'1', b'2']),
+            Bytes::from_static(&[0x01, 0xAA, 0xBB, 0xCC]),
+            Bytes::from_static(&[0x00, 0x04, 0xDE, 0xAD]),
+            Bytes::from_static(&[0x42, 0x10, 0x20, 0x30]),
         ] {
             send_app_datagram(&relay_conn, payload.clone()).expect("relay -> client");
             let got_c = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
                 .await
                 .expect("client recv timeout")
                 .expect("client recv");
-            assert_eq!(
-                got_c, payload,
-                "relay->client voice must survive T2-never-happens abort"
-            );
+            assert_eq!(got_c, payload);
 
             send_app_datagram(&client_conn, payload.clone()).expect("client -> relay");
             let got_r = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
                 .await
                 .expect("relay recv timeout")
                 .expect("relay recv");
-            assert_eq!(
-                got_r, payload,
-                "client->relay voice must survive T2a-abort rollback"
-            );
+            assert_eq!(got_r, payload);
         }
-        assert_eq!(mux_unknown_ctx_dropped(&client_conn), 0);
-        assert_eq!(mux_unknown_ctx_dropped(&relay_conn), 0);
+
+        // 2) Unknown Context IDs are dropped from datagram #1 even with zero
+        // active relay sessions!
+        let before = mux_unknown_ctx_dropped(&client_conn);
+        relay_conn
+            .send_datagram(Bytes::from_static(&[44u8, b'j', b'u', b'n', b'k']))
+            .expect("send unknown ctx");
+        let sentinel = Bytes::from_static(b"after-junk");
+        send_app_datagram(&relay_conn, sentinel.clone()).expect("send sentinel");
+        let got = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("sentinel timeout")
+            .expect("sentinel");
+        assert_eq!(got, sentinel);
+        assert!(mux_unknown_ctx_dropped(&client_conn) > before);
+
+        // 3) Simulate an aborted relay session (claim + activate, then drop
+        // before any stream capsule exchange): voice remains 100% intact.
+        {
+            let _relay_claim =
+                DatagramLaneClaim::try_claim_muxed(&relay_conn).expect("relay mux claim");
+            let mut client_claim =
+                DatagramLaneClaim::try_claim_for_client(&client_conn).expect("client prov");
+            assert!(client_claim.should_request_mux_v1());
+            assert!(!client_claim.should_request_legacy_hybrid());
+            assert!(client_claim.activate_mux_v1());
+        }
+        for payload in [
+            Bytes::from_static(&[0x01, b'v', b'o', b'i', b'c', b'e']),
+            Bytes::from_static(&[0x77, b'p', b'c', b'm', b'1', b'2']),
+        ] {
+            send_app_datagram(&relay_conn, payload.clone()).expect("post-abort relay -> client");
+            let got_c = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+                .await
+                .expect("post-abort client recv")
+                .expect("post-abort client msg");
+            assert_eq!(got_c, payload);
+
+            send_app_datagram(&client_conn, payload.clone()).expect("post-abort client -> relay");
+            let got_r = tokio::time::timeout(HYBRID_TEST_TIMEOUT, relay_app_rx.recv())
+                .await
+                .expect("post-abort relay recv")
+                .expect("post-abort relay msg");
+            assert_eq!(got_r, payload);
+        }
+    }
+
+    /// Mixed-version `0.30.0 <-> 0.29.0` interop test: when either peer does
+    /// NOT advertise `DatagramMuxV1 (0x50C4)` (simulated via `datagram_mux_v1(false)`),
+    /// `supports_datagram_mux_v1()` is `false` on both ends, app datagrams
+    /// remain 100% raw (0 extra bytes), `try_claim_muxed` is rejected, idle
+    /// `try_claim_for_client` offers legacy `0x02` only, and an active app
+    /// reader cleanly refuses legacy hybrid (`ClaimedByOtherReader`).
+    #[tokio::test]
+    async fn legacy_029_peer_without_datagram_mux_v1_stays_raw_and_uses_legacy_fallback() {
+        use crate::masque::DatagramLaneError;
+        use crate::masque::relay_socket::{open_app_datagram_channel, send_app_datagram};
+
+        // 0.30.0 client <-> 0.29.0 relay (relay lacks 0x50C4 transport param).
+        let (client_conn, relay_conn) = relay_loopback_pair_with_mux(1452, true, false).await;
+        assert!(!client_conn.supports_datagram_mux_v1());
+        assert!(!relay_conn.supports_datagram_mux_v1());
+
+        // `try_claim_muxed` must refuse non-mux connections.
+        assert_eq!(
+            DatagramLaneClaim::try_claim_muxed(&relay_conn).unwrap_err(),
+            DatagramLaneError::Unsupported
+        );
+
+        // Idle client offers legacy 0x02 ONLY (no 0x04), and activate_mux_v1 fails closed.
+        {
+            let mut claim =
+                DatagramLaneClaim::try_claim_for_client(&client_conn).expect("idle legacy prov");
+            assert!(claim.should_request_legacy_hybrid());
+            assert!(!claim.should_request_mux_v1());
+            assert!(!claim.activate_mux_v1());
+            assert!(claim.activate_legacy_hybrid());
+            assert_eq!(claim.uncompressed_context_id(), Some(VarInt::from_u32(0)));
+        }
+
+        // With an app reader active on a 0.29.0 connection, app datagrams cross
+        // RAW (0 extra bytes, even starting with 0x01 or 0x42) and legacy hybrid
+        // is refused (`ClaimedByOtherReader`) so voice never suffers packet theft.
+        let mut client_app_rx = open_app_datagram_channel(&client_conn).expect("client app rx");
+        assert_eq!(
+            DatagramLaneClaim::try_claim_for_client(&client_conn).unwrap_err(),
+            DatagramLaneError::ClaimedByOtherReader
+        );
+        let raw_payload = Bytes::from_static(&[0x01, b'r', b'a', b'w', b'2', b'9']);
+        send_app_datagram(&relay_conn, raw_payload.clone()).expect("raw relay -> client");
+        let got = tokio::time::timeout(HYBRID_TEST_TIMEOUT, client_app_rx.recv())
+            .await
+            .expect("raw recv timeout")
+            .expect("raw recv");
+        assert_eq!(
+            got, raw_payload,
+            "0.29.0 link must deliver raw unprefixed bytes"
+        );
     }
 
     /// N4 regression test (suspenders): if the relay rejects the client's first
@@ -4164,8 +4173,8 @@ mod tests {
     }
 
     /// N3 regression test: `DATAGRAM_MUXES` stores only a `WeakConnectionHandle`
-    /// so sticky `mux_v1` state never prevents an idle/dropped outer `Connection`
-    /// from closing and being pruned from the global registry.
+    /// so retained quarantine entries never prevent an idle/dropped outer
+    /// `Connection` from closing and being pruned from the global registry.
     #[tokio::test]
     async fn dropped_connection_does_not_leak_in_datagram_muxes() {
         use crate::masque::relay_socket::{mux_entry_present_for_test, prune_dead_muxes_for_test};
@@ -4177,13 +4186,10 @@ mod tests {
         {
             let mut claim = DatagramLaneClaim::try_claim_for_client(&client_conn).expect("claim");
             assert!(claim.activate_mux_v1());
-            // Simulate T3 committed sticky state so the entry remains in
-            // DATAGRAM_MUXES while `client_conn` is alive.
-            claim.confirm_client_mux_v1_confirmed();
         }
         assert!(
             mux_entry_present_for_test(client_id),
-            "sticky mux_v1 entry stays present while outer connection is alive"
+            "hot 30 s block-quarantine entry stays present while outer connection is alive"
         );
 
         // Close/drop the outer connections; DATAGRAM_MUXES must NOT keep
@@ -4200,7 +4206,7 @@ mod tests {
         let _ = prune_dead_muxes_for_test();
         assert!(
             !mux_entry_present_for_test(client_id),
-            "dead connection's sticky mux entry must be pruned cleanly"
+            "dead connection's mux entry must be pruned cleanly"
         );
     }
 }

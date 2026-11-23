@@ -7141,6 +7141,12 @@ impl Connection {
     pub(crate) fn supports_ack_receive_v2(&self) -> bool {
         self.peer_params.ack_receive_v2
     }
+
+    /// Whether both endpoints negotiated the `DatagramMuxV1` (`0x50C4`) QUIC
+    /// transport parameter during the handshake (ADR-020).
+    pub(crate) fn supports_datagram_mux_v1(&self) -> bool {
+        self.config.datagram_mux_v1 && self.peer_params.datagram_mux_v1
+    }
 }
 
 #[cfg(test)]

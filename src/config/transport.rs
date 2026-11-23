@@ -52,6 +52,10 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    /// Advertise the `DatagramMuxV1` (`0x50C4`) QUIC transport parameter
+    /// (ADR-020), enabling RFC 9297 Context-ID datagram multiplexing from
+    /// datagram #1 when both peers advertise it. Defaults to `true`.
+    pub(crate) datagram_mux_v1: bool,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -357,6 +361,17 @@ impl TransportConfig {
         self
     }
 
+    /// Whether to advertise the `DatagramMuxV1` (`0x50C4`) QUIC transport
+    /// parameter (ADR-020), enabling RFC 9297 Context-ID datagram multiplexing
+    /// from datagram #1 when both peers advertise it.
+    ///
+    /// Defaults to `true`. Disabling this simulates or forces legacy `0.29.0`
+    /// unprefixed datagram framing on the connection.
+    pub fn datagram_mux_v1(&mut self, value: bool) -> &mut Self {
+        self.datagram_mux_v1 = value;
+        self
+    }
+
     /// Whether to force every packet number to be used
     ///
     /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
@@ -548,6 +563,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            datagram_mux_v1: true,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -590,6 +606,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            datagram_mux_v1,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -627,6 +644,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field("datagram_mux_v1", datagram_mux_v1)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload)
             .field("nat_traversal_config", nat_traversal_config)

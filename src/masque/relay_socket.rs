@@ -313,7 +313,8 @@ struct ConnectionDatagramMux {
     connection: WeakConnectionHandle,
     /// Confirmed legacy 0.29.0 exclusive hybrid relay claim active.
     legacy_exclusive_relay: bool,
-    /// Client provisional-exclusive claim awaiting CONNECT-UDP answer.
+    /// Client provisional-exclusive claim awaiting CONNECT-UDP answer on a
+    /// legacy `0.28`/`0.29` connection (`!supports_datagram_mux_v1()`).
     /// Allows `open_app_datagram_channel` without returning an empty stream;
     /// if an app reader subscribes during this window, `provisional_saw_app_reader`
     /// prevents falling back to legacy 0.29.0 exclusive mode.
@@ -321,26 +322,6 @@ struct ConnectionDatagramMux {
     provisional_saw_app_reader: bool,
     /// Count of active `datagram_mux_v1` hybrid sessions on this connection.
     mux_v1_sessions: usize,
-    /// Causal RX readiness (Relay T2a before writing `CompressionAck`/`Close`,
-    /// Client T3 upon receiving first `CompressionAck`/`Close`).
-    ///
-    /// While `false` (direct / 0.28 / 0.29 / T0→T2 / T1→T3 / any pre-T2 abort),
-    /// 100% of inbound datagrams pass raw to `app_subscribers` with zero
-    /// stripping and zero drops. Rolled back to `false` if a pre-T2b relay
-    /// claim drops before its `CompressionAck`/`Close` write commits.
-    mux_v1_rx_ready: bool,
-    /// Causal TX prefixing (Relay T2b after `CompressionAck`/`Close` write
-    /// succeeds, Client T3 upon receiving first `CompressionAck`/`Close`).
-    /// Sticky for the remainder of the outer connection's lifetime so teardown
-    /// and subsequent sessions have zero asymmetry.
-    mux_v1_tx_prefix: bool,
-    /// Causal hard-mux RX drop barrier (Client T3 on first `CompressionAck`/`Close`,
-    /// Relay T4 on first `0x01`-prefixed app frame or registered-ctx MASQUE
-    /// datagram after T2a). Sticky once set.
-    ///
-    /// Unknown or closed Context IDs are dropped and counted ONLY once the peer
-    /// is causally proven to prefix its outbound app datagrams.
-    peer_tx_prefix_confirmed: bool,
     /// Legacy exclusive non-relay `register_other_datagram_reader` guards.
     legacy_other_readers: usize,
     /// Active `LinkConn::recv_datagrams` subscribers dispatched by `DatagramMux`.
@@ -363,8 +344,8 @@ struct ConnectionDatagramMux {
     free_local_blocks: VecDeque<(u64, Instant)>,
     /// Monotonic local subscriber / session identifier.
     next_sub_id: u64,
-    /// Count of frames dropped in hard-mux mode because their Context ID was
-    /// unknown or closed.
+    /// Count of frames dropped on a `DatagramMuxV1` connection because their
+    /// Context ID was unknown or closed.
     unknown_ctx_dropped: Arc<AtomicU64>,
     /// Count of app datagrams dropped because an app subscriber channel was full.
     app_rx_dropped: Arc<AtomicU64>,
@@ -384,9 +365,6 @@ impl ConnectionDatagramMux {
             provisional_exclusive: false,
             provisional_saw_app_reader: false,
             mux_v1_sessions: 0,
-            mux_v1_rx_ready: false,
-            mux_v1_tx_prefix: false,
-            peer_tx_prefix_confirmed: false,
             legacy_other_readers: 0,
             app_subscribers: HashMap::new(),
             masque_routes: HashMap::new(),
@@ -417,15 +395,13 @@ impl ConnectionDatagramMux {
         if !self.connection.is_alive() {
             return true;
         }
-        // Keep sticky mux_v1 negotiation state alive while the outer connection
-        // is alive, and retain any still-quarantined freed blocks until
-        // `CTX_BLOCK_REUSE_COOLDOWN` elapses (even if a session closed pre-T3
-        // after sending `CompressionAssign`).
-        let has_hot_quarantine = self
+        // `DatagramMuxV1` is a static handshake property of `Connection`, so no
+        // sticky state needs to be retained here — only retain recently-freed
+        // blocks while their 30 s reuse quarantine is still hot.
+        !self
             .free_local_blocks
             .back()
-            .is_some_and(|&(_, freed_at)| freed_at.elapsed() < CTX_BLOCK_REUSE_COOLDOWN);
-        !self.mux_v1_tx_prefix && !has_hot_quarantine
+            .is_some_and(|&(_, freed_at)| freed_at.elapsed() < CTX_BLOCK_REUSE_COOLDOWN)
     }
 
     fn needs_dispatcher(&self) -> bool {
@@ -445,7 +421,11 @@ impl ConnectionDatagramMux {
     /// cooldown (`CTX_BLOCK_REUSE_COOLDOWN`) has elapsed.
     fn allocate_local_block(&mut self) -> Option<VarInt> {
         let now = Instant::now();
-        while let Some(&(base, freed_at)) = self.free_local_blocks.front() {
+        let inspect_limit = self.free_local_blocks.len();
+        for _ in 0..inspect_limit {
+            let Some(&(base, freed_at)) = self.free_local_blocks.front() else {
+                break;
+            };
             if now.saturating_duration_since(freed_at) < CTX_BLOCK_REUSE_COOLDOWN {
                 // FIFO order: if the oldest entry is still in quarantine, all
                 // newer entries are too. Allocate a fresh block instead.
@@ -459,6 +439,8 @@ impl ConnectionDatagramMux {
             {
                 return VarInt::from_u64(base).ok();
             }
+            // Still overlapped by an active route: re-queue rather than discarding.
+            self.free_local_blocks.push_back((base, freed_at));
         }
         loop {
             let base = self.next_local_block_base;
@@ -607,6 +589,7 @@ fn ensure_dispatcher_running(connection: &Connection, mux: &SharedMux) {
     };
 
     let conn = connection.clone();
+    let mux_v1 = connection.supports_datagram_mux_v1();
     let key = connection.stable_id();
     let mux_weak = Arc::downgrade(mux);
     tokio::spawn(async move {
@@ -636,11 +619,10 @@ fn ensure_dispatcher_running(connection: &Connection, mux: &SharedMux) {
             }
 
             let action = {
-                let mut state = mux.lock();
-                if !state.mux_v1_rx_ready {
-                    // Direct / 0.28 / 0.29 / pre-T2 relay / pre-T3 client (and
-                    // any T2-never-happens abort path): deliver 100% raw app
-                    // datagrams with zero stripping and zero drops.
+                let state = mux.lock();
+                if !mux_v1 {
+                    // Legacy 0.28/0.29 peer (did not negotiate DatagramMuxV1
+                    // transport parameter): deliver 100% raw app datagrams.
                     if state.app_subscribers.is_empty() {
                         Dispatch::Drop
                     } else {
@@ -651,9 +633,8 @@ fn ensure_dispatcher_running(connection: &Connection, mux: &SharedMux) {
                         )
                     }
                 } else if decoded_ctx == Some(APP_DATAGRAM_CONTEXT_ID) {
-                    // RFC 9297 odd app context ID: peer is causally prefixing
-                    // (T4 on relay); strip 1-byte prefix and deliver.
-                    state.peer_tx_prefix_confirmed = true;
+                    // Negotiated DatagramMuxV1 connection: odd Context ID 1 is
+                    // always a `LinkConn` app datagram (strip 1-byte prefix).
                     if state.app_subscribers.is_empty() {
                         Dispatch::Drop
                     } else {
@@ -666,22 +647,11 @@ fn ensure_dispatcher_running(connection: &Connection, mux: &SharedMux) {
                 } else if let Some(ctx_id) = decoded_ctx
                     && let Some(route) = state.masque_routes.get(&ctx_id).cloned()
                 {
-                    // Peer sent a registered MASQUE context ID (causally proves
-                    // client received CompressionAck and entered T3 -> T4 on relay).
-                    state.peer_tx_prefix_confirmed = true;
                     Dispatch::Masque(route, frame)
-                } else if !state.peer_tx_prefix_confirmed && !state.app_subscribers.is_empty() {
-                    // Brief Relay T2a→T4 startup window while client's pre-T3
-                    // raw app datagrams may still be in flight.
-                    Dispatch::App(
-                        frame,
-                        state.app_subscribers.values().cloned().collect(),
-                        Arc::clone(&state.app_rx_dropped),
-                    )
                 } else {
-                    // Confirmed hard-mux RX mode (`peer_tx_prefix_confirmed`):
-                    // unknown or closed Context IDs are dropped and counted,
-                    // never handed raw to app subscribers.
+                    // Negotiated DatagramMuxV1 connection: unknown or closed
+                    // Context IDs are always dropped and counted, never leaked
+                    // raw to app subscribers.
                     state.unknown_ctx_dropped.fetch_add(1, Ordering::Relaxed);
                     Dispatch::Drop
                 }
@@ -796,16 +766,11 @@ impl DatagramLaneClaim {
     /// Take an active relay-server `0.30.0+` `DatagramMux` (`datagram_mux_v1`)
     /// lease on `connection`.
     ///
-    /// Per ADR-020:
-    /// - The relay server NEVER self-allocates Context IDs or Context ID `0`.
-    /// - At T0 (`try_claim_muxed`), neither `mux_v1_rx_ready` nor
-    ///   `mux_v1_tx_prefix` is armed yet so a failed or aborted pre-T2 session
-    ///   never strips or drops raw app datagrams (`client <-> relay`).
-    /// - `arm_relay_rx_ready()` arms `mux_v1_rx_ready` at T2a right before
-    ///   writing `CompressionAck`/`Close`, and `confirm_relay_tx_prefix()` arms
-    ///   sticky `mux_v1_tx_prefix` at T2b once that write succeeds.
+    /// Requires both QUIC datagrams AND the connection-level `DatagramMuxV1`
+    /// (`0x50C4`) transport parameter to have been negotiated during the QUIC
+    /// handshake. The relay server never self-allocates Context IDs or ctx `0`.
     pub fn try_claim_muxed(connection: &Connection) -> Result<Self, DatagramLaneError> {
-        if connection.max_datagram_size().is_none() {
+        if connection.max_datagram_size().is_none() || !connection.supports_datagram_mux_v1() {
             return Err(DatagramLaneError::Unsupported);
         }
         let key = connection.stable_id();
@@ -842,17 +807,21 @@ impl DatagramLaneClaim {
     }
 
     /// Take a client-side provisional claim before sending `CONNECT-UDP`:
-    /// - If `connection` is idle and not yet in sticky `mux_v1`, allows BOTH
-    ///   legacy `0.29.0` fallback (`0x02`) and `0.30.0` `DatagramMux` (`0x04`).
-    /// - If `LinkConn::recv_datagrams`, another `mux_v1` session, or sticky
-    ///   `mux_v1` is active, requests `0x04` ONLY so a `0.29.0` relay cleanly
-    ///   stays stream-only.
+    /// - When the connection negotiated `DatagramMuxV1` (`0x50C4`) in the QUIC
+    ///   handshake (`0.30.0+`), takes a multiplexed `ClientProvisionalMuxOnly`
+    ///   claim (`0x04` only — coexists with `LinkConn::recv_datagrams` and
+    ///   additional sessions with zero transition window).
+    /// - When the peer did NOT negotiate `DatagramMuxV1` (`0.28.0`/`0.29.0`),
+    ///   takes a legacy `ClientProvisionalExclusive` claim (`0x02` only) if
+    ///   idle, or returns `Err(ClaimedByOtherReader)` if an app reader is
+    ///   active so the session stays cleanly stream-only without packet theft.
     pub fn try_claim_for_client(connection: &Connection) -> Result<Self, DatagramLaneError> {
         if connection.max_datagram_size().is_none() {
             return Err(DatagramLaneError::Unsupported);
         }
         let key = connection.stable_id();
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
+        let supports_mux = connection.supports_datagram_mux_v1();
 
         let (mux, mode) = {
             let mut registry = DATAGRAM_MUXES.lock();
@@ -864,17 +833,16 @@ impl DatagramLaneClaim {
             if state.legacy_other_readers > 0 {
                 return Err(DatagramLaneError::ClaimedByOtherReader);
             }
-            let mode = if !state.provisional_exclusive
-                && !state.mux_v1_rx_ready
-                && !state.mux_v1_tx_prefix
-                && state.mux_v1_sessions == 0
-                && state.app_subscribers.is_empty()
-            {
+            let mode = if supports_mux {
+                ClaimMode::ClientProvisionalMuxOnly
+            } else if state.provisional_exclusive || state.mux_v1_sessions > 0 {
+                return Err(DatagramLaneError::ClaimedByRelaySession);
+            } else if !state.app_subscribers.is_empty() {
+                return Err(DatagramLaneError::ClaimedByOtherReader);
+            } else {
                 state.provisional_exclusive = true;
                 state.provisional_saw_app_reader = false;
                 ClaimMode::ClientProvisionalExclusive
-            } else {
-                ClaimMode::ClientProvisionalMuxOnly
             };
             drop(state);
             (mux, mode)
@@ -907,22 +875,21 @@ impl DatagramLaneClaim {
     pub fn should_request_mux_v1(&self) -> bool {
         matches!(
             self.mode,
-            ClaimMode::ClientProvisionalExclusive
-                | ClaimMode::ClientProvisionalMuxOnly
-                | ClaimMode::MuxV1 { .. }
+            ClaimMode::ClientProvisionalMuxOnly | ClaimMode::MuxV1 { .. }
         )
     }
 
     /// Finalize a client-side provisional claim once the relay answers with
-    /// `RESPONSE_FLAG_DATAGRAM_MUX_V1` (`0x08`) (T1).
+    /// `RESPONSE_FLAG_DATAGRAM_MUX_V1` (`0x08`).
     ///
     /// Allocates one disjoint even uncompressed Context ID from THIS QUIC side's
-    /// pool and registers it in `DatagramMux`, WITHOUT arming `mux_v1_rx_ready`,
-    /// `mux_v1_tx_prefix`, or `peer_tx_prefix_confirmed` yet. Those flags flip
-    /// at T3 (`confirm_client_mux_v1_confirmed`) when the relay sends its first
-    /// `CompressionAck`/`CompressionClose`, guaranteeing zero raw-voice
-    /// stripping or blackout during T1→T2 or if T2 never happens.
+    /// pool and registers it in `DatagramMux`. Because `DatagramMuxV1` (`0x50C4`)
+    /// was already negotiated in the QUIC handshake, framing is static from
+    /// datagram #1 and no runtime activation transition is required.
     pub fn activate_mux_v1(&mut self) -> bool {
+        if !self.connection.supports_datagram_mux_v1() {
+            return false;
+        }
         match self.mode {
             ClaimMode::MuxV1 { .. } => true,
             ClaimMode::ClientProvisionalExclusive | ClaimMode::ClientProvisionalMuxOnly => {
@@ -996,49 +963,6 @@ impl DatagramLaneClaim {
                 true
             }
             ClaimMode::ClientProvisionalMuxOnly | ClaimMode::MuxV1 { .. } => false,
-        }
-    }
-
-    /// T2a barrier on relay server: called when the relay receives the client's
-    /// first `CompressionAssign`/`EcnCompressionAssign` capsule, right BEFORE
-    /// writing `CompressionAck`/`CompressionClose` so the relay is ready to
-    /// accept `0x01`-prefixed app frames and MASQUE datagrams as soon as the
-    /// client receives the reply (T3).
-    ///
-    /// Does NOT arm `mux_v1_tx_prefix` yet; if writing the reply fails and this
-    /// claim drops before T2b, `Drop` rolls back `mux_v1_rx_ready` to `false`.
-    pub(crate) fn arm_relay_rx_ready(&self) {
-        if self.is_mux_v1() {
-            let mut state = self.mux.lock();
-            state.mux_v1_rx_ready = true;
-        }
-    }
-
-    /// T2b barrier on relay server: called right AFTER the relay successfully
-    /// writes `CompressionAck`/`CompressionClose` to the stream, committing
-    /// sticky `mux_v1_tx_prefix = true` (so relay's reply capsule is ordered
-    /// ahead of its first `0x01`-prefixed app datagram).
-    pub(crate) fn confirm_relay_tx_prefix(&self) {
-        if self.is_mux_v1() {
-            let mut state = self.mux.lock();
-            state.mux_v1_rx_ready = true;
-            state.mux_v1_tx_prefix = true;
-        }
-    }
-
-    /// T3 barrier on relay client: called when the client receives the relay's
-    /// first `CompressionAck` or `CompressionClose` capsule on the stream.
-    ///
-    /// Causally proves the relay reached T2 (`mux_v1_rx_ready = true` and
-    /// `mux_v1_tx_prefix = true`), so the client safely commits sticky
-    /// `mux_v1_rx_ready`, `mux_v1_tx_prefix`, and hard-mux RX
-    /// `peer_tx_prefix_confirmed` together.
-    pub(crate) fn confirm_client_mux_v1_confirmed(&self) {
-        if self.is_mux_v1() {
-            let mut state = self.mux.lock();
-            state.mux_v1_rx_ready = true;
-            state.mux_v1_tx_prefix = true;
-            state.peer_tx_prefix_confirmed = true;
         }
     }
 
@@ -1381,12 +1305,6 @@ impl Drop for DatagramLaneClaim {
                         }
                     }
                     state.mux_v1_sessions = state.mux_v1_sessions.saturating_sub(1);
-                    // N2 rollback: if all mux_v1 sessions dropped before T2b/T3
-                    // committed `mux_v1_tx_prefix`, roll back `mux_v1_rx_ready`
-                    // so raw app datagrams are never stripped on an aborted link.
-                    if state.mux_v1_sessions == 0 && !state.mux_v1_tx_prefix {
-                        state.mux_v1_rx_ready = false;
-                    }
                 }
             }
         }
@@ -1507,25 +1425,17 @@ pub(crate) fn open_app_datagram_channel(
 
 /// Send an application (`LinkConn`) datagram on `connection`.
 ///
-/// - Once symmetric `DATAGRAM_MUX_V1` (`mux_v1_tx_prefix == true`) is committed
-///   on `connection` (Relay T2b / Client T3), prepends the 1-byte odd RFC 9297
-///   Context ID [`APP_DATAGRAM_CONTEXT_ID`] (`0x01`) so the peer's `DatagramMux`
-///   demultiplexes it cleanly from MASQUE even Context IDs.
-/// - Otherwise (direct connections, `0.28.0`/`0.29.0` peers, or pre-T2/pre-T3
-///   startup), sends `data` raw with zero overhead.
+/// - When `DatagramMuxV1` (`0x50C4`) was negotiated in the QUIC handshake
+///   (`connection.supports_datagram_mux_v1()`), prepends the 1-byte odd RFC 9297
+///   Context ID [`APP_DATAGRAM_CONTEXT_ID`] (`0x01`) from datagram #1 so the
+///   peer's `DatagramMux` demultiplexes it cleanly from MASQUE even Context IDs.
+/// - On connections with `0.28.0`/`0.29.0` peers (without `0x50C4`), sends
+///   `data` raw with zero overhead.
 pub(crate) fn send_app_datagram(
     connection: &Connection,
     data: Bytes,
 ) -> Result<(), SendDatagramError> {
-    let prefix_app = {
-        let key = connection.stable_id();
-        let registry = DATAGRAM_MUXES.lock();
-        registry
-            .map
-            .get(&key)
-            .is_some_and(|mux| mux.lock().mux_v1_tx_prefix)
-    };
-    if prefix_app {
+    if connection.supports_datagram_mux_v1() {
         let ctx = VarInt::from_u32(APP_DATAGRAM_CONTEXT_ID as u32);
         let mut buf = BytesMut::with_capacity(ctx.size() + data.len());
         ctx.encode(&mut buf);
@@ -1934,11 +1844,6 @@ impl MasqueRelaySocket {
                 if mux_v1 && let Some(capsule_res) = Capsule::decode_stream_frame(&frame_buf) {
                     match capsule_res {
                         Ok(Capsule::CompressionAck(ack)) => {
-                            // Client T3 barrier: relay sent a mux_v1 capsule reply,
-                            // causally proving relay reached T2 (`rx_ready` + `tx_prefix`).
-                            if let Some(ref claim) = stream_reader_claim {
-                                claim.confirm_client_mux_v1_confirmed();
-                            }
                             let current_u_ctx = stream_reader_claim
                                 .as_deref()
                                 .and_then(DatagramLaneClaim::uncompressed_context_id);
@@ -1949,11 +1854,6 @@ impl MasqueRelaySocket {
                             }
                         }
                         Ok(Capsule::CompressionClose(close)) => {
-                            // Client T3 barrier: even a CompressionClose causally
-                            // proves the relay reached T2.
-                            if let Some(ref claim) = stream_reader_claim {
-                                claim.confirm_client_mux_v1_confirmed();
-                            }
                             let current_u_ctx = stream_reader_claim
                                 .as_deref()
                                 .and_then(DatagramLaneClaim::uncompressed_context_id);

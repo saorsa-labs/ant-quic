@@ -52,24 +52,37 @@ the "direct" result, and migration reported success without migrating.
    - Request bit `0x04` (`REQUEST_FLAG_DATAGRAM_MUX_V1`, 0.30.0+): client supports RFC 9297
      Context-ID `DatagramMux`, `COMPRESSION_ASSIGN` / `ECN_COMPRESSION_ASSIGN` capsules on the
      relay stream, and 4-context ECN mapping.
-   - When an outer connection has no competing datagram reader, a 0.30.0+ hybrid client sets
-     `0x02 | 0x04`. When `LinkConn::recv_datagrams` (e.g., x0x voice) or another muxed hybrid
-     session is already active on that connection, the client sets `0x04` only (not `0x02`) so a
-     0.29.0 relay cleanly stays stream-only while a 0.30.0+ relay accepts muxed hybrid.
-   - The relay sets response bit `0x04` (`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`) whenever hybrid is
-     accepted, and additionally sets `0x08` (`RESPONSE_FLAG_DATAGRAM_MUX_V1`) when both ends use
-     the 0.30.0+ Context-ID demultiplexer.
-   - Without `0x04` in the response, the session is stream-only in both directions.
-   - QUIC `DATAGRAM` support in transport parameters is not a signal.
+   - When the outer connection negotiated the `DatagramMuxV1 (0x50C4)` QUIC transport parameter
+     (`0.30.0+` ↔ `0.30.0+`), a hybrid client sets `0x04` (`REQUEST_FLAG_DATAGRAM_MUX_V1`) to
+     select per-session Context-ID + compression + ECN mode; the relay answers `0x04 | 0x08`
+     (`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE | RESPONSE_FLAG_DATAGRAM_MUX_V1`) when in `Hybrid` mode.
+   - When the peer did NOT advertise `DatagramMuxV1 (0x50C4)` (`0.28.0`/`0.29.0`), the client sets
+     `0x02` only (never `0x04`) if no `LinkConn::recv_datagrams` reader is active, and stays
+     stream-only (`0x00`) if an app reader is active so a `0.29.0` peer never suffers packet theft.
+   - Without `0x04` (`RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`) in the response, the session is
+     stream-only in both directions.
+   - QUIC `DATAGRAM` support (`max_datagram_frame_size`) is not a hybrid signal; `DatagramMuxV1
+     (0x50C4)` negotiates connection-level Context-ID framing, and CONNECT-UDP flags negotiate
+     per-session hybrid forwarding.
    - Decoders up to 0.28.0 ignore unknown bits (`0x02`/`0x04` in request, `0x04`/`0x08` in
-     response) and always get stream-only. Decoders on 0.29.0 ignore `0x04` (request) / `0x08`
-     (response) and negotiate legacy exclusive hybrid only when `0x02` is set.
-2. **RFC 9297 Context-ID `DatagramMux` on outer connections (replaces exclusive single-reader limit
-   when `DATAGRAM_MUX_V1` is negotiated).**
-   - A single per-connection `DatagramMux` reader task owns `Connection::read_datagram()` and
-     dispatches frames by leading QUIC `VarInt` Context ID:
+     response) and always get stream-only. Decoders on 0.29.0 lack `0x50C4` and negotiate legacy
+     exclusive hybrid only when `0x02` is set.
+2. **Connection-level `DatagramMuxV1 (0x50C4)` QUIC transport parameter & RFC 9297 Context-ID
+   `DatagramMux` (replaces exclusive single-reader limit on `0.30.0+` connections).**
+   - `DatagramMuxV1` (`0x50C4`, zero-length empty QUIC transport parameter, enabled by default via
+     `TransportConfig::datagram_mux_v1(true)`) is exchanged during the QUIC handshake. Mutual
+     advertisement (`Connection::supports_datagram_mux_v1()`) makes Context-ID datagram framing a
+     static, immutable property of the connection from datagram #1 to close — eliminating all
+     mid-connection raw→prefixed transitions, soft windows, byte-sniffing, and abort-path races.
+     `TransportParameters::validate_resumption_from` rejects any `datagram_mux_v1` mismatch on
+     0-RTT resumption.
+   - On a connection where `supports_datagram_mux_v1()` is `true`, a single per-connection
+     `DatagramMux` reader task (tracked in `DATAGRAM_MUXES` via a `WeakConnectionHandle` with
+     doubling amortized O(1) dead-entry pruning so idle connections never leak as zombies) owns
+     `Connection::read_datagram()` and dispatches frames strictly by leading QUIC `VarInt`
+     Context ID:
      - **Context ID `0` (even):** reserved exclusively for legacy `0.29.0` non-muxed hybrid
-       sessions (`0x02` without `0x04`); NEVER used by `DATAGRAM_MUX_V1` sessions.
+       sessions (`0x02` without `0x04`); NEVER used on `DatagramMuxV1` sessions.
      - **Client-allocated even Context IDs `>= 2` (disjoint per QUIC side):** ONLY the relay
        client allocates Context IDs (the relay server never self-allocates). To keep mutual
        relaying on one outer connection collision-free, `Side::Client` allocates 8-ID blocks
@@ -85,39 +98,17 @@ the "direct" result, and migration reported success without migrating.
        are hard-capped at `MAX_MUX_ROUTES_PER_CONNECTION = 2048` and odd Context IDs are rejected
        with `CompressionClose`.
      - **Odd Context ID `1` (`APP_DATAGRAM_CONTEXT_ID`):** multiplexed application datagrams
-       (`LinkConn::send_datagram` / `LinkConn::recv_datagrams`, such as x0x voice), disjoint from
-       even MASQUE Context IDs.
-   - **Causal sticky activation (T0→T1→T2a/T2b→T3→T4) & hard unknown-ctx drop:**
-     - T0 (relay accepts `0x04` and writes `0x08`) & T1 (client receives `0x08`, allocates `u_ctx`,
-       and sends `CompressionAssign::uncompressed(u_ctx)` on the stream): neither side arms
-       `mux_v1_rx_ready`, `mux_v1_tx_prefix`, or `peer_tx_prefix_confirmed` yet. All app datagrams
-       stay 100% raw with zero stripping and zero drops; any pre-T2 abort (missing session, missing
-       `public_address`, stream reset) leaves both sides untouched with zero voice blackout.
-     - T2a (relay receives client's first `CompressionAssign`/`EcnCompressionAssign`): relay arms
-       `mux_v1_rx_ready` and writes `CompressionAck`/`CompressionClose` on the stream. If writing
-       the reply fails and the claim drops before T2b, `mux_v1_rx_ready` rolls back to `false`.
-     - T2b (relay reply write succeeds): relay commits sticky `mux_v1_tx_prefix = true` (ordered
-       strictly after the reply capsule on the stream) and activates TX datagram routing on the
-       registered context.
-     - T3 (client receives relay's first `CompressionAck` or `CompressionClose`): causally proves
-       relay reached T2; client commits sticky `mux_v1_rx_ready = true`, `mux_v1_tx_prefix = true`,
-       and hard-mux RX `peer_tx_prefix_confirmed = true`.
-     - T4 (relay receives client's first `0x01`-prefixed app datagram or registered-ctx MASQUE
-       datagram after T2a): causally proves client reached T3; relay commits sticky
-       `peer_tx_prefix_confirmed = true`.
-     - Once committed, `mux_v1_tx_prefix` and `peer_tx_prefix_confirmed` stay sticky for the
-       outer connection's lifetime (retained in `DATAGRAM_MUXES` via a `WeakConnectionHandle` with
-       amortized O(1) dead-entry pruning so idle connections never become zombies). In confirmed
-       hard-mux RX mode (`peer_tx_prefix_confirmed == true`), any frame with an unknown or closed
-       Context ID is dropped and counted (`mux_unknown_ctx_dropped`) and never passed raw to app
-       subscribers.
-   - When `DATAGRAM_MUX_V1` is NOT active on a connection (direct peer connections, 0.28.0/0.29.0
-     peers), `LinkConn::send_datagram` and `recv_datagrams` carry raw unprefixed bytes (100%
-     backward compatible). Note: raw `Connection::send_datagram` remains a low-level transport
-     primitive and bypasses `APP_DATAGRAM_CONTEXT_ID` framing; callers sharing a connection with
-     `DATAGRAM_MUX_V1` should send application datagrams via `LinkConn::send_datagram`.
-   - For legacy 0.29.0 hybrid sessions (`0x02` without `0x04`), the exclusive single-reader claim
-     is retained so a 0.29.0 peer cannot suffer packet theft with `LinkConn::recv_datagrams`.
+       (`LinkConn::send_datagram` / `LinkConn::recv_datagrams`, such as x0x voice), prefixed from
+       datagram #1 on every `DatagramMuxV1` connection and disjoint from even MASQUE Context IDs.
+     - **Unknown/closed Context IDs:** always dropped and counted (`mux_unknown_ctx_dropped`) and
+       never passed raw to app subscribers.
+   - When `supports_datagram_mux_v1()` is `false` (peers on `0.28.0`/`0.29.0` or connections with
+     `datagram_mux_v1(false)`), `LinkConn::send_datagram` and `recv_datagrams` carry 100% raw
+     unprefixed bytes (0 extra bytes), and legacy `0.29.0` exclusive hybrid (`0x02` without `0x04`)
+     retains the single-reader lock so a `0.29.0` peer cannot suffer packet theft with
+     `LinkConn::recv_datagrams`. Note: raw `Connection::send_datagram` remains a low-level
+     transport primitive and bypasses `APP_DATAGRAM_CONTEXT_ID` framing; callers sharing a
+     `DatagramMuxV1` connection should send application datagrams via `LinkConn::send_datagram`.
 3. **`COMPRESSION_ASSIGN` socket data plane & `draft-seemann-masque-connect-udp-ecn-01` ECN
    propagation (when `DATAGRAM_MUX_V1` is negotiated).**
    - On the relay bidirectional stream, data frames remain `[4 B BE len][UncompressedDatagram]`
@@ -196,20 +187,23 @@ the "direct" result, and migration reported success without migrating.
 
 ### Negative / Trade-offs
 
-- When `DATAGRAM_MUX_V1` is active on a connection, `LinkConn::send_datagram` adds a 1-byte
-  Context ID prefix (`0x01`); direct non-relayed connections add 0 bytes.
+- On connections where both peers negotiate `DatagramMuxV1 (0x50C4)`, `LinkConn::send_datagram`
+  adds a 1-byte Context ID prefix (`0x01`) from datagram #1; connections with `0.28.0`/`0.29.0`
+  peers (without `0x50C4`) add 0 bytes.
 - Inner Initials and 1,200 B `PATH_CHALLENGE` probes on sub-1200 virtual paths still traverse the
   stream lane, while 1-RTT data uses the datagram lane.
 - Hybrid and `auto_migrate` stay off by default until the 1,280 B netem soak passes.
 
 ### Neutral / Operational
 
-- Wire change: two additional CONNECT-UDP flag bits (`0x04` request, `0x08` response), `0xFF`
-  stream capsule framing, and `0x14` `ECN_COMPRESSION_ASSIGN` capsule — negotiated only between
-  0.30.0+ Hybrid peers.
+- Wire change: one connection-level zero-length QUIC transport parameter `DatagramMuxV1 (0x50C4)`
+  (0.30.0+ default enabled), two per-session CONNECT-UDP flag bits (`0x04` request, `0x08`
+  response), `0xFF` stream capsule framing, and `0x14` `ECN_COMPRESSION_ASSIGN` capsule — gated
+  cleanly on mutual negotiation so 0.28.0/0.29.0 peers keep raw framing.
 
 ## Validation
 
+- `src/transport_parameters.rs`: `test_datagram_mux_v1_roundtrip_and_validation`.
 - `src/masque/connect.rs`: `hybrid_request_signal_is_one_flag_bit_and_backward_compatible`,
   `hybrid_response_signal_roundtrips_and_keeps_layout`,
   `datagram_mux_v1_flag_bits_roundtrip_and_stay_backward_compatible`.
@@ -230,8 +224,8 @@ the "direct" result, and migration reported success without migrating.
   `session_reuse_after_close_uses_clean_explicit_context`,
   `uncompressed_compression_assign_spam_is_bounded_and_odd_ctx_rejected`,
   `hard_mux_drops_unknown_ctx_without_leaking_to_app_subscribers`,
-  `t1_to_t2_window_preserves_raw_relay_app_datagrams_including_0x01_prefix`,
-  `t2_never_happens_abort_leaves_voice_intact_no_blackout`,
+  `datagram_mux_v1_transport_param_prefixes_from_packet_one_and_survives_aborts`,
+  `legacy_029_peer_without_datagram_mux_v1_stays_raw_and_uses_legacy_fallback`,
   `uncompressed_ctx_close_retries_fresh_block_and_reaches_datagram_lane`,
   `quarantined_freed_block_is_not_immediately_reused`,
   `dropped_connection_does_not_leak_in_datagram_muxes`,
