@@ -9,7 +9,7 @@
 //!
 //! A virtual UDP socket that routes QUIC packets through a MASQUE relay.
 //!
-//! Supports two forwarding modes per ADR-016:
+//! Supports two forwarding modes per ADR-016 and ADR-020:
 //! - [`RelayForwardMode::Stream`] (default): all packets travel over the persistent
 //!   bidirectional QUIC stream with `[4-byte BE length][UncompressedDatagram]` framing.
 //! - [`RelayForwardMode::Hybrid`]: non-Initial packets that fit the negotiated QUIC
@@ -17,80 +17,120 @@
 //!   head-of-line blocking, no nested retransmission), while QUIC Initial packets
 //!   and packets larger than `P_max` stay on the length-prefixed stream lane.
 //!
-//! Hybrid is negotiated per relay session: the client sets
-//! [`crate::masque::connect::REQUEST_FLAG_HYBRID_DATAGRAM_LANE`] in its CONNECT-UDP
-//! request and the relay answers with
-//! [`crate::masque::connect::RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`]. Without both
-//! bits the session is stream-only in both directions. Advertising QUIC
-//! `DATAGRAM` support in transport parameters is NOT a signal: every peer does
-//! it, including peers that never read the datagram lane.
-//!
-//! QUIC `DATAGRAM` frames carry no relay demultiplexer (the context ID is always
-//! `0`), so only one reader may consume a connection's datagrams. A hybrid
-//! session therefore holds a [`DatagramLaneClaim`] on its outer connection for
-//! its lifetime; a second hybrid session, or any other datagram reader on the
-//! same connection, is refused instead of silently stealing packets.
+//! Hybrid is negotiated per relay session:
+//! - `0.29.0+`: client sets [`crate::masque::connect::REQUEST_FLAG_HYBRID_DATAGRAM_LANE`]
+//!   and relay answers [`crate::masque::connect::RESPONSE_FLAG_HYBRID_DATAGRAM_LANE`].
+//! - `0.30.0+` (ADR-020): client additionally sets
+//!   [`crate::masque::connect::REQUEST_FLAG_DATAGRAM_MUX_V1`] and relay answers
+//!   [`crate::masque::connect::RESPONSE_FLAG_DATAGRAM_MUX_V1`], enabling:
+//!   1. RFC 9297 Context-ID `DatagramMux` with disjoint side-partitioned
+//!      client-allocated even Context IDs (`Side::Client` `{2..=8, 18..=24, ...}`
+//!      vs `Side::Server` `{10..=16, 26..=32, ...}`), eliminating Context ID `0`
+//!      split-brain under mutual relaying and reuse-after-close while allowing
+//!      concurrent `LinkConn::recv_datagrams` (e.g., voice) on odd Context ID `1`;
+//!   2. `COMPRESSION_ASSIGN` / `ECN_COMPRESSION_ASSIGN` capsules (`1–2 B`
+//!      [`CompressedDatagram`] headers instead of `8 B` IPv4 / `20 B` IPv6);
+//!   3. `draft-seemann-masque-connect-udp-ecn-01` 4-context ECN propagation
+//!      (`base + 0/2/4/6` for `Not-ECT`/`ECT(0)`/`ECT(1)`/`CE`);
+//!   4. `900 B` `P_max` floor (superseding ADR-016 Decision 3's `1,232 B` floor)
+//!      paired with an inner virtual-path MTU clamp (`min(P_max, 1380)`).
 //!
 //! Implements [`AsyncUdpSocket`] so it can be plugged into a Quinn endpoint
 //! as a transparent replacement for a real UDP socket.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
-use quinn_udp::{RecvMeta, Transmit};
+use quinn_udp::{EcnCodepoint, RecvMeta, Transmit};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::VarInt;
-use crate::high_level::{AsyncUdpSocket, Connection, SendDatagramError, UdpSender};
-use crate::masque::UncompressedDatagram;
+use crate::coding::Codec;
+use crate::high_level::{
+    AsyncUdpSocket, Connection, SendDatagramError, UdpSender, WeakConnectionHandle,
+};
+use crate::masque::capsule::{Capsule, CompressionAssign};
+use crate::masque::{CompressedDatagram, UncompressedDatagram};
+use crate::{Side, VarInt};
 
 /// Minimum QUIC Initial packet size per RFC 9000 §14.1.
 pub const QUIC_INITIAL_MIN_SIZE: usize = 1200;
 
-/// Margin above [`QUIC_INITIAL_MIN_SIZE`] that the datagram budget `P_max`
-/// must keep (ADR-016 Decision 3: never below 1200 B plus margin).
+/// Legacy margin constant retained from ADR-016 Decision 3 (superseded by
+/// ADR-020's `900 B` virtual-path floor).
 pub const RELAY_DATAGRAM_BUDGET_MARGIN: usize = 32;
 
-/// Smallest inner payload budget `P_max` for which the datagram lane is used.
+/// Smallest inner payload budget `P_max` for which the datagram lane is used
+/// (ADR-020, superseding ADR-016 Decision 3's `1,232 B` floor).
+pub const MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET: usize = 900;
+
+/// Upper cap for the inner virtual-path MTU clamp (`min(P_max, 1380)`, ADR-020).
+pub const MAX_INNER_RELAY_UDP_PAYLOAD_SIZE: usize = 1380;
+
+/// Odd RFC 9297 Context ID reserved for multiplexed application datagrams
+/// (`LinkConn::send_datagram` / `LinkConn::recv_datagrams`, e.g., x0x voice)
+/// when `DATAGRAM_MUX_V1` is active on an outer connection.
 ///
-/// When the outer connection cannot carry this many inner bytes in one QUIC
-/// `DATAGRAM` frame, [`compute_datagram_payload_budget`] returns `None` and
-/// every packet uses the stream lane.
-pub const MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET: usize =
-    QUIC_INITIAL_MIN_SIZE + RELAY_DATAGRAM_BUDGET_MARGIN;
+/// Odd IDs are disjoint from even MASQUE Context IDs (`0, 2, 4, ...`).
+pub const APP_DATAGRAM_CONTEXT_ID: u64 = 1;
+
+/// Stride of one 4-context ECN quad (`base + 0/2/4/6`, 4 consecutive even IDs).
+pub const ECN_CONTEXT_STRIDE: u64 = 8;
+
+/// Stride between consecutive blocks allocated by ONE QUIC side on a connection.
+///
+/// `Side::Client` allocates `{2..=8, 18..=24, 34..=40, ...}` and `Side::Server`
+/// allocates `{10..=16, 26..=32, 42..=48, ...}`, keeping both relay directions
+/// mathematically disjoint under mutual relaying on the same outer connection.
+pub const SIDE_BLOCK_STRIDE: u64 = 16;
+
+/// Maximum number of compressed target entries tracked per relay session.
+pub const DEFAULT_MAX_COMPRESSED_TARGETS: usize = 256;
+
+/// Hard cap on total Context ID entries registered in one outer connection's
+/// `DatagramMux` routing table (prevents unbounded heap growth DoS).
+pub const MAX_MUX_ROUTES_PER_CONNECTION: usize = 2048;
+
+/// Quarantine duration before a freed client-allocated 8-ID Context ID block
+/// may be recycled for a subsequent session/target on the same outer connection.
+///
+/// Prevents a fast session close + reopen from colliding with a relay that is
+/// still tearing down the prior stream or with stale in-flight datagrams.
+pub const CTX_BLOCK_REUSE_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Maximum bounded retries when a relay rejects a client's initial uncompressed
+/// Context ID via `CompressionClose`.
+const MAX_UNCOMPRESSED_CTX_RETRIES: usize = 3;
 
 /// Maximum queued outbound packets before tail-drop engages.
-///
-/// Bounding the channel prevents inner QUIC PTO retransmissions from causing
-/// unbounded memory growth and bufferbloat during outer-link congestion.
 pub const DEFAULT_RELAY_SEND_QUEUE_CAPACITY: usize = 256;
 
 /// Maximum queued inbound packets before oldest-drop engages (UDP ring semantics).
 pub const DEFAULT_RELAY_RECV_QUEUE_CAPACITY: usize = 256;
 
-/// Relay data-plane forwarding mode (ADR-016).
+/// Relay data-plane forwarding mode (ADR-016 / ADR-020).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayForwardMode {
     /// Forward all packets over the length-prefixed reliable QUIC stream (ADR-009).
     #[default]
     Stream,
-    /// Two-lane forwarding (ADR-016): unreliable QUIC `DATAGRAM` frames for
-    /// non-Initial packets `<= P_max`, length-prefixed stream for Initials
-    /// and oversized packets. Used for a session only when both ends signal
-    /// it in the CONNECT-UDP exchange.
+    /// Two-lane forwarding (ADR-016 / ADR-020): unreliable QUIC `DATAGRAM`
+    /// frames for non-Initial packets `<= P_max`, length-prefixed stream for
+    /// Initials and oversized packets. Used for a session only when both ends
+    /// signal it in the CONNECT-UDP exchange.
     Hybrid,
 }
 
-/// Forwarding lane selected for a single inner UDP packet (ADR-016).
+/// Forwarding lane selected for a single inner UDP packet (ADR-016 / ADR-020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RelayLane {
     /// Unreliable QUIC `DATAGRAM` frame on the outer relay connection.
@@ -99,10 +139,37 @@ pub enum RelayLane {
     Stream,
 }
 
+/// Map a compressed target's even `base` Context ID and inner ECN codepoint to
+/// the wire Context ID per `draft-seemann-masque-connect-udp-ecn-01`:
+/// - `None` (`Not-ECT`) → `base + 0`
+/// - `Some(Ect0)` → `base + 2`
+/// - `Some(Ect1)` → `base + 4`
+/// - `Some(Ce)` → `base + 6`
+#[must_use]
+pub fn ecn_context_id(base: VarInt, ecn: Option<EcnCodepoint>) -> VarInt {
+    let offset = match ecn {
+        None => 0,
+        Some(EcnCodepoint::Ect0) => 2,
+        Some(EcnCodepoint::Ect1) => 4,
+        Some(EcnCodepoint::Ce) => 6,
+    };
+    VarInt::from_u64(base.into_inner().saturating_add(offset)).unwrap_or(base)
+}
+
+/// Decode the ECN codepoint from the offset `ctx_id - base` inside a 4-context
+/// ECN quad (`0 => Not-ECT`, `2 => ECT(0)`, `4 => ECT(1)`, `6 => CE`).
+#[must_use]
+pub const fn decode_ecn_offset(offset: u64) -> Option<Option<EcnCodepoint>> {
+    match offset {
+        0 => Some(None),
+        2 => Some(Some(EcnCodepoint::Ect0)),
+        4 => Some(Some(EcnCodepoint::Ect1)),
+        6 => Some(Some(EcnCodepoint::Ce)),
+        _ => None,
+    }
+}
+
 /// Overhead in bytes of an [`UncompressedDatagram`] header using Context ID `0`.
-///
-/// Layout: `1 B` context varint (`0`) + `1 B` IP version + `4 B` (IPv4) or
-/// `16 B` (IPv6) address + `2 B` port.
 #[must_use]
 pub const fn uncompressed_datagram_header_overhead(target: SocketAddr) -> usize {
     match target {
@@ -111,12 +178,21 @@ pub const fn uncompressed_datagram_header_overhead(target: SocketAddr) -> usize 
     }
 }
 
+/// Overhead in bytes of an [`UncompressedDatagram`] header with a specific
+/// Context ID.
+#[must_use]
+pub fn uncompressed_datagram_header_overhead_for_ctx(
+    context_id: VarInt,
+    target: SocketAddr,
+) -> usize {
+    let ip_len = match target {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    };
+    context_id.size() + 1 + ip_len + 2
+}
+
 /// Returns `true` if `payload` looks like a QUIC Initial packet (v1 or v2).
-///
-/// Per RFC 9000 §17.2.2 and RFC 9369 §3.2:
-/// - Long header bit (`0x80`) is set.
-/// - For QUIC v1 (or unknown versions), long packet type bits `(b0 & 0x30) == 0x00`.
-/// - For QUIC v2 (`version == 0x6b33_43cf`), Initial uses `(b0 & 0x30) == 0x10`.
 #[must_use]
 pub fn is_quic_initial_packet(payload: &[u8]) -> bool {
     let Some(&first) = payload.first() else {
@@ -136,32 +212,63 @@ pub fn is_quic_initial_packet(payload: &[u8]) -> bool {
 }
 
 /// Compute the inner UDP payload budget `P_max` that fits inside one outer
-/// QUIC `DATAGRAM` frame for `target`.
-///
-/// Returns `None` when outer datagrams are disabled/unsupported, or when the
-/// budget after encapsulation overhead is below
-/// [`MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET`] (ADR-016 Decision 3). `None` sends
-/// every packet on the stream lane.
+/// QUIC `DATAGRAM` frame given an explicit encapsulation header size `overhead`.
 #[must_use]
-pub fn compute_datagram_payload_budget(
+pub fn compute_datagram_payload_budget_with_overhead(
     max_outer_datagram_size: Option<usize>,
-    target: SocketAddr,
+    overhead: usize,
 ) -> Option<usize> {
     let outer = max_outer_datagram_size?;
-    let overhead = uncompressed_datagram_header_overhead(target);
     outer
         .checked_sub(overhead)
         .filter(|&budget| budget >= MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET)
 }
 
-/// Select the forwarding lane for a single packet under `mode` (ADR-016).
-///
-/// Invariants:
-/// - [`RelayForwardMode::Stream`] always selects [`RelayLane::Stream`].
-/// - QUIC Initial packets always select [`RelayLane::Stream`].
-/// - Without a budget of at least [`MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET`], every
-///   packet selects [`RelayLane::Stream`].
-/// - Otherwise, packets whose length is `<= P_max` select [`RelayLane::Datagram`].
+/// Compute the inner UDP payload budget `P_max` for an uncompressed Context ID
+/// `0` datagram to `target`.
+#[must_use]
+pub fn compute_datagram_payload_budget(
+    max_outer_datagram_size: Option<usize>,
+    target: SocketAddr,
+) -> Option<usize> {
+    compute_datagram_payload_budget_with_overhead(
+        max_outer_datagram_size,
+        uncompressed_datagram_header_overhead(target),
+    )
+}
+
+/// Compute the recommended clamped inner virtual-path MTU (`min(P_max, 1380)`)
+/// for an inner QUIC endpoint running over a hybrid MASQUE relay (ADR-020).
+#[must_use]
+pub fn compute_inner_virtual_path_mtu(
+    max_outer_datagram_size: Option<usize>,
+    overhead: usize,
+) -> Option<u16> {
+    let budget = compute_datagram_payload_budget_with_overhead(max_outer_datagram_size, overhead)?;
+    let clamped = budget.min(MAX_INNER_RELAY_UDP_PAYLOAD_SIZE);
+    u16::try_from(clamped).ok()
+}
+
+/// Select the forwarding lane for a single packet given explicit encapsulation
+/// `overhead` (ADR-016 / ADR-020).
+#[must_use]
+pub fn select_relay_lane_with_overhead(
+    payload: &[u8],
+    overhead: usize,
+    max_outer_datagram_size: Option<usize>,
+    mode: RelayForwardMode,
+) -> RelayLane {
+    if mode == RelayForwardMode::Stream || is_quic_initial_packet(payload) {
+        return RelayLane::Stream;
+    }
+    match compute_datagram_payload_budget_with_overhead(max_outer_datagram_size, overhead) {
+        Some(p_max) if payload.len() <= p_max => RelayLane::Datagram,
+        _ => RelayLane::Stream,
+    }
+}
+
+/// Select the forwarding lane for a single packet using uncompressed Context ID
+/// `0` overhead (ADR-016 / ADR-020).
 #[must_use]
 pub fn select_relay_lane(
     payload: &[u8],
@@ -169,13 +276,12 @@ pub fn select_relay_lane(
     max_outer_datagram_size: Option<usize>,
     mode: RelayForwardMode,
 ) -> RelayLane {
-    if mode == RelayForwardMode::Stream || is_quic_initial_packet(payload) {
-        return RelayLane::Stream;
-    }
-    match compute_datagram_payload_budget(max_outer_datagram_size, target) {
-        Some(p_max) if payload.len() <= p_max => RelayLane::Datagram,
-        _ => RelayLane::Stream,
-    }
+    select_relay_lane_with_overhead(
+        payload,
+        uncompressed_datagram_header_overhead(target),
+        max_outer_datagram_size,
+        mode,
+    )
 }
 
 /// Why a [`DatagramLaneClaim`] could not be taken.
@@ -184,63 +290,786 @@ pub enum DatagramLaneError {
     /// The outer connection did not negotiate QUIC `DATAGRAM` frames.
     #[error("outer connection does not support QUIC datagrams")]
     Unsupported,
-    /// Another hybrid relay session already reads this connection's datagrams.
+    /// Another legacy (non-muxed) hybrid relay session exclusively owns this
+    /// connection's datagrams, or the per-connection route cap was hit.
     #[error("another hybrid relay session already reads this connection's datagrams")]
     ClaimedByRelaySession,
     /// A non-relay reader (for example `LinkConn::recv_datagrams`) already
-    /// reads this connection's datagrams.
+    /// reads this connection's datagrams and a legacy exclusive claim was asked.
     #[error("another reader already consumes this connection's datagrams")]
     ClaimedByOtherReader,
 }
 
-#[derive(Debug, Default)]
-struct DatagramReaders {
-    hybrid_relay: bool,
-    other_readers: usize,
+#[derive(Debug, Clone)]
+struct MasqueRoute {
+    owner_session: u64,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    rx_dropped: Arc<AtomicU64>,
 }
 
-/// Datagram readers per live connection, keyed by `Connection::stable_id`.
-///
-/// Every entry is owned by a guard that holds a clone of its connection, so
-/// the key cannot be reused while the entry exists, and the guard's drop
-/// removes the entry. The map therefore holds at most one entry per live
-/// claimed connection.
-static DATAGRAM_READERS: LazyLock<parking_lot::Mutex<HashMap<usize, DatagramReaders>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+#[derive(Debug)]
+struct ConnectionDatagramMux {
+    /// Weak handle to the outer connection (never prevents idle close / drop).
+    connection: WeakConnectionHandle,
+    /// Confirmed legacy 0.29.0 exclusive hybrid relay claim active.
+    legacy_exclusive_relay: bool,
+    /// Client provisional-exclusive claim awaiting CONNECT-UDP answer on a
+    /// legacy `0.28`/`0.29` connection (`!supports_datagram_mux_v1()`).
+    /// Allows `open_app_datagram_channel` without returning an empty stream;
+    /// if an app reader subscribes during this window, `provisional_saw_app_reader`
+    /// prevents falling back to legacy 0.29.0 exclusive mode.
+    provisional_exclusive: bool,
+    provisional_saw_app_reader: bool,
+    /// Count of active `datagram_mux_v1` hybrid sessions on this connection.
+    mux_v1_sessions: usize,
+    /// Legacy exclusive non-relay `register_other_datagram_reader` guards.
+    legacy_other_readers: usize,
+    /// Active `LinkConn::recv_datagrams` subscribers dispatched by `DatagramMux`.
+    app_subscribers: HashMap<u64, tokio::sync::mpsc::Sender<Bytes>>,
+    /// Registered MASQUE Context ID routes (`even >= 2`, bounded by
+    /// `MAX_MUX_ROUTES_PER_CONNECTION`). Context ID `0` is never used by `mux_v1`.
+    masque_routes: HashMap<u64, MasqueRoute>,
+    /// Per-session locally allocated 8-ID blocks (kept inside `ConnectionDatagramMux`
+    /// so all mux state lives under a single lock with zero lock-order inversions).
+    session_allocated_blocks: HashMap<u64, Vec<u64>>,
+    /// Relay-side currently active remote uncompressed Context ID per session
+    /// (strictly at most one per session; replaced atomically on re-assign).
+    session_uncompressed_ctx: HashMap<u64, u64>,
+    /// Next locally allocated 8-ID block base for THIS QUIC side
+    /// (`Side::Client` starts at 2, `Side::Server` starts at 10, step 16).
+    next_local_block_base: u64,
+    /// Quarantined 8-ID block bases `(base, freed_at)` recycled after
+    /// `CTX_BLOCK_REUSE_COOLDOWN` so wire Context IDs stay `1–2 B` under churn
+    /// without colliding with an in-flight relay teardown or stale datagrams.
+    free_local_blocks: VecDeque<(u64, Instant)>,
+    /// Monotonic local subscriber / session identifier.
+    next_sub_id: u64,
+    /// Count of frames dropped on a `DatagramMuxV1` connection because their
+    /// Context ID was unknown or closed.
+    unknown_ctx_dropped: Arc<AtomicU64>,
+    /// Count of app datagrams dropped because an app subscriber channel was full.
+    app_rx_dropped: Arc<AtomicU64>,
+    /// Cancel token for the single background `conn.read_datagram()` dispatcher.
+    reader_cancel: Option<CancellationToken>,
+}
 
-/// Exclusive right of one hybrid relay session to read (and send on) the
-/// QUIC `DATAGRAM` lane of one outer connection.
+impl ConnectionDatagramMux {
+    fn new(connection: &Connection) -> Self {
+        let first_block = match connection.side() {
+            Side::Client => 2,
+            Side::Server => 10,
+        };
+        Self {
+            connection: connection.weak_handle(),
+            legacy_exclusive_relay: false,
+            provisional_exclusive: false,
+            provisional_saw_app_reader: false,
+            mux_v1_sessions: 0,
+            legacy_other_readers: 0,
+            app_subscribers: HashMap::new(),
+            masque_routes: HashMap::new(),
+            session_allocated_blocks: HashMap::new(),
+            session_uncompressed_ctx: HashMap::new(),
+            next_local_block_base: first_block,
+            free_local_blocks: VecDeque::new(),
+            next_sub_id: 1,
+            unknown_ctx_dropped: Arc::new(AtomicU64::new(0)),
+            app_rx_dropped: Arc::new(AtomicU64::new(0)),
+            reader_cancel: None,
+        }
+    }
+
+    fn has_active_users(&self) -> bool {
+        self.legacy_exclusive_relay
+            || self.provisional_exclusive
+            || self.mux_v1_sessions > 0
+            || self.legacy_other_readers > 0
+            || !self.app_subscribers.is_empty()
+            || !self.masque_routes.is_empty()
+    }
+
+    fn can_remove_from_map(&self) -> bool {
+        if self.has_active_users() {
+            return false;
+        }
+        if !self.connection.is_alive() {
+            return true;
+        }
+        // `DatagramMuxV1` is a static handshake property of `Connection`, so no
+        // sticky state needs to be retained here — only retain recently-freed
+        // blocks while their 30 s reuse quarantine is still hot. Because blocks
+        // are appended in monotonic `Instant::now()` order (and re-queued blocks
+        // retain their older `freed_at`), checking `back()` is exact for the
+        // newest quarantine entry (and slightly conservative only if an older
+        // overlapped block was re-queued behind a newer one).
+        !self
+            .free_local_blocks
+            .back()
+            .is_some_and(|&(_, freed_at)| freed_at.elapsed() < CTX_BLOCK_REUSE_COOLDOWN)
+    }
+
+    fn needs_dispatcher(&self) -> bool {
+        !self.app_subscribers.is_empty()
+            || !self.masque_routes.is_empty()
+            || self.mux_v1_sessions > 0
+    }
+
+    fn allocate_sub_id(&mut self) -> u64 {
+        let id = self.next_sub_id;
+        self.next_sub_id = self.next_sub_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// Allocate one 8-ID even block `[base, base+2, base+4, base+6]` from THIS
+    /// QUIC side's disjoint pool, recycling only blocks whose quarantine
+    /// cooldown (`CTX_BLOCK_REUSE_COOLDOWN`) has elapsed.
+    fn allocate_local_block(&mut self) -> Option<VarInt> {
+        let now = Instant::now();
+        let inspect_limit = self.free_local_blocks.len();
+        for _ in 0..inspect_limit {
+            let Some(&(base, freed_at)) = self.free_local_blocks.front() else {
+                break;
+            };
+            if now.saturating_duration_since(freed_at) < CTX_BLOCK_REUSE_COOLDOWN {
+                // FIFO order: if the oldest entry is still in quarantine, all
+                // newer entries are too. Allocate a fresh block instead.
+                break;
+            }
+            self.free_local_blocks.pop_front();
+            if !self.masque_routes.contains_key(&base)
+                && !self.masque_routes.contains_key(&(base + 2))
+                && !self.masque_routes.contains_key(&(base + 4))
+                && !self.masque_routes.contains_key(&(base + 6))
+            {
+                return VarInt::from_u64(base).ok();
+            }
+            // Still overlapped by an active route: re-queue rather than discarding.
+            self.free_local_blocks.push_back((base, freed_at));
+        }
+        loop {
+            let base = self.next_local_block_base;
+            let max_id = base.checked_add(6)?;
+            if max_id > VarInt::MAX.into_inner() {
+                return None;
+            }
+            self.next_local_block_base = base.saturating_add(SIDE_BLOCK_STRIDE);
+            if !self.masque_routes.contains_key(&base)
+                && !self.masque_routes.contains_key(&(base + 2))
+                && !self.masque_routes.contains_key(&(base + 4))
+                && !self.masque_routes.contains_key(&(base + 6))
+            {
+                return VarInt::from_u64(base).ok();
+            }
+        }
+    }
+
+    fn recycle_local_block(&mut self, base: u64) {
+        if self.free_local_blocks.len() < MAX_MUX_ROUTES_PER_CONNECTION
+            && !self.free_local_blocks.iter().any(|&(b, _)| b == base)
+        {
+            self.free_local_blocks.push_back((base, Instant::now()));
+        }
+    }
+}
+
+type SharedMux = Arc<parking_lot::Mutex<ConnectionDatagramMux>>;
+
+/// Amortized O(1) registry of per-connection `DatagramMux` entries.
+struct MuxRegistry {
+    map: HashMap<usize, SharedMux>,
+    /// Next map size at which an amortized dead-entry sweep triggers
+    /// (`(live * 2).max(64)`), avoiding O(connections) scans on every claim.
+    next_prune_threshold: usize,
+}
+
+impl MuxRegistry {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            next_prune_threshold: 64,
+        }
+    }
+}
+
+/// Per-connection RFC 9297 Context-ID datagram demultiplexers, keyed by
+/// `Connection::stable_id`.
 ///
-/// Relay datagrams carry Context ID `0` and no session demultiplexer, so two
-/// readers on one connection would take each other's packets. The claim makes
-/// that impossible: while it exists, a second claim on the same connection and
-/// any other datagram reader registered through this module are refused. It is
-/// released on drop.
+/// Lock order invariant (eliminates create/cleanup races and ABBA inversions):
+/// whenever both locks are needed, ALWAYS acquire `DATAGRAM_MUXES` BEFORE
+/// locking an individual `ConnectionDatagramMux`, and NEVER hold either lock
+/// across an `.await`. There are no per-claim sub-mutexes.
+static DATAGRAM_MUXES: LazyLock<parking_lot::Mutex<MuxRegistry>> =
+    LazyLock::new(|| parking_lot::Mutex::new(MuxRegistry::new()));
+
+/// Inspect the count of unknown/closed Context ID frames dropped in hard-mux
+/// mode on `connection` (diagnostics & tests).
+#[must_use]
+pub fn mux_unknown_ctx_dropped(connection: &Connection) -> u64 {
+    let key = connection.stable_id();
+    let registry = DATAGRAM_MUXES.lock();
+    registry.map.get(&key).map_or(0, |mux| {
+        mux.lock().unknown_ctx_dropped.load(Ordering::Relaxed)
+    })
+}
+
+/// Inspect the count of `LinkConn` app datagrams dropped because a subscriber
+/// queue was full on `connection` (diagnostics & tests).
+#[must_use]
+pub fn mux_app_rx_dropped(connection: &Connection) -> u64 {
+    let key = connection.stable_id();
+    let registry = DATAGRAM_MUXES.lock();
+    registry
+        .map
+        .get(&key)
+        .map_or(0, |mux| mux.lock().app_rx_dropped.load(Ordering::Relaxed))
+}
+
+/// Inspect the current number of registered MASQUE routes in `DatagramMux` for
+/// `connection` (diagnostics & tests).
+#[must_use]
+pub fn mux_registered_route_count(connection: &Connection) -> usize {
+    let key = connection.stable_id();
+    let registry = DATAGRAM_MUXES.lock();
+    registry
+        .map
+        .get(&key)
+        .map_or(0, |mux| mux.lock().masque_routes.len())
+}
+
+#[cfg(test)]
+pub(crate) fn prune_dead_muxes_for_test() -> usize {
+    let mut registry = DATAGRAM_MUXES.lock();
+    let before = registry.map.len();
+    registry
+        .map
+        .retain(|_, existing| !existing.lock().can_remove_from_map());
+    registry.next_prune_threshold = registry.map.len().saturating_mul(2).max(64);
+    before.saturating_sub(registry.map.len())
+}
+
+#[cfg(test)]
+pub(crate) fn mux_entry_present_for_test(stable_id: usize) -> bool {
+    DATAGRAM_MUXES.lock().map.contains_key(&stable_id)
+}
+
+fn get_or_create_mux_locked(registry: &mut MuxRegistry, connection: &Connection) -> SharedMux {
+    let key = connection.stable_id();
+    if let Some(existing) = registry.map.get(&key) {
+        return Arc::clone(existing);
+    }
+    // Amortized O(1) dead-entry sweep: only scan when new insertions hit the
+    // doubling threshold, never on existing-key hot paths.
+    if registry.map.len() >= registry.next_prune_threshold {
+        registry
+            .map
+            .retain(|_, existing| !existing.lock().can_remove_from_map());
+        registry.next_prune_threshold = registry.map.len().saturating_mul(2).max(64);
+    }
+    let mux = Arc::new(parking_lot::Mutex::new(ConnectionDatagramMux::new(
+        connection,
+    )));
+    registry.map.insert(key, Arc::clone(&mux));
+    mux
+}
+
+fn cleanup_mux_locked(registry: &mut MuxRegistry, key: usize, mux: &SharedMux) {
+    let should_remove = {
+        let mut state = mux.lock();
+        if !state.needs_dispatcher()
+            && let Some(cancel) = state.reader_cancel.take()
+        {
+            cancel.cancel();
+        }
+        state.can_remove_from_map()
+    };
+    if should_remove {
+        registry.map.remove(&key);
+    }
+}
+
+/// Ensure the single per-connection `conn.read_datagram()` dispatcher is
+/// running. Safe to call outside a Tokio runtime (defers spawn until an async
+/// consumer calls it inside a runtime).
+fn ensure_dispatcher_running(connection: &Connection, mux: &SharedMux) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let cancel = {
+        let mut state = mux.lock();
+        if !state.needs_dispatcher() || state.reader_cancel.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        state.reader_cancel = Some(token.clone());
+        token
+    };
+
+    let conn = connection.clone();
+    let mux_v1 = connection.supports_datagram_mux_v1();
+    let key = connection.stable_id();
+    let mux_weak = Arc::downgrade(mux);
+    tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                _ = cancel.cancelled() => break,
+                read = conn.read_datagram() => match read {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "DatagramMux: outer datagram read ended");
+                        break;
+                    }
+                },
+            };
+
+            let Some(mux) = mux_weak.upgrade() else {
+                break;
+            };
+
+            let mut cursor = frame.clone();
+            let decoded_ctx = VarInt::decode(&mut cursor).ok().map(VarInt::into_inner);
+
+            enum Dispatch {
+                Masque(MasqueRoute, Bytes),
+                App(Bytes, Vec<tokio::sync::mpsc::Sender<Bytes>>, Arc<AtomicU64>),
+                Drop,
+            }
+
+            let action = {
+                let state = mux.lock();
+                if !mux_v1 {
+                    // Legacy 0.28/0.29 peer (did not negotiate DatagramMuxV1
+                    // transport parameter): deliver 100% raw app datagrams.
+                    if state.app_subscribers.is_empty() {
+                        Dispatch::Drop
+                    } else {
+                        Dispatch::App(
+                            frame,
+                            state.app_subscribers.values().cloned().collect(),
+                            Arc::clone(&state.app_rx_dropped),
+                        )
+                    }
+                } else if decoded_ctx == Some(APP_DATAGRAM_CONTEXT_ID) {
+                    // Negotiated DatagramMuxV1 connection: odd Context ID 1 is
+                    // always a `LinkConn` app datagram (strip 1-byte prefix).
+                    if state.app_subscribers.is_empty() {
+                        Dispatch::Drop
+                    } else {
+                        Dispatch::App(
+                            cursor,
+                            state.app_subscribers.values().cloned().collect(),
+                            Arc::clone(&state.app_rx_dropped),
+                        )
+                    }
+                } else if let Some(ctx_id) = decoded_ctx
+                    && let Some(route) = state.masque_routes.get(&ctx_id).cloned()
+                {
+                    Dispatch::Masque(route, frame)
+                } else {
+                    // Negotiated DatagramMuxV1 connection: unknown or closed
+                    // Context IDs are always dropped and counted, never leaked
+                    // raw to app subscribers.
+                    state.unknown_ctx_dropped.fetch_add(1, Ordering::Relaxed);
+                    Dispatch::Drop
+                }
+            };
+
+            match action {
+                Dispatch::Masque(route, frame) => {
+                    if route.tx.try_send(frame).is_err() {
+                        route.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Dispatch::App(payload, subs, drop_counter) => {
+                    for tx in subs {
+                        if tx.try_send(payload.clone()).is_err() {
+                            drop_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Dispatch::Drop => {}
+            }
+        }
+
+        // Clear reader_cancel on natural connection close and prune if idle.
+        if let Some(mux) = mux_weak.upgrade() {
+            let mut registry = DATAGRAM_MUXES.lock();
+            {
+                let mut state = mux.lock();
+                if state
+                    .reader_cancel
+                    .as_ref()
+                    .is_some_and(|c| c.is_cancelled() || conn.close_reason().is_some())
+                {
+                    state.reader_cancel = None;
+                }
+            }
+            cleanup_mux_locked(&mut registry, key, &mux);
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimMode {
+    /// Confirmed legacy 0.29.0 exclusive claim (reads `conn.read_datagram()` directly).
+    LegacyExclusive,
+    /// Client-side provisional claim awaiting CONNECT-UDP response; allows
+    /// concurrent `open_app_datagram_channel` without starving voice.
+    ClientProvisionalExclusive,
+    /// Client-side provisional `mux_v1`-only claim (app reader or mux_v1 already active).
+    ClientProvisionalMuxOnly,
+    /// Active RFC 9297 `DatagramMux` (`datagram_mux_v1`) lease (client or server).
+    MuxV1 { is_relay_client: bool },
+}
+
+/// Claim on the QUIC `DATAGRAM` lane of one outer connection for a hybrid
+/// MASQUE relay session.
 pub struct DatagramLaneClaim {
     connection: Connection,
     key: usize,
+    mux: SharedMux,
+    mode: ClaimMode,
+    session_id: u64,
+    /// Locally allocated uncompressed Context ID (client-initiated `mux_v1`
+    /// only; `None` on relay server until client sends `CompressionAssign`).
+    /// Stored as `AtomicU64` (`u64::MAX` = unassigned) so N4 bounded retry can
+    /// replace it cleanly without adding a per-claim mutex.
+    uncompressed_ctx_id: AtomicU64,
+    /// Per-session `rx_dropped` counter shared with `MasqueRelaySocketStats`.
+    rx_dropped: Arc<AtomicU64>,
+    tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
+    rx: Option<tokio::sync::mpsc::Receiver<Bytes>>,
 }
 
+const UNASSIGNED_LOCAL_CTX: u64 = u64::MAX;
+
 impl DatagramLaneClaim {
-    /// Claim the datagram lane of `connection` for one hybrid relay session.
+    /// Take a legacy exclusive datagram-lane claim (0.29.0 semantics).
     pub fn try_claim(connection: &Connection) -> Result<Self, DatagramLaneError> {
         if connection.max_datagram_size().is_none() {
             return Err(DatagramLaneError::Unsupported);
         }
         let key = connection.stable_id();
-        let mut readers = DATAGRAM_READERS.lock();
-        let entry = readers.entry(key).or_default();
-        if entry.hybrid_relay {
-            return Err(DatagramLaneError::ClaimedByRelaySession);
-        }
-        if entry.other_readers > 0 {
-            return Err(DatagramLaneError::ClaimedByOtherReader);
-        }
-        entry.hybrid_relay = true;
+        let mux = {
+            let mut registry = DATAGRAM_MUXES.lock();
+            let mux = get_or_create_mux_locked(&mut registry, connection);
+            let mut state = mux.lock();
+            if state.legacy_exclusive_relay
+                || state.provisional_exclusive
+                || state.mux_v1_sessions > 0
+            {
+                return Err(DatagramLaneError::ClaimedByRelaySession);
+            }
+            if state.legacy_other_readers > 0 || !state.app_subscribers.is_empty() {
+                return Err(DatagramLaneError::ClaimedByOtherReader);
+            }
+            state.legacy_exclusive_relay = true;
+            drop(state);
+            mux
+        };
         Ok(Self {
             connection: connection.clone(),
             key,
+            mux,
+            mode: ClaimMode::LegacyExclusive,
+            session_id: 0,
+            uncompressed_ctx_id: AtomicU64::new(0),
+            rx_dropped: Arc::new(AtomicU64::new(0)),
+            tx: None,
+            rx: None,
         })
+    }
+
+    /// Take an active relay-server `0.30.0+` `DatagramMux` (`datagram_mux_v1`)
+    /// lease on `connection`.
+    ///
+    /// Requires both QUIC datagrams AND the connection-level `DatagramMuxV1`
+    /// (`0x50C4`) transport parameter to have been negotiated during the QUIC
+    /// handshake. The relay server never self-allocates Context IDs or ctx `0`.
+    pub fn try_claim_muxed(connection: &Connection) -> Result<Self, DatagramLaneError> {
+        if connection.max_datagram_size().is_none() || !connection.supports_datagram_mux_v1() {
+            return Err(DatagramLaneError::Unsupported);
+        }
+        let key = connection.stable_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
+        let (mux, session_id) = {
+            let mut registry = DATAGRAM_MUXES.lock();
+            let mux = get_or_create_mux_locked(&mut registry, connection);
+            let mut state = mux.lock();
+            if state.legacy_exclusive_relay {
+                return Err(DatagramLaneError::ClaimedByRelaySession);
+            }
+            if state.legacy_other_readers > 0 {
+                return Err(DatagramLaneError::ClaimedByOtherReader);
+            }
+            let session_id = state.allocate_sub_id();
+            state.mux_v1_sessions += 1;
+            drop(state);
+            (mux, session_id)
+        };
+        ensure_dispatcher_running(connection, &mux);
+        Ok(Self {
+            connection: connection.clone(),
+            key,
+            mux,
+            mode: ClaimMode::MuxV1 {
+                is_relay_client: false,
+            },
+            session_id,
+            uncompressed_ctx_id: AtomicU64::new(UNASSIGNED_LOCAL_CTX),
+            rx_dropped: Arc::new(AtomicU64::new(0)),
+            tx: Some(tx),
+            rx: Some(rx),
+        })
+    }
+
+    /// Take a client-side provisional claim before sending `CONNECT-UDP`:
+    /// - When the connection negotiated `DatagramMuxV1` (`0x50C4`) in the QUIC
+    ///   handshake (`0.30.0+`), takes a multiplexed `ClientProvisionalMuxOnly`
+    ///   claim (`0x04` only — coexists with `LinkConn::recv_datagrams` and
+    ///   additional sessions with zero transition window).
+    /// - When the peer did NOT negotiate `DatagramMuxV1` (`0.28.0`/`0.29.0`),
+    ///   takes a legacy `ClientProvisionalExclusive` claim (`0x02` only) if
+    ///   idle, or returns `Err(ClaimedByOtherReader)` if an app reader is
+    ///   active so the session stays cleanly stream-only without packet theft.
+    pub fn try_claim_for_client(connection: &Connection) -> Result<Self, DatagramLaneError> {
+        if connection.max_datagram_size().is_none() {
+            return Err(DatagramLaneError::Unsupported);
+        }
+        let key = connection.stable_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
+        let supports_mux = connection.supports_datagram_mux_v1();
+
+        let (mux, mode) = {
+            let mut registry = DATAGRAM_MUXES.lock();
+            let mux = get_or_create_mux_locked(&mut registry, connection);
+            let mut state = mux.lock();
+            if state.legacy_exclusive_relay {
+                return Err(DatagramLaneError::ClaimedByRelaySession);
+            }
+            if state.legacy_other_readers > 0 {
+                return Err(DatagramLaneError::ClaimedByOtherReader);
+            }
+            let mode = if supports_mux {
+                ClaimMode::ClientProvisionalMuxOnly
+            } else if state.provisional_exclusive || state.mux_v1_sessions > 0 {
+                return Err(DatagramLaneError::ClaimedByRelaySession);
+            } else if !state.app_subscribers.is_empty() {
+                return Err(DatagramLaneError::ClaimedByOtherReader);
+            } else {
+                state.provisional_exclusive = true;
+                state.provisional_saw_app_reader = false;
+                ClaimMode::ClientProvisionalExclusive
+            };
+            drop(state);
+            (mux, mode)
+        };
+
+        Ok(Self {
+            connection: connection.clone(),
+            key,
+            mux,
+            mode,
+            session_id: 0,
+            uncompressed_ctx_id: AtomicU64::new(UNASSIGNED_LOCAL_CTX),
+            rx_dropped: Arc::new(AtomicU64::new(0)),
+            tx: Some(tx),
+            rx: Some(rx),
+        })
+    }
+
+    /// Whether the client should set `REQUEST_FLAG_HYBRID_DATAGRAM_LANE` (`0x02`).
+    #[must_use]
+    pub fn should_request_legacy_hybrid(&self) -> bool {
+        matches!(
+            self.mode,
+            ClaimMode::LegacyExclusive | ClaimMode::ClientProvisionalExclusive
+        )
+    }
+
+    /// Whether the client should set `REQUEST_FLAG_DATAGRAM_MUX_V1` (`0x04`).
+    #[must_use]
+    pub fn should_request_mux_v1(&self) -> bool {
+        matches!(
+            self.mode,
+            ClaimMode::ClientProvisionalMuxOnly | ClaimMode::MuxV1 { .. }
+        )
+    }
+
+    /// Finalize a client-side provisional claim once the relay answers with
+    /// `RESPONSE_FLAG_DATAGRAM_MUX_V1` (`0x08`).
+    ///
+    /// Allocates one disjoint even uncompressed Context ID from THIS QUIC side's
+    /// pool and registers it in `DatagramMux`. Because `DatagramMuxV1` (`0x50C4`)
+    /// was already negotiated in the QUIC handshake, framing is static from
+    /// datagram #1 and no runtime activation transition is required.
+    pub fn activate_mux_v1(&mut self) -> bool {
+        if !self.connection.supports_datagram_mux_v1() {
+            return false;
+        }
+        match self.mode {
+            ClaimMode::MuxV1 { .. } => true,
+            ClaimMode::ClientProvisionalExclusive | ClaimMode::ClientProvisionalMuxOnly => {
+                let Some(tx) = self.tx.clone() else {
+                    return false;
+                };
+                let was_prov_excl = self.mode == ClaimMode::ClientProvisionalExclusive;
+                let allocated = {
+                    let _registry = DATAGRAM_MUXES.lock();
+                    let mut state = self.mux.lock();
+                    if was_prov_excl {
+                        state.provisional_exclusive = false;
+                        state.provisional_saw_app_reader = false;
+                    }
+                    if state.masque_routes.len() >= MAX_MUX_ROUTES_PER_CONNECTION {
+                        return false;
+                    }
+                    let Some(u_ctx) = state.allocate_local_block() else {
+                        return false;
+                    };
+                    let session_id = state.allocate_sub_id();
+                    self.session_id = session_id;
+                    state.masque_routes.insert(
+                        u_ctx.into_inner(),
+                        MasqueRoute {
+                            owner_session: session_id,
+                            tx,
+                            rx_dropped: Arc::clone(&self.rx_dropped),
+                        },
+                    );
+                    state
+                        .session_allocated_blocks
+                        .entry(session_id)
+                        .or_default()
+                        .push(u_ctx.into_inner());
+                    state.mux_v1_sessions += 1;
+                    u_ctx
+                };
+                self.uncompressed_ctx_id
+                    .store(allocated.into_inner(), Ordering::Release);
+                self.mode = ClaimMode::MuxV1 {
+                    is_relay_client: true,
+                };
+                ensure_dispatcher_running(&self.connection, &self.mux);
+                true
+            }
+            ClaimMode::LegacyExclusive => false,
+        }
+    }
+
+    /// Finalize a client-side provisional claim when a legacy `0.29.0` relay
+    /// answered `HYBRID` without `DATAGRAM_MUX_V1`.
+    pub fn activate_legacy_hybrid(&mut self) -> bool {
+        match self.mode {
+            ClaimMode::LegacyExclusive => true,
+            ClaimMode::ClientProvisionalExclusive => {
+                let _registry = DATAGRAM_MUXES.lock();
+                let mut state = self.mux.lock();
+                state.provisional_exclusive = false;
+                if state.provisional_saw_app_reader
+                    || !state.app_subscribers.is_empty()
+                    || state.mux_v1_sessions > 0
+                {
+                    state.provisional_saw_app_reader = false;
+                    self.mode = ClaimMode::ClientProvisionalMuxOnly;
+                    return false;
+                }
+                state.legacy_exclusive_relay = true;
+                self.uncompressed_ctx_id.store(0, Ordering::Release);
+                self.mode = ClaimMode::LegacyExclusive;
+                true
+            }
+            ClaimMode::ClientProvisionalMuxOnly | ClaimMode::MuxV1 { .. } => false,
+        }
+    }
+
+    /// Client-side N4 recovery: if the relay rejected our initial uncompressed
+    /// Context ID via `CompressionClose`, unregister the rejected block (putting
+    /// it into quarantine) and allocate + register a fresh disjoint block.
+    pub(crate) fn reallocate_uncompressed_context(&self) -> Option<VarInt> {
+        if !matches!(
+            self.mode,
+            ClaimMode::MuxV1 {
+                is_relay_client: true
+            }
+        ) {
+            return None;
+        }
+        let tx = self.tx.as_ref()?.clone();
+        let old = self.uncompressed_ctx_id.load(Ordering::Acquire);
+        let new_ctx = {
+            let mut state = self.mux.lock();
+            if old != UNASSIGNED_LOCAL_CTX {
+                if state
+                    .masque_routes
+                    .get(&old)
+                    .is_some_and(|r| r.owner_session == self.session_id)
+                {
+                    state.masque_routes.remove(&old);
+                }
+                if let Some(blocks) = state.session_allocated_blocks.get_mut(&self.session_id)
+                    && let Some(pos) = blocks.iter().position(|&x| x == old)
+                {
+                    blocks.swap_remove(pos);
+                    state.recycle_local_block(old);
+                }
+            }
+            if state.masque_routes.len() >= MAX_MUX_ROUTES_PER_CONNECTION {
+                return None;
+            }
+            let fresh = state.allocate_local_block()?;
+            let c = fresh.into_inner();
+            state.masque_routes.insert(
+                c,
+                MasqueRoute {
+                    owner_session: self.session_id,
+                    tx,
+                    rx_dropped: Arc::clone(&self.rx_dropped),
+                },
+            );
+            state
+                .session_allocated_blocks
+                .entry(self.session_id)
+                .or_default()
+                .push(c);
+            fresh
+        };
+        self.uncompressed_ctx_id
+            .store(new_ctx.into_inner(), Ordering::Release);
+        Some(new_ctx)
+    }
+
+    /// Wire the socket's `rx_dropped` counter into this claim's `DatagramMux`
+    /// routes so channel-full drops are never silent.
+    pub(crate) fn attach_rx_dropped_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.rx_dropped = Arc::clone(&counter);
+        if self.is_mux_v1() {
+            let sid = self.session_id;
+            let mut state = self.mux.lock();
+            for route in state.masque_routes.values_mut() {
+                if route.owner_session == sid {
+                    route.rx_dropped = Arc::clone(&counter);
+                }
+            }
+        }
+    }
+
+    /// Whether this claim runs in `0.30.0+` RFC 9297 `DatagramMux` mode.
+    #[must_use]
+    pub fn is_mux_v1(&self) -> bool {
+        matches!(self.mode, ClaimMode::MuxV1 { .. })
+    }
+
+    /// Client-allocated uncompressed Context ID (`Some(u_ctx >= 2)` on a
+    /// client `mux_v1` session, `Some(0)` on legacy `0.29.0`, `None` on relay
+    /// server until the client sends `CompressionAssign::uncompressed`).
+    #[must_use]
+    pub fn uncompressed_context_id(&self) -> Option<VarInt> {
+        let raw = self.uncompressed_ctx_id.load(Ordering::Acquire);
+        if raw == UNASSIGNED_LOCAL_CTX {
+            None
+        } else {
+            VarInt::from_u64(raw).ok()
+        }
     }
 
     /// The outer connection whose datagram lane this claim holds.
@@ -248,69 +1077,527 @@ impl DatagramLaneClaim {
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
+
+    /// Take the `DatagramMux` inbound datagram channel for this session.
+    pub(crate) fn take_datagram_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<Bytes>> {
+        self.rx.take()
+    }
+
+    /// Client-side: allocate and register a disjoint 4-context even ECN quad
+    /// `{base, base+2, base+4, base+6}` on this connection's `DatagramMux`.
+    pub(crate) fn allocate_ecn_quad(&self) -> Option<VarInt> {
+        if !matches!(
+            self.mode,
+            ClaimMode::MuxV1 {
+                is_relay_client: true
+            }
+        ) {
+            return None;
+        }
+        let tx = self.tx.as_ref()?.clone();
+        let mut state = self.mux.lock();
+        if state.masque_routes.len() + 4 > MAX_MUX_ROUTES_PER_CONNECTION {
+            return None;
+        }
+        let base = state.allocate_local_block()?;
+        let b = base.into_inner();
+        for offset in [0u64, 2, 4, 6] {
+            state.masque_routes.insert(
+                b + offset,
+                MasqueRoute {
+                    owner_session: self.session_id,
+                    tx: tx.clone(),
+                    rx_dropped: Arc::clone(&self.rx_dropped),
+                },
+            );
+        }
+        state
+            .session_allocated_blocks
+            .entry(self.session_id)
+            .or_default()
+            .push(b);
+        Some(base)
+    }
+
+    /// Relay-side: register a client-assigned uncompressed Context ID,
+    /// enforcing strictly **one** uncompressed ctx per session (replacing and
+    /// unregistering any previous uncompressed ctx), rejecting `0` and odd IDs,
+    /// and enforcing `MAX_MUX_ROUTES_PER_CONNECTION`.
+    pub(crate) fn register_remote_uncompressed_context(&self, ctx_id: VarInt) -> bool {
+        if !self.is_mux_v1() {
+            return false;
+        }
+        let c = ctx_id.into_inner();
+        if c < 2 || c % 2 != 0 {
+            return false;
+        }
+        let Some(tx) = self.tx.as_ref().cloned() else {
+            return false;
+        };
+        let mut state = self.mux.lock();
+        if let Some(route) = state.masque_routes.get(&c)
+            && route.owner_session != self.session_id
+        {
+            return false;
+        }
+        let prev = state
+            .session_uncompressed_ctx
+            .get(&self.session_id)
+            .copied();
+        let replacing_same = prev == Some(c);
+        if !replacing_same
+            && prev.is_none()
+            && state.masque_routes.len() >= MAX_MUX_ROUTES_PER_CONNECTION
+        {
+            return false;
+        }
+        if let Some(old) = prev
+            && old != c
+            && state
+                .masque_routes
+                .get(&old)
+                .is_some_and(|r| r.owner_session == self.session_id)
+        {
+            state.masque_routes.remove(&old);
+        }
+        state.masque_routes.insert(
+            c,
+            MasqueRoute {
+                owner_session: self.session_id,
+                tx,
+                rx_dropped: Arc::clone(&self.rx_dropped),
+            },
+        );
+        state.session_uncompressed_ctx.insert(self.session_id, c);
+        true
+    }
+
+    /// Relay-side: register a client-assigned 4-context even ECN quad
+    /// `{base, base+2, base+4, base+6}`. Rejects odd IDs, `< 2`, collisions
+    /// with other sessions, and routes beyond `MAX_MUX_ROUTES_PER_CONNECTION`.
+    pub(crate) fn register_remote_ecn_quad(&self, base: VarInt) -> bool {
+        if !self.is_mux_v1() {
+            return false;
+        }
+        let b = base.into_inner();
+        if b < 2
+            || b % 2 != 0
+            || b.checked_add(6)
+                .is_none_or(|m| m > VarInt::MAX.into_inner())
+        {
+            return false;
+        }
+        let Some(tx) = self.tx.as_ref().cloned() else {
+            return false;
+        };
+        let mut state = self.mux.lock();
+        let mut new_slots = 0usize;
+        for offset in [0u64, 2, 4, 6] {
+            match state.masque_routes.get(&(b + offset)) {
+                Some(route) if route.owner_session != self.session_id => return false,
+                Some(_) => {}
+                None => new_slots += 1,
+            }
+        }
+        if state.masque_routes.len() + new_slots > MAX_MUX_ROUTES_PER_CONNECTION {
+            return false;
+        }
+        for offset in [0u64, 2, 4, 6] {
+            state.masque_routes.insert(
+                b + offset,
+                MasqueRoute {
+                    owner_session: self.session_id,
+                    tx: tx.clone(),
+                    rx_dropped: Arc::clone(&self.rx_dropped),
+                },
+            );
+        }
+        true
+    }
+
+    /// Relay-side: register a single client-assigned compressed Context ID.
+    /// Rejects `< 2`, odd IDs, collisions, and routes past the per-connection cap.
+    pub(crate) fn register_remote_context(&self, ctx_id: VarInt) -> bool {
+        if !self.is_mux_v1() {
+            return false;
+        }
+        let c = ctx_id.into_inner();
+        if c < 2 || c % 2 != 0 {
+            return false;
+        }
+        let Some(tx) = self.tx.as_ref().cloned() else {
+            return false;
+        };
+        let mut state = self.mux.lock();
+        let is_new = match state.masque_routes.get(&c) {
+            Some(route) if route.owner_session != self.session_id => return false,
+            Some(_) => false,
+            None => true,
+        };
+        if is_new && state.masque_routes.len() >= MAX_MUX_ROUTES_PER_CONNECTION {
+            return false;
+        }
+        state.masque_routes.insert(
+            c,
+            MasqueRoute {
+                owner_session: self.session_id,
+                tx,
+                rx_dropped: Arc::clone(&self.rx_dropped),
+            },
+        );
+        true
+    }
+
+    /// Unregister a 4-context ECN quad belonging to this session (and place the
+    /// block into reuse quarantine if locally allocated).
+    pub(crate) fn unregister_ecn_quad(&self, base: VarInt) {
+        let b = base.into_inner();
+        let mut state = self.mux.lock();
+        for offset in [0u64, 2, 4, 6] {
+            if state
+                .masque_routes
+                .get(&(b + offset))
+                .is_some_and(|r| r.owner_session == self.session_id)
+            {
+                state.masque_routes.remove(&(b + offset));
+            }
+        }
+        if let Some(blocks) = state.session_allocated_blocks.get_mut(&self.session_id)
+            && let Some(pos) = blocks.iter().position(|&x| x == b)
+        {
+            blocks.swap_remove(pos);
+            state.recycle_local_block(b);
+        }
+    }
+
+    /// Unregister a single Context ID belonging to this session.
+    pub(crate) fn unregister_context(&self, ctx_id: VarInt) {
+        let c = ctx_id.into_inner();
+        let mut state = self.mux.lock();
+        if state
+            .masque_routes
+            .get(&c)
+            .is_some_and(|r| r.owner_session == self.session_id)
+        {
+            state.masque_routes.remove(&c);
+        }
+        if state.session_uncompressed_ctx.get(&self.session_id) == Some(&c) {
+            state.session_uncompressed_ctx.remove(&self.session_id);
+        }
+    }
 }
 
 impl fmt::Debug for DatagramLaneClaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DatagramLaneClaim")
             .field("connection", &self.key)
+            .field("mode", &self.mode)
+            .field("uncompressed_ctx_id", &self.uncompressed_context_id())
             .finish()
     }
 }
 
 impl Drop for DatagramLaneClaim {
     fn drop(&mut self) {
-        let mut readers = DATAGRAM_READERS.lock();
-        if let Some(entry) = readers.get_mut(&self.key) {
-            entry.hybrid_relay = false;
-            if entry.other_readers == 0 {
-                readers.remove(&self.key);
+        let mut registry = DATAGRAM_MUXES.lock();
+        {
+            let mut state = self.mux.lock();
+            match self.mode {
+                ClaimMode::LegacyExclusive => {
+                    state.legacy_exclusive_relay = false;
+                }
+                ClaimMode::ClientProvisionalExclusive => {
+                    state.provisional_exclusive = false;
+                    state.provisional_saw_app_reader = false;
+                }
+                ClaimMode::ClientProvisionalMuxOnly => {}
+                ClaimMode::MuxV1 { .. } => {
+                    let sid = self.session_id;
+                    state.masque_routes.retain(|_, r| r.owner_session != sid);
+                    state.session_uncompressed_ctx.remove(&sid);
+                    if let Some(blocks) = state.session_allocated_blocks.remove(&sid) {
+                        for base in blocks {
+                            state.recycle_local_block(base);
+                        }
+                    }
+                    state.mux_v1_sessions = state.mux_v1_sessions.saturating_sub(1);
+                }
             }
         }
+        cleanup_mux_locked(&mut registry, self.key, &self.mux);
     }
 }
 
-/// Registration of a non-relay datagram reader (for example
-/// `LinkConn::recv_datagrams`) on one connection. Released on drop.
+/// Legacy registration guard for a non-relay datagram reader (retained for
+/// backward-compatible tests of the exclusive 0.29.0 claim).
 pub(crate) struct OtherDatagramReaderGuard {
     _connection: Connection,
     key: usize,
+    mux: SharedMux,
 }
 
 impl Drop for OtherDatagramReaderGuard {
     fn drop(&mut self) {
-        let mut readers = DATAGRAM_READERS.lock();
-        if let Some(entry) = readers.get_mut(&self.key) {
-            entry.other_readers = entry.other_readers.saturating_sub(1);
-            if entry.other_readers == 0 && !entry.hybrid_relay {
-                readers.remove(&self.key);
-            }
+        let mut registry = DATAGRAM_MUXES.lock();
+        {
+            let mut state = self.mux.lock();
+            state.legacy_other_readers = state.legacy_other_readers.saturating_sub(1);
         }
+        cleanup_mux_locked(&mut registry, self.key, &self.mux);
     }
 }
 
-/// Register a non-relay datagram reader on `connection`.
-///
-/// Returns `Err` when a hybrid relay session holds the connection's datagram
-/// lane: the caller must not read datagrams then, or it would take relayed
-/// packets (and the relay would take its datagrams).
+/// Register a legacy exclusive non-relay datagram reader on `connection`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn register_other_datagram_reader(
     connection: &Connection,
 ) -> Result<OtherDatagramReaderGuard, DatagramLaneError> {
     let key = connection.stable_id();
-    let mut readers = DATAGRAM_READERS.lock();
-    let entry = readers.entry(key).or_default();
-    if entry.hybrid_relay {
-        return Err(DatagramLaneError::ClaimedByRelaySession);
-    }
-    entry.other_readers += 1;
+    let mux = {
+        let mut registry = DATAGRAM_MUXES.lock();
+        let mux = get_or_create_mux_locked(&mut registry, connection);
+        let mut state = mux.lock();
+        if state.legacy_exclusive_relay || state.provisional_exclusive || state.mux_v1_sessions > 0
+        {
+            return Err(DatagramLaneError::ClaimedByRelaySession);
+        }
+        state.legacy_other_readers += 1;
+        drop(state);
+        mux
+    };
     Ok(OtherDatagramReaderGuard {
         _connection: connection.clone(),
         key,
+        mux,
     })
 }
 
-/// Per-socket counters for relay lane usage and queue pressure.
+/// Multiplexed subscription handle for `LinkConn::recv_datagrams` backed by
+/// RFC 9297 `DatagramMux`.
+pub(crate) struct AppDatagramSubscription {
+    connection: Connection,
+    key: usize,
+    mux: SharedMux,
+    sub_id: u64,
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl AppDatagramSubscription {
+    pub(crate) async fn recv(&mut self) -> Option<Bytes> {
+        // Lazily start the dispatcher inside an active Tokio runtime so
+        // `LinkConn::recv_datagrams()` itself never panics outside a runtime.
+        ensure_dispatcher_running(&self.connection, &self.mux);
+        self.rx.recv().await
+    }
+}
+
+impl Drop for AppDatagramSubscription {
+    fn drop(&mut self) {
+        let mut registry = DATAGRAM_MUXES.lock();
+        {
+            let mut state = self.mux.lock();
+            state.app_subscribers.remove(&self.sub_id);
+        }
+        cleanup_mux_locked(&mut registry, self.key, &self.mux);
+    }
+}
+
+/// Open a `LinkConn::recv_datagrams` subscription on `connection` through
+/// `DatagramMux`.
+///
+/// Safe to call outside a Tokio runtime (dispatcher spawns lazily on first
+/// poll). Coexists cleanly with `0.30.0+` `DATAGRAM_MUX_V1` hybrid sessions and
+/// provisional client claims; refused only if a confirmed legacy `0.29.0`
+/// exclusive hybrid claim holds the lane.
+pub(crate) fn open_app_datagram_channel(
+    connection: &Connection,
+) -> Result<AppDatagramSubscription, DatagramLaneError> {
+    let key = connection.stable_id();
+    let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
+    let (mux, sub_id) = {
+        let mut registry = DATAGRAM_MUXES.lock();
+        let mux = get_or_create_mux_locked(&mut registry, connection);
+        let mut state = mux.lock();
+        if state.legacy_exclusive_relay {
+            return Err(DatagramLaneError::ClaimedByRelaySession);
+        }
+        if state.provisional_exclusive {
+            state.provisional_saw_app_reader = true;
+        }
+        let sub_id = state.allocate_sub_id();
+        state.app_subscribers.insert(sub_id, tx);
+        drop(state);
+        (mux, sub_id)
+    };
+    ensure_dispatcher_running(connection, &mux);
+    Ok(AppDatagramSubscription {
+        connection: connection.clone(),
+        key,
+        mux,
+        sub_id,
+        rx,
+    })
+}
+
+/// Send an application (`LinkConn`) datagram on `connection`.
+///
+/// - When `DatagramMuxV1` (`0x50C4`) was negotiated in the QUIC handshake
+///   (`connection.supports_datagram_mux_v1()`), prepends the 1-byte odd RFC 9297
+///   Context ID [`APP_DATAGRAM_CONTEXT_ID`] (`0x01`) from datagram #1 so the
+///   peer's `DatagramMux` demultiplexes it cleanly from MASQUE even Context IDs.
+/// - On connections with `0.28.0`/`0.29.0` peers (without `0x50C4`), sends
+///   `data` raw with zero overhead.
+#[cfg(test)]
+pub(crate) fn send_app_datagram(
+    connection: &Connection,
+    data: Bytes,
+) -> Result<(), SendDatagramError> {
+    send_app_datagram_with_mux(connection, connection.supports_datagram_mux_v1(), data)
+}
+
+/// Hot-path helper for [`P2pLinkConn::send_datagram`](crate::link_transport_impl::P2pLinkConn)
+/// using a cached handshake `datagram_mux_v1` boolean so voice TX avoids an
+/// extra `ConnectionInner` mutex acquisition per datagram.
+pub(crate) fn send_app_datagram_with_mux(
+    connection: &Connection,
+    mux_v1: bool,
+    data: Bytes,
+) -> Result<(), SendDatagramError> {
+    if mux_v1 {
+        let ctx = VarInt::from_u32(APP_DATAGRAM_CONTEXT_ID as u32);
+        let mut buf = BytesMut::with_capacity(ctx.size() + data.len());
+        ctx.encode(&mut buf);
+        buf.put_slice(&data);
+        connection.send_datagram(buf.freeze())
+    } else {
+        connection.send_datagram(data)
+    }
+}
+
+/// State of a target's compressed context registration within a relay session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompressedTargetState {
+    Pending { base_ctx: VarInt, ecn_quad: bool },
+    Active { base_ctx: VarInt, ecn_quad: bool },
+}
+
+/// Per-session bidirectional mapping between target `SocketAddr`s and compressed
+/// MASQUE Context IDs (with optional 4-context ECN quads).
+#[derive(Debug)]
+pub(crate) struct SessionCompressionTable {
+    target_to_entry: HashMap<SocketAddr, CompressedTargetState>,
+    ctx_to_target: HashMap<u64, (SocketAddr, Option<EcnCodepoint>)>,
+    base_to_target: HashMap<u64, (SocketAddr, bool)>,
+    max_targets: usize,
+}
+
+impl SessionCompressionTable {
+    pub(crate) fn new(max_targets: usize) -> Self {
+        Self {
+            target_to_entry: HashMap::new(),
+            ctx_to_target: HashMap::new(),
+            base_to_target: HashMap::new(),
+            max_targets,
+        }
+    }
+
+    pub(crate) fn active_for_target(&self, target: SocketAddr) -> Option<(VarInt, bool)> {
+        match self.target_to_entry.get(&target) {
+            Some(CompressedTargetState::Active { base_ctx, ecn_quad }) => {
+                Some((*base_ctx, *ecn_quad))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_target(&self, target: SocketAddr) -> bool {
+        self.target_to_entry.contains_key(&target)
+    }
+
+    pub(crate) fn can_add_target(&self) -> bool {
+        self.target_to_entry.len() < self.max_targets
+    }
+
+    pub(crate) fn insert_pending_ecn_quad(&mut self, target: SocketAddr, base_ctx: VarInt) {
+        let b = base_ctx.into_inner();
+        self.target_to_entry.insert(
+            target,
+            CompressedTargetState::Pending {
+                base_ctx,
+                ecn_quad: true,
+            },
+        );
+        self.base_to_target.insert(b, (target, true));
+        for (offset, ecn) in [
+            (0u64, None),
+            (2, Some(EcnCodepoint::Ect0)),
+            (4, Some(EcnCodepoint::Ect1)),
+            (6, Some(EcnCodepoint::Ce)),
+        ] {
+            self.ctx_to_target.insert(b + offset, (target, ecn));
+        }
+    }
+
+    pub(crate) fn insert_active(
+        &mut self,
+        target: SocketAddr,
+        base_ctx: VarInt,
+        ecn_quad: bool,
+    ) -> bool {
+        if self.target_to_entry.contains_key(&target) || !self.can_add_target() {
+            return false;
+        }
+        let b = base_ctx.into_inner();
+        self.target_to_entry
+            .insert(target, CompressedTargetState::Active { base_ctx, ecn_quad });
+        self.base_to_target.insert(b, (target, ecn_quad));
+        if ecn_quad {
+            for (offset, ecn) in [
+                (0u64, None),
+                (2, Some(EcnCodepoint::Ect0)),
+                (4, Some(EcnCodepoint::Ect1)),
+                (6, Some(EcnCodepoint::Ce)),
+            ] {
+                self.ctx_to_target.insert(b + offset, (target, ecn));
+            }
+        } else {
+            self.ctx_to_target.insert(b, (target, None));
+        }
+        true
+    }
+
+    pub(crate) fn acknowledge(&mut self, base_ctx: VarInt) -> bool {
+        let Some(&(target, ecn_quad)) = self.base_to_target.get(&base_ctx.into_inner()) else {
+            return false;
+        };
+        self.target_to_entry
+            .insert(target, CompressedTargetState::Active { base_ctx, ecn_quad });
+        true
+    }
+
+    pub(crate) fn remove_by_base(&mut self, base_ctx: VarInt) -> Option<(SocketAddr, bool)> {
+        let b = base_ctx.into_inner();
+        let (target, ecn_quad) = self.base_to_target.remove(&b)?;
+        self.target_to_entry.remove(&target);
+        if ecn_quad {
+            for offset in [0u64, 2, 4, 6] {
+                self.ctx_to_target.remove(&(b + offset));
+            }
+        } else {
+            self.ctx_to_target.remove(&b);
+        }
+        Some((target, ecn_quad))
+    }
+
+    pub(crate) fn lookup_context(
+        &self,
+        ctx_id: VarInt,
+    ) -> Option<(SocketAddr, Option<EcnCodepoint>)> {
+        self.ctx_to_target.get(&ctx_id.into_inner()).copied()
+    }
+}
+
+/// Per-socket counters for relay lane usage, compression, ECN, and queue pressure.
 #[derive(Debug, Default)]
 pub struct MasqueRelaySocketStats {
     /// Outbound packets sent on the unreliable QUIC `DATAGRAM` lane.
@@ -321,9 +1608,18 @@ pub struct MasqueRelaySocketStats {
     pub datagrams_received: AtomicU64,
     /// Inbound packets received on the reliable length-prefixed stream lane.
     pub stream_frames_received: AtomicU64,
+    /// Outbound datagrams encoded with 1–2 B `CompressedDatagram` headers.
+    pub compressed_datagrams_sent: AtomicU64,
+    /// Inbound datagrams decoded from 1–2 B `CompressedDatagram` headers.
+    pub compressed_datagrams_received: AtomicU64,
+    /// Outbound compressed datagrams carrying a non-zero ECN codepoint.
+    pub ecn_marked_sent: AtomicU64,
+    /// Inbound compressed datagrams delivering a non-zero ECN codepoint.
+    pub ecn_marked_received: AtomicU64,
     /// Outbound packets dropped because the bounded send queue was full.
     pub tx_dropped: AtomicU64,
-    /// Inbound packets evicted because the bounded receive queue was full.
+    /// Inbound packets dropped/evicted because the bounded receive queue or
+    /// `DatagramMux` dispatch channel was full.
     pub rx_dropped: AtomicU64,
 }
 
@@ -345,22 +1641,17 @@ impl MasqueRelaySocketStats {
 
 struct OutboundRelayPacket {
     target: SocketAddr,
+    ecn: Option<EcnCodepoint>,
     raw_payload: Bytes,
-    encoded: Bytes,
 }
 
 #[derive(Default)]
 struct RecvState {
-    queue: VecDeque<(Vec<u8>, SocketAddr)>,
+    queue: VecDeque<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
     waker: Option<Waker>,
 }
 
 /// Bounded inbound packet ring with its waker under ONE lock.
-///
-/// The consumer stores its waker while it still holds the lock that showed
-/// the queue empty, and a producer takes the waker under the same lock after
-/// pushing. So no wake-up is lost, however many producers run (stream lane
-/// and datagram lane).
 struct RecvRing {
     state: std::sync::Mutex<RecvState>,
     capacity: usize,
@@ -377,9 +1668,7 @@ impl RecvRing {
         }
     }
 
-    /// Push one packet, evicting the oldest when full. Returns `true` when a
-    /// packet was evicted.
-    fn push(&self, payload: Vec<u8>, source: SocketAddr) -> bool {
+    fn push(&self, payload: Vec<u8>, source: SocketAddr, ecn: Option<EcnCodepoint>) -> bool {
         let (evicted, waker) = match self.state.lock() {
             Ok(mut state) => {
                 let evicted = if state.queue.len() >= self.capacity {
@@ -387,7 +1676,7 @@ impl RecvRing {
                 } else {
                     false
                 };
-                state.queue.push_back((payload, source));
+                state.queue.push_back((payload, source, ecn));
                 (evicted, state.waker.take())
             }
             Err(_) => (false, None),
@@ -398,7 +1687,6 @@ impl RecvRing {
         evicted
     }
 
-    /// Wake a pending receiver without queueing anything (lane closed).
     fn wake(&self) {
         let waker = self.state.lock().ok().and_then(|mut s| s.waker.take());
         if let Some(waker) = waker {
@@ -422,7 +1710,7 @@ impl RecvRing {
         let max_batch = bufs.len().min(meta.len());
         let mut count = 0;
         while count < max_batch {
-            let Some((payload, source)) = state.queue.pop_front() else {
+            let Some((payload, source, ecn)) = state.queue.pop_front() else {
                 break;
             };
             let len = payload.len().min(bufs[count].len());
@@ -432,7 +1720,7 @@ impl RecvRing {
             recv_meta.len = len;
             recv_meta.stride = len;
             recv_meta.addr = source;
-            recv_meta.ecn = None;
+            recv_meta.ecn = ecn;
             recv_meta.dst_ip = None;
             meta[count] = recv_meta;
             count += 1;
@@ -440,29 +1728,29 @@ impl RecvRing {
         if count > 0 {
             return Poll::Ready(Ok(count));
         }
-        // Still under the lock that showed the queue empty: a producer that
-        // pushes after this point finds the waker and wakes it.
         state.waker = Some(cx.waker().clone());
         Poll::Pending
     }
 }
 
+fn make_target_assign(base_ctx: VarInt, target: SocketAddr) -> CompressionAssign {
+    match target.ip() {
+        IpAddr::V4(v4) => CompressionAssign::compressed_v4(base_ctx, v4, target.port()),
+        IpAddr::V6(v6) => CompressionAssign::compressed_v6(base_ctx, v6, target.port()),
+    }
+}
+
 /// A virtual UDP socket that tunnels packets through a MASQUE relay
 /// via a persistent QUIC stream, optionally offloading regular packets
-/// onto unreliable QUIC `DATAGRAM` frames (ADR-016).
+/// onto unreliable QUIC `DATAGRAM` frames (ADR-016 / ADR-020).
 pub struct MasqueRelaySocket {
-    /// The relay's public address (returned as our local address)
     relay_public_addr: SocketAddr,
-    /// Forwarding mode negotiated for this session
     forward_mode: RelayForwardMode,
-    /// Bounded queue of received packets and the receiver's waker
+    mux_v1: bool,
+    outer_connection: Option<Connection>,
     recv: RecvRing,
-    /// Bounded channel for outbound packets (written to the relay by background task)
     send_tx: tokio::sync::mpsc::Sender<OutboundRelayPacket>,
-    /// Lane and queue statistics
     stats: Arc<MasqueRelaySocketStats>,
-    /// Cancelled when the socket is dropped or the session's stream ends;
-    /// stops the datagram-lane reader and releases its lane claim
     shutdown: CancellationToken,
 }
 
@@ -471,6 +1759,7 @@ impl fmt::Debug for MasqueRelaySocket {
         f.debug_struct("MasqueRelaySocket")
             .field("relay_public_addr", &self.relay_public_addr)
             .field("forward_mode", &self.forward_mode)
+            .field("mux_v1", &self.mux_v1)
             .field("recv_queue_len", &self.recv.len())
             .field("stats", &self.stats)
             .finish()
@@ -485,10 +1774,6 @@ impl Drop for MasqueRelaySocket {
 
 impl MasqueRelaySocket {
     /// Create a stream-only relay socket (ADR-009 / default mode).
-    ///
-    /// Spawns two background tasks:
-    /// - Read from `recv_stream`, decode frames, queue for `poll_recv`
-    /// - Read from bounded `send_tx` channel, write length-prefixed frames to `send_stream`
     pub fn new(
         send_stream: crate::high_level::SendStream,
         recv_stream: crate::high_level::RecvStream,
@@ -497,16 +1782,8 @@ impl MasqueRelaySocket {
         Self::build(None, send_stream, recv_stream, relay_public_addr)
     }
 
-    /// Create a hybrid relay socket (ADR-016) for a session whose CONNECT-UDP
-    /// exchange negotiated the datagram lane in both directions.
-    ///
-    /// `lane` must be the claim the client took before it set the hybrid bit
-    /// in its request, and the relay must have answered with the hybrid bit.
-    /// - Outbound packets selected for [`RelayLane::Datagram`] are sent with
-    ///   `send_datagram`, falling back to the stream lane when the outer
-    ///   connection refuses them (too large, disabled, unsupported).
-    /// - Inbound packets are read from both `recv_stream` and the claimed
-    ///   connection's datagram lane.
+    /// Create a hybrid relay socket (ADR-016 / ADR-020) for a session whose
+    /// CONNECT-UDP exchange negotiated the datagram lane in both directions.
     pub fn new_hybrid(
         lane: DatagramLaneClaim,
         send_stream: crate::high_level::SendStream,
@@ -517,7 +1794,7 @@ impl MasqueRelaySocket {
     }
 
     fn build(
-        lane: Option<DatagramLaneClaim>,
+        mut lane: Option<DatagramLaneClaim>,
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
         relay_public_addr: SocketAddr,
@@ -530,27 +1807,51 @@ impl MasqueRelaySocket {
         } else {
             RelayForwardMode::Stream
         };
+        let mux_v1 = lane.as_ref().is_some_and(DatagramLaneClaim::is_mux_v1);
+        let outer_connection = lane.as_ref().map(|c| c.connection().clone());
         let shutdown = CancellationToken::new();
+
+        // Wire mux `try_send` drop counter into this socket's `stats.rx_dropped`.
+        let mux_drop_counter = Arc::new(AtomicU64::new(0));
+        if let Some(ref mut claim) = lane {
+            claim.attach_rx_dropped_counter(Arc::clone(&mux_drop_counter));
+        }
 
         let socket = Arc::new(Self {
             relay_public_addr,
             forward_mode,
+            mux_v1,
+            outer_connection,
             recv: RecvRing::new(DEFAULT_RELAY_RECV_QUEUE_CAPACITY),
             send_tx,
             stats: Arc::clone(&stats),
             shutdown: shutdown.clone(),
         });
 
-        let writer_conn = lane.as_ref().map(|claim| claim.connection().clone());
+        let compression_table = Arc::new(parking_lot::RwLock::new(SessionCompressionTable::new(
+            DEFAULT_MAX_COMPRESSED_TARGETS,
+        )));
+        // Legacy 0.29.0 ctx 0 is active immediately; mux_v1 client waits for
+        // CompressionAck(u_ctx) before sending uncompressed datagrams so the
+        // relay has explicitly registered `u_ctx` before any datagram uses it.
+        let uncompressed_ctx_acked = Arc::new(AtomicBool::new(!mux_v1));
+        let (retry_assign_tx, mut retry_assign_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(MAX_UNCOMPRESSED_CTX_RETRIES + 1);
 
-        // Background task: read length-prefixed frames from relay stream → bounded queue.
-        // The session ends with the stream; that also stops the datagram reader.
+        let mux_rx = lane.as_mut().and_then(DatagramLaneClaim::take_datagram_rx);
+        let shared_claim = lane.map(Arc::new);
+
+        // Background task: read length-prefixed frames from relay stream → bounded queue
+        // (and handle `DATAGRAM_MUX_V1` control capsules).
         let stream_reader_socket = Arc::clone(&socket);
         let stream_reader_stats = Arc::clone(&stats);
+        let stream_reader_table = Arc::clone(&compression_table);
+        let stream_reader_claim = shared_claim.clone();
+        let stream_reader_u_acked = Arc::clone(&uncompressed_ctx_acked);
         let session_over = shutdown.clone();
         tokio::spawn(async move {
+            let mut uncompressed_ctx_retries = 0usize;
             loop {
-                // Read 4-byte length prefix
                 let mut len_buf = [0u8; 4];
                 if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (length)");
@@ -562,14 +1863,68 @@ impl MasqueRelaySocket {
                     break;
                 }
 
-                // Read frame data
                 let mut frame_buf = vec![0u8; frame_len];
                 if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (data)");
                     break;
                 }
 
-                // Decode as UncompressedDatagram
+                if mux_v1 && let Some(capsule_res) = Capsule::decode_stream_frame(&frame_buf) {
+                    match capsule_res {
+                        Ok(Capsule::CompressionAck(ack)) => {
+                            let current_u_ctx = stream_reader_claim
+                                .as_deref()
+                                .and_then(DatagramLaneClaim::uncompressed_context_id);
+                            if current_u_ctx == Some(ack.context_id) {
+                                stream_reader_u_acked.store(true, Ordering::Release);
+                            } else {
+                                stream_reader_table.write().acknowledge(ack.context_id);
+                            }
+                        }
+                        Ok(Capsule::CompressionClose(close)) => {
+                            let current_u_ctx = stream_reader_claim
+                                .as_deref()
+                                .and_then(DatagramLaneClaim::uncompressed_context_id);
+                            if current_u_ctx == Some(close.context_id) {
+                                stream_reader_u_acked.store(false, Ordering::Release);
+                                // N4 bounded recovery: if the relay rejected our
+                                // uncompressed ctx (e.g. lingering prior-session route),
+                                // allocate a fresh disjoint block and retry up to
+                                // `MAX_UNCOMPRESSED_CTX_RETRIES` times.
+                                if uncompressed_ctx_retries < MAX_UNCOMPRESSED_CTX_RETRIES
+                                    && let Some(ref claim) = stream_reader_claim
+                                    && let Some(fresh_u_ctx) =
+                                        claim.reallocate_uncompressed_context()
+                                {
+                                    uncompressed_ctx_retries += 1;
+                                    let frame = Capsule::CompressionAssign(
+                                        CompressionAssign::uncompressed(fresh_u_ctx),
+                                    )
+                                    .encode_stream_frame();
+                                    let _ = retry_assign_tx.try_send(frame);
+                                }
+                            } else {
+                                let removed =
+                                    stream_reader_table.write().remove_by_base(close.context_id);
+                                if let (Some((_, ecn_quad)), Some(claim)) =
+                                    (removed, &stream_reader_claim)
+                                {
+                                    if ecn_quad {
+                                        claim.unregister_ecn_quad(close.context_id);
+                                    } else {
+                                        claim.unregister_context(close.context_id);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            tracing::trace!("MasqueRelaySocket: failed to decode stream capsule");
+                        }
+                    }
+                    continue;
+                }
+
                 let mut cursor = Bytes::from(frame_buf);
                 match UncompressedDatagram::decode(&mut cursor) {
                     Ok(datagram) => {
@@ -578,7 +1933,8 @@ impl MasqueRelaySocket {
                             .fetch_add(1, Ordering::Relaxed);
                         stream_reader_socket.enqueue_received(
                             datagram.payload.to_vec(),
-                            datagram.target, // "target" in datagram = source from relay's perspective
+                            datagram.target,
+                            None,
                         );
                     }
                     Err(_) => {
@@ -588,49 +1944,110 @@ impl MasqueRelaySocket {
             }
 
             session_over.cancel();
-            // Wake pending recv on stream close
             stream_reader_socket.recv.wake();
         });
 
         // Background task (hybrid): read QUIC DATAGRAM frames → bounded queue.
-        // It owns the lane claim and holds only a weak socket reference, so it
-        // ends (and releases the claim) when the session ends, the socket is
-        // dropped, or the outer connection closes.
-        if let Some(claim) = lane {
-            let weak: Weak<Self> = Arc::downgrade(&socket);
+        if let Some(claim) = shared_claim.clone() {
+            let weak = Arc::downgrade(&socket);
             let dgram_stats = Arc::clone(&stats);
+            let dgram_table = Arc::clone(&compression_table);
+            let dgram_mux_drops = Arc::clone(&mux_drop_counter);
             let stop = shutdown.clone();
             tokio::spawn(async move {
                 let conn = claim.connection().clone();
+                let mut mux_rx = mux_rx;
                 loop {
-                    let frame = tokio::select! {
-                        _ = stop.cancelled() => break,
-                        read = conn.read_datagram() => match read {
-                            Ok(frame) => frame,
-                            Err(e) => {
-                                tracing::debug!(
-                                    error = %e,
-                                    "MasqueRelaySocket: outer datagram read ended"
-                                );
-                                break;
-                            }
-                        },
+                    let frame = if let Some(ref mut rx) = mux_rx {
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            item = rx.recv() => match item {
+                                Some(frame) => frame,
+                                None => break,
+                            },
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            read = conn.read_datagram() => match read {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "MasqueRelaySocket: outer datagram read ended"
+                                    );
+                                    break;
+                                }
+                            },
+                        }
                     };
+
+                    // Fold any mux channel-full drops into `stats.rx_dropped`.
+                    let dropped = dgram_mux_drops.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        dgram_stats.rx_dropped.fetch_add(dropped, Ordering::Relaxed);
+                    }
+
                     let Some(socket) = weak.upgrade() else {
                         break;
                     };
+
+                    let mut peek = frame.clone();
+                    let ctx_id = match VarInt::decode(&mut peek) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            tracing::trace!("MasqueRelaySocket: malformed datagram varint");
+                            continue;
+                        }
+                    };
+
+                    if mux_v1 && let Some((source, ecn)) = dgram_table.read().lookup_context(ctx_id)
+                    {
+                        let mut cursor = frame;
+                        match CompressedDatagram::decode(&mut cursor) {
+                            Ok(comp) => {
+                                dgram_stats
+                                    .datagrams_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                                dgram_stats
+                                    .compressed_datagrams_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if ecn.is_some() {
+                                    dgram_stats
+                                        .ecn_marked_received
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                socket.enqueue_received(comp.payload.to_vec(), source, ecn);
+                            }
+                            Err(_) => {
+                                tracing::trace!(
+                                    "MasqueRelaySocket: failed to decode compressed datagram"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     let mut cursor = frame;
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
                             dgram_stats
                                 .datagrams_received
                                 .fetch_add(1, Ordering::Relaxed);
-                            socket.enqueue_received(datagram.payload.to_vec(), datagram.target);
+                            socket.enqueue_received(
+                                datagram.payload.to_vec(),
+                                datagram.target,
+                                None,
+                            );
                         }
                         Err(_) => {
                             tracing::trace!("MasqueRelaySocket: failed to decode datagram frame");
                         }
                     }
+                }
+                let dropped = dgram_mux_drops.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    dgram_stats.rx_dropped.fetch_add(dropped, Ordering::Relaxed);
                 }
                 if let Some(socket) = weak.upgrade() {
                     socket.recv.wake();
@@ -639,62 +2056,200 @@ impl MasqueRelaySocket {
             });
         }
 
-        // Background task: write queued outbound packets via datagram lane (hybrid) or stream lane
+        // Background task: write queued outbound packets via datagram lane (hybrid)
+        // or stream lane, announcing client-allocated Context IDs on the stream.
         let writer_stats = Arc::clone(&stats);
+        let writer_table = Arc::clone(&compression_table);
+        let writer_claim = shared_claim;
+        let writer_u_acked = uncompressed_ctx_acked;
         tokio::spawn(async move {
-            loop {
-                let Some(packet) = send_rx.recv().await else {
-                    // Every sender is gone, i.e. the socket was dropped. Nothing is
-                    // half-written, so finish gracefully: QUIC keeps retransmitting
-                    // frames that are queued but not yet acknowledged, so packets
-                    // already handed to the relay still arrive.
-                    if let Err(e) = send_stream.finish() {
-                        tracing::debug!(error = %e, "MasqueRelaySocket: stream finish error");
-                    }
+            // For every `mux_v1` client session, register its client-allocated
+            // uncompressed Context ID on the stream immediately (this also
+            // triggers the relay's T2 symmetric mux activation barrier!).
+            if let Some(ref claim) = writer_claim
+                && claim.is_mux_v1()
+                && let Some(u_ctx) = claim.uncompressed_context_id()
+            {
+                let capsule = Capsule::CompressionAssign(CompressionAssign::uncompressed(u_ctx));
+                let frame = capsule.encode_stream_frame();
+                let frame_len = frame.len() as u32;
+                if send_stream
+                    .write_all(&frame_len.to_be_bytes())
+                    .await
+                    .is_err()
+                    || send_stream.write_all(&frame).await.is_err()
+                {
                     return;
-                };
+                }
+            }
 
-                if let Some(ref conn) = writer_conn {
-                    let lane = select_relay_lane(
-                        &packet.raw_payload,
-                        packet.target,
-                        conn.max_datagram_size(),
-                        RelayForwardMode::Hybrid,
-                    );
-                    if lane == RelayLane::Datagram {
-                        match conn.send_datagram(packet.encoded.clone()) {
-                            Ok(()) => {
-                                writer_stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+            let mut retry_rx_open = true;
+            loop {
+                let packet = tokio::select! {
+                    biased;
+                    maybe_retry = retry_assign_rx.recv(), if retry_rx_open => {
+                        match maybe_retry {
+                            Some(frame) => {
+                                let frame_len = frame.len() as u32;
+                                if send_stream
+                                    .write_all(&frame_len.to_be_bytes())
+                                    .await
+                                    .is_err()
+                                    || send_stream.write_all(&frame).await.is_err()
+                                {
+                                    return;
+                                }
                                 continue;
                             }
-                            Err(
-                                SendDatagramError::TooLarge
-                                | SendDatagramError::UnsupportedByPeer
-                                | SendDatagramError::Disabled,
-                            ) => {
-                                // Fall through to reliable stream lane for this packet.
+                            None => {
+                                retry_rx_open = false;
+                                continue;
                             }
-                            Err(SendDatagramError::ConnectionLost(e)) => {
-                                tracing::debug!(
-                                    error = %e,
-                                    "MasqueRelaySocket: outer connection lost on datagram send"
-                                );
-                                return;
+                        }
+                    }
+                    maybe_pkt = send_rx.recv() => {
+                        let Some(packet) = maybe_pkt else {
+                            if let Err(e) = send_stream.finish() {
+                                tracing::debug!(error = %e, "MasqueRelaySocket: stream finish error");
+                            }
+                            return;
+                        };
+                        packet
+                    }
+                };
+
+                if let Some(ref claim) = writer_claim {
+                    let conn = claim.connection();
+                    if claim.is_mux_v1() {
+                        let active = writer_table.read().active_for_target(packet.target);
+                        if let Some((base_ctx, ecn_quad)) = active {
+                            let ctx_id = if ecn_quad {
+                                ecn_context_id(base_ctx, packet.ecn)
+                            } else {
+                                base_ctx
+                            };
+                            let lane = select_relay_lane_with_overhead(
+                                &packet.raw_payload,
+                                ctx_id.size(),
+                                conn.max_datagram_size(),
+                                RelayForwardMode::Hybrid,
+                            );
+                            if lane == RelayLane::Datagram {
+                                let encoded =
+                                    CompressedDatagram::new(ctx_id, packet.raw_payload.clone())
+                                        .encode();
+                                match conn.send_datagram(encoded) {
+                                    Ok(()) => {
+                                        writer_stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                                        writer_stats
+                                            .compressed_datagrams_sent
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if ecn_quad && packet.ecn.is_some() {
+                                            writer_stats
+                                                .ecn_marked_sent
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        continue;
+                                    }
+                                    Err(
+                                        SendDatagramError::TooLarge
+                                        | SendDatagramError::UnsupportedByPeer
+                                        | SendDatagramError::Disabled,
+                                    ) => {}
+                                    Err(SendDatagramError::ConnectionLost(e)) => {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "MasqueRelaySocket: outer connection lost on compressed datagram send"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        } else {
+                            let assign_frame = {
+                                let mut table = writer_table.write();
+                                if !table.has_target(packet.target) && table.can_add_target() {
+                                    claim.allocate_ecn_quad().map(|base_ctx| {
+                                        table.insert_pending_ecn_quad(packet.target, base_ctx);
+                                        Capsule::EcnCompressionAssign(make_target_assign(
+                                            base_ctx,
+                                            packet.target,
+                                        ))
+                                        .encode_stream_frame()
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(frame) = assign_frame {
+                                let frame_len = frame.len() as u32;
+                                if send_stream
+                                    .write_all(&frame_len.to_be_bytes())
+                                    .await
+                                    .is_err()
+                                    || send_stream.write_all(&frame).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Uncompressed datagram path (legacy 0.29.0 ctx 0, or mux_v1
+                    // once client-allocated `u_ctx` has been ACKed by the relay).
+                    if writer_u_acked.load(Ordering::Acquire)
+                        && let Some(u_ctx) = claim.uncompressed_context_id()
+                    {
+                        let overhead =
+                            uncompressed_datagram_header_overhead_for_ctx(u_ctx, packet.target);
+                        let lane = select_relay_lane_with_overhead(
+                            &packet.raw_payload,
+                            overhead,
+                            conn.max_datagram_size(),
+                            RelayForwardMode::Hybrid,
+                        );
+                        if lane == RelayLane::Datagram {
+                            let encoded = UncompressedDatagram::new(
+                                u_ctx,
+                                packet.target,
+                                packet.raw_payload.clone(),
+                            )
+                            .encode();
+                            match conn.send_datagram(encoded) {
+                                Ok(()) => {
+                                    writer_stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(
+                                    SendDatagramError::TooLarge
+                                    | SendDatagramError::UnsupportedByPeer
+                                    | SendDatagramError::Disabled,
+                                ) => {}
+                                Err(SendDatagramError::ConnectionLost(e)) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "MasqueRelaySocket: outer connection lost on datagram send"
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
                 }
 
-                // A failed write may have left a partial frame on the wire. Return
-                // without finishing so the drop resets the stream, and the relay's
-                // length-prefixed reader sees a stream error rather than misparsing
-                // a truncated frame.
-                let frame_len = packet.encoded.len() as u32;
+                // Stream fallback (or pre-ACK startup / stream-only mode).
+                let encoded = UncompressedDatagram::new(
+                    VarInt::from_u32(0),
+                    packet.target,
+                    packet.raw_payload,
+                )
+                .encode();
+                let frame_len = encoded.len() as u32;
                 if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (length)");
                     return;
                 }
-                if let Err(e) = send_stream.write_all(&packet.encoded).await {
+                if let Err(e) = send_stream.write_all(&encoded).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (data)");
                     return;
                 }
@@ -713,14 +2268,31 @@ impl MasqueRelaySocket {
         self.forward_mode
     }
 
+    /// Return whether `DATAGRAM_MUX_V1` (Context-ID demux + compression + ECN)
+    /// is active for this relay session.
+    #[must_use]
+    pub fn is_mux_v1(&self) -> bool {
+        self.mux_v1
+    }
+
+    /// Compute the recommended clamped inner virtual-path MTU (`min(P_max, 1380)`)
+    /// from the outer connection's QUIC `DATAGRAM` budget at endpoint creation
+    /// (ADR-020).
+    #[must_use]
+    pub fn recommended_inner_mtu(&self) -> Option<u16> {
+        let conn = self.outer_connection.as_ref()?;
+        let overhead = if self.mux_v1 { 2 } else { 8 };
+        compute_inner_virtual_path_mtu(conn.max_datagram_size(), overhead)
+    }
+
     /// Return per-lane and queue-pressure statistics for this relay socket.
     #[must_use]
     pub fn stats(&self) -> &Arc<MasqueRelaySocketStats> {
         &self.stats
     }
 
-    fn enqueue_received(&self, payload: Vec<u8>, source: SocketAddr) {
-        if self.recv.push(payload, source) {
+    fn enqueue_received(&self, payload: Vec<u8>, source: SocketAddr, ecn: Option<EcnCodepoint>) {
+        if self.recv.push(payload, source, ecn) {
             self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -768,23 +2340,15 @@ impl UdpSender for MasqueRelaySender {
         _cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         let raw_payload = Bytes::copy_from_slice(transmit.contents);
-        let datagram = UncompressedDatagram::new(
-            VarInt::from_u32(0),
-            transmit.destination,
-            raw_payload.clone(),
-        );
-        let encoded = datagram.encode();
         let packet = OutboundRelayPacket {
             target: transmit.destination,
+            ecn: transmit.ecn,
             raw_payload,
-            encoded,
         };
 
         match self.send_tx.try_send(packet) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // UDP tail-drop semantics under relay congestion: avoid
-                // bufferbloat and let inner QUIC observe real packet loss.
                 self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
                 Poll::Ready(Ok(()))
             }
@@ -798,7 +2362,7 @@ impl UdpSender for MasqueRelaySender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
 
@@ -838,32 +2402,27 @@ mod tests {
 
     #[test]
     fn detects_quic_v1_and_v2_initial_packets() {
-        // QUIC v1 Initial: long header bit (0x80) | fixed bit (0x40) | type 00 (0x00)
         let v1_initial = [0xc0, 0x00, 0x00, 0x00, 0x01, 0x00];
         assert!(is_quic_initial_packet(&v1_initial));
 
-        // QUIC v2 Initial: version 0x6b3343cf, type 01 (0x10)
         let v2_initial = [0xd0, 0x6b, 0x33, 0x43, 0xcf, 0x00];
         assert!(is_quic_initial_packet(&v2_initial));
 
-        // QUIC v1 Handshake: type 10 (0x20) -> not Initial
         let v1_handshake = [0xe0, 0x00, 0x00, 0x00, 0x01, 0x00];
         assert!(!is_quic_initial_packet(&v1_handshake));
 
-        // Short header 1-RTT packet: high bit 0
         let short_1rtt = [0x40, 0x11, 0x22, 0x33, 0x44];
         assert!(!is_quic_initial_packet(&short_1rtt));
     }
 
-    /// ADR-016 Decision 3: `P_max` is never computed below 1200 B plus
-    /// margin. An outer budget under the floor yields no datagram lane.
     #[test]
-    fn datagram_budget_is_never_below_initial_size_plus_margin() {
+    fn datagram_budget_respects_900b_floor_and_compressed_overhead() {
         let v4 = v4_target();
         let v6 = v6_target();
         let v4_floor_outer = MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET + 8;
         let v6_floor_outer = MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET + 20;
 
+        assert_eq!(MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET, 900);
         assert_eq!(
             compute_datagram_payload_budget(Some(v4_floor_outer), v4),
             Some(MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET)
@@ -880,12 +2439,20 @@ mod tests {
             compute_datagram_payload_budget(Some(v6_floor_outer - 1), v6),
             None
         );
-        // A typical QUIC minimum-MTU outer budget (~1150 B) is below the floor.
-        assert_eq!(compute_datagram_payload_budget(Some(1150), v4), None);
+
+        assert_eq!(compute_datagram_payload_budget(Some(1180), v4), Some(1172));
+        assert_eq!(compute_datagram_payload_budget(Some(1180), v6), Some(1160));
+        assert_eq!(
+            compute_datagram_payload_budget_with_overhead(Some(1180), 1),
+            Some(1179)
+        );
+        assert_eq!(compute_inner_virtual_path_mtu(Some(1180), 1), Some(1179));
+        assert_eq!(compute_inner_virtual_path_mtu(Some(1452), 2), Some(1380));
+        assert_eq!(compute_datagram_payload_budget(Some(850), v4), None);
         assert_eq!(compute_datagram_payload_budget(None, v4), None);
         for outer in 0..4096 {
             if let Some(p_max) = compute_datagram_payload_budget(Some(outer), v6) {
-                assert!(p_max >= QUIC_INITIAL_MIN_SIZE + RELAY_DATAGRAM_BUDGET_MARGIN);
+                assert!(p_max >= MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET);
             }
         }
     }
@@ -898,13 +2465,10 @@ mod tests {
 
         let short_pkt = vec![0x40u8; 600];
 
-        // Stream mode ALWAYS selects Stream even when datagram budget fits.
         assert_eq!(
             select_relay_lane(&short_pkt, target_v4, outer, RelayForwardMode::Stream),
             RelayLane::Stream
         );
-
-        // Hybrid mode selects Datagram when payload <= P_max.
         assert_eq!(
             select_relay_lane(&short_pkt, target_v4, outer, RelayForwardMode::Hybrid),
             RelayLane::Datagram
@@ -914,7 +2478,6 @@ mod tests {
             RelayLane::Datagram
         );
 
-        // Exact P_max boundary: outer 1400 - 8 B (v4) = 1392 B fits; 1393 B spills to Stream.
         let p_max_v4 = compute_datagram_payload_budget(outer, target_v4).unwrap();
         assert_eq!(p_max_v4, 1392);
         let at_limit = vec![0x40u8; p_max_v4];
@@ -928,19 +2491,9 @@ mod tests {
             RelayLane::Stream
         );
 
-        // IPv6 overhead is 20 B: outer 1400 - 20 = 1380 B.
         let p_max_v6 = compute_datagram_payload_budget(outer, target_v6).unwrap();
         assert_eq!(p_max_v6, 1380);
 
-        // A full-size (1200 B) short-header packet rides the datagram lane
-        // once the budget clears the floor.
-        let full_short = vec![0x40u8; QUIC_INITIAL_MIN_SIZE];
-        assert_eq!(
-            select_relay_lane(&full_short, target_v4, outer, RelayForwardMode::Hybrid),
-            RelayLane::Datagram
-        );
-
-        // QUIC Initial packets ALWAYS take Stream even if small or outer budget is huge.
         let mut small_initial = vec![0x00u8; 200];
         small_initial[0] = 0xc0;
         small_initial[4] = 0x01;
@@ -954,9 +2507,12 @@ mod tests {
             RelayLane::Stream
         );
 
-        // Budget below the floor, or no outer datagrams: every packet takes Stream.
         assert_eq!(
             select_relay_lane(&short_pkt, target_v4, Some(1150), RelayForwardMode::Hybrid),
+            RelayLane::Datagram
+        );
+        assert_eq!(
+            select_relay_lane(&short_pkt, target_v4, Some(850), RelayForwardMode::Hybrid),
             RelayLane::Stream
         );
         assert_eq!(
@@ -965,8 +2521,61 @@ mod tests {
         );
     }
 
-    /// Inbound ring: at most `capacity` packets; overflow evicts the oldest
-    /// and reports each eviction (it feeds `rx_dropped`).
+    #[test]
+    fn path_challenge_over_sub_1200_virtual_path_rides_stream_lane() {
+        let outer_1280_dgram_budget = Some(1180);
+        let compressed_hdr = 1;
+        let clamped_1rtt = compute_inner_virtual_path_mtu(outer_1280_dgram_budget, compressed_hdr)
+            .expect("1280 B outer clears 900 B floor");
+        assert!(clamped_1rtt < QUIC_INITIAL_MIN_SIZE as u16);
+
+        let one_rtt_pkt = vec![0x40u8; clamped_1rtt as usize];
+        assert_eq!(
+            select_relay_lane_with_overhead(
+                &one_rtt_pkt,
+                compressed_hdr,
+                outer_1280_dgram_budget,
+                RelayForwardMode::Hybrid
+            ),
+            RelayLane::Datagram
+        );
+
+        let padded_path_challenge = vec![0x40u8; QUIC_INITIAL_MIN_SIZE];
+        assert_eq!(
+            select_relay_lane_with_overhead(
+                &padded_path_challenge,
+                compressed_hdr,
+                outer_1280_dgram_budget,
+                RelayForwardMode::Hybrid
+            ),
+            RelayLane::Stream
+        );
+    }
+
+    #[test]
+    fn ecn_context_id_mapping_roundtrips_all_codepoints() {
+        let base = VarInt::from_u32(2);
+        let cases = [
+            (None, 2u64, 0u64),
+            (Some(EcnCodepoint::Ect0), 4, 2),
+            (Some(EcnCodepoint::Ect1), 6, 4),
+            (Some(EcnCodepoint::Ce), 8, 6),
+        ];
+        for (ecn, expected_id, expected_offset) in cases {
+            let cid = ecn_context_id(base, ecn);
+            assert_eq!(cid.into_inner(), expected_id);
+            assert_eq!(cid.into_inner() % 2, 0, "all ECN context IDs must be even");
+            assert_eq!(
+                decode_ecn_offset(cid.into_inner() - base.into_inner()),
+                Some(ecn)
+            );
+            assert_eq!(cid.into_inner() - base.into_inner(), expected_offset);
+            assert_eq!(cid.size(), 1, "first blocks fit in 1-byte VarInt");
+        }
+        assert_eq!(decode_ecn_offset(1), None);
+        assert_eq!(decode_ecn_offset(8), None);
+    }
+
     #[test]
     fn recv_ring_is_bounded_and_evicts_oldest() {
         let ring = RecvRing::new(DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
@@ -974,7 +2583,11 @@ mod tests {
         let total = DEFAULT_RELAY_RECV_QUEUE_CAPACITY + 44;
         let mut evicted = 0;
         for i in 0..total {
-            if ring.push((i as u32).to_be_bytes().to_vec(), src) {
+            if ring.push(
+                (i as u32).to_be_bytes().to_vec(),
+                src,
+                Some(EcnCodepoint::Ce),
+            ) {
                 evicted += 1;
             }
             assert!(ring.len() <= DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
@@ -982,7 +2595,6 @@ mod tests {
         assert_eq!(evicted, 44);
         assert_eq!(ring.len(), DEFAULT_RELAY_RECV_QUEUE_CAPACITY);
 
-        // The survivors are the newest packets, oldest first.
         let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
         let mut cx = Context::from_waker(&waker);
         let mut b0 = [0u8; 8];
@@ -993,10 +2605,9 @@ mod tests {
             other => panic!("expected one packet, got {other:?}"),
         }
         assert_eq!(&b0[..4], &44u32.to_be_bytes());
+        assert_eq!(meta[0].ecn, Some(EcnCodepoint::Ce));
     }
 
-    /// Outbound queue: a full channel tail-drops (counted in `tx_dropped`)
-    /// and never grows past its capacity.
     #[test]
     fn send_queue_is_bounded_and_counts_drops() {
         let (send_tx, send_rx) =
@@ -1022,7 +2633,6 @@ mod tests {
         assert_eq!(stats.tx_dropped.load(Ordering::Relaxed), 44);
         assert_eq!(send_rx.len(), DEFAULT_RELAY_SEND_QUEUE_CAPACITY);
 
-        // Closed channel: the sender reports the relay stream as gone.
         drop(send_rx);
         match sender
             .as_mut()
@@ -1033,8 +2643,6 @@ mod tests {
         }
     }
 
-    /// `poll_recv` stores its waker under the lock that showed the queue
-    /// empty, so a push from either of two producers always wakes it.
     #[test]
     fn recv_ring_never_loses_a_wakeup_with_two_producers() {
         for _ in 0..200 {
@@ -1049,7 +2657,7 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     std::thread::spawn(move || {
                         barrier.wait();
-                        ring.push(vec![i], v4_target());
+                        ring.push(vec![i], v4_target(), None);
                     })
                 })
                 .collect();
@@ -1065,8 +2673,6 @@ mod tests {
                     Poll::Ready(Err(e)) => panic!("poll error: {e}"),
                     Poll::Pending => {
                         pending_polls += 1;
-                        // Every Pending stored a waker; some producer must
-                        // wake it. A lost wake-up would spin to the bound.
                         let start = std::time::Instant::now();
                         while counter.0.load(Ordering::SeqCst) < pending_polls {
                             assert!(

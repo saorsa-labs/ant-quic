@@ -78,11 +78,33 @@ impl PathData {
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
+        let initial_mtu = config.effective_initial_mtu();
+        let min_mtu = config.effective_min_mtu();
         let congestion = config.congestion_controller_factory.new_controller(
-            config.get_initial_mtu() as u64,
+            initial_mtu as u64,
             16 * 1024 * 1024,
             now,
         );
+        let mtud = match (
+            config.mtu_discovery_config.as_ref().filter(|_| allow_mtud),
+            config.virtual_path_max_udp_payload_size,
+        ) {
+            (Some(mtud_config), Some(vp_mtu)) if vp_mtu > initial_mtu => {
+                let mut clamped = mtud_config.clone();
+                clamped.upper_bound = clamped.upper_bound.min(vp_mtu);
+                MtuDiscovery::new(initial_mtu, min_mtu, peer_max_udp_payload_size, clamped)
+            }
+            // ADR-020: when a virtual-path clamp is at or below `initial_mtu`
+            // (e.g. sub-1200 over a 1,280 B outer path), lock DPLPMTUD at the
+            // exact clamp so 1-RTT traffic never probes above the outer budget.
+            (_, Some(_)) | (None, None) => MtuDiscovery::disabled(initial_mtu, min_mtu),
+            (Some(mtud_config), None) => MtuDiscovery::new(
+                initial_mtu,
+                min_mtu,
+                peer_max_udp_payload_size,
+                mtud_config.clone(),
+            ),
+        };
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -90,7 +112,7 @@ impl PathData {
             pacing: Pacer::new(
                 config.initial_rtt,
                 congestion.initial_window(),
-                config.get_initial_mtu(),
+                initial_mtu,
                 now,
             ),
             congestion,
@@ -99,21 +121,7 @@ impl PathData {
             validated: false,
             total_sent: 0,
             total_recvd: 0,
-            mtud: config
-                .mtu_discovery_config
-                .as_ref()
-                .filter(|_| allow_mtud)
-                .map_or(
-                    MtuDiscovery::disabled(config.get_initial_mtu(), config.min_mtu),
-                    |mtud_config| {
-                        MtuDiscovery::new(
-                            config.get_initial_mtu(),
-                            config.min_mtu,
-                            peer_max_udp_payload_size,
-                            mtud_config.clone(),
-                        )
-                    },
-                ),
+            mtud,
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
@@ -158,13 +166,15 @@ impl PathData {
     ///
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+        let initial_mtu = config.effective_initial_mtu();
+        let min_mtu = config.effective_min_mtu();
         self.rtt = RttEstimator::new(config.initial_rtt);
         self.congestion = config.congestion_controller_factory.new_controller(
-            config.get_initial_mtu() as u64,
+            initial_mtu as u64,
             16 * 1024 * 1024,
             now,
         );
-        self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
+        self.mtud.reset(initial_mtu, min_mtu);
         self.address_info = PathAddressInfo::new(); // Reset address info
         // Reset tokens but preserve rate
         let rate = self.observation_rate_limiter.rate as u8;

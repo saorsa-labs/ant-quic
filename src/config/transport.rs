@@ -9,6 +9,11 @@ use std::{fmt, sync::Arc};
 
 use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
+/// Minimum allowed post-handshake UDP payload size for a relayed virtual path
+/// (ADR-020), exempting virtual MASQUE tunnels from the physical `INITIAL_MTU`
+/// (`1200 B`) egress floor after Initial keys are discarded.
+pub const MIN_VIRTUAL_PATH_MTU: u16 = 900;
+
 /// Parameters governing the core QUIC state machine
 ///
 /// Default values should be suitable for most internet applications. Applications protocols which
@@ -36,6 +41,7 @@ pub struct TransportConfig {
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
+    pub(crate) virtual_path_max_udp_payload_size: Option<u16>,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
@@ -46,6 +52,10 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    /// Advertise the `DatagramMuxV1` (`0x50C4`) QUIC transport parameter
+    /// (ADR-020), enabling RFC 9297 Context-ID datagram multiplexing from
+    /// datagram #1 when both peers advertise it. Defaults to `true`.
+    pub(crate) datagram_mux_v1: bool,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -214,6 +224,53 @@ impl TransportConfig {
         self
     }
 
+    /// Clamp post-handshake (1-RTT) UDP payload size for a virtual path such as
+    /// a hybrid MASQUE relay tunnel (ADR-020).
+    ///
+    /// Physical paths always keep the RFC 9000 §14 `INITIAL_MTU` (`1200 B`) floor
+    /// enforced by [`TransportConfig::initial_mtu`] and [`TransportConfig::min_mtu`].
+    /// Virtual paths running over an outer QUIC `DATAGRAM` tunnel (e.g., 1,280 B
+    /// IPv6, WireGuard, or Cloudflare WARP) may have a post-handshake outer
+    /// datagram budget below `1200 B` (down to [`MIN_VIRTUAL_PATH_MTU`] = `900 B`).
+    ///
+    /// When set to `Some(limit)`:
+    /// - Initial datagrams (`SpaceId::Initial`) still expand to `1200 B`
+    ///   (RFC 9000 §14.1) and travel on the MASQUE stream lane.
+    /// - Post-handshake 1-RTT datagrams (`SpaceId::Data`) are clamped to
+    ///   `limit.clamp(MIN_VIRTUAL_PATH_MTU, MAX_UDP_PAYLOAD)`.
+    /// - DPLPMTUD upper bound is locked to that clamp (never probing above the
+    ///   outer datagram budget).
+    pub fn virtual_path_max_udp_payload_size(&mut self, value: Option<u16>) -> &mut Self {
+        self.virtual_path_max_udp_payload_size =
+            value.map(|v| v.clamp(MIN_VIRTUAL_PATH_MTU, MAX_UDP_PAYLOAD));
+        self
+    }
+
+    /// Effective minimum UDP payload size for this transport, honoring any
+    /// virtual-path sub-1200 floor exemption (ADR-020).
+    pub(crate) fn effective_min_mtu(&self) -> u16 {
+        match self.virtual_path_max_udp_payload_size {
+            Some(vp) => self.min_mtu.min(vp),
+            None => self.min_mtu,
+        }
+    }
+
+    /// Effective initial post-handshake UDP payload size for this transport,
+    /// honoring any virtual-path clamp (ADR-020).
+    pub(crate) fn effective_initial_mtu(&self) -> u16 {
+        let base = self.get_initial_mtu();
+        match self.virtual_path_max_udp_payload_size {
+            Some(vp) => base.min(vp),
+            None => base,
+        }
+    }
+
+    /// Configured virtual-path post-handshake MTU clamp, if any.
+    #[must_use]
+    pub fn get_virtual_path_max_udp_payload_size(&self) -> Option<u16> {
+        self.virtual_path_max_udp_payload_size
+    }
+
     /// Specifies the MTU discovery config (see [`MtuDiscoveryConfig`] for details).
     ///
     /// Enabled by default.
@@ -301,6 +358,17 @@ impl TransportConfig {
     /// sent, older datagrams are dropped until sufficient space is available.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
+        self
+    }
+
+    /// Whether to advertise the `DatagramMuxV1` (`0x50C4`) QUIC transport
+    /// parameter (ADR-020), enabling RFC 9297 Context-ID datagram multiplexing
+    /// from datagram #1 when both peers advertise it.
+    ///
+    /// Defaults to `true`. Disabling this simulates or forces legacy `0.29.0`
+    /// unprefixed datagram framing on the connection.
+    pub fn datagram_mux_v1(&mut self, value: bool) -> &mut Self {
+        self.datagram_mux_v1 = value;
         self
     }
 
@@ -480,6 +548,7 @@ impl Default for TransportConfig {
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
+            virtual_path_max_udp_payload_size: None,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             ack_frequency_config: None,
@@ -494,6 +563,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            datagram_mux_v1: true,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -526,6 +596,7 @@ impl fmt::Debug for TransportConfig {
             initial_rtt,
             initial_mtu,
             min_mtu,
+            virtual_path_max_udp_payload_size,
             mtu_discovery_config,
             pad_to_mtu,
             ack_frequency_config,
@@ -535,6 +606,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            datagram_mux_v1,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -556,6 +628,10 @@ impl fmt::Debug for TransportConfig {
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
+            .field(
+                "virtual_path_max_udp_payload_size",
+                virtual_path_max_udp_payload_size,
+            )
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
@@ -568,6 +644,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field("datagram_mux_v1", datagram_mux_v1)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload)
             .field("nat_traversal_config", nat_traversal_config)

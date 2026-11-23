@@ -266,7 +266,9 @@ impl MasqueRelayClient {
         match capsule {
             Capsule::CompressionAck(ack) => self.handle_ack(ack).await,
             Capsule::CompressionClose(close) => self.handle_close(close).await,
-            Capsule::CompressionAssign(assign) => self.handle_assign(assign).await,
+            Capsule::CompressionAssign(assign) | Capsule::EcnCompressionAssign(assign) => {
+                self.handle_assign(assign).await
+            }
             Capsule::Unknown { capsule_type, .. } => {
                 tracing::debug!(
                     capsule_type = capsule_type.into_inner(),

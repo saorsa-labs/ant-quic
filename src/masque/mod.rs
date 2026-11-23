@@ -104,12 +104,15 @@ pub mod relay_socket;
 
 // Re-export primary types for convenience
 pub use capsule::{
-    CAPSULE_COMPRESSION_ACK, CAPSULE_COMPRESSION_ASSIGN, CAPSULE_COMPRESSION_CLOSE, Capsule,
-    CompressionAck, CompressionAssign, CompressionClose,
+    CAPSULE_COMPRESSION_ACK, CAPSULE_COMPRESSION_ASSIGN, CAPSULE_COMPRESSION_CLOSE,
+    CAPSULE_ECN_COMPRESSION_ASSIGN, Capsule, CompressionAck, CompressionAssign, CompressionClose,
+    STREAM_CAPSULE_MARKER,
 };
 pub use connect::{
     BIND_ANY_HOST, BIND_ANY_PORT, CONNECT_UDP_BIND_PROTOCOL, CONNECT_UDP_PROTOCOL, ConnectError,
-    ConnectUdpRequest, ConnectUdpResponse,
+    ConnectUdpRequest, ConnectUdpResponse, REQUEST_FLAG_DATAGRAM_MUX_V1,
+    REQUEST_FLAG_HYBRID_DATAGRAM_LANE, RESPONSE_FLAG_DATAGRAM_MUX_V1,
+    RESPONSE_FLAG_HYBRID_DATAGRAM_LANE,
 };
 pub use context::{ContextError, ContextInfo, ContextManager, ContextState};
 pub use datagram::{CompressedDatagram, Datagram, UncompressedDatagram};
@@ -126,9 +129,15 @@ pub use relay_server::{
 };
 pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats};
 pub use relay_socket::{
-    DEFAULT_RELAY_RECV_QUEUE_CAPACITY, DEFAULT_RELAY_SEND_QUEUE_CAPACITY, DatagramLaneClaim,
-    DatagramLaneError, MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET, MasqueRelaySocket,
-    MasqueRelaySocketStats, QUIC_INITIAL_MIN_SIZE, RELAY_DATAGRAM_BUDGET_MARGIN, RelayForwardMode,
-    RelayLane, compute_datagram_payload_budget, is_quic_initial_packet, select_relay_lane,
-    uncompressed_datagram_header_overhead,
+    APP_DATAGRAM_CONTEXT_ID, DEFAULT_MAX_COMPRESSED_TARGETS, DEFAULT_RELAY_RECV_QUEUE_CAPACITY,
+    DEFAULT_RELAY_SEND_QUEUE_CAPACITY, DatagramLaneClaim, DatagramLaneError, ECN_CONTEXT_STRIDE,
+    MAX_INNER_RELAY_UDP_PAYLOAD_SIZE, MAX_MUX_ROUTES_PER_CONNECTION,
+    MIN_RELAY_DATAGRAM_PAYLOAD_BUDGET, MasqueRelaySocket, MasqueRelaySocketStats,
+    QUIC_INITIAL_MIN_SIZE, RELAY_DATAGRAM_BUDGET_MARGIN, RelayForwardMode, RelayLane,
+    SIDE_BLOCK_STRIDE, compute_datagram_payload_budget,
+    compute_datagram_payload_budget_with_overhead, compute_inner_virtual_path_mtu,
+    decode_ecn_offset, ecn_context_id, is_quic_initial_packet, mux_app_rx_dropped,
+    mux_registered_route_count, mux_unknown_ctx_dropped, select_relay_lane,
+    select_relay_lane_with_overhead, uncompressed_datagram_header_overhead,
+    uncompressed_datagram_header_overhead_for_ctx,
 };

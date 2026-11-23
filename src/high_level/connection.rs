@@ -691,6 +691,22 @@ impl Connection {
             .supports_ack_receive_v2()
     }
 
+    /// Returns `true` if both endpoints negotiated the `DatagramMuxV1`
+    /// (`0x50C4`) QUIC transport parameter during the handshake (ADR-020).
+    ///
+    /// Immutable once the handshake completes: on a `datagram_mux_v1`
+    /// connection, `LinkConn::send_datagram` / `recv_datagrams` use odd
+    /// Context ID `1` from datagram #1 and hybrid MASQUE sessions use even
+    /// Context IDs `>= 2`. On connections with `0.28`/`0.29` peers that lack
+    /// the parameter, this returns `false` and datagrams remain unprefixed.
+    pub fn supports_datagram_mux_v1(&self) -> bool {
+        self.0
+            .state
+            .lock("supports_datagram_mux_v1")
+            .inner
+            .supports_datagram_mux_v1()
+    }
+
     /// Close the connection immediately.
     ///
     /// Pending operations will fail immediately with [`ConnectionError::LocallyClosed`]. No

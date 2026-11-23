@@ -73,16 +73,21 @@ pub struct P2pLinkConn {
     remote_addr: SocketAddr,
     /// Connection start time.
     connected_at: std::time::Instant,
+    /// Cached immutable handshake result of `DatagramMuxV1 (0x50C4)` so
+    /// `send_datagram` avoids an extra `ConnectionInner` lock per voice frame.
+    datagram_mux_v1: bool,
 }
 
 impl P2pLinkConn {
     /// Create a new connection wrapper.
     pub fn new(inner: HighLevelConnection, peer_id: PeerId, remote_addr: SocketAddr) -> Self {
+        let datagram_mux_v1 = inner.supports_datagram_mux_v1();
         Self {
             inner,
             peer_id,
             remote_addr,
             connected_at: std::time::Instant::now(),
+            datagram_mux_v1,
         }
     }
 
@@ -129,37 +134,34 @@ impl LinkConn for P2pLinkConn {
     }
 
     fn send_datagram(&self, data: Bytes) -> LinkResult<()> {
-        self.inner
-            .send_datagram(data)
-            .map_err(|e| LinkError::Io(e.to_string()))
+        crate::masque::relay_socket::send_app_datagram_with_mux(
+            &self.inner,
+            self.datagram_mux_v1,
+            data,
+        )
+        .map_err(|e| LinkError::Io(e.to_string()))
     }
 
     fn recv_datagrams(&self) -> BoxStream<'_, Bytes> {
-        // QUIC datagrams carry no demultiplexer: a hybrid MASQUE relay session
-        // (ADR-016) on this connection reads them all. Refuse to compete with
-        // it; the registration is held for the life of the stream and keeps a
-        // later hybrid session off this connection.
-        let guard = match crate::masque::relay_socket::register_other_datagram_reader(&self.inner) {
-            Ok(guard) => guard,
+        // ADR-020: route application datagrams through the per-connection RFC 9297
+        // Context-ID `DatagramMux` so `LinkConn::recv_datagrams` (e.g., voice)
+        // coexists concurrently with `datagram_mux_v1` hybrid MASQUE relay
+        // sessions. Only refused if a legacy 0.29.0 exclusive hybrid claim owns
+        // the outer connection.
+        let sub = match crate::masque::relay_socket::open_app_datagram_channel(&self.inner) {
+            Ok(sub) => sub,
             Err(e) => {
                 tracing::warn!(
                     peer = ?self.peer_id,
                     error = %e,
-                    "recv_datagrams: datagram lane owned by a hybrid relay session; no datagrams"
+                    "recv_datagrams: datagram lane owned by a legacy hybrid relay session; no datagrams"
                 );
                 return Box::pin(futures_util::stream::empty());
             }
         };
-        let conn = self.inner.clone();
-        Box::pin(futures_util::stream::unfold(
-            (conn, guard),
-            |(conn, guard)| async move {
-                match conn.read_datagram().await {
-                    Ok(data) => Some((data, (conn, guard))),
-                    Err(_) => None,
-                }
-            },
-        ))
+        Box::pin(futures_util::stream::unfold(sub, |mut sub| async move {
+            sub.recv().await.map(|data| (data, sub))
+        }))
     }
 
     fn close(&self, error_code: u64, reason: &str) {

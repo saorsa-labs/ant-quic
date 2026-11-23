@@ -31,6 +31,25 @@ pub const CAPSULE_COMPRESSION_ACK: u64 = 0x12;
 /// Capsule type identifier for COMPRESSION_CLOSE
 pub const CAPSULE_COMPRESSION_CLOSE: u64 = 0x13;
 
+/// Capsule type identifier for ECN_COMPRESSION_ASSIGN (ADR-020 /
+/// `draft-seemann-masque-connect-udp-ecn-01`).
+///
+/// Uses the same body layout as [`CompressionAssign`] (`[base_context_id][ip_ver][ip][port]`),
+/// registering 4 consecutive even Context IDs for one target:
+/// - `base + 0`: `Not-ECT`
+/// - `base + 2`: `ECT(0)`
+/// - `base + 4`: `ECT(1)`
+/// - `base + 6`: `CE`
+///
+/// Acknowledged by a single [`CompressionAck`] carrying `base_context_id` and
+/// closed by a single [`CompressionClose`] carrying `base_context_id`.
+pub const CAPSULE_ECN_COMPRESSION_ASSIGN: u64 = 0x14;
+
+/// Leading marker byte distinguishing a control [`Capsule`] frame from an
+/// [`crate::masque::UncompressedDatagram`] (which starts with Context ID `0x00`)
+/// inside a length-prefixed relay bidirectional stream frame (`datagram_mux_v1`).
+pub const STREAM_CAPSULE_MARKER: u8 = 0xFF;
+
 /// COMPRESSION_ASSIGN Capsule
 ///
 /// Registers a Context ID for either uncompressed or compressed operation.
@@ -238,6 +257,8 @@ pub enum Capsule {
     CompressionAck(CompressionAck),
     /// COMPRESSION_CLOSE capsule
     CompressionClose(CompressionClose),
+    /// ECN_COMPRESSION_ASSIGN capsule (registers a 4-context ECN quad `{base, base+2, base+4, base+6}`)
+    EcnCompressionAssign(CompressionAssign),
     /// Unknown capsule type (forward compatibility)
     Unknown {
         /// The capsule type identifier
@@ -261,25 +282,41 @@ impl Capsule {
             return Err(coding::UnexpectedEnd);
         }
 
-        match capsule_type.into_inner() {
+        let mut body = vec![0u8; length_usize];
+        buf.copy_to_slice(&mut body);
+        let mut body_slice = body.as_slice();
+
+        let decoded = match capsule_type.into_inner() {
             CAPSULE_COMPRESSION_ASSIGN => {
-                let capsule = CompressionAssign::decode(buf)?;
-                Ok(Capsule::CompressionAssign(capsule))
+                let capsule = CompressionAssign::decode(&mut body_slice)?;
+                Capsule::CompressionAssign(capsule)
             }
             CAPSULE_COMPRESSION_ACK => {
-                let capsule = CompressionAck::decode(buf)?;
-                Ok(Capsule::CompressionAck(capsule))
+                let capsule = CompressionAck::decode(&mut body_slice)?;
+                Capsule::CompressionAck(capsule)
             }
             CAPSULE_COMPRESSION_CLOSE => {
-                let capsule = CompressionClose::decode(buf)?;
-                Ok(Capsule::CompressionClose(capsule))
+                let capsule = CompressionClose::decode(&mut body_slice)?;
+                Capsule::CompressionClose(capsule)
+            }
+            CAPSULE_ECN_COMPRESSION_ASSIGN => {
+                let capsule = CompressionAssign::decode(&mut body_slice)?;
+                Capsule::EcnCompressionAssign(capsule)
             }
             _ => {
-                let mut data = vec![0u8; length_usize];
-                buf.copy_to_slice(&mut data);
-                Ok(Capsule::Unknown { capsule_type, data })
+                return Ok(Capsule::Unknown {
+                    capsule_type,
+                    data: body,
+                });
             }
+        };
+
+        // Exact body consumption: reject capsules whose declared length leaves
+        // unconsumed trailing bytes.
+        if !body_slice.is_empty() {
+            return Err(coding::UnexpectedEnd);
         }
+        Ok(decoded)
     }
 
     /// Encode a capsule to a buffer
@@ -301,6 +338,10 @@ impl Capsule {
             Capsule::CompressionClose(c) => {
                 c.encode(&mut payload);
                 CAPSULE_COMPRESSION_CLOSE
+            }
+            Capsule::EcnCompressionAssign(c) => {
+                c.encode(&mut payload);
+                CAPSULE_ECN_COMPRESSION_ASSIGN
             }
             Capsule::Unknown { capsule_type, data } => {
                 payload.put_slice(data);
@@ -330,8 +371,39 @@ impl Capsule {
             Capsule::CompressionAssign(_) => CAPSULE_COMPRESSION_ASSIGN,
             Capsule::CompressionAck(_) => CAPSULE_COMPRESSION_ACK,
             Capsule::CompressionClose(_) => CAPSULE_COMPRESSION_CLOSE,
+            Capsule::EcnCompressionAssign(_) => CAPSULE_ECN_COMPRESSION_ASSIGN,
             Capsule::Unknown { capsule_type, .. } => capsule_type.into_inner(),
         }
+    }
+
+    /// Encode this capsule as a relay-stream frame body prefixed with
+    /// [`STREAM_CAPSULE_MARKER`] (`0xFF`).
+    #[must_use]
+    pub fn encode_stream_frame(&self) -> Bytes {
+        let encoded = self.encode();
+        let mut buf = BytesMut::with_capacity(1 + encoded.len());
+        buf.put_u8(STREAM_CAPSULE_MARKER);
+        buf.put_slice(&encoded);
+        buf.freeze()
+    }
+
+    /// Decode a relay-stream frame body if it begins with [`STREAM_CAPSULE_MARKER`].
+    ///
+    /// Returns `None` if the frame does not start with `STREAM_CAPSULE_MARKER`
+    /// (i.e. it is a regular data frame). Rejects trailing bytes after the
+    /// capsule body (exact frame consumption).
+    pub fn decode_stream_frame(frame: &[u8]) -> Option<coding::Result<Self>> {
+        if frame.first() != Some(&STREAM_CAPSULE_MARKER) {
+            return None;
+        }
+        let mut slice = &frame[1..];
+        Some(Self::decode(&mut slice).and_then(|capsule| {
+            if slice.is_empty() {
+                Ok(capsule)
+            } else {
+                Err(coding::UnexpectedEnd)
+            }
+        }))
     }
 }
 
@@ -429,6 +501,60 @@ mod tests {
         assert_eq!(
             Capsule::CompressionClose(CompressionClose::new(VarInt::from_u32(1))).capsule_type(),
             CAPSULE_COMPRESSION_CLOSE
+        );
+        assert_eq!(
+            Capsule::EcnCompressionAssign(CompressionAssign::compressed_v4(
+                VarInt::from_u32(2),
+                Ipv4Addr::LOCALHOST,
+                9000,
+            ))
+            .capsule_type(),
+            CAPSULE_ECN_COMPRESSION_ASSIGN
+        );
+    }
+
+    #[test]
+    fn ecn_compression_assign_capsule_roundtrips_v4_and_v6() {
+        let v4 = CompressionAssign::compressed_v4(
+            VarInt::from_u32(2),
+            Ipv4Addr::new(198, 51, 100, 10),
+            4433,
+        );
+        let framed_v4 = Capsule::EcnCompressionAssign(v4.clone()).encode_stream_frame();
+        assert_eq!(framed_v4[0], STREAM_CAPSULE_MARKER);
+        match Capsule::decode_stream_frame(&framed_v4)
+            .expect("stream capsule")
+            .expect("valid decode")
+        {
+            Capsule::EcnCompressionAssign(decoded) => assert_eq!(decoded, v4),
+            other => panic!("expected EcnCompressionAssign, got {other:?}"),
+        }
+
+        let v6 = CompressionAssign::compressed_v6(
+            VarInt::from_u32(10),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            8443,
+        );
+        let framed_v6 = Capsule::EcnCompressionAssign(v6.clone()).encode_stream_frame();
+        match Capsule::decode_stream_frame(&framed_v6)
+            .expect("stream capsule")
+            .expect("valid decode")
+        {
+            Capsule::EcnCompressionAssign(decoded) => assert_eq!(decoded, v6),
+            other => panic!("expected EcnCompressionAssign, got {other:?}"),
+        }
+
+        // Legacy UncompressedDatagram starts with 0x00, not STREAM_CAPSULE_MARKER.
+        assert!(Capsule::decode_stream_frame(&[0x00, 0x04, 127, 0, 0, 1, 0, 80]).is_none());
+
+        // Exact body consumption: trailing garbage bytes after the capsule are rejected.
+        let mut trailing = framed_v4.to_vec();
+        trailing.push(0xAA);
+        assert!(
+            Capsule::decode_stream_frame(&trailing)
+                .expect("marker present")
+                .is_err(),
+            "stream capsule with trailing bytes must fail closed"
         );
     }
 }
