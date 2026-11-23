@@ -993,6 +993,18 @@ impl Connection {
         self.0.state.lock("rtt").inner.rtt()
     }
 
+    /// The keep-alive interval this connection uses on its current path
+    ///
+    /// See [`crate::TransportConfig::keep_alive_policy`]. `None` means
+    /// keep-alives are off.
+    pub fn keep_alive_interval(&self) -> Option<Duration> {
+        self.0
+            .state
+            .lock("keep_alive_interval")
+            .inner
+            .keep_alive_interval()
+    }
+
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         self.0.state.lock("stats").inner.stats()

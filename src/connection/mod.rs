@@ -2601,11 +2601,39 @@ impl Connection {
     }
 
     fn reset_keep_alive(&mut self, now: Instant) {
-        let interval = match self.config.keep_alive_interval {
-            Some(x) if self.state.is_established() => x,
-            _ => return,
+        if !self.state.is_established() {
+            return;
+        }
+        let Some(interval) = self.keep_alive_interval() else {
+            return;
         };
         self.timers.set(Timer::KeepAlive, now + interval);
+    }
+
+    /// The keep-alive interval this connection uses on its current path
+    ///
+    /// Under [`crate::config::KeepAlivePolicy::Fixed`] (the default) this is
+    /// [`TransportConfig::keep_alive_interval()`]. Under
+    /// [`crate::config::KeepAlivePolicy::PathAdaptive`] it depends on the path
+    /// class (see [`crate::config::classify_keep_alive_path`]) and is capped
+    /// below the negotiated idle timeout. `None` means keep-alives are off.
+    pub fn keep_alive_interval(&self) -> Option<Duration> {
+        let class = match self.config.keep_alive_policy {
+            crate::config::KeepAlivePolicy::Fixed => return self.config.keep_alive_interval,
+            crate::config::KeepAlivePolicy::PathAdaptive(_) => {
+                crate::config::classify_keep_alive_path(
+                    self.path.remote,
+                    self.observed_address(),
+                    self.local_ip,
+                )
+            }
+        };
+        crate::config::effective_keep_alive_interval(
+            self.config.keep_alive_interval,
+            self.config.keep_alive_policy,
+            class,
+            self.idle_timeout,
+        )
     }
 
     fn reset_cid_retirement(&mut self) {

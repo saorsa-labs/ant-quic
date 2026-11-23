@@ -532,6 +532,235 @@ where
     Err(HappyEyeballsError::AllAttemptsFailed { errors })
 }
 
+// ============================================================================
+// Happy Eyeballs v3 per-interface family-health cache (#374)
+// ============================================================================
+
+/// IPv4-preferred races on one network before the cache re-tests IPv6 first.
+pub const DEFAULT_FAMILY_HEALTH_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Dual-stack races that IPv4 must win, with IPv6 dialled first, before the
+/// cache marks IPv6 as broken on the current network.
+pub const DEFAULT_IPV6_FAILURE_THRESHOLD: u32 = 2;
+
+/// Identifies the local network attachment for the family-health cache.
+///
+/// It holds the source address the host would use for an IPv4 and for an
+/// IPv6 destination on the default route. A new interface, a new DHCP lease
+/// or a new IPv6 prefix changes it, and a changed fingerprint flushes what
+/// the cache learned (draft-ietf-happy-happyeyeballs-v3: remember per
+/// network, forget on network change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetworkFingerprint {
+    ipv4_source: Option<std::net::Ipv4Addr>,
+    ipv6_source: Option<std::net::Ipv6Addr>,
+}
+
+impl NetworkFingerprint {
+    /// Build a fingerprint from known source addresses.
+    pub fn new(
+        ipv4_source: Option<std::net::Ipv4Addr>,
+        ipv6_source: Option<std::net::Ipv6Addr>,
+    ) -> Self {
+        Self {
+            ipv4_source,
+            ipv6_source,
+        }
+    }
+
+    /// The fingerprint of the current default routes.
+    ///
+    /// Each family is resolved by `connect()`ing an unbound UDP socket to a
+    /// documentation address (RFC 5737 `192.0.2.1`, RFC 3849 `2001:db8::1`)
+    /// and reading the local address the kernel picked. A UDP `connect()`
+    /// sends no packet. A family without a route resolves to `None`.
+    pub fn current() -> Self {
+        fn route_source(target: SocketAddr) -> Option<std::net::IpAddr> {
+            let bind: SocketAddr = match target {
+                SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+                SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+            };
+            let socket = std::net::UdpSocket::bind(bind).ok()?;
+            socket.connect(target).ok()?;
+            let ip = socket.local_addr().ok()?.ip();
+            (!ip.is_unspecified()).then_some(ip)
+        }
+        let ipv4_source = match route_source((std::net::Ipv4Addr::new(192, 0, 2, 1), 9).into()) {
+            Some(std::net::IpAddr::V4(ip)) => Some(ip),
+            _ => None,
+        };
+        let ipv6_source = match route_source(
+            (std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9).into(),
+        ) {
+            Some(std::net::IpAddr::V6(ip)) => Some(ip),
+            _ => None,
+        };
+        Self {
+            ipv4_source,
+            ipv6_source,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FamilyHealthState {
+    fingerprint: Option<NetworkFingerprint>,
+    ipv6_strikes: u32,
+    ipv6_broken_until: Option<std::time::Instant>,
+}
+
+impl FamilyHealthState {
+    /// Switch to `fingerprint`, forgetting everything learned on another network.
+    fn observe(&mut self, fingerprint: NetworkFingerprint) {
+        if self.fingerprint != Some(fingerprint) {
+            if self.fingerprint.is_some() {
+                debug!("Happy Eyeballs: network changed; flushing family-health cache");
+            }
+            *self = Self {
+                fingerprint: Some(fingerprint),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn ipv6_broken(&mut self, now: std::time::Instant) -> bool {
+        match self.ipv6_broken_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                // Expired: re-test IPv6 first from a clean slate.
+                self.ipv6_broken_until = None;
+                self.ipv6_strikes = 0;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// Per-network memory of a broken IPv6 path (Happy Eyeballs v3).
+///
+/// RFC 8305 dials IPv6 first and waits 250 ms before IPv4. On a network whose
+/// IPv6 is broken or black-holed, every dual-stack connect pays that stall
+/// and sends a wasted ~1.2 KiB pure-PQC Initial (plus retransmits) on IPv6.
+/// The cache remembers, for the current [`NetworkFingerprint`] only, that
+/// IPv4 kept winning races that IPv6 started first, and then starts IPv4
+/// first; IPv6 still races after the stagger, so nothing is lost if IPv4 is
+/// the broken family instead.
+///
+/// The cache is bounded (one network's state) and in memory only. A changed
+/// fingerprint flushes it, an IPv6 win clears it, and the learned state
+/// expires after the TTL so IPv6 is re-tested.
+#[derive(Debug)]
+pub struct FamilyHealthCache {
+    state: parking_lot::Mutex<FamilyHealthState>,
+    ipv6_failure_threshold: u32,
+    ttl: Duration,
+}
+
+impl Default for FamilyHealthCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_IPV6_FAILURE_THRESHOLD, DEFAULT_FAMILY_HEALTH_TTL)
+    }
+}
+
+/// Whether the candidate list holds both address families.
+pub fn is_dual_stack(candidates: &[SocketAddr]) -> bool {
+    candidates.iter().any(SocketAddr::is_ipv4) && candidates.iter().any(SocketAddr::is_ipv6)
+}
+
+impl FamilyHealthCache {
+    /// A cache that marks IPv6 broken after `ipv6_failure_threshold` (at least
+    /// 1) lost races and keeps that state for `ttl`.
+    pub fn new(ipv6_failure_threshold: u32, ttl: Duration) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(FamilyHealthState::default()),
+            ipv6_failure_threshold: ipv6_failure_threshold.max(1),
+            ttl,
+        }
+    }
+
+    /// The race configuration to use on `fingerprint`'s network.
+    ///
+    /// Returns `base` unchanged unless IPv6 is currently marked broken on this
+    /// network and `base` prefers IPv6; then IPv4 is dialled first.
+    pub fn config_for(
+        &self,
+        fingerprint: NetworkFingerprint,
+        base: &HappyEyeballsConfig,
+        now: std::time::Instant,
+    ) -> HappyEyeballsConfig {
+        let mut config = base.clone();
+        if base.preferred_family == AddressFamily::IPv6Preferred
+            && self.ipv6_suppressed(fingerprint, now)
+        {
+            debug!("Happy Eyeballs: IPv6 marked broken on this network; dialling IPv4 first");
+            config.preferred_family = AddressFamily::IPv4Preferred;
+        }
+        config
+    }
+
+    /// Whether IPv6-first racing is currently suppressed on `fingerprint`'s network.
+    pub fn ipv6_suppressed(
+        &self,
+        fingerprint: NetworkFingerprint,
+        now: std::time::Instant,
+    ) -> bool {
+        let mut state = self.state.lock();
+        state.observe(fingerprint);
+        state.ipv6_broken(now)
+    }
+
+    /// Learn from one finished race.
+    ///
+    /// * `candidates` — the addresses raced; races with one family teach nothing.
+    /// * `config` — the configuration the race used (from [`Self::config_for`]).
+    /// * `winner` — the winning address, or `None` when every attempt failed
+    ///   (the peer may simply be down, so that teaches nothing either).
+    ///
+    /// An IPv4 win in a race that dialled IPv6 first counts as an IPv6
+    /// failure: IPv6 did not complete within the stagger plus a whole IPv4
+    /// handshake. An IPv6 win clears all IPv6 failures.
+    pub fn record_race(
+        &self,
+        fingerprint: NetworkFingerprint,
+        candidates: &[SocketAddr],
+        config: &HappyEyeballsConfig,
+        winner: Option<SocketAddr>,
+        now: std::time::Instant,
+    ) {
+        if !is_dual_stack(candidates) {
+            return;
+        }
+        let Some(winner) = winner else {
+            return;
+        };
+        let mut state = self.state.lock();
+        state.observe(fingerprint);
+        if winner.is_ipv6() {
+            state.ipv6_strikes = 0;
+            state.ipv6_broken_until = None;
+            return;
+        }
+        if config.preferred_family != AddressFamily::IPv6Preferred {
+            // IPv4 went first; the race says nothing about IPv6.
+            return;
+        }
+        state.ipv6_strikes = state.ipv6_strikes.saturating_add(1);
+        if state.ipv6_strikes >= self.ipv6_failure_threshold && state.ipv6_broken_until.is_none() {
+            info!(
+                strikes = state.ipv6_strikes,
+                ttl_secs = self.ttl.as_secs(),
+                "Happy Eyeballs: IPv6 keeps losing to IPv4 on this network; dialling IPv4 first"
+            );
+            // `checked_add` keeps a huge configured TTL from panicking; an
+            // unrepresentable deadline falls back to one day.
+            state.ipv6_broken_until = now
+                .checked_add(self.ttl)
+                .or_else(|| now.checked_add(Duration::from_secs(24 * 60 * 60)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1458,5 +1687,174 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("10.0.0.1:80: refused"));
         assert!(display.contains("[::1]:80: timeout"));
+    }
+}
+
+#[cfg(test)]
+mod family_health_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Instant;
+
+    fn home() -> NetworkFingerprint {
+        NetworkFingerprint::new(
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 10)),
+        )
+    }
+
+    fn cafe() -> NetworkFingerprint {
+        NetworkFingerprint::new(Some(Ipv4Addr::new(10, 0, 0, 7)), None)
+    }
+
+    fn v4() -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 1), 9000))
+    }
+
+    fn v6() -> SocketAddr {
+        SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1), 9000))
+    }
+
+    /// Record `n` races that IPv4 won after IPv6 was dialled first.
+    fn lose_ipv6(cache: &FamilyHealthCache, fp: NetworkFingerprint, n: u32, now: Instant) {
+        for _ in 0..n {
+            let config = cache.config_for(fp, &HappyEyeballsConfig::default(), now);
+            cache.record_race(fp, &[v6(), v4()], &config, Some(v4()), now);
+        }
+    }
+
+    #[test]
+    fn learns_broken_ipv6_after_threshold() {
+        let cache = FamilyHealthCache::default();
+        let now = Instant::now();
+        lose_ipv6(&cache, home(), DEFAULT_IPV6_FAILURE_THRESHOLD - 1, now);
+        assert!(
+            !cache.ipv6_suppressed(home(), now),
+            "one loss is not enough"
+        );
+        lose_ipv6(&cache, home(), 1, now);
+        assert!(cache.ipv6_suppressed(home(), now));
+        let config = cache.config_for(home(), &HappyEyeballsConfig::default(), now);
+        assert_eq!(config.preferred_family, AddressFamily::IPv4Preferred);
+        assert_eq!(
+            sort_addresses(&[v6(), v4()], &config),
+            vec![v4(), v6()],
+            "IPv4 is dialled first; IPv6 still races after the stagger"
+        );
+    }
+
+    #[test]
+    fn failures_and_single_family_races_teach_nothing() {
+        let cache = FamilyHealthCache::new(1, DEFAULT_FAMILY_HEALTH_TTL);
+        let now = Instant::now();
+        let config = HappyEyeballsConfig::default();
+        cache.record_race(home(), &[v6(), v4()], &config, None, now);
+        cache.record_race(home(), &[v4()], &config, Some(v4()), now);
+        let v4_first = HappyEyeballsConfig {
+            preferred_family: AddressFamily::IPv4Preferred,
+            ..HappyEyeballsConfig::default()
+        };
+        cache.record_race(home(), &[v6(), v4()], &v4_first, Some(v4()), now);
+        assert!(!cache.ipv6_suppressed(home(), now));
+    }
+
+    #[test]
+    fn ipv6_win_clears_learned_state() {
+        let cache = FamilyHealthCache::default();
+        let now = Instant::now();
+        lose_ipv6(&cache, home(), DEFAULT_IPV6_FAILURE_THRESHOLD, now);
+        assert!(cache.ipv6_suppressed(home(), now));
+        let config = cache.config_for(home(), &HappyEyeballsConfig::default(), now);
+        cache.record_race(home(), &[v6(), v4()], &config, Some(v6()), now);
+        assert!(!cache.ipv6_suppressed(home(), now));
+    }
+
+    #[test]
+    fn learned_state_expires_after_ttl() {
+        let ttl = Duration::from_secs(60);
+        let cache = FamilyHealthCache::new(1, ttl);
+        let now = Instant::now();
+        lose_ipv6(&cache, home(), 1, now);
+        assert!(cache.ipv6_suppressed(home(), now + ttl - Duration::from_secs(1)));
+        assert!(!cache.ipv6_suppressed(home(), now + ttl));
+        // Expiry also reset the strike count: one more loss is needed.
+        lose_ipv6(&cache, home(), 1, now + ttl);
+        assert!(cache.ipv6_suppressed(home(), now + ttl));
+    }
+
+    #[test]
+    fn interface_change_flushes_cache() {
+        let cache = FamilyHealthCache::default();
+        let now = Instant::now();
+        lose_ipv6(&cache, home(), DEFAULT_IPV6_FAILURE_THRESHOLD, now);
+        assert!(cache.ipv6_suppressed(home(), now));
+        // Moving to another network forgets what was learned at home ...
+        assert!(!cache.ipv6_suppressed(cafe(), now));
+        // ... and coming back starts from scratch too.
+        assert!(!cache.ipv6_suppressed(home(), now));
+        // Strikes from one network do not add up with another's.
+        lose_ipv6(&cache, home(), DEFAULT_IPV6_FAILURE_THRESHOLD - 1, now);
+        lose_ipv6(&cache, cafe(), 1, now);
+        assert!(!cache.ipv6_suppressed(cafe(), now));
+    }
+
+    #[test]
+    fn ipv4_preferred_base_config_is_left_alone() {
+        let cache = FamilyHealthCache::new(1, DEFAULT_FAMILY_HEALTH_TTL);
+        let now = Instant::now();
+        let base = HappyEyeballsConfig {
+            preferred_family: AddressFamily::IPv4Preferred,
+            connection_attempt_delay: Duration::from_millis(100),
+            ..HappyEyeballsConfig::default()
+        };
+        let config = cache.config_for(home(), &base, now);
+        assert_eq!(config.preferred_family, AddressFamily::IPv4Preferred);
+        assert_eq!(config.connection_attempt_delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn current_fingerprint_is_stable() {
+        // No packets are sent; on a host without routes both families are None.
+        assert_eq!(NetworkFingerprint::current(), NetworkFingerprint::current());
+    }
+
+    /// A black-holed IPv6 dial: never completes.
+    async fn dial(addr: SocketAddr) -> Result<SocketAddr, String> {
+        if addr.is_ipv6() {
+            std::future::pending::<()>().await;
+        }
+        Ok(addr)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn learned_cache_skips_the_ipv6_stall() {
+        let cache = FamilyHealthCache::default();
+        let fp = home();
+        let candidates = [v6(), v4()];
+
+        // Cold cache: IPv6 goes first and IPv4 only starts after the 250 ms stagger.
+        for _ in 0..DEFAULT_IPV6_FAILURE_THRESHOLD {
+            let config = cache.config_for(fp, &HappyEyeballsConfig::default(), Instant::now());
+            let started = tokio::time::Instant::now();
+            let (winner, _) = race_connect(&candidates, &config, dial)
+                .await
+                .unwrap_or_else(|e| panic!("race must succeed over IPv4: {e}"));
+            assert_eq!(winner, v4());
+            assert!(started.elapsed() >= Duration::from_millis(250));
+            cache.record_race(fp, &candidates, &config, Some(winner), Instant::now());
+        }
+
+        // Learned: IPv4 goes first and wins with no stall.
+        let config = cache.config_for(fp, &HappyEyeballsConfig::default(), Instant::now());
+        let started = tokio::time::Instant::now();
+        let (winner, _) = race_connect(&candidates, &config, dial)
+            .await
+            .unwrap_or_else(|e| panic!("race must succeed over IPv4: {e}"));
+        assert_eq!(winner, v4());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "learned IPv6 breakage must remove the stagger, took {:?}",
+            started.elapsed()
+        );
     }
 }

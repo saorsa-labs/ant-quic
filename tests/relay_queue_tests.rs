@@ -155,6 +155,8 @@ mod nat_traversal_api_tests {
             transport_registry: None,
             max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: Default::default(),
+            keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
         };
 
@@ -299,6 +301,8 @@ mod functional_tests {
             transport_registry: None,
             max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: Default::default(),
+            keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
         };
 
@@ -488,6 +492,8 @@ mod performance_tests {
                 transport_registry: None,
                 max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
                 max_concurrent_uni_streams: 100,
+                stateless_retry: Default::default(),
+                keep_alive_policy: Default::default(),
                 additional_bind_addrs: Vec::new(),
             };
 
@@ -559,6 +565,8 @@ mod relay_functionality_tests {
             transport_registry: None,
             max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: Default::default(),
+            keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
         };
 
