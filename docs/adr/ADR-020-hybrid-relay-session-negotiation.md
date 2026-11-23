@@ -106,9 +106,11 @@ the "direct" result, and migration reported success without migrating.
      `datagram_mux_v1(false)`), `LinkConn::send_datagram` and `recv_datagrams` carry 100% raw
      unprefixed bytes (0 extra bytes), and legacy `0.29.0` exclusive hybrid (`0x02` without `0x04`)
      retains the single-reader lock so a `0.29.0` peer cannot suffer packet theft with
-     `LinkConn::recv_datagrams`. Note: raw `Connection::send_datagram` remains a low-level
-     transport primitive and bypasses `APP_DATAGRAM_CONTEXT_ID` framing; callers sharing a
-     `DatagramMuxV1` connection should send application datagrams via `LinkConn::send_datagram`.
+     `LinkConn::recv_datagrams`. Note: raw `Connection::send_datagram` and
+     `Connection::read_datagram` remain low-level transport primitives that bypass
+     `APP_DATAGRAM_CONTEXT_ID` framing (and raw `read_datagram` would race with the per-connection
+     `DatagramMux` dispatcher); callers sharing a `DatagramMuxV1` connection (including x0x voice
+     on the 0.30 pin bump) MUST use `LinkConn::send_datagram` and `LinkConn::recv_datagrams`.
 3. **`COMPRESSION_ASSIGN` socket data plane & `draft-seemann-masque-connect-udp-ecn-01` ECN
    propagation (when `DATAGRAM_MUX_V1` is negotiated).**
    - On the relay bidirectional stream, data frames remain `[4 B BE len][UncompressedDatagram]`

@@ -8135,18 +8135,38 @@ impl NatTraversalEndpoint {
         // cleanly without registering routes or mutating mux state.
         let relay_socket = match public_address {
             Some(addr) => {
-                let datagram_lane = datagram_lane.and_then(|mut claim| {
-                    if !response.hybrid_datagram_lane {
-                        return None;
+                let datagram_lane = if response.hybrid_datagram_lane {
+                    match datagram_lane {
+                        Some(mut claim) if response.datagram_mux_v1 => {
+                            claim.activate_mux_v1().then_some(claim)
+                        }
+                        Some(mut claim) => {
+                            if claim.activate_legacy_hybrid() {
+                                Some(claim)
+                            } else {
+                                // F1: a legacy 0.29.0 relay committed exclusive
+                                // hybrid on this stream, while a local app
+                                // reader (`LinkConn::recv_datagrams`) subscribed
+                                // during the CONNECT round trip. Tear down this
+                                // mismatched session instead of falling back to
+                                // stream-only so the 0.29 relay does not push
+                                // raw MASQUE datagrams into the app reader; the
+                                // caller will retry cleanly without 0x02.
+                                drop(claim);
+                                drop(send_stream);
+                                drop(recv_stream);
+                                return Err(NatTraversalError::ConnectionFailed(
+                                    "Legacy hybrid relay claim preempted by local datagram reader; retry stream-only"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        None => None,
                     }
-                    if response.datagram_mux_v1 {
-                        claim.activate_mux_v1().then_some(claim)
-                    } else if claim.activate_legacy_hybrid() {
-                        Some(claim)
-                    } else {
-                        None
-                    }
-                });
+                } else {
+                    drop(datagram_lane);
+                    None
+                };
                 Some(match datagram_lane {
                     Some(lane) => crate::masque::MasqueRelaySocket::new_hybrid(
                         lane,

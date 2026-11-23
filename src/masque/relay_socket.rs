@@ -397,7 +397,11 @@ impl ConnectionDatagramMux {
         }
         // `DatagramMuxV1` is a static handshake property of `Connection`, so no
         // sticky state needs to be retained here — only retain recently-freed
-        // blocks while their 30 s reuse quarantine is still hot.
+        // blocks while their 30 s reuse quarantine is still hot. Because blocks
+        // are appended in monotonic `Instant::now()` order (and re-queued blocks
+        // retain their older `freed_at`), checking `back()` is exact for the
+        // newest quarantine entry (and slightly conservative only if an older
+        // overlapped block was re-queued behind a newer one).
         !self
             .free_local_blocks
             .back()
@@ -506,6 +510,18 @@ pub fn mux_unknown_ctx_dropped(connection: &Connection) -> u64 {
     registry.map.get(&key).map_or(0, |mux| {
         mux.lock().unknown_ctx_dropped.load(Ordering::Relaxed)
     })
+}
+
+/// Inspect the count of `LinkConn` app datagrams dropped because a subscriber
+/// queue was full on `connection` (diagnostics & tests).
+#[must_use]
+pub fn mux_app_rx_dropped(connection: &Connection) -> u64 {
+    let key = connection.stable_id();
+    let registry = DATAGRAM_MUXES.lock();
+    registry
+        .map
+        .get(&key)
+        .map_or(0, |mux| mux.lock().app_rx_dropped.load(Ordering::Relaxed))
 }
 
 /// Inspect the current number of registered MASQUE routes in `DatagramMux` for
@@ -1431,11 +1447,23 @@ pub(crate) fn open_app_datagram_channel(
 ///   peer's `DatagramMux` demultiplexes it cleanly from MASQUE even Context IDs.
 /// - On connections with `0.28.0`/`0.29.0` peers (without `0x50C4`), sends
 ///   `data` raw with zero overhead.
+#[cfg(test)]
 pub(crate) fn send_app_datagram(
     connection: &Connection,
     data: Bytes,
 ) -> Result<(), SendDatagramError> {
-    if connection.supports_datagram_mux_v1() {
+    send_app_datagram_with_mux(connection, connection.supports_datagram_mux_v1(), data)
+}
+
+/// Hot-path helper for [`P2pLinkConn::send_datagram`](crate::link_transport_impl::P2pLinkConn)
+/// using a cached handshake `datagram_mux_v1` boolean so voice TX avoids an
+/// extra `ConnectionInner` mutex acquisition per datagram.
+pub(crate) fn send_app_datagram_with_mux(
+    connection: &Connection,
+    mux_v1: bool,
+    data: Bytes,
+) -> Result<(), SendDatagramError> {
+    if mux_v1 {
         let ctx = VarInt::from_u32(APP_DATAGRAM_CONTEXT_ID as u32);
         let mut buf = BytesMut::with_capacity(ctx.size() + data.len());
         ctx.encode(&mut buf);

@@ -136,7 +136,8 @@ pub use relay_socket::{
     QUIC_INITIAL_MIN_SIZE, RELAY_DATAGRAM_BUDGET_MARGIN, RelayForwardMode, RelayLane,
     SIDE_BLOCK_STRIDE, compute_datagram_payload_budget,
     compute_datagram_payload_budget_with_overhead, compute_inner_virtual_path_mtu,
-    decode_ecn_offset, ecn_context_id, is_quic_initial_packet, mux_registered_route_count,
-    mux_unknown_ctx_dropped, select_relay_lane, select_relay_lane_with_overhead,
-    uncompressed_datagram_header_overhead, uncompressed_datagram_header_overhead_for_ctx,
+    decode_ecn_offset, ecn_context_id, is_quic_initial_packet, mux_app_rx_dropped,
+    mux_registered_route_count, mux_unknown_ctx_dropped, select_relay_lane,
+    select_relay_lane_with_overhead, uncompressed_datagram_header_overhead,
+    uncompressed_datagram_header_overhead_for_ctx,
 };

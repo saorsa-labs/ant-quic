@@ -1187,7 +1187,10 @@ impl MasqueRelayServer {
         }
         let claim_result = if request.datagram_mux_v1 && connection.supports_datagram_mux_v1() {
             DatagramLaneClaim::try_claim_muxed(connection)
-        } else if request.hybrid_datagram_lane && !request.datagram_mux_v1 {
+        } else if request.hybrid_datagram_lane
+            && !request.datagram_mux_v1
+            && !connection.supports_datagram_mux_v1()
+        {
             DatagramLaneClaim::try_claim(connection)
         } else {
             return None;
@@ -1303,8 +1306,12 @@ impl MasqueRelayServer {
                     segment_size: None,
                     src_ip: None,
                 };
+                // Use `try_send` (not `send`) so OS-rejected ECN cmsgs (such as
+                // Windows `WSASendMsg` rejecting `IP_ECN` on loopback / CE)
+                // return `Err` and trigger the plain `socket.send_to` fallback
+                // rather than being swallowed as `Ok(())` with silent packet loss.
                 let res = socket.try_io(tokio::io::Interest::WRITABLE, || {
-                    state.send(quinn_udp::UdpSockRef::from(socket), &transmit)
+                    state.try_send(quinn_udp::UdpSockRef::from(socket), &transmit)
                 });
                 match res {
                     Ok(()) => return Ok(()),
@@ -2883,7 +2890,10 @@ mod tests {
             test_addr(9000),
         ));
         let (session_id, session_local) = live_session_with_socket(&server).await;
-        let (client_conn, relay_conn) = relay_loopback_pair_mtu(initial_mtu).await;
+        // Legacy 0.29.0 hybrid helper: client lacks the `DatagramMuxV1 (0x50C4)`
+        // transport parameter, exercising the legacy 0x02 exclusive claim path.
+        let (client_conn, relay_conn) =
+            relay_loopback_pair_with_mux(initial_mtu, false, true).await;
 
         // Client side.
         let claim = if client_mode == RelayForwardMode::Hybrid {
@@ -3599,7 +3609,8 @@ mod tests {
         use crate::masque::relay_socket::register_other_datagram_reader;
         use crate::masque::{DatagramLaneClaim, DatagramLaneError};
 
-        let (client_conn, relay_conn) = relay_loopback_pair_mtu(1452).await;
+        // Legacy 0.29.0 client lacking `DatagramMuxV1 (0x50C4)`.
+        let (client_conn, relay_conn) = relay_loopback_pair_with_mux(1452, false, true).await;
         let first = DatagramLaneClaim::try_claim(&client_conn).expect("first claim");
         assert_eq!(
             DatagramLaneClaim::try_claim(&client_conn).unwrap_err(),
@@ -3982,6 +3993,24 @@ mod tests {
         assert_eq!(got, sentinel);
         assert!(mux_unknown_ctx_dropped(&client_conn) > before);
 
+        // F7 check: on a negotiated `DatagramMuxV1 (0x50C4)` connection, a bare
+        // legacy 0x02 request (without 0x04) is refused so legacy ctx-0 cannot
+        // mix with Context-ID mux framing.
+        let server = MasqueRelayServer::new(
+            MasqueRelayConfig {
+                forward_mode: RelayForwardMode::Hybrid,
+                ..MasqueRelayConfig::default()
+            },
+            test_addr(9000),
+        );
+        let bare_legacy = ConnectUdpRequest::bind_any().with_hybrid_datagram_lane(true);
+        assert!(
+            server
+                .negotiate_datagram_lane(&bare_legacy, &relay_conn)
+                .is_none(),
+            "bare legacy 0x02 must be refused on a DatagramMuxV1 connection"
+        );
+
         // 3) Simulate an aborted relay session (claim + activate, then drop
         // before any stream capsule exchange): voice remains 100% intact.
         {
@@ -4044,6 +4073,22 @@ mod tests {
             assert!(!claim.activate_mux_v1());
             assert!(claim.activate_legacy_hybrid());
             assert_eq!(claim.uncompressed_context_id(), Some(VarInt::from_u32(0)));
+        }
+
+        // F1 race check: if an app reader subscribes DURING the 1-RTT CONNECT
+        // window while a client holds `ClientProvisionalExclusive` on a 0.29.0
+        // link, `activate_legacy_hybrid()` MUST refuse (so the caller tears
+        // down and retries stream-only instead of leaking raw MASQUE into voice).
+        {
+            let mut prov =
+                DatagramLaneClaim::try_claim_for_client(&client_conn).expect("provisional 0.29");
+            assert!(prov.should_request_legacy_hybrid());
+            let _voice_during_rtt =
+                open_app_datagram_channel(&client_conn).expect("voice during CONNECT RTT");
+            assert!(
+                !prov.activate_legacy_hybrid(),
+                "legacy hybrid must refuse if voice subscribed during CONNECT RTT"
+            );
         }
 
         // With an app reader active on a 0.29.0 connection, app datagrams cross

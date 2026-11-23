@@ -73,16 +73,21 @@ pub struct P2pLinkConn {
     remote_addr: SocketAddr,
     /// Connection start time.
     connected_at: std::time::Instant,
+    /// Cached immutable handshake result of `DatagramMuxV1 (0x50C4)` so
+    /// `send_datagram` avoids an extra `ConnectionInner` lock per voice frame.
+    datagram_mux_v1: bool,
 }
 
 impl P2pLinkConn {
     /// Create a new connection wrapper.
     pub fn new(inner: HighLevelConnection, peer_id: PeerId, remote_addr: SocketAddr) -> Self {
+        let datagram_mux_v1 = inner.supports_datagram_mux_v1();
         Self {
             inner,
             peer_id,
             remote_addr,
             connected_at: std::time::Instant::now(),
+            datagram_mux_v1,
         }
     }
 
@@ -129,8 +134,12 @@ impl LinkConn for P2pLinkConn {
     }
 
     fn send_datagram(&self, data: Bytes) -> LinkResult<()> {
-        crate::masque::relay_socket::send_app_datagram(&self.inner, data)
-            .map_err(|e| LinkError::Io(e.to_string()))
+        crate::masque::relay_socket::send_app_datagram_with_mux(
+            &self.inner,
+            self.datagram_mux_v1,
+            data,
+        )
+        .map_err(|e| LinkError::Io(e.to_string()))
     }
 
     fn recv_datagrams(&self) -> BoxStream<'_, Bytes> {
