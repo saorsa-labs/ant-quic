@@ -165,6 +165,12 @@ struct ResultMetadata {
     test_duration_ms: u64,
 }
 
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 fn rtt_ms_from_connection_stats(stats: &ConnectionStats) -> Option<u64> {
     let rtt = stats.path.rtt;
     (stats.frame_rx.acks > 0 && !rtt.is_zero()).then_some(rtt.as_millis() as u64)
@@ -206,7 +212,7 @@ async fn test_endpoint(
                         protocols_tested,
                         successful_protocols,
                         features_tested: vec![],
-                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        timestamp: rfc3339_now(),
                         metrics: None,
                     };
                 }
@@ -225,7 +231,7 @@ async fn test_endpoint(
                 protocols_tested,
                 successful_protocols,
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -248,7 +254,7 @@ async fn test_endpoint(
                 protocols_tested,
                 successful_protocols,
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -277,7 +283,7 @@ async fn test_endpoint(
                 protocols_tested: vec![],
                 successful_protocols: vec![],
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -297,7 +303,7 @@ async fn test_endpoint(
                 protocols_tested: vec![],
                 successful_protocols: vec![],
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -317,7 +323,7 @@ async fn test_endpoint(
                 protocols_tested,
                 successful_protocols,
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -339,7 +345,7 @@ async fn test_endpoint(
                 protocols_tested,
                 successful_protocols,
                 features_tested: vec![],
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: None,
             };
         }
@@ -376,7 +382,7 @@ async fn test_endpoint(
                 protocols_tested,
                 successful_protocols,
                 features_tested: endpoint.features.clone(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: rfc3339_now(),
                 metrics: Some(EndpointMetrics {
                     handshake_time_ms: handshake_ms,
                     rtt_ms,
@@ -396,7 +402,7 @@ async fn test_endpoint(
             protocols_tested,
             successful_protocols,
             features_tested: vec![],
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: rfc3339_now(),
             metrics: None,
         },
         Err(_) => TestResult {
@@ -411,7 +417,7 @@ async fn test_endpoint(
             protocols_tested,
             successful_protocols,
             features_tested: vec![],
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: rfc3339_now(),
             metrics: None,
         },
     }
@@ -559,7 +565,7 @@ async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>>
         summary,
         metadata: ResultMetadata {
             ant_quic_version: env!("CARGO_PKG_VERSION").to_string(),
-            test_date: chrono::Utc::now().to_rfc3339(),
+            test_date: rfc3339_now(),
             test_duration_ms: test_duration.as_millis() as u64,
         },
     };

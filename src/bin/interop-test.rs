@@ -140,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let json_path = args.output.join("report.json");
             let json_report = serde_json::json!({
                 "version": "1.0",
-                "test_date": chrono::Utc::now().to_rfc3339(),
+                "test_date": rfc3339_now(),
                 "summary": "Interoperability test results"
             });
             std::fs::write(&json_path, serde_json::to_string_pretty(&json_report)?)?;
@@ -371,6 +371,12 @@ fn bind_addr_for_remote(remote_addr: SocketAddr) -> SocketAddr {
     }
 }
 
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 /// Generate a simple HTML report
 fn generate_html_report() -> String {
     format!(
@@ -392,7 +398,7 @@ fn generate_html_report() -> String {
     </div>
 </body>
 </html>"#,
-        chrono::Utc::now()
+        rfc3339_now()
     )
 }
 
