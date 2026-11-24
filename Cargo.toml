@@ -135,7 +135,7 @@ rcgen = { version = "0.14" }
 tokio-util = { version = "0.7" }
 futures-util = { version = "0.3" }
 
-time = { version = "0.3.47" }
+time = { version = "0.3.47", features = ["formatting"] }
 rustls-pemfile = { version = "2.0" }
 
 # Feature-specific dependencies (optional)
@@ -168,7 +168,6 @@ mdns-sd = { version = "0.19" }
 
 # Compliance validator dependencies
 regex = "1.11"
-chrono = { version = "0.4", features = ["serde"] }
 rustls-native-certs = "0.8"
 
 # Platform-specific target dependencies

@@ -9,13 +9,27 @@
 ///
 /// Generates compliance reports in various formats
 use super::{ComplianceReport, ComplianceResult, Evidence};
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::SystemTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+fn format_utc(timestamp: SystemTime) -> String {
+    let t = OffsetDateTime::from(timestamp);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
 
 /// Generate HTML compliance report
 pub fn generate_html_report(report: &ComplianceReport) -> String {
-    let timestamp: DateTime<Utc> = report.timestamp.into();
+    let timestamp = format_utc(report.timestamp);
     let mut html = String::new();
 
     // HTML header
@@ -155,7 +169,7 @@ pub fn generate_html_report(report: &ComplianceReport) -> String {
         </table>
     </div>
 "#,
-        timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+        timestamp,
         report.summary.compliance_percentage(),
         report.summary.compliance_percentage(),
         report.summary.total_requirements,
@@ -304,7 +318,9 @@ pub fn generate_html_report(report: &ComplianceReport) -> String {
 
 /// Generate JSON compliance report
 pub fn generate_json_report(report: &ComplianceReport) -> Value {
-    let timestamp: DateTime<Utc> = report.timestamp.into();
+    let timestamp = OffsetDateTime::from(report.timestamp)
+        .format(&Rfc3339)
+        .unwrap_or_default();
 
     let mut results_json = Vec::new();
     for result in &report.results {
@@ -375,7 +391,7 @@ pub fn generate_json_report(report: &ComplianceReport) -> Value {
 
     json!({
         "report": {
-            "timestamp": timestamp.to_rfc3339(),
+            "timestamp": timestamp,
             "type": "quic_compliance_report",
             "version": "1.0"
         },
@@ -394,7 +410,7 @@ pub fn generate_json_report(report: &ComplianceReport) -> Value {
 
 /// Generate markdown compliance report
 pub fn generate_markdown_report(report: &ComplianceReport) -> String {
-    let timestamp: DateTime<Utc> = report.timestamp.into();
+    let timestamp = format_utc(report.timestamp);
     let mut md = String::new();
 
     // Header
@@ -415,7 +431,7 @@ Generated: {}
 | MUST Requirements Met | {} |
 
 "#,
-        timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+        timestamp,
         report.summary.compliance_percentage(),
         report.summary.total_requirements,
         report.summary.passed,
@@ -584,6 +600,20 @@ mod tests {
         assert!(md.contains("Overall Compliance Score: 100.0%"));
         assert!(md.contains("✅ COMPLIANT"));
         assert!(md.contains("RFC9000"));
+    }
+
+    #[test]
+    fn test_report_timestamp_formats() {
+        let mut report = create_test_report();
+        report.timestamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        assert_eq!(format_utc(report.timestamp), "2023-11-14 22:13:20 UTC");
+        assert!(generate_markdown_report(&report).contains("2023-11-14 22:13:20 UTC"));
+        assert!(generate_html_report(&report).contains("2023-11-14 22:13:20 UTC"));
+        assert_eq!(
+            generate_json_report(&report)["report"]["timestamp"],
+            "2023-11-14T22:13:20Z"
+        );
     }
 
     #[test]
