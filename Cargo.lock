@@ -181,7 +181,6 @@ dependencies = [
 name = "ant-quic-workspace-hack"
 version = "0.1.0"
 dependencies = [
- "either",
  "futures-channel",
  "futures-task",
  "futures-util",
@@ -193,7 +192,6 @@ dependencies = [
  "percent-encoding",
  "proc-macro2",
  "quote",
- "rand_core 0.9.5",
  "serde",
  "serde_core",
  "serde_json",
