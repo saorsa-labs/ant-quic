@@ -1,6 +1,6 @@
 # ADR-020: Hybrid Relay Session Negotiation and Verified Relay-to-Direct Migration
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-25). Accepted by David Irvine in chat, 2026-11-25, together with ADR-021 (satisfying ADR-021's acceptance-ordering constraint).
 - **Date:** 2026-11-19 (amended 2026-11-22 for ant-quic 0.30.0 / #374)
 - **Decision owners:** David Irvine
 - **Reviewers:** to be assigned
