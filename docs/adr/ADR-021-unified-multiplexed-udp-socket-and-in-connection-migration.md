@@ -1,6 +1,6 @@
 # ADR-021: Unified MultiplexedUdpSocket, In-Connection Relay-to-Direct Migration, Single-Process Dual-Port, and Staged Multipath/NAT64 Follow-Ons
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-25). Accepted by David Irvine in chat, 2026-11-25, together with ADR-020 in the same commit (the acceptance-ordering constraint below is satisfied).
 - **Date:** 2026-11-25
 - **Decision owners:** David Irvine
 - **Reviewers:** to be assigned

@@ -21,8 +21,8 @@ ADRs document significant architectural decisions made in the project. Each reco
 | [ADR-010](ADR-010-ble-transport-opt-in.md) | BLE Transport Stays Opt-In Until macOS Packaging Is Solved | Proposed | 2026-08-06 |
 | [ADR-017](ADR-017-single-arbiter-connection-retirement.md) | Single-Arbiter, Evidence-Gated Connection Retirement | Accepted | 2026-10-12 |
 | [ADR-019](ADR-019-relay-serving-opt-out.md) | Relay-Serving Opt-Out for Leaf Nodes | Accepted | 2026-11-17 |
-| [ADR-020](ADR-020-hybrid-relay-session-negotiation.md) | Hybrid Relay Session Negotiation and Verified Relay-to-Direct Migration | Proposed | 2026-11-19 |
-| [ADR-021](ADR-021-unified-multiplexed-udp-socket-and-in-connection-migration.md) | Unified MultiplexedUdpSocket, In-Connection Relay-to-Direct Migration, Single-Process Dual-Port, and Staged Multipath/NAT64 Follow-Ons | Proposed | 2026-11-25 |
+| [ADR-020](ADR-020-hybrid-relay-session-negotiation.md) | Hybrid Relay Session Negotiation and Verified Relay-to-Direct Migration | Accepted | 2026-11-19 |
+| [ADR-021](ADR-021-unified-multiplexed-udp-socket-and-in-connection-migration.md) | Unified MultiplexedUdpSocket, In-Connection Relay-to-Direct Migration, Single-Process Dual-Port, and Staged Multipath/NAT64 Follow-Ons | Accepted | 2026-11-25 |
 
 ## ADR Template
 
