@@ -1259,6 +1259,9 @@ pub(crate) mod retirement_test_hooks {
 impl PeerHintRecord {
     fn merge(&mut self, addrs: Vec<SocketAddr>, capabilities: Option<PeerCapabilities>) {
         for addr in addrs {
+            if crate::socket_slot::is_synthetic_virtual_addr(addr) {
+                continue;
+            }
             if !self.addrs.contains(&addr) {
                 self.addrs.push(addr);
             }
@@ -1275,7 +1278,9 @@ impl PeerHintRecord {
                 self.capabilities.nat_type = caps.nat_type;
             }
             for addr in caps.external_addresses {
-                self.capabilities.record_external_address(addr);
+                if !crate::socket_slot::is_synthetic_virtual_addr(addr) {
+                    self.capabilities.record_external_address(addr);
+                }
             }
         }
     }
@@ -1293,6 +1298,7 @@ fn direct_candidate_rank(addr: SocketAddr) -> (u8, u8) {
 }
 
 fn prioritize_direct_candidate_addrs(addrs: &mut Vec<SocketAddr>) {
+    addrs.retain(|addr| !crate::socket_slot::is_synthetic_virtual_addr(*addr));
     addrs.sort_by_key(|addr| std::cmp::Reverse(direct_candidate_rank(*addr)));
     addrs.dedup();
 }
@@ -4134,11 +4140,6 @@ impl P2pEndpoint {
             .as_ref()
             .and_then(|addr| addr.as_socket_addr());
 
-        // Track DualStackSocket for local_addrs() API
-        let mut _dual_stack_ref: Option<
-            std::sync::Arc<crate::high_level::runtime::dual_stack::DualStackSocket>,
-        > = None;
-
         let sockets = socket_binding::bind(
             requested_addr,
             crate::transport::UdpTransport::bind_dual_stack_for_endpoint,
@@ -4150,7 +4151,7 @@ impl P2pEndpoint {
             socket_binding::BoundSocket::Dual((_transport, dual_socket)) => {
                 let (v4_addr, v6_addr) = dual_socket.local_addrs();
                 info!(
-                    "Bound dual-socket: IPv4={}, IPv6={} (true dual-stack, separate sockets)",
+                    "Bound dual-socket: IPv4={}, IPv6={} (true dual-stack, unified MultiplexedUdpSocket)",
                     v4_addr
                         .map(|a| a.to_string())
                         .unwrap_or_else(|| "none".into()),
@@ -4159,7 +4160,24 @@ impl P2pEndpoint {
                         .unwrap_or_else(|| "none".into()),
                 );
 
-                let actual_bind_addr = dual_socket.local_addr().map_err(|e| {
+                let dual_owned = Arc::try_unwrap(dual_socket).map_err(|_| {
+                    EndpointError::Config("DualStackSocket unexpectedly shared".to_string())
+                })?;
+                let primary_slot = dual_owned
+                    .into_physical_bind_slot(crate::SocketSlotId::PRIMARY)
+                    .map_err(|e| {
+                        EndpointError::Config(format!(
+                            "Failed to wrap dual-stack slot in MultiplexedUdpSocket: {e}"
+                        ))
+                    })?;
+                let (multiplexed, extra_bound_addrs) =
+                    NatTraversalEndpoint::build_multiplexed_socket(
+                        primary_slot,
+                        &nat_config.extra_bind_slots,
+                    )
+                    .map_err(|e| EndpointError::Config(e.to_string()))?;
+
+                let actual_bind_addr = multiplexed.local_addr().map_err(|e| {
                     EndpointError::Config(format!("Failed to get local address: {e}"))
                 })?;
 
@@ -4173,20 +4191,18 @@ impl P2pEndpoint {
                 nat_config.transport_registry = Some(Arc::new(transport_registry));
                 nat_config.bind_addr = Some(actual_bind_addr);
 
-                // Add the other address family to additional_bind_addrs for discovery
-                // Primary is IPv6 (from local_addr()), so add IPv4 as additional
+                // Add the other address family and any extra physical slots to
+                // additional_bind_addrs for discovery.
                 if let Some(v4_addr) = v4_addr {
                     nat_config.additional_bind_addrs.push(v4_addr);
                 }
+                nat_config.additional_bind_addrs.extend(extra_bound_addrs);
 
-                let abs_socket: std::sync::Arc<dyn AsyncUdpSocket> = dual_socket.clone();
-                _dual_stack_ref = Some(dual_socket);
-
-                NatTraversalEndpoint::new_with_abstract_socket(
+                NatTraversalEndpoint::new_with_multiplexed_socket(
                     nat_config,
                     Some(event_callback),
                     Some(token_store.clone()),
-                    abs_socket,
+                    multiplexed,
                 )
                 .await
                 .map_err(|e| EndpointError::Config(e.to_string()))?
@@ -5833,6 +5849,13 @@ impl P2pEndpoint {
             );
             return;
         }
+
+        // ADR-021 §1.2: strip synthetic virtual ULA addresses before merging into
+        // peer hint records or persisting into BootstrapCache.
+        let addrs: Vec<SocketAddr> = addrs
+            .into_iter()
+            .filter(|addr| !crate::socket_slot::is_synthetic_virtual_addr(*addr))
+            .collect();
 
         {
             let mut hints = self.peer_hint_records.write().await;
@@ -7579,10 +7602,11 @@ impl P2pEndpoint {
             target, relay_addr
         );
 
-        // Step 1: Establish or reuse the shared relay endpoint.
-        let (public_addr, relay_endpoint) = self
+        // Step 1: Attach relay session to the unified MultiplexedUdpSocket and
+        // allocate a synthetic virtual ULA route for `target` (ADR-021).
+        let (public_addr, synthetic_target, unified_endpoint) = self
             .inner
-            .ensure_shared_relay_endpoint(relay_addr)
+            .prepare_relayed_dial(relay_addr, target)
             .await
             .map_err(EndpointError::NatTraversal)?;
 
@@ -7591,10 +7615,13 @@ impl P2pEndpoint {
             relay_addr, public_addr
         );
 
-        // Step 2: Connect to target through the relay endpoint
-        let connecting = relay_endpoint.connect(target, "peer").map_err(|e| {
-            EndpointError::Connection(format!("Failed to initiate relay connection: {}", e))
-        })?;
+        // Step 2: Connect to target through the sole unified endpoint on
+        // SocketSlotId::VIRTUAL (automatically selected for synthetic ULA targets).
+        let connecting = unified_endpoint
+            .connect(synthetic_target, "peer")
+            .map_err(|e| {
+                EndpointError::Connection(format!("Failed to initiate relay connection: {}", e))
+            })?;
 
         let handshake_timeout = self
             .config
@@ -7671,7 +7698,10 @@ impl P2pEndpoint {
                 })?;
             let peer_conn = PeerConnection {
                 peer_id: relay_peer_id,
-                remote_addr: TransportAddr::Udp(live_connection.remote_address()),
+                remote_addr: TransportAddr::Udp(
+                    self.inner
+                        .resolve_remote_display_addr(live_connection.remote_address()),
+                ),
                 traversal_method: TraversalMethod::Relay,
                 side: live_connection.side(),
                 authenticated: true,
@@ -8554,6 +8584,19 @@ impl P2pEndpoint {
                     }
                 }
 
+                let is_relayed = crate::socket_slot::is_synthetic_virtual_addr(remote_addr);
+                let display_remote_addr = self.inner.resolve_remote_display_addr(remote_addr);
+                let traversal_method = if is_relayed {
+                    self.inner.mark_connection_traversal_method(
+                        &resolved_peer_id,
+                        connection.stable_id(),
+                        TraversalMethod::Relay,
+                    );
+                    TraversalMethod::Relay
+                } else {
+                    TraversalMethod::Direct
+                };
+
                 // Register peer ID at low-level endpoint for PUNCH_ME_NOW routing
                 self.inner
                     .register_connection_peer_id(remote_addr, resolved_peer_id);
@@ -8581,8 +8624,8 @@ impl P2pEndpoint {
                 // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
                 let peer_conn = PeerConnection {
                     peer_id: resolved_peer_id,
-                    remote_addr: TransportAddr::Udp(remote_addr),
-                    traversal_method: TraversalMethod::Direct,
+                    remote_addr: TransportAddr::Udp(display_remote_addr),
+                    traversal_method,
                     side: Side::Server,
                     authenticated: true, // TLS handles authentication
                     connected_at: Instant::now(),
@@ -11617,11 +11660,25 @@ impl P2pEndpoint {
         self.add_bootstrap(addr).await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn inner_for_test(&self) -> &Arc<NatTraversalEndpoint> {
+        &self.inner
+    }
+
     /// Add a bootstrap node dynamically.
     ///
     /// Compatibility-oriented alias retained for older callers. Prefer
     /// [`Self::add_known_peer`].
     pub async fn add_bootstrap(&self, addr: SocketAddr) {
+        // ADR-021 §1.2: synthetic virtual ULA addresses are process-internal
+        // and must never enter bootstrap/manual-known-peer lists.
+        if crate::socket_slot::is_synthetic_virtual_addr(addr) {
+            debug!(
+                "ignoring synthetic virtual ULA address {} in add_bootstrap",
+                addr
+            );
+            return;
+        }
         let _ = self.inner.add_bootstrap_node(addr);
         {
             let mut manual = self.manual_known_peer_udp_addrs.write().await;
@@ -16330,14 +16387,14 @@ mod tests {
             .await
             .expect("connect to relay does not time out")
             .expect("connect to relay succeeds");
-        let (public_addr, relay_endpoint) = tokio::time::timeout(
+        let (public_addr, relay_socket) = tokio::time::timeout(
             Duration::from_secs(10),
-            endpoint.inner.ensure_shared_relay_endpoint(relay_addr),
+            endpoint.inner.establish_relay_session(relay_addr),
         )
         .await
         .expect("relay session setup does not time out")
         .expect("relay session is established");
-        drop(relay_endpoint);
+        drop(relay_socket);
         // A loopback relay binds its CONNECT-UDP data plane on loopback, so
         // this test opens no wildcard listener.
         assert!(

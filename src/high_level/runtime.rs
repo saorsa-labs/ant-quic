@@ -11,14 +11,14 @@ use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU16},
     task::{Context, Poll},
 };
 
 use quinn_udp::{RecvMeta, Transmit};
 use tracing::error;
 
-use crate::Instant;
+use crate::{Instant, SocketSlotId};
 
 /// Abstracts I/O and timer operations for runtime independence
 pub trait Runtime: Send + Sync + Debug + 'static {
@@ -65,6 +65,45 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>>;
 
+    /// Receive UDP datagrams along with the [`SocketSlotId`] on which each datagram
+    /// arrived (ADR-021).
+    ///
+    /// Default implementations tag every datagram with [`SocketSlotId::PRIMARY`].
+    /// Multi-port / virtual-route sockets override this to preserve exact slot identity.
+    fn poll_recv_with_slots(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        slots: &mut [SocketSlotId],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(count)) => {
+                for slot in slots.iter_mut().take(count) {
+                    *slot = SocketSlotId::PRIMARY;
+                }
+                Poll::Ready(Ok(count))
+            }
+            other => other,
+        }
+    }
+
+    /// Return the current dynamic inner 1-RTT virtual path MTU for `remote`, if
+    /// `remote` targets a virtual MASQUE route on this socket (ADR-021).
+    ///
+    /// Returns `None` for physical UDP paths so they use standard `INITIAL_MTU = 1200`
+    /// and full physical DPLPMTUD.
+    fn virtual_path_mtu(&self, _remote: SocketAddr) -> Option<u16> {
+        None
+    }
+
+    /// Return a shared live `AtomicU16` virtual path MTU handle for `remote`, if
+    /// `remote` targets a virtual MASQUE route whose outer datagram ceiling can
+    /// shrink mid-session (ADR-021).
+    fn virtual_path_mtu_handle(&self, _remote: SocketAddr) -> Option<Arc<AtomicU16>> {
+        None
+    }
+
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
@@ -105,6 +144,18 @@ pub trait UdpSender: Send + Sync + Debug + 'static {
         transmit: &Transmit,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>>;
+
+    /// Send a UDP datagram strictly via `local_slot` (ADR-021).
+    ///
+    /// Default implementations ignore `local_slot` and delegate to [`UdpSender::poll_send`].
+    fn poll_send_on_slot(
+        self: Pin<&mut Self>,
+        transmit: &Transmit,
+        _local_slot: SocketSlotId,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_send(transmit, cx)
+    }
 
     /// Maximum number of datagrams that a [`Transmit`] may encode.
     fn max_transmit_segments(&self) -> usize {
@@ -204,3 +255,6 @@ pub use self::tokio::TokioRuntime;
 
 // Dual-stack socket (separate IPv4 + IPv6 sockets behind single AsyncUdpSocket)
 pub mod dual_stack;
+
+// Unified multi-slot physical + virtual MASQUE UDP socket (ADR-021)
+pub mod multiplexed;

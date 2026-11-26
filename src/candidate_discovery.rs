@@ -715,6 +715,9 @@ impl CandidateDiscoveryManager {
 
     /// Set the actual bound address of the local endpoint
     pub fn set_bound_address(&mut self, address: SocketAddr) {
+        if crate::socket_slot::is_synthetic_virtual_addr(address) {
+            return;
+        }
         self.config.bound_address = Some(address);
         // Clear cached local candidates to force refresh with new bound address
         self.cached_local_candidates = None;
@@ -726,8 +729,21 @@ impl CandidateDiscoveryManager {
     /// `bound_address` is set to the IPv6 address (for endpoint compatibility),
     /// and this method adds the IPv4 address as an additional candidate.
     pub fn add_additional_bound_address(&mut self, address: SocketAddr) {
+        if crate::socket_slot::is_synthetic_virtual_addr(address) {
+            return;
+        }
         self.additional_bound_addresses.push(address);
         self.cached_local_candidates = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bound_address_for_test(&self) -> Option<SocketAddr> {
+        self.config.bound_address
+    }
+
+    #[cfg(test)]
+    pub(crate) fn additional_bound_addresses_for_test(&self) -> &[SocketAddr] {
+        &self.additional_bound_addresses
     }
 
     /// Discover local network interface candidates synchronously
@@ -754,6 +770,9 @@ impl CandidateDiscoveryManager {
 
                 for interface in interfaces {
                     for addr in interface.addresses {
+                        if crate::socket_slot::is_synthetic_virtual_addr(addr) {
+                            continue;
+                        }
                         candidates.push(ValidatedCandidate {
                             id: CandidateId(rand::random()),
                             address: addr,

@@ -12,7 +12,9 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
+use crate::{
+    Instant, MAX_CID_SIZE, ResetToken, SocketSlotId, coding::BufExt, packet::PartialDecode,
+};
 
 /// Events sent from an Endpoint to a Connection
 #[derive(Debug)]
@@ -35,6 +37,7 @@ pub(crate) enum ConnectionEventInner {
 pub(crate) struct DatagramConnectionEvent {
     pub(crate) now: Instant,
     pub(crate) remote: SocketAddr,
+    pub(crate) local_slot: SocketSlotId,
     pub(crate) ecn: Option<EcnCodepoint>,
     pub(crate) first_decode: PartialDecode,
     pub(crate) remaining: Option<BytesMut>,

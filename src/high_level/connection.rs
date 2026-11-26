@@ -1648,10 +1648,11 @@ impl State {
             let is_gso_bundle = segment_count > 1;
 
             let len = t.size;
-            match udp_sender
-                .as_mut()
-                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
-            {
+            match udp_sender.as_mut().poll_send_on_slot(
+                &udp_transmit(&t, &self.send_buffer[..len]),
+                t.local_slot,
+                cx,
+            ) {
                 Poll::Pending => {
                     self.buffered_transmit = Some(t);
                     return Ok(false);
@@ -2187,6 +2188,7 @@ mod tests {
                 size: 0,
                 segment_size: None,
                 src_ip: None,
+                local_slot: crate::SocketSlotId::PRIMARY,
             });
         }
         timeout(Duration::from_secs(1), async {

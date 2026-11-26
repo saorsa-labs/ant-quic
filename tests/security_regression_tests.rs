@@ -45,6 +45,7 @@ fn test_peer_config() -> NatTraversalConfig {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     }
 }
 
@@ -73,6 +74,7 @@ fn test_server_config() -> NatTraversalConfig {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     }
 }
 
@@ -177,6 +179,7 @@ async fn test_error_handling_no_panic() {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -205,6 +208,7 @@ async fn test_error_handling_no_panic() {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -314,6 +318,7 @@ async fn test_malformed_config_handling() {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     };
 
     if let Some(endpoint) = endpoint_or_skip_udp_blocked(
@@ -347,6 +352,7 @@ async fn test_malformed_config_handling() {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -383,6 +389,7 @@ async fn test_input_sanitization() {
         stateless_retry: Default::default(),
         keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
+        extra_bind_slots: Vec::new(),
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -458,6 +465,7 @@ mod specific_regression_tests {
             stateless_retry: Default::default(),
             keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
         };
 
         if let Some(endpoint) = endpoint_or_skip_udp_blocked(
@@ -497,6 +505,7 @@ mod specific_regression_tests {
             stateless_retry: Default::default(),
             keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
         };
 
         let result = NatTraversalEndpoint::new(problematic_config, None, None).await;

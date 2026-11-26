@@ -1805,15 +1805,13 @@ pub struct NatTraversalEndpoint {
     /// stable id, from the moment `establish_relay_session` selects the
     /// connection until the session is published or the handshake ends.
     client_relay_uses: Arc<ClientRelayUseCounts>,
-    /// Shared QUIC endpoint bound to the relay socket.
+    /// Unified multiplexed UDP socket backing `inner_endpoint` (ADR-021).
     ///
-    /// The relay server allows one CONNECT-UDP bind session per client address,
-    /// so callers must reuse the same abstract socket/endpoint instead of
-    /// trying to create a second independent bind session on the same local
-    /// QUIC endpoint.
-    shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
-    /// Whether the shared relay endpoint already has an accept loop attached.
-    relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Owns physical bind slots (`1..=MAX_PHYSICAL_SLOTS`) and the non-re-entrant
+    /// virtual MASQUE relay plane under the sole `InnerEndpoint`. Taken (`None`)
+    /// during shutdown so `#305` socket-release checks never observe a lingering
+    /// descriptor reference.
+    multiplexed_socket: ParkingRwLock<Option<Arc<crate::high_level::MultiplexedUdpSocket>>>,
     /// #374: stateless Retry decisions and counters for the main accept loop.
     inbound_retry: crate::inbound_retry::InboundRetryGate,
     /// #286: join handles of background connection workers (accept loops,
@@ -2048,6 +2046,14 @@ pub struct NatTraversalConfig {
     /// These are added as local NAT traversal candidates so peers can reach us
     /// via either address family.
     pub additional_bind_addrs: Vec<SocketAddr>,
+    /// Explicit opt-in additional physical UDP bind slots (ADR-021 §1.5).
+    ///
+    /// Clients leave this empty (1 ephemeral bind slot by default). Multi-port
+    /// servers, seeds, and relays can bind up to `MAX_PHYSICAL_SLOTS - 1` (3)
+    /// extra ports (e.g. `:5483` alongside primary `:443`) under the single
+    /// unified QUIC endpoint.
+    #[serde(default)]
+    pub extra_bind_slots: Vec<SocketAddr>,
     /// Prefer RFC-compliant NAT traversal frame format
     /// When true, will send RFC-compliant frames if the peer supports it
     pub prefer_rfc_nat_traversal: bool,
@@ -2937,6 +2943,7 @@ impl Default for NatTraversalConfig {
             max_concurrent_attempts: 3,
             bind_addr: None,
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
             prefer_rfc_nat_traversal: true, // Default to RFC format for standards compliance
             // v0.13.0+: PQC is ALWAYS enabled - default to PqcConfig::default()
             // This ensures non-PQC handshakes cannot happen
@@ -3186,25 +3193,34 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
-        let (inner_endpoint, local_addr, relay_server_config) =
-            Self::create_inner_endpoint(&config, token_store, registry_ref, None).await?;
+        let (
+            inner_endpoint,
+            local_addr,
+            relay_server_config,
+            multiplexed_socket,
+            extra_bound_addrs,
+        ) = Self::create_inner_endpoint(&config, token_store, registry_ref, None).await?;
         let event_tx = PollEventQueue::new();
 
         // Update discovery manager with the actual bound address and any additional addresses
         {
             let mut discovery = discovery_manager.lock();
             discovery.set_bound_address(local_addr);
-            for &extra_addr in &config.additional_bind_addrs {
+            for &extra_addr in config
+                .additional_bind_addrs
+                .iter()
+                .chain(extra_bound_addrs.iter())
+            {
                 discovery.add_additional_bound_address(extra_addr);
                 info!(
-                    "Added dual-stack address {} to discovery candidates",
+                    "Added additional bound address {} to discovery candidates",
                     extra_addr
                 );
             }
             info!(
                 "Updated discovery manager with bound address: {} (+{} additional)",
                 local_addr,
-                config.additional_bind_addrs.len()
+                config.additional_bind_addrs.len() + extra_bound_addrs.len()
             );
         }
 
@@ -3281,8 +3297,7 @@ impl NatTraversalEndpoint {
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
-            shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            multiplexed_socket: ParkingRwLock::new(multiplexed_socket),
             inbound_retry: crate::inbound_retry::InboundRetryGate::new(config.stateless_retry),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
@@ -3626,6 +3641,28 @@ impl NatTraversalEndpoint {
             token_store,
             None,
             Some(abstract_socket),
+            None,
+        )
+        .await
+    }
+
+    /// Create a NAT traversal endpoint backed by a pre-built
+    /// [`crate::high_level::MultiplexedUdpSocket`] (ADR-021 unified endpoint).
+    pub async fn new_with_multiplexed_socket(
+        config: NatTraversalConfig,
+        event_callback: Option<Box<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        token_store: Option<Arc<dyn crate::TokenStore>>,
+        multiplexed_socket: Arc<crate::high_level::MultiplexedUdpSocket>,
+    ) -> Result<Self, NatTraversalError> {
+        let abs_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket> =
+            Arc::clone(&multiplexed_socket) as _;
+        Self::new_with_socket_inner(
+            config,
+            event_callback,
+            token_store,
+            None,
+            Some(abs_socket),
+            Some(multiplexed_socket),
         )
         .await
     }
@@ -3636,7 +3673,15 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         quinn_socket: Option<std::net::UdpSocket>,
     ) -> Result<Self, NatTraversalError> {
-        Self::new_with_socket_inner(config, event_callback, token_store, quinn_socket, None).await
+        Self::new_with_socket_inner(
+            config,
+            event_callback,
+            token_store,
+            quinn_socket,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn new_with_socket_inner(
@@ -3645,6 +3690,7 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         quinn_socket: Option<std::net::UdpSocket>,
         abstract_socket: Option<Arc<dyn crate::high_level::runtime::AsyncUdpSocket>>,
+        multiplexed_socket: Option<Arc<crate::high_level::MultiplexedUdpSocket>>,
     ) -> Result<Self, NatTraversalError> {
         // Wrap the callback in Arc so it can be shared with background tasks
         let event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>> =
@@ -3697,16 +3743,20 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
-        let (inner_endpoint, local_addr, relay_server_config) = if let Some(abs_socket) =
-            abstract_socket
-        {
+        let (
+            inner_endpoint,
+            local_addr,
+            relay_server_config,
+            multiplexed_socket,
+            extra_bound_addrs,
+        ) = if let Some(abs_socket) = abstract_socket {
             let (ep, addr) = Self::create_inner_endpoint_with_abstract_socket(
                 &config,
                 token_store.clone(),
                 abs_socket,
             )
             .await?;
-            (ep, addr, None)
+            (ep, addr, None, multiplexed_socket, Vec::new())
         } else {
             Self::create_inner_endpoint(&config, token_store.clone(), registry_ref, quinn_socket)
                 .await?
@@ -3717,17 +3767,21 @@ impl NatTraversalEndpoint {
         {
             let mut discovery = discovery_manager.lock();
             discovery.set_bound_address(local_addr);
-            for &extra_addr in &config.additional_bind_addrs {
+            for &extra_addr in config
+                .additional_bind_addrs
+                .iter()
+                .chain(extra_bound_addrs.iter())
+            {
                 discovery.add_additional_bound_address(extra_addr);
                 info!(
-                    "Added dual-stack address {} to discovery candidates",
+                    "Added additional bound address {} to discovery candidates",
                     extra_addr
                 );
             }
             info!(
                 "Updated discovery manager with bound address: {} (+{} additional)",
                 local_addr,
-                config.additional_bind_addrs.len()
+                config.additional_bind_addrs.len() + extra_bound_addrs.len()
             );
         }
 
@@ -3804,8 +3858,7 @@ impl NatTraversalEndpoint {
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
             client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
-            shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            multiplexed_socket: ParkingRwLock::new(multiplexed_socket),
             inbound_retry: crate::inbound_retry::InboundRetryGate::new(config.stateless_retry),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
@@ -4176,136 +4229,20 @@ impl NatTraversalEndpoint {
             bootstrap_addr
         );
 
-        // Step 1: Establish or reuse the shared relay endpoint.
-        let (public_addr, relay_endpoint) =
-            self.ensure_shared_relay_endpoint(bootstrap_addr).await?;
+        // Step 1: Establish or reuse the relay session and attach its virtual
+        // route plane directly to the sole InnerEndpoint's MultiplexedUdpSocket
+        // (ADR-021 — inbound relayed connections arrive on the single accept loop).
+        let (public_addr, _relay_socket) = self.establish_relay_session(bootstrap_addr).await?;
         let relay_public_addr = public_addr.ok_or_else(|| {
             NatTraversalError::ConnectionFailed("Relay did not provide public address".to_string())
         })?;
 
         info!(
-            "Relay session established, public address: {}",
+            "Relay session established and attached to unified endpoint, public address: {}",
             relay_public_addr
         );
 
-        // Step 2: Spawn the accept loop exactly once for the shared relay endpoint.
-        if !self
-            .relay_accept_loop_started
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            info!(
-                "Shared relay endpoint ready for accepting connections at {}",
-                relay_public_addr
-            );
-
-            let connections = self.connections.clone();
-            let connection_lifecycle = self.connection_lifecycle.clone();
-            let next_connection_generation = self.next_connection_generation.clone();
-            let local_peer_id = self.accept_local_peer_id.clone();
-            let emitted_events = self.emitted_established_events.clone();
-            let observed_address_tx = self.observed_address_tx.clone();
-            let traversal_event_notify = self.traversal_event_notify.clone();
-            let incoming_notify = self.incoming_notify.clone();
-            let pending_accepts = self.pending_accepts.clone();
-            let relay_event_tx = self.event_tx.clone();
-            let relay_shutdown = self.shutdown.clone();
-            let relay_worker_handle = tokio::spawn(async move {
-                loop {
-                    match relay_endpoint.accept().await {
-                        Some(incoming) => match incoming.await {
-                            Ok(conn) => {
-                                let remote = conn.remote_address();
-                                // Derive a temporary PeerId from the remote address.
-                                // The real identity exchange will update this later
-                                // via extract_peer_id_from_connection in accept().
-                                let peer_id = {
-                                    use std::hash::{Hash, Hasher};
-                                    let mut hasher =
-                                        std::collections::hash_map::DefaultHasher::new();
-                                    remote.hash(&mut hasher);
-                                    let hash = hasher.finish();
-                                    let mut id = [0u8; 32];
-                                    id[..8].copy_from_slice(&hash.to_le_bytes());
-                                    id[8..16].copy_from_slice(&hash.to_be_bytes());
-                                    PeerId(id)
-                                };
-                                info!(
-                                    "Accepted relayed connection from {} (peer {}) — registering",
-                                    remote,
-                                    hex::encode(&peer_id.0[..8])
-                                );
-                                let local_peer_id = *local_peer_id.read();
-                                let outcome = Self::register_connection_lifecycle_parts(
-                                    local_peer_id,
-                                    connections.as_ref(),
-                                    connection_lifecycle.as_ref(),
-                                    next_connection_generation.as_ref(),
-                                    emitted_events.as_ref(),
-                                    relay_shutdown.as_ref(),
-                                    peer_id,
-                                    conn.clone(),
-                                );
-                                let generation = match outcome {
-                                    ConnectionRegistrationOutcome::Live { generation, .. } => {
-                                        generation
-                                    }
-                                    ConnectionRegistrationOutcome::Rejected {
-                                        winner_generation,
-                                    } => {
-                                        debug!(
-                                            "Rejected relayed connection for peer {:?}; live generation {} kept",
-                                            peer_id, winner_generation
-                                        );
-                                        continue;
-                                    }
-                                    ConnectionRegistrationOutcome::Refused => {
-                                        // Late registration during shutdown;
-                                        // the connection is already closed.
-                                        continue;
-                                    }
-                                };
-
-                                Self::push_pending_accept(
-                                    &pending_accepts,
-                                    PendingAccept {
-                                        peer_id,
-                                        generation,
-                                    },
-                                );
-                                if let Some(ref tx) = relay_event_tx {
-                                    tx.send(NatTraversalEvent::ConnectionEstablished {
-                                        peer_id,
-                                        remote_address: remote,
-                                        side: Side::Server,
-                                    });
-                                    traversal_event_notify.notify_waiters();
-                                }
-                                incoming_notify.notify_waiters();
-                                traversal_event_notify.notify_waiters();
-                                Self::spawn_observed_address_watch_task_parts(
-                                    observed_address_tx.clone(),
-                                    peer_id,
-                                    conn.clone(),
-                                );
-                            }
-                            Err(e) => {
-                                debug!("Relayed connection handshake failed: {}", e);
-                            }
-                        },
-                        None => {
-                            info!("Relay accept endpoint closed");
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // #286: keep the relay accept worker's handle so shutdown can
-            // abort and join it inside the bounded drain.
-            self.accept_worker_handles.lock().push(relay_worker_handle);
-        }
-
-        // Step 4: Store relay public address for re-advertisement to future peers
+        // Step 2: Store relay public address for re-advertisement to future peers
         self.relay_setup_attempted
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
@@ -4315,7 +4252,7 @@ impl NatTraversalEndpoint {
             peers.clear();
         }
 
-        // Step 5: Now that the endpoint is accepting, advertise to all peers
+        // Step 3: Advertise to all peers
         let mut advertised = 0;
         let peer_ids: Vec<_> = self.connections.iter().map(|entry| *entry.key()).collect();
         for peer_id in peer_ids {
@@ -6565,7 +6502,16 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         transport_registry: &crate::transport::TransportRegistry,
         quinn_socket: Option<std::net::UdpSocket>,
-    ) -> Result<(InnerEndpoint, SocketAddr, Option<crate::ServerConfig>), NatTraversalError> {
+    ) -> Result<
+        (
+            InnerEndpoint,
+            SocketAddr,
+            Option<crate::ServerConfig>,
+            Option<Arc<crate::high_level::MultiplexedUdpSocket>>,
+            Vec<SocketAddr>,
+        ),
+        NatTraversalError,
+    > {
         use std::sync::Arc;
 
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
@@ -6728,18 +6674,29 @@ impl NatTraversalEndpoint {
             })?
         };
 
-        // Create QUIC endpoint
+        // Create QUIC endpoint backed by MultiplexedUdpSocket (ADR-021).
         let runtime = default_runtime().ok_or_else(|| {
             NatTraversalError::ConfigError("No compatible async runtime found".to_string())
         })?;
 
-        // Clone server config for potential secondary endpoint (relay accept)
         let server_config_for_relay = server_config.clone();
 
-        let mut endpoint = InnerEndpoint::new(
+        let primary_slot =
+            crate::high_level::PhysicalBindSlot::from_std(crate::SocketSlotId::PRIMARY, std_socket)
+                .map_err(|e| {
+                    NatTraversalError::NetworkError(format!(
+                        "Failed to wrap primary UDP socket slot: {e}"
+                    ))
+                })?;
+        let (multiplexed, extra_bound_addrs) =
+            Self::build_multiplexed_socket(primary_slot, &config.extra_bind_slots)?;
+        let abs_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket> =
+            Arc::clone(&multiplexed) as _;
+
+        let mut endpoint = InnerEndpoint::new_with_abstract_socket(
             EndpointConfig::default(),
             server_config,
-            std_socket,
+            abs_socket,
             runtime,
         )
         .map_err(|e| {
@@ -6756,7 +6713,63 @@ impl NatTraversalEndpoint {
 
         info!("Endpoint bound to actual address: {}", local_addr);
 
-        Ok((endpoint, local_addr, server_config_for_relay))
+        Ok((
+            endpoint,
+            local_addr,
+            server_config_for_relay,
+            Some(multiplexed),
+            extra_bound_addrs,
+        ))
+    }
+
+    /// Build a [`crate::high_level::MultiplexedUdpSocket`] from `primary_slot`
+    /// plus any explicit opt-in `extra_bind_slots` (ADR-021 §1.5).
+    pub(crate) fn build_multiplexed_socket(
+        primary_slot: crate::high_level::PhysicalBindSlot,
+        extra_bind_slots: &[SocketAddr],
+    ) -> Result<
+        (
+            Arc<crate::high_level::MultiplexedUdpSocket>,
+            Vec<SocketAddr>,
+        ),
+        NatTraversalError,
+    > {
+        if extra_bind_slots.len() >= crate::MAX_PHYSICAL_SLOTS {
+            return Err(NatTraversalError::ConfigError(format!(
+                "extra_bind_slots ({}) exceeds MAX_PHYSICAL_SLOTS - 1 ({})",
+                extra_bind_slots.len(),
+                crate::MAX_PHYSICAL_SLOTS - 1
+            )));
+        }
+        let mut slots = Vec::with_capacity(1 + extra_bind_slots.len());
+        slots.push(primary_slot);
+        let mut extra_bound_addrs = Vec::new();
+        for (idx, &addr) in extra_bind_slots.iter().enumerate() {
+            let slot_id = crate::SocketSlotId::physical(idx + 1).ok_or_else(|| {
+                NatTraversalError::ConfigError(format!(
+                    "physical slot index {} exceeds MAX_PHYSICAL_SLOTS ({})",
+                    idx + 1,
+                    crate::MAX_PHYSICAL_SLOTS
+                ))
+            })?;
+            let slot =
+                crate::high_level::PhysicalBindSlot::bind_addr(slot_id, addr).map_err(|e| {
+                    NatTraversalError::NetworkError(format!(
+                        "Failed to bind extra physical slot {slot_id:?} on {addr}: {e}"
+                    ))
+                })?;
+            if let Some(v4) = slot.local_addr_v4() {
+                extra_bound_addrs.push(v4);
+            }
+            if let Some(v6) = slot.local_addr_v6() {
+                extra_bound_addrs.push(v6);
+            }
+            slots.push(slot);
+        }
+        let multiplexed = crate::high_level::MultiplexedUdpSocket::new(slots).map_err(|e| {
+            NatTraversalError::NetworkError(format!("Failed to create MultiplexedUdpSocket: {e}"))
+        })?;
+        Ok((Arc::new(multiplexed), extra_bound_addrs))
     }
 
     /// Create the inner QUIC endpoint using a pre-built abstract socket.
@@ -7893,13 +7906,11 @@ impl NatTraversalEndpoint {
     pub fn reset_relay_state(&self) {
         self.relay_setup_attempted
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.relay_accept_loop_started
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
             *addr = None;
         }
-        if let Ok(mut endpoint) = self.shared_relay_endpoint.lock() {
-            *endpoint = None;
+        if let Some(mux) = self.multiplexed_socket.read().clone() {
+            mux.detach_all_relays();
         }
         if let Ok(mut peers) = self.relay_advertised_peers.lock() {
             peers.clear();
@@ -7922,87 +7933,52 @@ impl NatTraversalEndpoint {
         self.peer_address_update_rx.lock().await.recv().await
     }
 
-    /// Get or create the shared QUIC endpoint that runs over the relay socket.
-    pub(crate) async fn ensure_shared_relay_endpoint(
+    /// Resolve a potentially synthetic virtual ULA remote address back to its
+    /// underlying peer UDP address for display/application metadata (ADR-021 §1.2).
+    pub(crate) fn resolve_remote_display_addr(&self, addr: SocketAddr) -> SocketAddr {
+        if !crate::socket_slot::is_synthetic_virtual_addr(addr) {
+            return addr;
+        }
+        self.multiplexed_socket
+            .read()
+            .as_ref()
+            .and_then(|mux| mux.resolve_virtual_target(addr))
+            .unwrap_or(addr)
+    }
+
+    /// Ensure a MASQUE relay session is attached to the unified
+    /// [`crate::high_level::MultiplexedUdpSocket`] and allocate/reuse a
+    /// synthetic virtual ULA route for dialing `target` over the sole
+    /// `InnerEndpoint` (ADR-021).
+    pub(crate) async fn prepare_relayed_dial(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<(Option<SocketAddr>, InnerEndpoint), NatTraversalError> {
+        target: SocketAddr,
+    ) -> Result<(Option<SocketAddr>, SocketAddr, InnerEndpoint), NatTraversalError> {
         let relay_addr = normalize_socket_addr(relay_addr);
+        let (public_addr, _relay_socket) = self.establish_relay_session(relay_addr).await?;
 
-        if let Some(endpoint) = self
-            .shared_relay_endpoint
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-        {
-            let public_addr = self
-                .relay_sessions
-                .get(&relay_addr)
-                .and_then(|session| session.public_address)
-                .or_else(|| self.relay_public_addr());
-            return Ok((public_addr, endpoint));
-        }
-
-        let (public_addr, relay_socket) = self.establish_relay_session(relay_addr).await?;
-        let relay_socket = relay_socket.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed("Relay did not provide socket".to_string())
+        let mux = self.multiplexed_socket.read().clone().ok_or_else(|| {
+            NatTraversalError::ConfigError(
+                "unified MultiplexedUdpSocket is not available for relayed dial".to_string(),
+            )
         })?;
-        let runtime = crate::high_level::default_runtime().ok_or_else(|| {
-            NatTraversalError::ConfigError("No async runtime for relay endpoint".to_string())
+        let relay_slot = mux.relay_slot_for_addr(relay_addr).ok_or_else(|| {
+            NatTraversalError::ConnectionFailed(format!(
+                "relay session for {relay_addr} is not attached to MultiplexedUdpSocket"
+            ))
         })?;
-
-        // ADR-020: when hybrid is negotiated, clamp the inner relayed QUIC
-        // endpoint's post-handshake 1-RTT MTU to `min(outer_max_dgram - hdr, 1380)`
-        // and lock inner DPLPMTUD to that clamp so steady-state packets ride
-        // the outer datagram lane with zero stream-lane spill (while Initials
-        // keep RFC 9000 §14.1 1200 B padding on the stream lane).
-        let recommended_inner_mtu = relay_socket.recommended_inner_mtu();
-        let relay_server_config = self.server_config.clone().map(|mut cfg| {
-            if let Some(vp_mtu) = recommended_inner_mtu {
-                let mut transport = (*cfg.transport).clone();
-                transport.virtual_path_max_udp_payload_size(Some(vp_mtu));
-                cfg.transport_config(Arc::new(transport));
-            }
-            cfg
-        });
-
-        let mut relay_endpoint = InnerEndpoint::new_with_abstract_socket(
-            crate::EndpointConfig::default(),
-            relay_server_config,
-            relay_socket,
-            runtime,
-        )
-        .map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!("Failed to create relay endpoint: {}", e))
+        let synthetic_target = mux
+            .register_virtual_route(relay_slot, target)
+            .map_err(|e| {
+                NatTraversalError::ConnectionFailed(format!(
+                    "failed to register virtual route to {target} via {relay_addr}: {e}"
+                ))
+            })?;
+        let endpoint = self.inner_endpoint.clone().ok_or_else(|| {
+            NatTraversalError::ConfigError("QUIC endpoint not initialized".to_string())
         })?;
-
-        if let Some(mut client_config) = self
-            .inner_endpoint
-            .as_ref()
-            .and_then(|endpoint| endpoint.default_client_config.clone())
-        {
-            if let Some(vp_mtu) = recommended_inner_mtu {
-                let mut transport = (*client_config.transport).clone();
-                transport.virtual_path_max_udp_payload_size(Some(vp_mtu));
-                client_config.transport_config(Arc::new(transport));
-            }
-            relay_endpoint.set_default_client_config(client_config);
-        }
-
-        if let Ok(mut shared) = self.shared_relay_endpoint.lock() {
-            // #305: shutdown takes the shared relay endpoint under this lock
-            // after setting the flag, so never store one after that.
-            if self.shutdown.load(Ordering::Relaxed) {
-                drop(shared);
-                relay_endpoint.close(crate::VarInt::from_u32(0), b"Shutdown");
-                return Err(NatTraversalError::NetworkError(
-                    "endpoint is shutting down".to_string(),
-                ));
-            }
-            *shared = Some(relay_endpoint.clone());
-        }
-
-        Ok((public_addr, relay_endpoint))
+        Ok((public_addr, synthetic_target, endpoint))
     }
 
     /// Establish a relay session with a MASQUE relay server
@@ -8039,16 +8015,16 @@ impl NatTraversalEndpoint {
 
         info!("Establishing relay session to {}", relay_addr);
 
-        // Prefer reusing an existing peer connection to the relay: the
-        // endpoint's reader task demultiplexes relay bidi streams for every
-        // connection the application accepts (#280), so an existing
-        // connection already carries a serving path.
+        // Prefer reusing an existing DIRECT physical peer connection to the relay
+        // (ADR-021 §1.1: never nest an outer relay session over an inner virtual route).
         let existing_conn = self.connections.iter().find_map(|entry| {
             let conn = entry.value();
+            let remote = conn.remote_address();
+            if crate::socket_slot::is_synthetic_virtual_addr(remote) {
+                return None;
+            }
             // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6.
-            if normalize_socket_addr(conn.remote_address()) == relay_addr
-                && conn.close_reason().is_none()
-            {
+            if normalize_socket_addr(remote) == relay_addr && conn.close_reason().is_none() {
                 Some(conn.clone())
             } else {
                 None
@@ -8262,10 +8238,30 @@ impl NatTraversalEndpoint {
         // DashMap provides lock-free .insert()
         self.relay_sessions.insert(relay_addr, session);
 
-        // #305: shutdown clears `relay_sessions` after setting the flag. A
-        // session stored after that clear would keep the original socket
-        // alive, so take it back out.
+        // ADR-021: attach the relay socket to the sole InnerEndpoint's
+        // MultiplexedUdpSocket virtual plane so inbound relayed packets arrive
+        // through the single accept loop and outbound relayed dials route via
+        // non-re-entrant synthetic ULA channels.
+        if let (Some(sock), Some(mux)) = (
+            relay_socket.as_ref(),
+            self.multiplexed_socket.read().clone(),
+        ) {
+            if let Err(e) = mux.attach_relay_socket(relay_addr, Arc::clone(sock)) {
+                warn!(
+                    relay = %relay_addr,
+                    error = %e,
+                    "failed to attach relay socket to MultiplexedUdpSocket"
+                );
+            }
+        }
+
+        // #305: shutdown clears `relay_sessions` and takes `multiplexed_socket`
+        // after setting the flag. A session stored after that clear would keep
+        // the original socket alive, so take it back out.
         if self.shutdown.load(Ordering::Relaxed) {
+            if let Some(mux) = self.multiplexed_socket.read().clone() {
+                mux.detach_relay(relay_addr);
+            }
             if let Some((_, session)) = self.relay_sessions.remove(&relay_addr)
                 && session.connection.close_reason().is_none()
             {
@@ -8292,22 +8288,40 @@ impl NatTraversalEndpoint {
 
     /// Create a fresh QUIC connection to a relay server.
     ///
-    /// Used as a fallback when no existing peer connection is available.
+    /// ADR-021 §1.1: outer MASQUE relay connections are always pinned to a
+    /// physical UDP slot (`pin_to_physical_slot(true)` on `SocketSlotId::PRIMARY`)
+    /// so they can never route through or migrate onto `SocketSlotId::VIRTUAL`.
     async fn connect_new_to_relay(
         &self,
         relay_addr: SocketAddr,
     ) -> Result<InnerConnection, NatTraversalError> {
+        if crate::socket_slot::is_synthetic_virtual_addr(relay_addr) {
+            return Err(NatTraversalError::ConnectionFailed(
+                "outer relay address cannot be a synthetic virtual ULA address".to_string(),
+            ));
+        }
         let endpoint = self.inner_endpoint.as_ref().ok_or_else(|| {
             NatTraversalError::ConfigError("QUIC endpoint not initialized".to_string())
         })?;
 
         let server_name = relay_addr.ip().to_string();
-        let connecting = endpoint.connect(relay_addr, &server_name).map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!(
-                "Failed to initiate relay connection: {}",
-                e
-            ))
+        let mut client_config = endpoint.default_client_config.clone().ok_or_else(|| {
+            NatTraversalError::ConfigError("no default client config".to_string())
         })?;
+        client_config.pin_to_physical_slot(true);
+        let connecting = endpoint
+            .connect_with_slot(
+                client_config,
+                relay_addr,
+                &server_name,
+                crate::SocketSlotId::PRIMARY,
+            )
+            .map_err(|e| {
+                NatTraversalError::ConnectionFailed(format!(
+                    "Failed to initiate relay connection: {}",
+                    e
+                ))
+            })?;
 
         let connection = timeout(Self::coordination_connect_timeout(&self.config), connecting)
             .await
@@ -11676,7 +11690,7 @@ impl NatTraversalEndpoint {
         // not reach, before the bounded drain so their closes are still sent.
         // The dial workers that store session handles were aborted above; the
         // bounded join does not prove they have all finished.
-        let relay_endpoint = self.release_traversal_holders_for_shutdown();
+        self.release_traversal_holders_for_shutdown();
 
         // #309: close every connection still open on the endpoint. The sweeps
         // above close only the connections that the maps track. A connection
@@ -11689,26 +11703,14 @@ impl NatTraversalEndpoint {
         }
 
         // Bounded drain: in simultaneous-shutdown scenarios both sides may
-        // close at once, so wait_idle can stall until the idle timeout. The
-        // closed shared relay endpoint drains in the same budget: its
-        // connections hold the relay socket, which owns the CONNECT-UDP
-        // streams on the original socket.
+        // close at once, so wait_idle can stall until the idle timeout.
         if let Some(ref endpoint) = self.inner_endpoint {
-            let relay_idle = async {
-                if let Some(relay_endpoint) = &relay_endpoint {
-                    relay_endpoint.wait_idle().await;
-                }
-            };
-            if tokio::time::timeout(
-                SHUTDOWN_DRAIN_TIMEOUT,
-                futures_util::future::join(endpoint.wait_idle(), relay_idle),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, endpoint.wait_idle())
+                .await
+                .is_err()
             {
                 info!("wait_idle timed out during shutdown, proceeding");
             }
-            drop(relay_endpoint);
 
             // Drop lifecycle-tracked connection handles. Each TrackedConnection
             // holds a `Connection` clone, which keeps the endpoint's UDP socket
@@ -11843,18 +11845,16 @@ impl NatTraversalEndpoint {
         Ok(())
     }
 
-    /// #305: release the connection handles that outlive the shutdown sweeps
-    /// of `connections` and the lifecycle map. Each one keeps the original UDP
-    /// socket alive, so the socket-release settle would time out with
+    /// #305: release the connection and socket holders that outlive the shutdown
+    /// sweeps of `connections` and the lifecycle map. Each one keeps the original
+    /// UDP socket alive, so the socket-release settle would time out with
     /// `weak_socket_owner_still_live`:
     /// - NAT-traversal session handles (`session_state.connection`);
     /// - MASQUE relay sessions: the relay connection clone, and the relay
     ///   socket that owns the CONNECT-UDP bind streams;
-    /// - the shared relay endpoint, which runs on that relay socket.
-    ///
-    /// Their connections are closed. The shared relay endpoint is closed and
-    /// returned so the bounded drain can wait for it to go idle.
-    fn release_traversal_holders_for_shutdown(&self) -> Option<InnerEndpoint> {
+    /// - the `MultiplexedUdpSocket` reference stored on `NatTraversalEndpoint`
+    ///   (taking it detaches all virtual relays and drops our Arc clone).
+    fn release_traversal_holders_for_shutdown(&self) {
         let mut released = Vec::new();
 
         let session_peers: Vec<PeerId> = self.active_sessions.iter().map(|e| *e.key()).collect();
@@ -11881,26 +11881,17 @@ impl NatTraversalEndpoint {
             }
         }
 
-        let relay_endpoint = match self.shared_relay_endpoint.lock() {
-            Ok(mut shared) => shared.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(relay_endpoint) = &relay_endpoint {
-            relay_endpoint.close(crate::VarInt::from_u32(0), b"Shutdown");
+        let detached_mux = self.multiplexed_socket.write().take();
+        if let Some(mux) = detached_mux {
+            mux.detach_all_relays();
         }
 
-        if !released.is_empty() || relay_endpoint.is_some() {
+        if !released.is_empty() {
             info!(
-                "shutdown: released {} session/relay connection handle(s){}",
-                released.len(),
-                if relay_endpoint.is_some() {
-                    " and the shared relay endpoint"
-                } else {
-                    ""
-                }
+                "shutdown: released {} session/relay connection handle(s)",
+                released.len()
             );
         }
-        relay_endpoint
     }
 
     /// Settle every original socket retained from the first shutdown attempt.

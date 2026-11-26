@@ -30,6 +30,10 @@ pub use self::connection::{
 pub use self::endpoint::{Accept, Endpoint, EndpointStats};
 pub use self::incoming::{Incoming, IncomingFuture, RetryError};
 pub use self::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
+pub use self::runtime::multiplexed::{
+    DEFAULT_VIRTUAL_RECV_QUEUE_CAPACITY, MAX_RECV_BURST_PER_SOURCE, MultiplexedSocketStats,
+    MultiplexedUdpSocket, PhysicalBindSlot, VirtualRelayHandle,
+};
 pub use self::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, default_runtime};
 pub use self::send_stream::{DROPPED_UNFINISHED_ERROR_CODE, SendStream, StoppedError, WriteError};
 pub use crate::path::{Path, PathId, WeakPathHandle};

@@ -707,6 +707,11 @@ pub struct ClientConfig {
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
+
+    /// When `true`, pins this connection strictly to physical UDP bind slots:
+    /// rejects synthetic virtual ULA targets at dial time and forbids migration
+    /// onto [`crate::SocketSlotId::VIRTUAL`] (ADR-021 acyclic outer relay DAG).
+    pub(crate) pin_to_physical_slot: bool,
 }
 
 impl ClientConfig {
@@ -720,7 +725,18 @@ impl ClientConfig {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
+            pin_to_physical_slot: false,
         }
+    }
+
+    /// Pin this outgoing connection strictly to physical UDP bind slots (ADR-021).
+    ///
+    /// Outer MASQUE relay connections set this to `true` so they can never dial
+    /// a synthetic ULA virtual route or migrate onto `SocketSlotId::VIRTUAL`,
+    /// preserving the acyclic 2-level relay DAG.
+    pub fn pin_to_physical_slot(&mut self, value: bool) -> &mut Self {
+        self.pin_to_physical_slot = value;
+        self
     }
 
     /// Configure how to populate the destination CID of the initial packet when attempting to

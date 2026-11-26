@@ -1639,11 +1639,17 @@ impl MasqueRelaySocketStats {
     }
 }
 
-struct OutboundRelayPacket {
-    target: SocketAddr,
-    ecn: Option<EcnCodepoint>,
-    raw_payload: Bytes,
+pub(crate) struct OutboundRelayPacket {
+    pub(crate) target: SocketAddr,
+    pub(crate) ecn: Option<EcnCodepoint>,
+    pub(crate) raw_payload: Bytes,
 }
+
+/// Non-blocking ingress hook attached when a [`MasqueRelaySocket`] feeds into a
+/// [`crate::high_level::runtime::multiplexed::MultiplexedUdpSocket`] virtual
+/// plane (ADR-021 §1.1).
+pub(crate) type VirtualIngressHook =
+    Arc<dyn Fn(Vec<u8>, SocketAddr, Option<EcnCodepoint>) + Send + Sync>;
 
 #[derive(Default)]
 struct RecvState {
@@ -1691,6 +1697,13 @@ impl RecvRing {
         let waker = self.state.lock().ok().and_then(|mut s| s.waker.take());
         if let Some(waker) = waker {
             waker.wake();
+        }
+    }
+
+    fn drain_all(&self) -> Vec<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)> {
+        match self.state.lock() {
+            Ok(mut state) => state.queue.drain(..).collect(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -1749,6 +1762,7 @@ pub struct MasqueRelaySocket {
     mux_v1: bool,
     outer_connection: Option<Connection>,
     recv: RecvRing,
+    ingress_hook: parking_lot::RwLock<Option<VirtualIngressHook>>,
     send_tx: tokio::sync::mpsc::Sender<OutboundRelayPacket>,
     stats: Arc<MasqueRelaySocketStats>,
     shutdown: CancellationToken,
@@ -1823,6 +1837,7 @@ impl MasqueRelaySocket {
             mux_v1,
             outer_connection,
             recv: RecvRing::new(DEFAULT_RELAY_RECV_QUEUE_CAPACITY),
+            ingress_hook: parking_lot::RwLock::new(None),
             send_tx,
             stats: Arc::clone(&stats),
             shutdown: shutdown.clone(),
@@ -2291,7 +2306,40 @@ impl MasqueRelaySocket {
         &self.stats
     }
 
+    /// Return the relay-allocated public address for this session.
+    #[must_use]
+    pub fn public_addr(&self) -> SocketAddr {
+        self.relay_public_addr
+    }
+
+    /// Clone the bounded non-blocking outbound packet sender (ADR-021 §1.1).
+    pub(crate) fn egress_sender(&self) -> tokio::sync::mpsc::Sender<OutboundRelayPacket> {
+        self.send_tx.clone()
+    }
+
+    /// Return the outer QUIC relay connection if hybrid datagram forwarding is active.
+    pub(crate) fn outer_connection(&self) -> Option<&Connection> {
+        self.outer_connection.as_ref()
+    }
+
+    /// Attach or detach a non-blocking ingress sink that forwards decoded
+    /// inbound MASQUE packets directly into a [`crate::high_level::runtime::multiplexed::MultiplexedUdpSocket`]
+    /// virtual plane without extra copies or locks.
+    pub(crate) fn set_ingress_hook(&self, hook: Option<VirtualIngressHook>) {
+        let flush_hook = hook.clone();
+        *self.ingress_hook.write() = hook;
+        if let Some(hook) = flush_hook {
+            for (payload, source, ecn) in self.recv.drain_all() {
+                hook(payload, source, ecn);
+            }
+        }
+    }
+
     fn enqueue_received(&self, payload: Vec<u8>, source: SocketAddr, ecn: Option<EcnCodepoint>) {
+        if let Some(hook) = self.ingress_hook.read().as_ref().cloned() {
+            hook(payload, source, ecn);
+            return;
+        }
         if self.recv.push(payload, source, ecn) {
             self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
         }

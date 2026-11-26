@@ -279,7 +279,6 @@ impl TransportParameters {
             || cached.grease_quic_bit && !self.grease_quic_bit
             || cached.ack_receive_v2 && !self.ack_receive_v2
             || cached.datagram_mux_v1 != self.datagram_mux_v1
-            || cached.in_connection_migration_v1 && !self.in_connection_migration_v1
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "0-RTT accepted with incompatible transport parameters",
@@ -2455,14 +2454,15 @@ mod test {
             Err(Error::Malformed)
         ));
 
-        // 0-RTT resumption (RFC 9000 §7.4.1):
-        // - Enabling 0x50C6 on upgrade (false -> true) is post-handshake-only and MUST succeed.
-        // - Dropping 0x50C6 on rollback (true -> false) MUST fail with PROTOCOL_VIOLATION.
+        // 0-RTT resumption (RFC 9000 §7.4.1 / §9):
+        // 0-RTT packets can never perform connection migration, so 0x50C6 governs
+        // post-handshake 1-RTT migration only. Both enabling (false -> true) and
+        // disabling as a runtime kill-switch (true -> false) MUST preserve 0-RTT cleanly.
         let without = TransportParameters::default();
-        let err_drop = without
-            .validate_resumption_from(&params)
-            .expect_err("0x50C6 drop across 0-RTT must fail");
-        assert_eq!(err_drop.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert!(
+            without.validate_resumption_from(&params).is_ok(),
+            "0x50C6 kill-switch toggle (true -> false) must preserve 0-RTT"
+        );
         assert!(
             params.validate_resumption_from(&without).is_ok(),
             "0x50C6 enable on 0.30.x -> Wave-4 upgrade must preserve 0-RTT"

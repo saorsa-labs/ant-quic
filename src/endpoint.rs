@@ -26,7 +26,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
-    Side, Transmit, TransportConfig, TransportError,
+    Side, SocketSlotId, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -43,6 +43,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
     },
+    socket_slot::is_synthetic_virtual_addr,
     token::{IncomingToken, InvalidRetryTokenError},
     transport_parameters::{PreferredAddress, TransportParameters},
 };
@@ -780,12 +781,27 @@ impl Endpoint {
         None
     }
 
-    /// Process an incoming UDP datagram
+    /// Process an incoming UDP datagram on the primary socket slot
     pub fn handle(
         &mut self,
         now: Instant,
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        self.handle_with_slot(now, remote, local_ip, SocketSlotId::PRIMARY, ecn, data, buf)
+    }
+
+    /// Process an incoming UDP datagram along with the [`SocketSlotId`] on which it arrived
+    /// (ADR-021 validated `(remote_addr, local_slot)` path identity).
+    pub fn handle_with_slot(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        local_slot: SocketSlotId,
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
         buf: &mut Vec<u8>,
@@ -801,6 +817,7 @@ impl Endpoint {
             Ok((first_decode, remaining)) => DatagramConnectionEvent {
                 now,
                 remote,
+                local_slot,
                 ecn,
                 first_decode,
                 remaining,
@@ -836,6 +853,7 @@ impl Endpoint {
                     size: buf.len(),
                     segment_size: None,
                     src_ip: local_ip,
+                    local_slot,
                 }));
             }
             Err(e) => {
@@ -844,7 +862,11 @@ impl Endpoint {
             }
         };
 
-        let addresses = FourTuple { remote, local_ip };
+        let addresses = FourTuple {
+            remote,
+            local_ip,
+            local_slot,
+        };
         let dst_cid = event.first_decode.dst_cid();
 
         if let Some(route_to) = self.index.get(&addresses, &event.first_decode) {
@@ -969,10 +991,12 @@ impl Endpoint {
             size: buf.len(),
             segment_size: None,
             src_ip: addresses.local_ip,
+            local_slot: addresses.local_slot,
         })
     }
 
-    /// Initiate a connection
+    /// Initiate a connection on the default slot ([`SocketSlotId::VIRTUAL`] if `remote` is a
+    /// synthetic ULA virtual route, otherwise [`SocketSlotId::PRIMARY`]).
     pub fn connect(
         &mut self,
         now: Instant,
@@ -980,10 +1004,34 @@ impl Endpoint {
         remote: SocketAddr,
         server_name: &str,
     ) -> Result<(ConnectionHandle, Connection), ConnectError> {
+        let local_slot = if is_synthetic_virtual_addr(remote) {
+            SocketSlotId::VIRTUAL
+        } else {
+            SocketSlotId::PRIMARY
+        };
+        self.connect_with_slot(now, config, remote, server_name, local_slot)
+    }
+
+    /// Initiate a connection explicitly bound to `local_slot` (ADR-021).
+    pub fn connect_with_slot(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+        local_slot: SocketSlotId,
+    ) -> Result<(ConnectionHandle, Connection), ConnectError> {
         if self.cids_exhausted() {
             return Err(ConnectError::CidsExhausted);
         }
         if remote.port() == 0 || remote.ip().is_unspecified() {
+            return Err(ConnectError::InvalidRemoteAddress(remote));
+        }
+        // ADR-021 acyclic outer relay DAG: physical-pinned connections MUST NEVER target
+        // synthetic virtual ULA routes or bind to `SocketSlotId::VIRTUAL`.
+        if config.pin_to_physical_slot
+            && (local_slot.is_virtual() || is_synthetic_virtual_addr(remote))
+        {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
         if !self.config.supported_versions.contains(&config.version) {
@@ -1007,7 +1055,7 @@ impl Endpoint {
             .crypto
             .start_session(config.version, server_name, &params)?;
 
-        let conn = self.add_connection(
+        let mut conn = self.add_connection(
             ch,
             config.version,
             remote_id,
@@ -1016,6 +1064,7 @@ impl Endpoint {
             FourTuple {
                 remote,
                 local_ip: None,
+                local_slot,
             },
             now,
             tls,
@@ -1025,6 +1074,9 @@ impl Endpoint {
                 server_name: server_name.into(),
             },
         );
+        if config.pin_to_physical_slot {
+            conn.set_pin_to_physical_slot(true);
+        }
         Ok((ch, conn))
     }
 
@@ -1469,6 +1521,7 @@ impl Endpoint {
             size: buf.len(),
             segment_size: None,
             src_ip: incoming.addresses.local_ip,
+            local_slot: incoming.addresses.local_slot,
         })
     }
 
@@ -1513,6 +1566,7 @@ impl Endpoint {
             rem_cid,
             addresses.remote,
             addresses.local_ip,
+            addresses.local_slot,
             tls,
             self.local_cid_generator.as_ref(),
             now,
@@ -1594,6 +1648,7 @@ impl Endpoint {
             size: buf.len(),
             segment_size: None,
             src_ip: addresses.local_ip,
+            local_slot: addresses.local_slot,
         }
     }
 
@@ -2027,6 +2082,11 @@ impl Incoming {
         self.addresses.local_ip
     }
 
+    /// The local socket slot on which this incoming connection arrived (ADR-021).
+    pub fn local_slot(&self) -> SocketSlotId {
+        self.addresses.local_slot
+    }
+
     /// The peer's UDP address
     pub fn remote_address(&self) -> SocketAddr {
         self.addresses.remote
@@ -2223,8 +2283,8 @@ impl ResetTokenTable {
 #[derive(Hash, Eq, PartialEq, Debug, Copy, Clone)]
 struct FourTuple {
     remote: SocketAddr,
-    // A single socket can only listen on a single port, so no need to store it explicitly
     local_ip: Option<IpAddr>,
+    local_slot: SocketSlotId,
 }
 
 #[cfg(test)]
@@ -2288,6 +2348,7 @@ mod tests {
         let addresses = FourTuple {
             remote: SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)),
             local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            local_slot: crate::SocketSlotId::PRIMARY,
         };
         let stale_initial = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let fresh_initial = ConnectionId::new(&[8, 7, 6, 5, 4, 3, 2, 1]);

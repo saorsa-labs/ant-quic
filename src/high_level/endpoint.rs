@@ -373,7 +373,8 @@ impl Endpoint {
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(ConnectError::EndpointStopping);
         }
-        if addr.is_ipv6() && !endpoint.ipv6 {
+        if addr.is_ipv6() && !endpoint.ipv6 && !crate::socket_slot::is_synthetic_virtual_addr(addr)
+        {
             return Err(ConnectError::InvalidRemoteAddress(addr));
         }
         let addr = if endpoint.ipv6 {
@@ -382,11 +383,66 @@ impl Endpoint {
             addr
         };
 
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
+        let (ch, mut conn) =
+            endpoint
+                .inner
+                .connect(self.runtime.now(), config, addr, server_name)?;
 
         let socket = endpoint.socket.clone();
+        if let Some(mtu_hint) = socket.virtual_path_mtu_handle(addr) {
+            conn.set_virtual_path_mtu_hint(Some(mtu_hint));
+        } else if let Some(vp_mtu) = socket.virtual_path_mtu(addr) {
+            conn.apply_virtual_path_mtu(vp_mtu);
+        }
+        endpoint.stats.outgoing_handshakes += 1;
+        let registry = endpoint.buffered_registry.clone();
+        Ok(endpoint
+            .recv_state
+            .connections
+            .insert(ch, conn, socket, self.runtime.clone(), registry))
+    }
+
+    /// Connect to a remote endpoint using a custom configuration and explicit [`crate::SocketSlotId`]
+    /// (ADR-021).
+    pub fn connect_with_slot(
+        &self,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        local_slot: crate::SocketSlotId,
+    ) -> Result<Connecting, ConnectError> {
+        let mut endpoint = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ConnectError::EndpointStopping)?;
+        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
+            return Err(ConnectError::EndpointStopping);
+        }
+        if addr.is_ipv6() && !endpoint.ipv6 && !crate::socket_slot::is_synthetic_virtual_addr(addr)
+        {
+            return Err(ConnectError::InvalidRemoteAddress(addr));
+        }
+        let addr = if endpoint.ipv6 {
+            SocketAddr::V6(ensure_ipv6(addr))
+        } else {
+            addr
+        };
+
+        let (ch, mut conn) = endpoint.inner.connect_with_slot(
+            self.runtime.now(),
+            config,
+            addr,
+            server_name,
+            local_slot,
+        )?;
+
+        let socket = endpoint.socket.clone();
+        if let Some(mtu_hint) = socket.virtual_path_mtu_handle(addr) {
+            conn.set_virtual_path_mtu_hint(Some(mtu_hint));
+        } else if let Some(vp_mtu) = socket.virtual_path_mtu(addr) {
+            conn.apply_virtual_path_mtu(vp_mtu);
+        }
         endpoint.stats.outgoing_handshakes += 1;
         let registry = endpoint.buffered_registry.clone();
         Ok(endpoint
@@ -1037,9 +1093,15 @@ impl EndpointInner {
             .inner
             .accept(incoming, now, &mut response_buffer, server_config)
         {
-            Ok((handle, conn)) => {
+            Ok((handle, mut conn)) => {
                 state.stats.accepted_handshakes += 1;
                 let socket = state.socket.clone();
+                let remote = conn.remote_address();
+                if let Some(mtu_hint) = socket.virtual_path_mtu_handle(remote) {
+                    conn.set_virtual_path_mtu_hint(Some(mtu_hint));
+                } else if let Some(vp_mtu) = socket.virtual_path_mtu(remote) {
+                    conn.apply_virtual_path_mtu(vp_mtu);
+                }
                 let runtime = state.runtime.clone();
                 let registry = state.buffered_registry.clone();
                 Ok(state
@@ -1243,8 +1305,9 @@ fn respond(transmit: crate::Transmit, response_buffer: &[u8], socket: &dyn Async
     let mut sender = socket.create_sender();
     let waker = futures_util::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let _ = sender.as_mut().poll_send(
+    let _ = sender.as_mut().poll_send_on_slot(
         &udp_transmit(&transmit, &response_buffer[..transmit.size]),
+        transmit.local_slot,
         &mut cx,
     );
 }
@@ -1604,6 +1667,7 @@ impl RecvState {
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut slots = [crate::SocketSlotId::PRIMARY; BATCH_SIZE];
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
             let mut bufs = self
                 .recv_buf
@@ -1621,18 +1685,21 @@ impl RecvState {
             })
         };
         loop {
-            match socket.poll_recv(cx, &mut iovs, &mut metas) {
+            match socket.poll_recv_with_slots(cx, &mut iovs, &mut metas, &mut slots) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
-                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
+                    for ((meta, slot), buf) in
+                        metas.iter().zip(slots.iter()).zip(iovs.iter()).take(msgs)
+                    {
                         let mut data: BytesMut = buf[0..meta.len].into();
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
                             let mut response_buffer = Vec::new();
-                            match endpoint.handle(
+                            match endpoint.handle_with_slot(
                                 now,
                                 meta.addr,
                                 meta.dst_ip,
+                                *slot,
                                 meta.ecn.map(proto_ecn),
                                 buf,
                                 &mut response_buffer,
