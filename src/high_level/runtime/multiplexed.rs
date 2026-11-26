@@ -162,25 +162,61 @@ impl PhysicalBindSlot {
     /// Wrap an existing `std::net::UdpSocket` as a single-family physical slot.
     pub fn from_std(slot_id: SocketSlotId, socket: std::net::UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        let addr = socket.local_addr()?;
         let tokio_sock = tokio::net::UdpSocket::from_std(socket)?;
-        if addr.is_ipv6() {
-            Self::new(slot_id, None, Some(tokio_sock))
-        } else {
-            Self::new(slot_id, Some(tokio_sock), None)
-        }
+        Self::from_tokio(slot_id, tokio_sock)
     }
 
     /// Wrap an already-bound `tokio::net::UdpSocket` as a single-family
-    /// physical slot without round-tripping through `into_std()` / `from_std()`
-    /// (which fails with `WSAEINVAL` on Windows because the socket handle is
-    /// already associated with Tokio's I/O reactor).
+    /// physical slot without round-tripping through `into_std()` / `from_std()`.
+    ///
+    /// Uses `quinn_udp::UdpSocketState` for GSO/GRO/ECN when supported, and
+    /// gracefully falls back to a plain Tokio [`AsyncUdpSocket`] wrapper if
+    /// `UdpSocketState::new` returns an OS error (for example on Windows sockets
+    /// with `IPV6_V6ONLY=0` where `quinn-udp`'s `IPPROTO_IP` socket options
+    /// fail with `WSAEINVAL`).
     pub fn from_tokio(slot_id: SocketSlotId, socket: tokio::net::UdpSocket) -> io::Result<Self> {
+        if !slot_id.is_physical() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid physical slot id {slot_id:?}"),
+            ));
+        }
         let addr = socket.local_addr()?;
-        if addr.is_ipv6() {
-            Self::new(slot_id, None, Some(socket))
-        } else {
-            Self::new(slot_id, Some(socket), None)
+        match UdpSocketState::new(UdpSockRef::from(&socket)) {
+            Ok(state) => {
+                let sock = Arc::new(socket);
+                let state = Arc::new(state);
+                if addr.is_ipv6() {
+                    Self::from_arc_sockets(
+                        slot_id,
+                        None,
+                        Some(sock),
+                        None,
+                        Some(state),
+                        None,
+                        Some(addr),
+                    )
+                } else {
+                    Self::from_arc_sockets(
+                        slot_id,
+                        Some(sock),
+                        None,
+                        Some(state),
+                        None,
+                        Some(addr),
+                        None,
+                    )
+                }
+            }
+            Err(e) => {
+                debug!(
+                    %addr,
+                    ?slot_id,
+                    error = %e,
+                    "quinn-udp UdpSocketState::new unsupported on socket; falling back to plain Tokio AsyncUdpSocket"
+                );
+                Self::from_abstract(slot_id, super::tokio::wrap_tokio_udp_socket(socket))
+            }
         }
     }
 
