@@ -56,9 +56,9 @@ ant-quic supports **both IPv4 and IPv6** addresses:
 
 ### NAT Traversal: Native QUIC (NO STUN, NO ICE, NO TURN)
 
-**CRITICAL**: We use **native QUIC protocol extensions** based on the Seemann draft:
-- Reference: `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt`
-- Specification: [draft-seemann-quic-nat-traversal](https://datatracker.ietf.org/doc/draft-seemann-quic-nat-traversal/)
+**CRITICAL**: We use **native QUIC protocol extensions** specified normatively in:
+- Normative Spec: `docs/rfcs/ant-quic-nat-traversal.md` (ADR-012 / ADR-021)
+- Provenance: `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt` (expired IETF draft, inspiration only)
 
 We do **NOT** use:
 - STUN (Session Traversal Utilities for NAT)
@@ -72,6 +72,8 @@ All NAT traversal is performed **natively within QUIC** using:
 - `0x3d7e9f0bca12fea6`: NAT traversal capability negotiation
 - `0x3d7e9f0bca12fea8`: RFC-compliant frame format
 - `0x9f81a176`: Address discovery configuration
+- `0x50C4`: Connection-level RFC 9297 Context-ID datagram multiplexing (`DatagramMuxV1`)
+- `0x50C6`: Non-disruptive in-connection relay-to-direct migration (`InConnectionMigrationV1`)
 
 **Extension Frames:**
 - `ADD_ADDRESS`: 0x3d7e90 (IPv4), 0x3d7e91 (IPv6) - Advertise candidate addresses
@@ -179,8 +181,9 @@ Conventional Commits required:
 - `ant-quic-pqc-authentication.md` - **Pure PQC Raw Public Keys** (v0.2 - our specification)
 
 ### NAT Traversal (Native QUIC - NO STUN/ICE)
-- `draft-seemann-quic-nat-traversal-02.txt` - **QUIC NAT Traversal** (primary spec)
-- `draft-ietf-quic-address-discovery-00.txt` - QUIC Address Discovery Extension
+- `ant-quic-nat-traversal.md` - **QUIC NAT Traversal, Address Discovery & Relay Wire Specification** (normative spec, ADR-012 / ADR-021)
+- `draft-seemann-quic-nat-traversal-02.txt` - Historical provenance only (expired IETF draft)
+- `draft-ietf-quic-address-discovery-00.txt` - Historical provenance (`OBSERVED_ADDRESS` aligns with `-01`)
 
 ### Post-Quantum Cryptography
 - `fips-203-ml-kem.pdf` - ML-KEM (Kyber) key encapsulation

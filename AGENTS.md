@@ -34,14 +34,15 @@ future RFCs must go through negotiation under our own spec versioning (ADR-012).
 They are pinned by tests in `src/transport_parameters.rs`,
 `tests/nat_traversal_frame_tests.rs` and `tests/frame_encoding_tests.rs`.
 - Transport params: `0x3d7e9f0bca12fea6` (NAT traversal), `0x3d7e9f0bca12fea8`
-  (RFC-format frames), `0x9f81a176` (address discovery)
+  (RFC-format frames), `0x9f81a176` (address discovery), `0x50C4`
+  (`DatagramMuxV1`), `0x50C6` (`InConnectionMigrationV1`)
 - Frames: `ADD_ADDRESS` 0x3d7e90/91, `PUNCH_ME_NOW` 0x3d7e92/93,
   `REMOVE_ADDRESS` 0x3d7e94, `OBSERVED_ADDRESS` 0x9f81a6/a7 (IPv4/IPv6 pairs)
 
-The external drafts in `docs/rfcs/` (`draft-seemann-quic-nat-traversal-02`,
-`draft-ietf-quic-address-discovery-00`) are provenance, not conformance targets;
-the normative self-hosted spec `docs/rfcs/ant-quic-nat-traversal.md` is still to
-be written.
+The normative self-hosted specification is `docs/rfcs/ant-quic-nat-traversal.md`
+(ADR-012 / ADR-021); the external drafts in `docs/rfcs/`
+(`draft-seemann-quic-nat-traversal-02`, `draft-ietf-quic-address-discovery-00`)
+are cited strictly as provenance, not conformance targets.
 
 ## Wording rules for docs, comments and logs
 - Don't use "DHT"/"Kademlia"/"routing table" — ant-quic provides no record

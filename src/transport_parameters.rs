@@ -131,6 +131,14 @@ macro_rules! make_struct {
             /// MASQUE hybrid sessions use even Context IDs `>= 2`.
             pub(crate) datagram_mux_v1: bool,
 
+            /// Non-disruptive in-connection relay-to-direct migration
+            /// (`InConnectionMigrationV1 = 0x50C6`, ADR-021). When both peers
+            /// advertise this empty parameter during the QUIC handshake (and
+            /// the server has not set `disable_active_migration`), the client
+            /// is authorized to validate and migrate onto a direct server
+            /// address within the live connection.
+            pub(crate) in_connection_migration_v1: bool,
+
             /// Post-Quantum Cryptography algorithms supported by this endpoint
             ///
             /// When present, indicates support for PQC algorithms
@@ -178,6 +186,7 @@ macro_rules! make_struct {
                     address_discovery: None,
                     ack_receive_v2: false,
                     datagram_mux_v1: false,
+                    in_connection_migration_v1: false,
                     pqc_algorithms: None,
 
                     original_dst_cid: None,
@@ -217,7 +226,13 @@ impl TransportParameters {
             active_connection_id_limit: if cid_gen.cid_len() == 0 {
                 2 // i.e. default, i.e. unsent
             } else {
-                CidQueue::LEN as u32
+                #[cfg(test)]
+                let limit = config
+                    .active_connection_id_limit_override
+                    .unwrap_or(CidQueue::LEN as u32);
+                #[cfg(not(test))]
+                let limit = CidQueue::LEN as u32;
+                limit
             }
             .into(),
             max_datagram_frame_size: config
@@ -244,6 +259,7 @@ impl TransportParameters {
             address_discovery: config.address_discovery_config,
             ack_receive_v2: true,
             datagram_mux_v1: config.datagram_mux_v1,
+            in_connection_migration_v1: config.in_connection_migration_v1,
             pqc_algorithms: config.pqc_algorithms.clone(),
             ..Self::default()
         })
@@ -263,6 +279,7 @@ impl TransportParameters {
             || cached.grease_quic_bit && !self.grease_quic_bit
             || cached.ack_receive_v2 && !self.ack_receive_v2
             || cached.datagram_mux_v1 != self.datagram_mux_v1
+            || cached.in_connection_migration_v1 && !self.in_connection_migration_v1
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "0-RTT accepted with incompatible transport parameters",
@@ -637,6 +654,12 @@ impl TransportParameters {
                         write_var!(0);
                     }
                 }
+                TransportParameterId::InConnectionMigrationV1 => {
+                    if self.in_connection_migration_v1 {
+                        write_var!(id as u64);
+                        write_var!(0);
+                    }
+                }
                 TransportParameterId::PqcAlgorithms => {
                     if let Some(ref algorithms) = self.pqc_algorithms {
                         write_var!(id as u64);
@@ -819,6 +842,12 @@ impl TransportParameters {
                         return Err(Error::Malformed);
                     }
                     params.datagram_mux_v1 = true;
+                }
+                TransportParameterId::InConnectionMigrationV1 => {
+                    if params.in_connection_migration_v1 || len != 0 {
+                        return Err(Error::Malformed);
+                    }
+                    params.in_connection_migration_v1 = true;
                 }
                 TransportParameterId::PqcAlgorithms => {
                     if params.pqc_algorithms.is_some() {
@@ -1165,11 +1194,13 @@ pub(crate) enum TransportParameterId {
     AckReceiveV2 = 0x50C2,
     // Connection-level RFC 9297 Context-ID datagram multiplexing (ADR-020)
     DatagramMuxV1 = 0x50C4,
+    // Non-disruptive in-connection relay-to-direct migration (ADR-021)
+    InConnectionMigrationV1 = 0x50C6,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 27] = [
+    const SUPPORTED: [Self; 28] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -1197,6 +1228,7 @@ impl TransportParameterId {
         Self::PqcAlgorithms,
         Self::AckReceiveV2,
         Self::DatagramMuxV1,
+        Self::InConnectionMigrationV1,
     ];
 }
 
@@ -1242,6 +1274,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::PqcAlgorithms == id => Self::PqcAlgorithms,
             id if Self::AckReceiveV2 == id => Self::AckReceiveV2,
             id if Self::DatagramMuxV1 == id => Self::DatagramMuxV1,
+            id if Self::InConnectionMigrationV1 == id => Self::InConnectionMigrationV1,
             _ => return Err(()),
         };
         Ok(param)
@@ -2380,6 +2413,112 @@ mod test {
         assert!(without.validate_resumption_from(&params).is_err());
         assert!(params.validate_resumption_from(&without).is_err());
         assert!(params.validate_resumption_from(&params).is_ok());
+    }
+
+    #[test]
+    fn test_in_connection_migration_v1_roundtrip_and_validation() {
+        assert_eq!(TransportParameterId::InConnectionMigrationV1 as u64, 0x50C6);
+        assert_eq!(
+            TransportParameterId::try_from(0x50C6),
+            Ok(TransportParameterId::InConnectionMigrationV1)
+        );
+
+        let mut params = TransportParameters::default();
+        assert!(!params.in_connection_migration_v1);
+        params.in_connection_migration_v1 = true;
+
+        let mut encoded = Vec::new();
+        params.write(&mut encoded).expect("encode transport params");
+
+        let decoded = TransportParameters::read(Side::Client, &mut encoded.as_slice())
+            .expect("decode transport params");
+        assert!(decoded.in_connection_migration_v1);
+
+        // Non-empty payload must be rejected as Malformed.
+        let mut bad = Vec::new();
+        bad.write_var_or_debug_assert(TransportParameterId::InConnectionMigrationV1 as u64);
+        bad.write_var_or_debug_assert(1u64);
+        bad.write(0x01u8);
+        assert!(matches!(
+            TransportParameters::read(Side::Client, &mut bad.as_slice()),
+            Err(Error::Malformed)
+        ));
+
+        // Duplicate parameter must be rejected as Malformed.
+        let mut dup = Vec::new();
+        dup.write_var_or_debug_assert(TransportParameterId::InConnectionMigrationV1 as u64);
+        dup.write_var_or_debug_assert(0u64);
+        dup.write_var_or_debug_assert(TransportParameterId::InConnectionMigrationV1 as u64);
+        dup.write_var_or_debug_assert(0u64);
+        assert!(matches!(
+            TransportParameters::read(Side::Client, &mut dup.as_slice()),
+            Err(Error::Malformed)
+        ));
+
+        // 0-RTT resumption (RFC 9000 §7.4.1):
+        // - Enabling 0x50C6 on upgrade (false -> true) is post-handshake-only and MUST succeed.
+        // - Dropping 0x50C6 on rollback (true -> false) MUST fail with PROTOCOL_VIOLATION.
+        let without = TransportParameters::default();
+        let err_drop = without
+            .validate_resumption_from(&params)
+            .expect_err("0x50C6 drop across 0-RTT must fail");
+        assert_eq!(err_drop.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert!(
+            params.validate_resumption_from(&without).is_ok(),
+            "0x50C6 enable on 0.30.x -> Wave-4 upgrade must preserve 0-RTT"
+        );
+        assert!(params.validate_resumption_from(&params).is_ok());
+    }
+
+    #[test]
+    fn test_cid16_limits_and_030_compat() {
+        let mut rng = rand::thread_rng();
+        let transport_cfg = TransportConfig::default();
+        let endpoint_cfg = EndpointConfig::default();
+        let cid_gen = crate::cid_generator::HashedConnectionIdGenerator::new();
+        let initial_src_cid = ConnectionId::new(&[1; 8]);
+
+        let wave4 = TransportParameters::new(
+            &transport_cfg,
+            &endpoint_cfg,
+            &cid_gen,
+            initial_src_cid,
+            None,
+            &mut rng,
+        )
+        .expect("build Wave-4 transport params");
+        assert_eq!(wave4.active_connection_id_limit, VarInt::from_u32(16));
+        assert!(wave4.in_connection_migration_v1);
+        assert_eq!(wave4.issue_cids_limit(), 16);
+
+        // Simulated 0.30.0 peer advertising active_connection_id_limit = 5.
+        let mut peer_030 = TransportParameters::default();
+        peer_030.active_connection_id_limit = VarInt::from_u32(5);
+        assert_eq!(peer_030.issue_cids_limit(), 5);
+
+        // Zero-length CID generator must keep the RFC 9000 default (2).
+        let empty_cid_gen = crate::cid_generator::RandomConnectionIdGenerator::new(0);
+        let zero_cid = TransportParameters::new(
+            &transport_cfg,
+            &endpoint_cfg,
+            &empty_cid_gen,
+            ConnectionId::new(&[]),
+            None,
+            &mut rng,
+        )
+        .expect("build zero-len CID transport params");
+        assert_eq!(zero_cid.active_connection_id_limit, VarInt::from_u32(2));
+
+        // 0-RTT validation: 5 -> 16 upgrade succeeds, 16 -> 5 rollback fails with PROTOCOL_VIOLATION.
+        let mut limit5 = TransportParameters::default();
+        limit5.active_connection_id_limit = VarInt::from_u32(5);
+        let mut limit16 = TransportParameters::default();
+        limit16.active_connection_id_limit = VarInt::from_u32(16);
+        assert!(limit16.validate_resumption_from(&limit5).is_ok());
+        let rollback_err = limit5
+            .validate_resumption_from(&limit16)
+            .expect_err("16 -> 5 0-RTT rollback must return PROTOCOL_VIOLATION");
+        assert_eq!(rollback_err.code, TransportErrorCode::PROTOCOL_VIOLATION);
     }
 
     // Include comprehensive tests module

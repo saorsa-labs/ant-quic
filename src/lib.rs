@@ -679,8 +679,9 @@ pub(crate) use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Used by both `P2pEndpoint` and `NatTraversalEndpoint` to bound graceful-shutdown waits.
 pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The maximum number of CIDs we bother to issue per connection
-pub(crate) const LOC_CID_COUNT: u64 = 8;
+/// The maximum number of CIDs we bother to issue per connection (ADR-021: 16 to support
+/// N = 8 concurrent ADR-015 candidate spray probes with RFC 9000 §9.5 CID unlinkability).
+pub(crate) const LOC_CID_COUNT: u64 = 16;
 pub(crate) const RESET_TOKEN_SIZE: usize = 16;
 pub(crate) const MAX_CID_SIZE: usize = 20;
 pub(crate) const MIN_INITIAL_SIZE: u16 = 1200;

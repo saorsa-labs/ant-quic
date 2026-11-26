@@ -707,6 +707,24 @@ impl Connection {
             .supports_datagram_mux_v1()
     }
 
+    /// Returns `true` if both endpoints negotiated the `InConnectionMigrationV1`
+    /// (`0x50C6`) QUIC transport parameter during the handshake AND active
+    /// connection migration is enabled (`!disable_active_migration` / server
+    /// `migration == true`, ADR-021 §Phase 4A.4).
+    ///
+    /// Immutable once the handshake completes: when `true`, the connection
+    /// supports non-disruptive in-connection relay-to-direct migration. On
+    /// connections with `<= 0.30.x` peers that lack the parameter, or when the
+    /// server disabled active migration, this returns `false` and callers fall
+    /// back to ADR-020 Decision 5 new-handshake migration.
+    pub fn supports_in_connection_migration_v1(&self) -> bool {
+        self.0
+            .state
+            .lock("supports_in_connection_migration_v1")
+            .inner
+            .supports_in_connection_migration_v1()
+    }
+
     /// Close the connection immediately.
     ///
     /// Pending operations will fail immediately with [`ConnectionError::LocallyClosed`]. No
