@@ -7147,11 +7147,25 @@ impl Connection {
     pub(crate) fn supports_datagram_mux_v1(&self) -> bool {
         self.config.datagram_mux_v1 && self.peer_params.datagram_mux_v1
     }
+
+    /// Whether both endpoints negotiated the `InConnectionMigrationV1`
+    /// (`0x50C6`) QUIC transport parameter during the handshake (ADR-021).
+    ///
+    /// Note: callers initiating client-side migration onto a direct server
+    /// address must additionally verify `!self.peer_params.disable_active_migration`
+    /// (server `migration == true`) per ADR-021 §Phase 4A.4.
+    pub(crate) fn supports_in_connection_migration_v1(&self) -> bool {
+        self.config.in_connection_migration_v1 && self.peer_params.in_connection_migration_v1
+    }
 }
 
 #[cfg(test)]
 #[path = "pqc_mtu_regression_tests.rs"]
 mod pqc_mtu_regression_tests;
+
+#[cfg(test)]
+#[path = "wave4_cid_migration_tests.rs"]
+mod wave4_cid_migration_tests;
 
 /// Outcome of applying a peer's NEW_CONNECTION_ID frame to the remote CID state
 #[derive(Debug, PartialEq, Eq)]

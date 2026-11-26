@@ -56,6 +56,13 @@ pub struct TransportConfig {
     /// (ADR-020), enabling RFC 9297 Context-ID datagram multiplexing from
     /// datagram #1 when both peers advertise it. Defaults to `true`.
     pub(crate) datagram_mux_v1: bool,
+    /// Advertise the `InConnectionMigrationV1` (`0x50C6`) QUIC transport
+    /// parameter (ADR-021), authorizing non-disruptive client-initiated
+    /// relay-to-direct in-connection migration when both peers advertise it.
+    /// Defaults to `true`.
+    pub(crate) in_connection_migration_v1: bool,
+    #[cfg(test)]
+    pub(crate) active_connection_id_limit_override: Option<u32>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -372,6 +379,23 @@ impl TransportConfig {
         self
     }
 
+    /// Whether to advertise the `InConnectionMigrationV1` (`0x50C6`) QUIC
+    /// transport parameter (ADR-021), authorizing non-disruptive client-initiated
+    /// relay-to-direct in-connection migration when both peers advertise it.
+    ///
+    /// Defaults to `true`. Disabling this simulates or forces `<= 0.30.x`
+    /// new-handshake migration fallback on the connection.
+    pub fn in_connection_migration_v1(&mut self, value: bool) -> &mut Self {
+        self.in_connection_migration_v1 = value;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_connection_id_limit_override(&mut self, value: u32) -> &mut Self {
+        self.active_connection_id_limit_override = Some(value);
+        self
+    }
+
     /// Whether to force every packet number to be used
     ///
     /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
@@ -564,6 +588,9 @@ impl Default for TransportConfig {
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
             datagram_mux_v1: true,
+            in_connection_migration_v1: true,
+            #[cfg(test)]
+            active_connection_id_limit_override: None,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -607,6 +634,9 @@ impl fmt::Debug for TransportConfig {
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
             datagram_mux_v1,
+            in_connection_migration_v1,
+            #[cfg(test)]
+                active_connection_id_limit_override: _,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -645,6 +675,7 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             .field("datagram_mux_v1", datagram_mux_v1)
+            .field("in_connection_migration_v1", in_connection_migration_v1)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload)
             .field("nat_traversal_config", nat_traversal_config)

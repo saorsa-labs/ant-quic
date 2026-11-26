@@ -136,7 +136,18 @@ impl CidQueue {
         self.offset
     }
 
-    pub(crate) const LEN: usize = 5;
+    /// Return the number of unused (spare) remote CIDs currently queued beyond the active CID.
+    ///
+    /// Used by ADR-015 / ADR-021 speculative candidate probing to bound concurrent probe paths
+    /// (`min(MAX_CONCURRENT_PROBE_PATHS, rem_cids.spare_count())`) without reusing an active DCID.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn spare_count(&self) -> usize {
+        self.iter().count().saturating_sub(1)
+    }
+
+    /// Active Connection ID pool capacity (ADR-021: 1 active + 8 concurrent ADR-015 spray probes
+    /// + 2 standby/migration slots + 5 retirement headroom).
+    pub(crate) const LEN: usize = 16;
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -312,5 +323,39 @@ mod tests {
         assert!(q.next().is_none());
         assert_eq!(q.active(), initial_cid());
         assert_eq!(q.active_seq(), 0);
+    }
+
+    #[test]
+    fn cid_queue_len_16_and_spare_count() {
+        assert_eq!(CidQueue::LEN, 16);
+        assert_eq!(crate::LOC_CID_COUNT, 16);
+
+        let mut q = CidQueue::new(initial_cid());
+        assert_eq!(q.spare_count(), 0);
+
+        // Simulated <= 0.30.x peer issues LOC_CID_COUNT = 8 total CIDs (seq 0..8 -> 7 spare).
+        for seq in 1..8u64 {
+            q.insert(cid(seq, 0)).unwrap();
+        }
+        assert_eq!(q.spare_count(), 7);
+        // Outbound probe budget dynamically caps to min(MAX_CONCURRENT_PROBE_PATHS=8, spare_count).
+        assert_eq!(8usize.min(q.spare_count()), 7);
+
+        // Wave-4 peer issues 16 total CIDs (seq 0..16 -> 15 spare, unblocking N = 8 spray + headroom).
+        for seq in 8..CidQueue::LEN as u64 {
+            q.insert(cid(seq, 0)).unwrap();
+        }
+        assert_eq!(q.spare_count(), 15);
+        assert_eq!(8usize.min(q.spare_count()), 8);
+        assert_eq!(
+            q.insert(cid(CidQueue::LEN as u64, 0)),
+            Err(InsertError::ExceedsLimit)
+        );
+
+        // Consuming one CID lowers spare_count and opens one slot for replenishment.
+        q.next().unwrap();
+        assert_eq!(q.spare_count(), 14);
+        q.insert(cid(CidQueue::LEN as u64, 0)).unwrap();
+        assert_eq!(q.spare_count(), 15);
     }
 }
