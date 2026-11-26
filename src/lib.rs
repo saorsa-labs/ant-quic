@@ -145,6 +145,10 @@ pub mod connection_strategy;
 /// RFC 8305 Happy Eyeballs v2 for parallel IPv4/IPv6 connection racing
 pub mod happy_eyeballs;
 
+/// Stateless QUIC Retry policy for inbound connections
+pub mod inbound_retry;
+pub use inbound_retry::StatelessRetryPolicy;
+
 /// Standardized error handling patterns
 pub mod error_handling;
 
@@ -690,8 +694,8 @@ pub(crate) const MAX_STREAM_COUNT: u64 = 1 << 60;
 // Internal type re-exports for crate modules
 pub use cid_generator::RandomConnectionIdGenerator;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, EndpointConfig, MtuDiscoveryConfig, ServerConfig,
-    TransportConfig,
+    AckFrequencyConfig, AdaptiveKeepAlive, ClientConfig, EndpointConfig, KeepAlivePolicy,
+    MtuDiscoveryConfig, ServerConfig, TransportConfig,
 };
 
 // Post-Quantum Cryptography (PQC) re-exports - always available

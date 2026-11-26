@@ -340,6 +340,22 @@ pub struct NatConfig {
 
     /// Prefer RFC-compliant NAT traversal frame format
     pub prefer_rfc_nat_traversal: bool,
+
+    /// Stateless QUIC Retry policy for inbound connections (#374).
+    ///
+    /// Default [`crate::StatelessRetryPolicy::Disabled`]. Public relay and
+    /// bootstrap nodes can opt in so unvalidated source addresses must echo a
+    /// Retry token before the node spends ML-KEM-768 CPU or sends the ~7 KiB
+    /// PQC server flight.
+    pub stateless_retry: crate::StatelessRetryPolicy,
+
+    /// Keep-alive interval policy (#374).
+    ///
+    /// Default [`crate::KeepAlivePolicy::Fixed`] keeps the transport's flat
+    /// 15 s interval. [`crate::KeepAlivePolicy::path_adaptive`] uses 22 s on
+    /// paths that may cross IPv4 NAT/CGNAT and 55 s on native IPv6 or public
+    /// paths, each capped at 3/4 of the negotiated idle timeout.
+    pub keep_alive_policy: crate::KeepAlivePolicy,
 }
 
 /// Best-effort policy for router-assisted port mapping.
@@ -380,6 +396,8 @@ impl Default for NatConfig {
             relay_nodes: Vec::new(),
             max_concurrent_attempts: 3,
             prefer_rfc_nat_traversal: true,
+            stateless_retry: crate::StatelessRetryPolicy::Disabled,
+            keep_alive_policy: crate::KeepAlivePolicy::Fixed,
         }
     }
 }
@@ -564,6 +582,8 @@ impl P2pConfig {
             max_message_size: self.max_message_size,
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
             additional_bind_addrs: Vec::new(),
+            stateless_retry: self.nat.stateless_retry,
+            keep_alive_policy: self.nat.keep_alive_policy,
         }
     }
 
@@ -885,6 +905,26 @@ impl P2pConfigBuilder {
     pub fn relay_service_enabled(mut self, enabled: bool) -> Self {
         let mut nat = self.nat.unwrap_or_default();
         nat.enable_relay_service = enabled;
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Set the stateless QUIC Retry policy for inbound connections (#374).
+    ///
+    /// Default: [`crate::StatelessRetryPolicy::Disabled`].
+    pub fn stateless_retry(mut self, policy: crate::StatelessRetryPolicy) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.stateless_retry = policy;
+        self.nat = Some(nat);
+        self
+    }
+
+    /// Set the keep-alive interval policy (#374).
+    ///
+    /// Default: [`crate::KeepAlivePolicy::Fixed`].
+    pub fn keep_alive_policy(mut self, policy: crate::KeepAlivePolicy) -> Self {
+        let mut nat = self.nat.unwrap_or_default();
+        nat.keep_alive_policy = policy;
         self.nat = Some(nat);
         self
     }

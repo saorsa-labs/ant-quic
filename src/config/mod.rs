@@ -27,6 +27,12 @@ use crate::{
     token_v2::TokenKey,
 };
 
+mod keep_alive;
+pub use keep_alive::{
+    AdaptiveKeepAlive, DEFAULT_DIRECT_KEEP_ALIVE, DEFAULT_TRANSLATED_KEEP_ALIVE,
+    KeepAlivePathClass, KeepAlivePolicy, classify_keep_alive_path, effective_keep_alive_interval,
+};
+
 mod transport;
 pub use transport::{
     AckFrequencyConfig, IdleTimeout, MIN_VIRTUAL_PATH_MTU, MtuDiscoveryConfig, TransportConfig,

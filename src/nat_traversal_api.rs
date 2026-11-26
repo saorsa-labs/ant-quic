@@ -1814,6 +1814,8 @@ pub struct NatTraversalEndpoint {
     shared_relay_endpoint: Arc<std::sync::Mutex<Option<InnerEndpoint>>>,
     /// Whether the shared relay endpoint already has an accept loop attached.
     relay_accept_loop_started: Arc<std::sync::atomic::AtomicBool>,
+    /// #374: stateless Retry decisions and counters for the main accept loop.
+    inbound_retry: crate::inbound_retry::InboundRetryGate,
     /// #286: join handles of background connection workers (accept loops,
     /// shared-relay accept, and outgoing hole-punch attempts). `shutdown`
     /// aborts and joins them inside the bounded drain so no worker can retain
@@ -2101,6 +2103,21 @@ pub struct NatTraversalConfig {
     /// throughput should increase this. Default: 100.
     #[serde(default = "default_max_concurrent_uni_streams")]
     pub max_concurrent_uni_streams: u32,
+
+    /// Stateless QUIC Retry policy for inbound connections (#374).
+    ///
+    /// Default [`crate::StatelessRetryPolicy::Disabled`]. Public relay and
+    /// bootstrap nodes can set `UnderLoad` or `Always` so unvalidated source
+    /// addresses must echo a Retry token before the node spends ML-KEM-768
+    /// CPU or sends the ~7 KiB PQC server flight.
+    #[serde(default)]
+    pub stateless_retry: crate::StatelessRetryPolicy,
+
+    /// Keep-alive interval policy for this endpoint's connections (#374).
+    ///
+    /// Default [`crate::KeepAlivePolicy::Fixed`] (the transport's flat 15 s).
+    #[serde(default)]
+    pub keep_alive_policy: crate::KeepAlivePolicy,
 }
 
 fn default_max_message_size() -> usize {
@@ -2930,6 +2947,8 @@ impl Default for NatTraversalConfig {
             transport_registry: None, // Use direct UDP binding by default
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: crate::StatelessRetryPolicy::Disabled,
+            keep_alive_policy: crate::KeepAlivePolicy::Fixed,
         }
     }
 }
@@ -3264,6 +3283,7 @@ impl NatTraversalEndpoint {
             client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inbound_retry: crate::inbound_retry::InboundRetryGate::new(config.stateless_retry),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
@@ -3473,6 +3493,7 @@ impl NatTraversalEndpoint {
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
+            let inbound_retry_clone = endpoint.inbound_retry.clone();
 
             let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
@@ -3488,6 +3509,7 @@ impl NatTraversalEndpoint {
                     traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
+                    inbound_retry_clone,
                 )
                 .await;
             });
@@ -3784,6 +3806,7 @@ impl NatTraversalEndpoint {
             client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inbound_retry: crate::inbound_retry::InboundRetryGate::new(config.stateless_retry),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
             relay_server,
             relay_requests_refused_disabled: Arc::new(AtomicU64::new(0)),
@@ -3993,6 +4016,7 @@ impl NatTraversalEndpoint {
             let traversal_event_notify_clone = endpoint.traversal_event_notify.clone();
             let incoming_notify_clone = endpoint.incoming_notify.clone();
             let pending_accepts_clone = endpoint.pending_accepts.clone();
+            let inbound_retry_clone = endpoint.inbound_retry.clone();
 
             let accept_worker_handle = tokio::spawn(async move {
                 Self::accept_connections(
@@ -4008,6 +4032,7 @@ impl NatTraversalEndpoint {
                     traversal_event_notify_clone,
                     incoming_notify_clone,
                     pending_accepts_clone,
+                    inbound_retry_clone,
                 )
                 .await;
             });
@@ -4509,6 +4534,13 @@ impl NatTraversalEndpoint {
     /// `false` when relay serving is turned off (ADR-019).
     pub(crate) fn relay_server_present(&self) -> bool {
         self.relay_server.is_some()
+    }
+
+    /// #374: count of stateless QUIC Retry packets this endpoint's accept
+    /// loop sent to unvalidated source addresses (see
+    /// [`NatTraversalConfig::stateless_retry`]).
+    pub fn stateless_retries_sent(&self) -> u64 {
+        self.inbound_retry.retries_sent()
     }
 
     /// ADR-019: count of relay requests this node refused with
@@ -6454,8 +6486,9 @@ impl NatTraversalEndpoint {
         transport_config.receive_window(crate::VarInt::from_u32(16 * 1024 * 1024));
 
         // QUIC keep-alive is a transport-level concern. Do not couple it to NAT
-        // traversal retry cadence; use the transport default unless/until we add
-        // an explicit transport-level override to NatTraversalConfig/P2pConfig.
+        // traversal retry cadence: keep the transport's default interval and
+        // apply only the configured per-path policy (#374).
+        transport_config.keep_alive_policy(config.keep_alive_policy);
         let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
             concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
         };
@@ -6864,6 +6897,7 @@ impl NatTraversalEndpoint {
         let traversal_event_notify_clone = self.traversal_event_notify.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
         let pending_accepts_clone = self.pending_accepts.clone();
+        let inbound_retry_clone = self.inbound_retry.clone();
 
         let accept_worker_handle = tokio::spawn(async move {
             Self::accept_connections(
@@ -6879,6 +6913,7 @@ impl NatTraversalEndpoint {
                 traversal_event_notify_clone,
                 incoming_notify_clone,
                 pending_accepts_clone,
+                inbound_retry_clone,
             )
             .await;
         });
@@ -6903,10 +6938,35 @@ impl NatTraversalEndpoint {
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
         pending_accepts: Arc<ParkingMutex<std::collections::VecDeque<PendingAccept>>>,
+        inbound_retry: crate::inbound_retry::InboundRetryGate,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
                 Some(connecting) => {
+                    // #374: answer an unvalidated source with a stateless
+                    // Retry (~100 B, no ML-KEM work) when the policy says so.
+                    // The client's second Initial carries the Retry token and
+                    // is accepted below.
+                    if inbound_retry.should_retry(
+                        connecting.remote_address_validated(),
+                        connecting.may_retry(),
+                    ) {
+                        let remote = connecting.remote_address();
+                        match connecting.retry() {
+                            Ok(()) => {
+                                inbound_retry.record_retry();
+                                debug!("Sent stateless Retry to unvalidated source {}", remote);
+                            }
+                            Err(error) => {
+                                // Retry is no longer possible: drop the
+                                // attempt without spending handshake work.
+                                debug!("Stateless Retry to {} failed; ignoring attempt", remote);
+                                error.into_incoming().ignore();
+                            }
+                        }
+                        continue;
+                    }
+                    let pending_handshake = inbound_retry.begin_handshake();
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
                     let connection_lifecycle = connection_lifecycle.clone();
@@ -6921,7 +6981,9 @@ impl NatTraversalEndpoint {
                     tokio::spawn(async move {
                         #[cfg(all(test, feature = "network-discovery"))]
                         let registration_gate = take_registration_gate_for_pause(shutdown.as_ref());
-                        match connecting.await {
+                        let handshake = connecting.await;
+                        drop(pending_handshake);
+                        match handshake {
                             Ok(connection) => {
                                 info!("Accepted connection from {}", connection.remote_address());
                                 #[cfg(all(test, feature = "network-discovery"))]
@@ -17521,6 +17583,155 @@ mod tests {
             .expect("loopback handshake must not hang")
             .expect("loopback handshake must succeed");
         (server, client, conn)
+    }
+
+    /// #374: dial a loopback server built with `server_config` from a default
+    /// client, and return the server's Retry count once the handshake is done,
+    /// plus the client-side connection.
+    async fn loopback_handshake_with_server(
+        server_config: NatTraversalConfig,
+    ) -> (
+        u64,
+        NatTraversalEndpoint,
+        NatTraversalEndpoint,
+        InnerConnection,
+    ) {
+        let server = NatTraversalEndpoint::new(server_config, None, None)
+            .await
+            .expect("server endpoint binds");
+        let client = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+            .await
+            .expect("client endpoint binds");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound to a local address");
+        let connecting = client
+            .get_endpoint()
+            .expect("client endpoint present")
+            .connect(server_addr, "peer")
+            .expect("initiate client connection");
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+            .await
+            .expect("loopback handshake must not hang")
+            .expect("loopback handshake must succeed");
+        (server.stateless_retries_sent(), server, client, conn)
+    }
+
+    #[tokio::test]
+    async fn stateless_retry_disabled_sends_no_retry() {
+        let (retries, server, client, conn) =
+            loopback_handshake_with_server(loopback_shutdown_test_config()).await;
+        assert_eq!(retries, 0, "default policy must not send Retry");
+        assert_eq!(
+            client.config.stateless_retry,
+            crate::StatelessRetryPolicy::Disabled
+        );
+        shutdown_nat_test_endpoints(server, client, conn).await;
+    }
+
+    #[tokio::test]
+    async fn stateless_retry_always_completes_handshake_after_one_retry() {
+        let mut config = loopback_shutdown_test_config();
+        config.stateless_retry = crate::StatelessRetryPolicy::Always;
+        let (retries, server, client, conn) = loopback_handshake_with_server(config).await;
+        // The pure-PQC ClientHello (ML-KEM-768 key share) spans two Initial
+        // datagrams. Each tokenless datagram is answered with its own Retry
+        // (same original DCID); the client acts on the first and drops the
+        // rest (RFC 9000 §17.2.5.2), so the handshake still takes exactly one
+        // Retry round trip.
+        assert!(
+            (1..=2).contains(&retries),
+            "one Retry per tokenless Initial datagram of the first flight, got {retries}"
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "connection is live after Retry"
+        );
+        shutdown_nat_test_endpoints(server, client, conn).await;
+    }
+
+    #[tokio::test]
+    async fn stateless_retry_under_load_below_threshold_sends_no_retry() {
+        let mut config = loopback_shutdown_test_config();
+        config.stateless_retry = crate::StatelessRetryPolicy::UnderLoad {
+            pending_handshakes: 1,
+        };
+        // No other handshake is in flight, so the first dial is below the
+        // threshold and pays no extra round trip.
+        let (retries, server, client, conn) = loopback_handshake_with_server(config).await;
+        assert_eq!(retries, 0);
+        shutdown_nat_test_endpoints(server, client, conn).await;
+    }
+
+    #[test]
+    fn build_nat_transport_config_carries_keep_alive_policy() {
+        let default_transport =
+            NatTraversalEndpoint::build_nat_transport_config(&NatTraversalConfig::default());
+        assert_eq!(
+            default_transport.keep_alive_policy,
+            crate::KeepAlivePolicy::Fixed
+        );
+        let config = NatTraversalConfig {
+            keep_alive_policy: crate::KeepAlivePolicy::path_adaptive(),
+            ..Default::default()
+        };
+        let transport = NatTraversalEndpoint::build_nat_transport_config(&config);
+        assert_eq!(
+            transport.keep_alive_policy,
+            crate::KeepAlivePolicy::path_adaptive()
+        );
+        assert_eq!(
+            transport.keep_alive_interval,
+            TransportConfig::default().keep_alive_interval,
+            "the policy refines, not replaces, the configured interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_adaptive_keep_alive_applies_to_live_connection() {
+        let (server, client, conn) = loopback_quic_connection().await;
+        assert_eq!(
+            conn.keep_alive_interval(),
+            TransportConfig::default().keep_alive_interval,
+            "default policy keeps the flat interval"
+        );
+        shutdown_nat_test_endpoints(server, client, conn).await;
+
+        let adaptive = || NatTraversalConfig {
+            keep_alive_policy: crate::KeepAlivePolicy::path_adaptive(),
+            ..loopback_shutdown_test_config()
+        };
+        let server = NatTraversalEndpoint::new(adaptive(), None, None)
+            .await
+            .expect("server endpoint binds");
+        let client = NatTraversalEndpoint::new(adaptive(), None, None)
+            .await
+            .expect("client endpoint binds");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound to a local address");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .get_endpoint()
+                .expect("client endpoint present")
+                .connect(server_addr, "peer")
+                .expect("initiate client connection"),
+        )
+        .await
+        .expect("loopback handshake must not hang")
+        .expect("loopback handshake must succeed");
+        // A loopback peer is a direct path: 55 s, capped at 3/4 of the
+        // 30 s idle timeout this config negotiates.
+        assert_eq!(
+            conn.keep_alive_interval(),
+            Some(std::time::Duration::from_millis(22_500))
+        );
+        shutdown_nat_test_endpoints(server, client, conn).await;
     }
 
     /// Loopback-only config for the #305 shutdown socket-release tests.

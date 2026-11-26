@@ -1668,6 +1668,10 @@ pub struct P2pEndpoint {
     #[cfg(test)]
     force_relay_stage: Arc<std::sync::atomic::AtomicBool>,
 
+    /// #374: Happy Eyeballs v3 memory of a broken IPv6 path on the current
+    /// network, shared by every direct dual-stack race of this endpoint.
+    family_health: Arc<happy_eyeballs::FamilyHealthCache>,
+
     /// Internal NAT traversal endpoint
     inner: Arc<NatTraversalEndpoint>,
 
@@ -4280,6 +4284,7 @@ impl P2pEndpoint {
             late_direct_gate: Arc::default(),
             #[cfg(test)]
             force_relay_stage: Arc::default(),
+            family_health: Arc::default(),
             inner: inner_arc,
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -5335,10 +5340,12 @@ impl P2pEndpoint {
             }
         }
 
+        let (he_config, fingerprint) = self.happy_eyeballs_config_for(&direct_candidate_addrs);
         let endpoint = self.clone();
         self.race_dual_stack_and_finalize(
             &direct_candidate_addrs,
-            &HappyEyeballsConfig::default(),
+            &he_config,
+            fingerprint,
             stage_budget,
             peer_id,
             move |addr| {
@@ -5355,6 +5362,49 @@ impl P2pEndpoint {
         .await
     }
 
+    /// #374: the Happy Eyeballs configuration for a direct race over
+    /// `candidates`, adjusted by the per-network family-health cache.
+    ///
+    /// Only dual-stack candidate sets consult the cache (and resolve the
+    /// network fingerprint); the fingerprint is returned so the race outcome
+    /// is recorded against the same network.
+    fn happy_eyeballs_config_for(
+        &self,
+        candidates: &[SocketAddr],
+    ) -> (
+        HappyEyeballsConfig,
+        Option<happy_eyeballs::NetworkFingerprint>,
+    ) {
+        let base = HappyEyeballsConfig::default();
+        if !happy_eyeballs::is_dual_stack(candidates) {
+            return (base, None);
+        }
+        let fingerprint = happy_eyeballs::NetworkFingerprint::current();
+        let config = self
+            .family_health
+            .config_for(fingerprint, &base, std::time::Instant::now());
+        (config, Some(fingerprint))
+    }
+
+    /// #374: feed one direct race's outcome to the family-health cache.
+    fn record_happy_eyeballs_race(
+        &self,
+        fingerprint: Option<happy_eyeballs::NetworkFingerprint>,
+        candidates: &[SocketAddr],
+        config: &HappyEyeballsConfig,
+        winner: Option<SocketAddr>,
+    ) {
+        if let Some(fingerprint) = fingerprint {
+            self.family_health.record_race(
+                fingerprint,
+                candidates,
+                config,
+                winner,
+                std::time::Instant::now(),
+            );
+        }
+    }
+
     /// Race QUIC handshakes only (RFC 8305), then register ONLY the winner.
     ///
     /// A losing attempt never reaches `finalize_direct_connection`, so it can
@@ -5365,6 +5415,7 @@ impl P2pEndpoint {
         &self,
         candidates: &[SocketAddr],
         he_config: &HappyEyeballsConfig,
+        fingerprint: Option<happy_eyeballs::NetworkFingerprint>,
         stage_budget: Duration,
         peer_id: Option<PeerId>,
         dial: F,
@@ -5373,12 +5424,21 @@ impl P2pEndpoint {
         F: Fn(SocketAddr) -> Fut,
         Fut: std::future::Future<Output = Result<PendingDirectConnection, String>> + Send + 'static,
     {
-        match timeout(
+        let race = timeout(
             stage_budget,
             happy_eyeballs::race_connect(candidates, he_config, dial),
         )
-        .await
-        {
+        .await;
+        self.record_happy_eyeballs_race(
+            fingerprint,
+            candidates,
+            he_config,
+            match &race {
+                Ok(Ok((_, winning_addr))) => Some(*winning_addr),
+                _ => None,
+            },
+        );
+        match race {
             Ok(Ok((pending, winning_addr))) => {
                 info!(
                     "Dual-stack Happy Eyeballs connected to {} ({})",
@@ -6466,7 +6526,8 @@ impl P2pEndpoint {
                         }
                     }
 
-                    let he_config = HappyEyeballsConfig::default();
+                    let (he_config, he_fingerprint) =
+                        self.happy_eyeballs_config_for(&direct_addresses);
                     // A dial that cannot hole-punch (address-only, synthetic
                     // id, or no coordinator) gains nothing from the short
                     // adaptive cutoff: it would only turn a slow handshake
@@ -6556,6 +6617,15 @@ impl P2pEndpoint {
                     // Borrow the race: the stage timer must not drop its owned
                     // Connecting attempts when punching can start (#304).
                     let he_result = timeout(direct_timeout, &mut direct_race).await;
+                    self.record_happy_eyeballs_race(
+                        he_fingerprint,
+                        &direct_addresses,
+                        &he_config,
+                        match &he_result {
+                            Ok(Ok((_, winning_addr))) => Some(*winning_addr),
+                            _ => None,
+                        },
+                    );
 
                     match he_result {
                         Ok(Ok((connection, winning_addr))) => {
@@ -13527,6 +13597,7 @@ impl Clone for P2pEndpoint {
             late_direct_gate: Arc::clone(&self.late_direct_gate),
             #[cfg(test)]
             force_relay_stage: Arc::clone(&self.force_relay_stage),
+            family_health: Arc::clone(&self.family_health),
             inner: Arc::clone(&self.inner),
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),
@@ -18268,6 +18339,7 @@ mod tests {
                 .race_dual_stack_and_finalize(
                     &[v6, v4],
                     &he_config,
+                    None,
                     Duration::from_secs(20),
                     Some(b_id),
                     move |addr| {

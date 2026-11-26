@@ -7,6 +7,7 @@
 
 use std::{fmt, sync::Arc};
 
+use super::keep_alive::KeepAlivePolicy;
 use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
 /// Minimum allowed post-handshake UDP payload size for a relayed virtual path
@@ -48,6 +49,7 @@ pub struct TransportConfig {
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
+    pub(crate) keep_alive_policy: KeepAlivePolicy,
     pub(crate) crypto_buffer_size: usize,
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
@@ -324,6 +326,19 @@ impl TransportConfig {
         self
     }
 
+    /// How each connection picks its keep-alive interval
+    ///
+    /// [`KeepAlivePolicy::Fixed`] (the default) uses
+    /// [`keep_alive_interval()`](Self::keep_alive_interval) on every path.
+    /// [`KeepAlivePolicy::PathAdaptive`] picks a per-path interval from what the
+    /// connection observes (see [`crate::config::classify_keep_alive_path`]),
+    /// capped at 3/4 of the negotiated idle timeout. Keep-alives stay disabled
+    /// while `keep_alive_interval` is `None`.
+    pub fn keep_alive_policy(&mut self, value: KeepAlivePolicy) -> &mut Self {
+        self.keep_alive_policy = value;
+        self
+    }
+
     /// Maximum quantity of out-of-order crypto layer data to buffer
     pub fn crypto_buffer_size(&mut self, value: usize) -> &mut Self {
         self.crypto_buffer_size = value;
@@ -559,6 +574,7 @@ impl Default for TransportConfig {
             // processing between quote and chunk storage phases). Must be less
             // than max_idle_timeout (30s).
             keep_alive_interval: Some(Duration::from_secs(15)),
+            keep_alive_policy: KeepAlivePolicy::Fixed,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
@@ -602,6 +618,7 @@ impl fmt::Debug for TransportConfig {
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
+            keep_alive_policy,
             crypto_buffer_size,
             allow_spin,
             datagram_receive_buffer_size,
@@ -640,6 +657,7 @@ impl fmt::Debug for TransportConfig {
                 persistent_congestion_threshold,
             )
             .field("keep_alive_interval", keep_alive_interval)
+            .field("keep_alive_policy", keep_alive_policy)
             .field("crypto_buffer_size", crypto_buffer_size)
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)

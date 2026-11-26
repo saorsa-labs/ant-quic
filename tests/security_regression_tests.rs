@@ -42,6 +42,8 @@ fn test_peer_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     }
 }
@@ -68,6 +70,8 @@ fn test_server_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     }
 }
@@ -170,6 +174,8 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     };
 
@@ -196,6 +202,8 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     };
 
@@ -303,6 +311,8 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     };
 
@@ -334,6 +344,8 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     };
 
@@ -368,6 +380,8 @@ async fn test_input_sanitization() {
         transport_registry: None,
         max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         max_concurrent_uni_streams: 100,
+        stateless_retry: Default::default(),
+        keep_alive_policy: Default::default(),
         additional_bind_addrs: Vec::new(),
     };
 
@@ -441,6 +455,8 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: Default::default(),
+            keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
         };
 
@@ -478,6 +494,8 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: ant_quic::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_uni_streams: 100,
+            stateless_retry: Default::default(),
+            keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
         };
 
