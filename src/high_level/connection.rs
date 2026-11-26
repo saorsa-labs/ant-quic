@@ -833,6 +833,20 @@ impl Connection {
             .max_size()
     }
 
+    /// Subscribe a shared virtual-path MTU atomic to synchronous outer MTU
+    /// updates from this connection (ADR-021 §1.4).
+    pub(crate) fn subscribe_virtual_path_mtu(
+        &self,
+        target: Arc<std::sync::atomic::AtomicU16>,
+        encapsulation_overhead: usize,
+    ) {
+        self.0
+            .state
+            .lock("subscribe_virtual_path_mtu")
+            .inner
+            .subscribe_virtual_path_mtu(target, encapsulation_overhead);
+    }
+
     /// Bytes available in the outgoing datagram buffer
     ///
     /// When greater than zero, calling [`send_datagram()`](Self::send_datagram) with a datagram of

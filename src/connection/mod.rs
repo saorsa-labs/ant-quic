@@ -321,6 +321,11 @@ pub struct Connection {
     /// Active traffic stays on `self.path` until the matching `PATH_RESPONSE`
     /// arrives on `(remote, local_slot)`.
     pending_slot_validation: Option<PendingSlotValidation>,
+    /// ADR-021 §1.4: weak observers notified synchronously whenever this
+    /// connection's effective datagram MTU changes (used by outer MASQUE relay
+    /// sessions to publish inner virtual-path MTU updates before inner
+    /// `poll_transmit` builds its next packet).
+    virtual_mtu_observers: Vec<(std::sync::Weak<AtomicU16>, usize)>,
 }
 
 /// Pending path validation for a local-slot mismatch (ADR-021 §1.3).
@@ -386,6 +391,7 @@ impl Connection {
                 drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
             }
         }
+        self.notify_virtual_mtu_observers();
     }
 
     /// Apply a virtual-path MTU ceiling directly (ADR-021 §1.4).
@@ -399,6 +405,47 @@ impl Connection {
                 drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
             }
         }
+        self.notify_virtual_mtu_observers();
+    }
+
+    /// Register a shared virtual-path MTU atomic to be updated synchronously
+    /// whenever this outer connection's effective datagram MTU changes
+    /// (ADR-021 §1.4). Dead observers are pruned automatically.
+    pub(crate) fn subscribe_virtual_path_mtu(
+        &mut self,
+        target: Arc<AtomicU16>,
+        encapsulation_overhead: usize,
+    ) {
+        if let Some(vp_mtu) = crate::masque::relay_socket::compute_inner_virtual_path_mtu(
+            self.datagrams().max_size(),
+            encapsulation_overhead,
+        ) {
+            target.store(vp_mtu, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.virtual_mtu_observers
+            .push((Arc::downgrade(&target), encapsulation_overhead));
+    }
+
+    /// Synchronously publish any updated inner virtual-path MTU derived from
+    /// this connection's current `datagrams().max_size()` to all live observers.
+    fn notify_virtual_mtu_observers(&mut self) {
+        if self.virtual_mtu_observers.is_empty() {
+            return;
+        }
+        let outer_max_dgram = self.datagrams().max_size();
+        self.virtual_mtu_observers
+            .retain(|(weak, encapsulation_overhead)| {
+                let Some(target) = weak.upgrade() else {
+                    return false;
+                };
+                if let Some(vp_mtu) = crate::masque::relay_socket::compute_inner_virtual_path_mtu(
+                    outer_max_dgram,
+                    *encapsulation_overhead,
+                ) {
+                    target.store(vp_mtu, std::sync::atomic::Ordering::Relaxed);
+                }
+                true
+            });
     }
 
     /// Poll the active path's dynamic virtual-path MTU handle for mid-session
@@ -406,10 +453,17 @@ impl Connection {
     /// queued datagrams immediately.
     fn refresh_virtual_mtu(&mut self) {
         let peer_max = self.peer_max_udp_payload_size_opt();
-        if self.path.refresh_virtual_mtu(peer_max) == Some(true) {
-            if let Some(max_datagram_size) = self.datagrams().max_size() {
-                drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+        if let Some(shrunk) = self.path.refresh_virtual_mtu(peer_max) {
+            if shrunk {
+                if let Some(max_datagram_size) = self.datagrams().max_size() {
+                    drop_oversized_datagrams(
+                        &mut self.datagrams,
+                        &mut self.events,
+                        max_datagram_size,
+                    );
+                }
             }
+            self.notify_virtual_mtu_observers();
         }
     }
 
@@ -556,6 +610,7 @@ impl Connection {
             delay_new_token_until_binding: false,
             pin_to_physical_slot: false,
             pending_slot_validation: None,
+            virtual_mtu_observers: Vec::new(),
         };
 
         // Trace connection creation
@@ -1989,6 +2044,7 @@ impl Connection {
                         // declared lost (issue #230).
                         self.path = prev;
                         self.path.restart_in_flight();
+                        self.notify_virtual_mtu_observers();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -2344,6 +2400,7 @@ impl Connection {
                     self.path
                         .congestion
                         .on_mtu_update(self.path.mtud.current_mtu());
+                    self.notify_virtual_mtu_observers();
                 }
 
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
@@ -2622,6 +2679,7 @@ impl Connection {
                         max_datagram_size,
                     );
                 }
+                self.notify_virtual_mtu_observers();
             }
 
             // Don't apply congestion penalty for lost ack-only packets
@@ -4306,6 +4364,7 @@ impl Connection {
         if let Some(max_datagram_size) = self.datagrams().max_size() {
             drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
         }
+        self.notify_virtual_mtu_observers();
 
         self.update_rem_cid();
         self.spin = false;
@@ -5016,6 +5075,7 @@ impl Connection {
         self.path.mtud.on_peer_max_udp_payload_size_received(
             u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX),
         );
+        self.notify_virtual_mtu_observers();
     }
 
     /// Negotiate NAT traversal capability between local and peer configurations

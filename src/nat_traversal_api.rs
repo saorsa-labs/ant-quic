@@ -3635,15 +3635,11 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         abstract_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
     ) -> Result<Self, NatTraversalError> {
-        Self::new_with_socket_inner(
-            config,
-            event_callback,
-            token_store,
-            None,
-            Some(abstract_socket),
-            None,
-        )
-        .await
+        let mux = Arc::new(
+            crate::high_level::MultiplexedUdpSocket::from_abstract_socket(abstract_socket)
+                .map_err(|e| NatTraversalError::NetworkError(e.to_string()))?,
+        );
+        Self::new_with_multiplexed_socket(config, event_callback, token_store, mux).await
     }
 
     /// Create a NAT traversal endpoint backed by a pre-built
@@ -6631,14 +6627,19 @@ impl NatTraversalEndpoint {
 
         // Get UDP socket for Quinn endpoint
         // Priority: 1) quinn_socket parameter, 2) transport registry address, 3) create new
-        let std_socket = if let Some(socket) = quinn_socket {
+        let primary_slot = if let Some(socket) = quinn_socket {
             // Use pre-bound socket (preferred for socket sharing with transport registry)
             let socket_addr = socket
                 .local_addr()
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             info!("Using pre-bound UDP socket at {}", socket_addr);
-            socket
+            crate::high_level::PhysicalBindSlot::from_std(crate::SocketSlotId::PRIMARY, socket)
+                .map_err(|e| {
+                    NatTraversalError::NetworkError(format!(
+                        "Failed to wrap primary UDP socket slot: {e}"
+                    ))
+                })?
         } else if let Some(registry_addr) = transport_registry.get_udp_local_addr() {
             // Transport registry has UDP - bind new socket on same interface
             // Note: We can't share the registry's socket directly because:
@@ -6653,9 +6654,12 @@ impl NatTraversalEndpoint {
             let socket = UdpSocket::bind(new_addr).await.map_err(|e| {
                 NatTraversalError::NetworkError(format!("Failed to bind UDP socket: {e}"))
             })?;
-            socket.into_std().map_err(|e| {
-                NatTraversalError::NetworkError(format!("Failed to convert socket: {e}"))
-            })?
+            crate::high_level::PhysicalBindSlot::from_tokio(crate::SocketSlotId::PRIMARY, socket)
+                .map_err(|e| {
+                    NatTraversalError::NetworkError(format!(
+                        "Failed to wrap primary UDP socket slot: {e}"
+                    ))
+                })?
         } else {
             // No transport registry UDP - create new socket
             // Use config.bind_addr if provided, otherwise random port
@@ -6669,9 +6673,12 @@ impl NatTraversalEndpoint {
             let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
                 NatTraversalError::NetworkError(format!("Failed to bind UDP socket: {e}"))
             })?;
-            socket.into_std().map_err(|e| {
-                NatTraversalError::NetworkError(format!("Failed to convert socket: {e}"))
-            })?
+            crate::high_level::PhysicalBindSlot::from_tokio(crate::SocketSlotId::PRIMARY, socket)
+                .map_err(|e| {
+                    NatTraversalError::NetworkError(format!(
+                        "Failed to wrap primary UDP socket slot: {e}"
+                    ))
+                })?
         };
 
         // Create QUIC endpoint backed by MultiplexedUdpSocket (ADR-021).
@@ -6681,13 +6688,6 @@ impl NatTraversalEndpoint {
 
         let server_config_for_relay = server_config.clone();
 
-        let primary_slot =
-            crate::high_level::PhysicalBindSlot::from_std(crate::SocketSlotId::PRIMARY, std_socket)
-                .map_err(|e| {
-                    NatTraversalError::NetworkError(format!(
-                        "Failed to wrap primary UDP socket slot: {e}"
-                    ))
-                })?;
         let (multiplexed, extra_bound_addrs) =
             Self::build_multiplexed_socket(primary_slot, &config.extra_bind_slots)?;
         let abs_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket> =
@@ -7931,6 +7931,12 @@ impl NatTraversalEndpoint {
     /// Receive a peer address update originating from an ADD_ADDRESS frame.
     pub async fn recv_peer_address_update(&self) -> Option<(SocketAddr, SocketAddr)> {
         self.peer_address_update_rx.lock().await.recv().await
+    }
+
+    /// Return whether this endpoint owns a unified `MultiplexedUdpSocket`.
+    #[cfg(test)]
+    pub(crate) fn has_multiplexed_socket(&self) -> bool {
+        self.multiplexed_socket.read().is_some()
     }
 
     /// Resolve a potentially synthetic virtual ULA remote address back to its

@@ -1131,3 +1131,387 @@ async fn unified_p2p_endpoint_masque_relay_end_to_end_and_clean_shutdown() {
     relay_accept.abort();
     relay.try_shutdown().await.expect("R clean shutdown");
 }
+
+#[test]
+fn outer_connection_mtu_shrink_publishes_synchronously_before_inner_poll_transmit() {
+    let mut outer_server_transport = TransportConfig::default();
+    outer_server_transport.datagram_receive_buffer_size(Some(65_536));
+    outer_server_transport.datagram_send_buffer_size(65_536);
+    outer_server_transport.initial_mtu(1400);
+    let mut outer_client_transport = TransportConfig::default();
+    outer_client_transport.datagram_receive_buffer_size(Some(65_536));
+    outer_client_transport.datagram_send_buffer_size(65_536);
+    outer_client_transport.initial_mtu(1400);
+    let (mut outer_client, _outer_server, _outer_now) = establish_slot_pair(
+        outer_server_transport,
+        outer_client_transport,
+        SocketSlotId::PRIMARY,
+    );
+
+    let mut inner_server_transport = TransportConfig::default();
+    inner_server_transport.datagram_receive_buffer_size(Some(65_536));
+    inner_server_transport.datagram_send_buffer_size(65_536);
+    let mut inner_client_transport = TransportConfig::default();
+    inner_client_transport.datagram_receive_buffer_size(Some(65_536));
+    inner_client_transport.datagram_send_buffer_size(65_536);
+    let (mut inner_client, _inner_server, inner_now) = establish_slot_pair(
+        inner_server_transport,
+        inner_client_transport,
+        SocketSlotId::VIRTUAL,
+    );
+
+    // Subscribe shared virtual MTU atomic directly to the outer QUIC connection.
+    let shared_vp_mtu = Arc::new(AtomicU16::new(0));
+    outer_client
+        .conn_mut()
+        .subscribe_virtual_path_mtu(Arc::clone(&shared_vp_mtu), 2);
+    let initial_vp_mtu = shared_vp_mtu.load(Ordering::Relaxed);
+    assert!(
+        initial_vp_mtu >= 1200,
+        "expected initial outer-derived virtual MTU >= 1200, got {initial_vp_mtu}"
+    );
+    inner_client
+        .conn_mut()
+        .set_virtual_path_mtu_hint(Some(Arc::clone(&shared_vp_mtu)));
+    assert_eq!(inner_client.conn().path_mtu(), initial_vp_mtu);
+
+    // Queue an inner datagram near the initial ceiling (1100 B).
+    inner_client
+        .conn_mut()
+        .datagrams()
+        .send(Bytes::from(vec![0x42u8; 1100]), true)
+        .expect("1100 B datagram fits at initial outer-derived virtual MTU");
+
+    // Trigger a real outer MTU shrink (1400 -> 1020) with ZERO intervening
+    // send_virtual or ingress calls. The outer connection must publish into
+    // `shared_vp_mtu` synchronously.
+    outer_client.conn_mut().apply_virtual_path_mtu(1020);
+    let shrunk_vp_mtu = shared_vp_mtu.load(Ordering::Relaxed);
+    assert!(
+        (900..1020).contains(&shrunk_vp_mtu),
+        "outer shrink must synchronously update shared virtual MTU into [900, 1020), got {shrunk_vp_mtu}"
+    );
+
+    // Inner connection's VERY FIRST poll_transmit observes the shrunk outer MTU
+    // BEFORE building any packet and drops the oversized 1100 B queued datagram.
+    let mut buf = Vec::with_capacity(4096);
+    let first_tx = inner_client
+        .conn_mut()
+        .poll_transmit(inner_now, 1, &mut buf);
+    assert!(
+        first_tx.is_none(),
+        "first inner poll_transmit after real outer shrink must drop oversized datagram rather than emit > shrunk MTU"
+    );
+    assert_eq!(inner_client.conn().path_mtu(), shrunk_vp_mtu);
+    assert!(inner_client.conn().datagrams.outgoing.is_empty());
+
+    // Smaller datagram fits within the synchronously-updated ceiling.
+    inner_client
+        .conn_mut()
+        .datagrams()
+        .send(Bytes::from(vec![0x99u8; 700]), true)
+        .expect("700 B datagram fits at shrunk virtual MTU");
+    buf.clear();
+    let tx = inner_client
+        .conn_mut()
+        .poll_transmit(inner_now, 1, &mut buf)
+        .expect("700 B datagram transmits cleanly");
+    assert!(
+        tx.size <= usize::from(shrunk_vp_mtu),
+        "1-RTT packet size {} exceeded shrunk outer-derived virtual MTU {}",
+        tx.size,
+        shrunk_vp_mtu
+    );
+}
+
+#[tokio::test]
+async fn virtual_route_idle_reaping_and_active_route_preservation() {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind primary");
+    let primary = PhysicalBindSlot::from_std(SocketSlotId::PRIMARY, std_sock).unwrap();
+    let mux = Arc::new(MultiplexedUdpSocket::new(vec![primary]).unwrap());
+    mux.set_virtual_route_idle_timeout(Duration::from_millis(60));
+
+    let relay_addr: SocketAddr = "198.51.100.11:443".parse().unwrap();
+    let public_addr: SocketAddr = "203.0.113.51:40001".parse().unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundRelayPacket>(8);
+    let handle = mux
+        .attach_virtual_channel(relay_addr, public_addr, tx, 1280)
+        .expect("attach virtual channel");
+
+    // Fill all MAX_VIRTUAL_ROUTES (4096) slots.
+    let mut first_active_peer = None;
+    let mut first_active_synth = None;
+    for i in 0..MAX_VIRTUAL_ROUTES {
+        let ip = Ipv4Addr::new(198, 18, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8);
+        let addr = SocketAddr::new(IpAddr::V4(ip), 5000 + (i % 1000) as u16);
+        let synth = mux
+            .register_virtual_route(handle.relay_slot, addr)
+            .expect("within MAX_VIRTUAL_ROUTES");
+        if i == 0 {
+            first_active_peer = Some(addr);
+            first_active_synth = Some(synth);
+        }
+    }
+    let active_peer = first_active_peer.unwrap();
+    let active_synth = first_active_synth.unwrap();
+
+    // While all 4096 entries are fresh, a 4097th peer must be rejected.
+    let fresh_overflow: SocketAddr = "198.19.1.1:9001".parse().unwrap();
+    let err = mux
+        .register_virtual_route(handle.relay_slot, fresh_overflow)
+        .expect_err("fresh table at cap must reject overflow");
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+    assert_eq!(
+        mux.stats()
+            .virtual_route_cap_rejected
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    // Wait half the idle window, keep `active_peer` fresh via activity, then wait
+    // past the idle timeout for the remaining 4095 untouched routes.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let refreshed = mux
+        .register_virtual_route(handle.relay_slot, active_peer)
+        .expect("re-touch active peer");
+    assert_eq!(refreshed, active_synth);
+    tokio::time::sleep(Duration::from_millis(35)).await;
+
+    // Now the 4095 idle entries are >= 75 ms old (>= 60 ms timeout) while
+    // `active_peer` is only ~35 ms old (< 60 ms timeout). New peer allocation
+    // must succeed by reaping idle routes without evicting `active_peer`!
+    let new_synth = mux
+        .register_virtual_route(handle.relay_slot, fresh_overflow)
+        .expect("reaping idle routes must admit new peer");
+    assert_eq!(mux.resolve_virtual_target(new_synth), Some(fresh_overflow));
+    assert_eq!(
+        mux.resolve_virtual_target(active_synth),
+        Some(active_peer),
+        "recently active route must not be evicted when reaping idle routes"
+    );
+
+    // Explicit cleanup removes the route cleanly.
+    assert!(mux.remove_virtual_route(active_synth));
+    assert_eq!(mux.resolve_virtual_target(active_synth), None);
+}
+
+#[tokio::test]
+async fn abstract_socket_wrapper_preserves_relay_plane_and_nat_endpoint() {
+    use crate::high_level::runtime::dual_stack::DualStackSocket;
+    use crate::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint};
+
+    let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind v4");
+    let ds = Arc::new(DualStackSocket::new(Some(v4), None).expect("dual stack"));
+    let mux = Arc::new(
+        MultiplexedUdpSocket::from_abstract_socket(Arc::clone(&ds) as _)
+            .expect("wrap custom AsyncUdpSocket in MultiplexedUdpSocket"),
+    );
+
+    // Attach a virtual relay channel onto the abstract-socket-backed multiplexer.
+    let relay_addr: SocketAddr = "198.51.100.22:443".parse().unwrap();
+    let public_addr: SocketAddr = "203.0.113.62:40002".parse().unwrap();
+    let peer_addr: SocketAddr = "198.51.100.88:5556".parse().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundRelayPacket>(4);
+    let h = mux
+        .attach_virtual_channel(relay_addr, public_addr, tx, 1240)
+        .expect("attach virtual channel on abstract-socket mux");
+    let synth = mux
+        .register_virtual_route(h.relay_slot, peer_addr)
+        .expect("register virtual route");
+    assert!(is_synthetic_virtual_addr(synth));
+
+    // Physical send to synthetic ULA is still rejected with InvalidInput.
+    let mut sender = mux.create_sender();
+    let phys_err = poll_fn(|cx| {
+        sender.as_mut().poll_send_on_slot(
+            &UdpTransmit {
+                destination: synth,
+                ecn: None,
+                contents: b"blocked",
+                segment_size: None,
+                src_ip: None,
+            },
+            SocketSlotId::PRIMARY,
+            cx,
+        )
+    })
+    .await
+    .expect_err("abstract physical slot must still reject synthetic ULA");
+    assert_eq!(phys_err.kind(), io::ErrorKind::InvalidInput);
+
+    // Virtual send succeeds onto the attached channel.
+    poll_fn(|cx| {
+        sender.as_mut().poll_send_on_slot(
+            &UdpTransmit {
+                destination: synth,
+                ecn: None,
+                contents: b"via-abstract-mux",
+                segment_size: None,
+                src_ip: None,
+            },
+            SocketSlotId::VIRTUAL,
+            cx,
+        )
+    })
+    .await
+    .expect("virtual send succeeds");
+    let out = rx.try_recv().expect("received outbound relay packet");
+    assert_eq!(out.target, peer_addr);
+    assert_eq!(&out.raw_payload[..], b"via-abstract-mux");
+
+    // NatTraversalEndpoint::new_with_abstract_socket wraps the custom socket
+    // into a MultiplexedUdpSocket so relay fallback stays available.
+    let v4_ep = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind v4 ep");
+    let custom_sock: Arc<dyn AsyncUdpSocket> =
+        Arc::new(DualStackSocket::new(Some(v4_ep), None).expect("custom dual stack"));
+    let nat_ep = NatTraversalEndpoint::new_with_abstract_socket(
+        NatTraversalConfig::default(),
+        None,
+        None,
+        custom_sock,
+    )
+    .await
+    .expect("new_with_abstract_socket succeeds");
+    // Verify `prepare_relayed_dial` is no longer blocked by missing multiplexed_socket
+    // (multiplexed_socket is present and wired).
+    assert!(
+        nat_ep.has_multiplexed_socket(),
+        "new_with_abstract_socket must retain unified MultiplexedUdpSocket for relay fallback"
+    );
+    assert!(
+        nat_ep
+            .get_endpoint()
+            .expect("inner endpoint")
+            .local_addr()
+            .is_ok()
+    );
+    nat_ep.shutdown().await.expect("nat_ep shutdown");
+}
+
+#[tokio::test]
+async fn relay_socket_drop_without_detach_breaks_arc_cycle_and_concurrent_replace_never_deadlocks()
+{
+    use crate::masque::MasqueRelaySocket;
+
+    let (server_cfg, client_cfg) =
+        build_pqc_rpk_configs(TransportConfig::default(), TransportConfig::default());
+    let runtime = default_runtime().expect("tokio runtime");
+
+    let srv_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind srv");
+    let srv_addr = srv_std.local_addr().unwrap();
+    let srv_mux = Arc::new(MultiplexedUdpSocket::from_std_socket(srv_std).unwrap());
+    let srv_ep = HighLevelEndpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        Some((*server_cfg).clone()),
+        srv_mux as _,
+        Arc::clone(&runtime),
+    )
+    .expect("srv ep");
+
+    let cli_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind cli");
+    let cli_mux = Arc::new(MultiplexedUdpSocket::from_std_socket(cli_std).unwrap());
+    let mut cli_ep = HighLevelEndpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        cli_mux as _,
+        runtime,
+    )
+    .expect("cli ep");
+    cli_ep.set_default_client_config(client_cfg);
+
+    let accept_task = tokio::spawn(async move {
+        let incoming = srv_ep.accept().await.expect("incoming");
+        let conn = incoming.await.expect("srv handshake");
+        let (s1, _r1) = conn.accept_bi().await.expect("accept bi 1");
+        let (s2, _r2) = conn.accept_bi().await.expect("accept bi 2");
+        (srv_ep, conn, s1, s2)
+    });
+
+    let cli_conn = cli_ep
+        .connect(srv_addr, "localhost")
+        .expect("dial")
+        .await
+        .expect("cli handshake");
+    let (mut c_s1, c_r1) = cli_conn.open_bi().await.expect("open bi 1");
+    let (mut c_s2, c_r2) = cli_conn.open_bi().await.expect("open bi 2");
+    // Write 1 byte so server's accept_bi observes both streams immediately.
+    c_s1.write_all(&[0u8]).await.expect("kick bi 1");
+    c_s2.write_all(&[0u8]).await.expect("kick bi 2");
+
+    let (srv_ep, srv_conn, mut srv_s1, mut srv_s2) = accept_task.await.expect("accept join");
+
+    let relay_addr: SocketAddr = "198.51.100.33:443".parse().unwrap();
+    let pub_addr: SocketAddr = "203.0.113.73:40003".parse().unwrap();
+    let sock1 = MasqueRelaySocket::new(c_s1, c_r1, pub_addr);
+    let sock2 = MasqueRelaySocket::new(c_s2, c_r2, pub_addr);
+    let weak1 = Arc::downgrade(&sock1);
+    let weak2 = Arc::downgrade(&sock2);
+
+    let mux_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind mux");
+    let mux = Arc::new(MultiplexedUdpSocket::from_std_socket(mux_std).unwrap());
+
+    // Stream framed relay datagrams concurrently on both relay streams while
+    // rapidly replacing the attached relay socket on the same `relay_addr`.
+    // Prior to the lock-order fix this could AB-BA deadlock between
+    // `virtual_routes.write()` and `ingress_hook.read()`.
+    let feeder = tokio::spawn(async move {
+        // Framed MasqueRelaySocket stream record: [context_id=0][len varint][payload]
+        // Send valid-length frames (or minimal header bytes) continuously.
+        let frame = [0u8, 1u8, 198, 51, 100, 99, 0x15, 0xb3, 0, 4, 1, 2, 3, 4];
+        for _ in 0..40 {
+            let _ = srv_s1.write_all(&frame).await;
+            let _ = srv_s2.write_all(&frame).await;
+            tokio::task::yield_now().await;
+        }
+        let _ = srv_s1.finish();
+        let _ = srv_s2.finish();
+        (srv_ep, srv_conn)
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for round in 0..30 {
+            let chosen = if round % 2 == 0 {
+                Arc::clone(&sock1)
+            } else {
+                Arc::clone(&sock2)
+            };
+            mux.attach_relay_socket(relay_addr, chosen)
+                .expect("replace relay socket without deadlock");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("concurrent relay replacement must not deadlock");
+
+    // Shut down streams and drop `mux`, `sock1`, and `sock2` WITHOUT calling
+    // `detach_all_relays()`. Because the ingress hook holds only a `Weak`
+    // reference to `virtual_routes`, neither relay socket may leak.
+    let (srv_ep, srv_conn) = feeder.await.expect("feeder join");
+    drop(sock1);
+    drop(sock2);
+    drop(mux);
+    cli_conn.close(0u32.into(), b"done");
+    srv_conn.close(0u32.into(), b"done");
+    drop(cli_conn);
+    drop(srv_conn);
+    cli_ep.close(0u32.into(), b"done");
+    srv_ep.close(0u32.into(), b"done");
+
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if weak1.upgrade().is_none() && weak2.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        freed.is_ok(),
+        "dropping MultiplexedUdpSocket without detach_all_relays must free attached MasqueRelaySocket (no Arc cycle)"
+    );
+}

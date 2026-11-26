@@ -32,6 +32,7 @@ use std::{
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -64,6 +65,11 @@ pub const DEFAULT_VIRTUAL_RECV_QUEUE_CAPACITY: usize = 512;
 /// single physical port or virtual relay can starve other active sources.
 pub const MAX_RECV_BURST_PER_SOURCE: usize = 32;
 
+/// Default idle timeout after which an inactive virtual route may be reclaimed
+/// when `MAX_VIRTUAL_ROUTES` (4096) capacity is reached, without ever evicting
+/// routes with recent activity.
+pub const DEFAULT_VIRTUAL_ROUTE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Diagnostic counters for [`MultiplexedUdpSocket`] isolation and backpressure
 /// invariants (ADR-021).
 #[derive(Debug, Default)]
@@ -86,7 +92,7 @@ pub struct MultiplexedSocketStats {
 }
 
 /// One physical UDP bind slot (dual-stack IPv4 + IPv6 sockets sharing a
-/// [`SocketSlotId`]).
+/// [`SocketSlotId`], or a custom caller-provided [`AsyncUdpSocket`]).
 pub struct PhysicalBindSlot {
     slot_id: SocketSlotId,
     v4: Option<Arc<tokio::net::UdpSocket>>,
@@ -95,6 +101,7 @@ pub struct PhysicalBindSlot {
     v6_state: Option<Arc<UdpSocketState>>,
     v4_addr: Option<SocketAddr>,
     v6_addr: Option<SocketAddr>,
+    abstract_socket: Option<Arc<dyn AsyncUdpSocket>>,
 }
 
 impl fmt::Debug for PhysicalBindSlot {
@@ -103,6 +110,7 @@ impl fmt::Debug for PhysicalBindSlot {
             .field("slot_id", &self.slot_id)
             .field("v4_addr", &self.v4_addr)
             .field("v6_addr", &self.v6_addr)
+            .field("abstract_socket", &self.abstract_socket.is_some())
             .finish()
     }
 }
@@ -147,6 +155,7 @@ impl PhysicalBindSlot {
             v6_state,
             v4_addr,
             v6_addr,
+            abstract_socket: None,
         })
     }
 
@@ -159,6 +168,19 @@ impl PhysicalBindSlot {
             Self::new(slot_id, None, Some(tokio_sock))
         } else {
             Self::new(slot_id, Some(tokio_sock), None)
+        }
+    }
+
+    /// Wrap an already-bound `tokio::net::UdpSocket` as a single-family
+    /// physical slot without round-tripping through `into_std()` / `from_std()`
+    /// (which fails with `WSAEINVAL` on Windows because the socket handle is
+    /// already associated with Tokio's I/O reactor).
+    pub fn from_tokio(slot_id: SocketSlotId, socket: tokio::net::UdpSocket) -> io::Result<Self> {
+        let addr = socket.local_addr()?;
+        if addr.is_ipv6() {
+            Self::new(slot_id, None, Some(socket))
+        } else {
+            Self::new(slot_id, Some(socket), None)
         }
     }
 
@@ -215,6 +237,50 @@ impl PhysicalBindSlot {
             v6_state,
             v4_addr,
             v6_addr,
+            abstract_socket: None,
+        })
+    }
+
+    /// Wrap an arbitrary caller-provided [`AsyncUdpSocket`] as a physical slot
+    /// (used by `NatTraversalEndpoint::new_with_abstract_socket` so custom
+    /// sockets retain unified virtual MASQUE relay support).
+    pub fn from_abstract(
+        slot_id: SocketSlotId,
+        socket: Arc<dyn AsyncUdpSocket>,
+    ) -> io::Result<Self> {
+        if !slot_id.is_physical() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid physical slot id {slot_id:?}"),
+            ));
+        }
+        let addrs = socket
+            .local_addrs()
+            .or_else(|_| socket.local_addr().map(|addr| vec![addr]))?;
+        let mut v4_addr = None;
+        let mut v6_addr = None;
+        for addr in addrs {
+            match addr {
+                SocketAddr::V4(_) if v4_addr.is_none() => v4_addr = Some(addr),
+                SocketAddr::V6(_) if v6_addr.is_none() => v6_addr = Some(addr),
+                _ => {}
+            }
+        }
+        if v4_addr.is_none() && v6_addr.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "abstract UDP socket reported no local addresses",
+            ));
+        }
+        Ok(Self {
+            slot_id,
+            v4: None,
+            v6: None,
+            v4_state: None,
+            v6_state: None,
+            v4_addr,
+            v6_addr,
+            abstract_socket: Some(socket),
         })
     }
 
@@ -298,7 +364,7 @@ impl RelaySessionSlot {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct VirtualRouteEntry {
     relay_slot: u16,
     route_gen: u32,
@@ -307,9 +373,17 @@ struct VirtualRouteEntry {
     real_target: SocketAddr,
     #[allow(dead_code)]
     synthetic_addr: SocketAddr,
+    /// Milliseconds since `VirtualRouteTable::created_at` of the latest
+    /// outbound send, inbound receive, or registration on this route.
+    last_activity_ms: AtomicU64,
 }
 
-#[derive(Default)]
+impl VirtualRouteEntry {
+    fn touch(&self, now_ms: u64) {
+        self.last_activity_ms.store(now_ms, Ordering::Relaxed);
+    }
+}
+
 struct VirtualRouteTable {
     /// Active relay sessions keyed by `relay_slot` (1..=65535).
     relays: HashMap<u16, RelaySessionSlot>,
@@ -325,6 +399,10 @@ struct VirtualRouteTable {
     by_synthetic: HashMap<SocketAddr, VirtualRouteEntry>,
     /// `(relay_slot, normalized real_target)` -> synthetic ULA `SocketAddr`.
     by_target: HashMap<(u16, SocketAddr), SocketAddr>,
+    /// Monotonic epoch for lock-free per-route activity timestamps.
+    created_at: Instant,
+    /// Minimum idle duration before a route is eligible for reclamation at cap.
+    route_idle_timeout: Duration,
 }
 
 impl VirtualRouteTable {
@@ -337,7 +415,49 @@ impl VirtualRouteTable {
             next_peer_id: 1,
             by_synthetic: HashMap::new(),
             by_target: HashMap::new(),
+            created_at: Instant::now(),
+            route_idle_timeout: DEFAULT_VIRTUAL_ROUTE_IDLE_TIMEOUT,
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.created_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn reap_idle_routes(&mut self, now_ms: u64) -> usize {
+        let idle_timeout_ms = self
+            .route_idle_timeout
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut expired = Vec::new();
+        for (&synth, entry) in &self.by_synthetic {
+            let last = entry.last_activity_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= idle_timeout_ms {
+                expired.push((synth, entry.relay_slot, entry.real_target));
+            }
+        }
+        let count = expired.len();
+        for (synth, relay_slot, real_target) in expired {
+            self.by_synthetic.remove(&synth);
+            if self.by_target.get(&(relay_slot, real_target)) == Some(&synth) {
+                self.by_target.remove(&(relay_slot, real_target));
+            }
+        }
+        count
+    }
+
+    fn remove_route(&mut self, synthetic_addr: SocketAddr) -> bool {
+        let Some(entry) = self.by_synthetic.remove(&synthetic_addr) else {
+            return false;
+        };
+        if self.by_target.get(&(entry.relay_slot, entry.real_target)) == Some(&synthetic_addr) {
+            self.by_target
+                .remove(&(entry.relay_slot, entry.real_target));
+        }
+        true
     }
 
     fn allocate_slot_and_gen(&mut self, relay_addr: SocketAddr) -> io::Result<(u16, u32)> {
@@ -397,16 +517,25 @@ impl VirtualRouteTable {
             ));
         };
         let route_gen = relay.route_gen;
+        let now_ms = self.elapsed_ms();
 
         if let Some(&existing_synthetic) = self.by_target.get(&(relay_slot, normalized)) {
             if let Some(entry) = self.by_synthetic.get(&existing_synthetic) {
                 if entry.route_gen == route_gen {
+                    entry.touch(now_ms);
                     return Ok(existing_synthetic);
                 }
             }
             // Stale entry; clean up before reallocating.
             self.by_synthetic.remove(&existing_synthetic);
             self.by_target.remove(&(relay_slot, normalized));
+        }
+
+        if self.by_synthetic.len() >= MAX_VIRTUAL_ROUTES {
+            let reaped = self.reap_idle_routes(now_ms);
+            if reaped > 0 {
+                trace!(reaped, "reaped expired idle virtual routes at capacity");
+            }
         }
 
         if self.by_synthetic.len() >= MAX_VIRTUAL_ROUTES {
@@ -429,6 +558,7 @@ impl VirtualRouteTable {
             peer_id,
             real_target: normalized,
             synthetic_addr,
+            last_activity_ms: AtomicU64::new(now_ms),
         };
         self.by_synthetic.insert(synthetic_addr, entry);
         self.by_target
@@ -530,6 +660,7 @@ impl VirtualRecvQueue {
 #[derive(Clone, Copy)]
 enum PollSource {
     Physical { slot_idx: usize, is_v6: bool },
+    PhysicalAbstract { slot_idx: usize },
     Virtual,
 }
 
@@ -610,6 +741,22 @@ impl MultiplexedUdpSocket {
         let mut first_v4 = None;
 
         for (idx, slot) in physical_slots.iter().enumerate() {
+            if slot.abstract_socket.is_some() {
+                if let Some(v4_addr) = slot.v4_addr {
+                    cached_local_addrs.push(v4_addr);
+                    if first_v4.is_none() {
+                        first_v4 = Some(v4_addr);
+                    }
+                }
+                if let Some(v6_addr) = slot.v6_addr {
+                    cached_local_addrs.push(v6_addr);
+                    if first_v6.is_none() {
+                        first_v6 = Some(v6_addr);
+                    }
+                }
+                poll_sources.push(PollSource::PhysicalAbstract { slot_idx: idx });
+                continue;
+            }
             if let Some(v4_addr) = slot.v4_addr {
                 cached_local_addrs.push(v4_addr);
                 if first_v4.is_none() {
@@ -673,6 +820,14 @@ impl MultiplexedUdpSocket {
         Self::new(vec![primary])
     }
 
+    /// Convenience constructor wrapping an existing [`AsyncUdpSocket`] on
+    /// [`SocketSlotId::PRIMARY`] so custom sockets gain the unified virtual
+    /// MASQUE relay plane.
+    pub fn from_abstract_socket(socket: Arc<dyn AsyncUdpSocket>) -> io::Result<Self> {
+        let primary = PhysicalBindSlot::from_abstract(SocketSlotId::PRIMARY, socket)?;
+        Self::new(vec![primary])
+    }
+
     /// Number of bound physical slots (`1..=MAX_PHYSICAL_SLOTS`).
     #[must_use]
     pub fn physical_slot_count(&self) -> usize {
@@ -726,13 +881,20 @@ impl MultiplexedUdpSocket {
             Some(Arc::clone(&relay_socket)),
         )?;
 
-        let routes = Arc::clone(&self.virtual_routes);
+        // Capture a Weak reference to `virtual_routes` so `virtual_routes ->
+        // MasqueRelaySocket -> ingress_hook -> virtual_routes` never forms a
+        // strong reference cycle if the socket is dropped without explicitly
+        // calling `detach_all_relays()`.
+        let routes = Arc::downgrade(&self.virtual_routes);
         let recv_queue = Arc::clone(&self.virtual_recv);
         let stats = Arc::clone(&self.stats);
         let relay_slot = handle.relay_slot;
         let route_gen = handle.route_gen;
 
         relay_socket.set_ingress_hook(Some(Arc::new(move |payload, real_source, ecn| {
+            let Some(routes) = routes.upgrade() else {
+                return;
+            };
             Self::enqueue_virtual_ingress(
                 &routes,
                 &recv_queue,
@@ -786,15 +948,11 @@ impl MultiplexedUdpSocket {
     ) -> io::Result<VirtualRelayHandle> {
         let normalized_relay = normalize_socket_addr(relay_addr);
         let virtual_mtu = Arc::new(AtomicU16::new(initial_virtual_mtu));
-        let (relay_slot, route_gen) = {
+        let outer_for_subscribe = outer_connection.clone();
+        let (relay_slot, route_gen, replaced_socket) = {
             let mut table = self.virtual_routes.write();
             let (slot, next_gen) = table.allocate_slot_and_gen(normalized_relay)?;
-            // Detach ingress hook on any replaced relay socket for this slot.
-            if let Some(old) = table.relays.remove(&slot) {
-                if let Some(old_sock) = old.relay_socket {
-                    old_sock.set_ingress_hook(None);
-                }
-            }
+            let old_sock = table.relays.remove(&slot).and_then(|old| old.relay_socket);
             table.relays.insert(
                 slot,
                 RelaySessionSlot {
@@ -810,8 +968,24 @@ impl MultiplexedUdpSocket {
                     relay_socket,
                 },
             );
-            (slot, next_gen)
+            (slot, next_gen, old_sock)
         };
+
+        // Detach ingress hook on any replaced relay socket AFTER releasing
+        // `self.virtual_routes.write()` to avoid lock-order inversion with
+        // `MasqueRelaySocket::enqueue_received` (which holds
+        // `ingress_hook.read()` while acquiring `virtual_routes`).
+        if let Some(old_sock) = replaced_socket {
+            old_sock.set_ingress_hook(None);
+        }
+
+        // Subscribe to synchronous outer connection MTU updates so mid-session
+        // outer PMTU shrinks publish into `virtual_mtu` BEFORE inner
+        // `poll_transmit` builds its next packet (ADR-021 §1.4).
+        if let Some(conn) = outer_for_subscribe {
+            let overhead = if mux_v1 { 2 } else { 8 };
+            conn.subscribe_virtual_path_mtu(Arc::clone(&virtual_mtu), overhead);
+        }
 
         Ok(VirtualRelayHandle {
             relay_slot,
@@ -880,6 +1054,18 @@ impl MultiplexedUdpSocket {
         }
         let mut table = self.virtual_routes.write();
         table.get_or_insert_route(relay_slot, real_target, &self.stats)
+    }
+
+    /// Explicitly remove a synthetic virtual route (for example after all
+    /// sessions to that peer have closed).
+    pub fn remove_virtual_route(&self, synthetic_addr: SocketAddr) -> bool {
+        self.virtual_routes.write().remove_route(synthetic_addr)
+    }
+
+    /// Override the virtual route idle timeout (for deterministic unit tests).
+    #[cfg(test)]
+    pub(crate) fn set_virtual_route_idle_timeout(&self, timeout: Duration) {
+        self.virtual_routes.write().route_idle_timeout = timeout;
     }
 
     /// Resolve a synthetic virtual ULA address back to the real peer target
@@ -951,15 +1137,20 @@ impl MultiplexedUdpSocket {
                 return false;
             }
             let _ = relay.refresh_virtual_mtu();
+            let now_ms = table.elapsed_ms();
             table
                 .by_target
                 .get(&(relay_slot, normalized_source))
                 .copied()
                 .filter(|addr| {
-                    table
-                        .by_synthetic
-                        .get(addr)
-                        .is_some_and(|e| e.route_gen == route_gen)
+                    table.by_synthetic.get(addr).is_some_and(|e| {
+                        if e.route_gen == route_gen {
+                            e.touch(now_ms);
+                            true
+                        } else {
+                            false
+                        }
+                    })
                 })
         };
 
@@ -1122,6 +1313,7 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
                 v6_state: slot.v6_state.clone(),
                 v4_writable: slot.v4.as_ref().map(make_socket_poller),
                 v6_writable: slot.v6.as_ref().map(make_socket_poller),
+                abstract_sender: slot.abstract_socket.as_ref().map(|s| s.create_sender()),
             })
             .collect();
 
@@ -1204,6 +1396,58 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
                         }
                     }
                 }
+                PollSource::PhysicalAbstract { slot_idx } => {
+                    let slot = &self.physical_slots[slot_idx];
+                    if let Some(ref abs_sock) = slot.abstract_socket {
+                        let burst = limit.min(MAX_RECV_BURST_PER_SOURCE);
+                        loop {
+                            match abs_sock.poll_recv(cx, &mut bufs[..burst], &mut meta[..burst]) {
+                                Poll::Ready(Ok(0)) => break,
+                                Poll::Ready(Ok(count)) => {
+                                    let mut kept = 0usize;
+                                    for i in 0..count {
+                                        let m = meta[i];
+                                        if is_synthetic_virtual_ip(m.addr.ip()) {
+                                            self.stats
+                                                .synthetic_prefix_spoof_dropped
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                addr = %m.addr,
+                                                slot_id = ?slot.slot_id,
+                                                "dropped spoofed synthetic virtual ULA packet on abstract physical UDP socket"
+                                            );
+                                            continue;
+                                        }
+                                        if kept != i {
+                                            let len =
+                                                m.len.min(bufs[kept].len()).min(bufs[i].len());
+                                            let (left, right) = bufs.split_at_mut(i);
+                                            left[kept][..len].copy_from_slice(&right[0][..len]);
+                                        }
+                                        meta[kept] = m;
+                                        slots[kept] = slot.slot_id;
+                                        kept += 1;
+                                    }
+                                    if kept > 0 {
+                                        return Poll::Ready(Ok(kept));
+                                    }
+                                    // Every datagram in this batch was a dropped spoof; keep
+                                    // polling so the underlying socket registers our waker.
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    debug!(
+                                        slot_id = ?slot.slot_id,
+                                        error = %e,
+                                        "MultiplexedUdpSocket abstract physical recv error"
+                                    );
+                                    last_err = Some(e);
+                                    break;
+                                }
+                                Poll::Pending => break,
+                            }
+                        }
+                    }
+                }
                 PollSource::Virtual => {
                     match self.virtual_recv.poll_pop(
                         cx,
@@ -1264,20 +1508,36 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
     fn max_receive_segments(&self) -> usize {
         self.physical_slots
             .iter()
-            .flat_map(|slot| [slot.v4_state.as_ref(), slot.v6_state.as_ref()])
-            .flatten()
-            .map(|state| state.gro_segments())
+            .map(|slot| {
+                let raw_max = [slot.v4_state.as_ref(), slot.v6_state.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|state| state.gro_segments())
+                    .max()
+                    .unwrap_or(1);
+                let abs_max = slot
+                    .abstract_socket
+                    .as_ref()
+                    .map(|s| s.max_receive_segments())
+                    .unwrap_or(1);
+                raw_max.max(abs_max)
+            })
             .max()
             .unwrap_or(1)
             .max(1)
     }
 
     fn may_fragment(&self) -> bool {
-        self.physical_slots
-            .iter()
-            .flat_map(|slot| [slot.v4_state.as_ref(), slot.v6_state.as_ref()])
-            .flatten()
-            .any(|state| state.may_fragment())
+        self.physical_slots.iter().any(|slot| {
+            [slot.v4_state.as_ref(), slot.v6_state.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|state| state.may_fragment())
+                || slot
+                    .abstract_socket
+                    .as_ref()
+                    .is_some_and(|s| s.may_fragment())
+        })
     }
 }
 
@@ -1297,6 +1557,7 @@ struct PhysicalSlotSender {
     v6_state: Option<Arc<UdpSocketState>>,
     v4_writable: Option<Pin<Box<dyn UdpPoller>>>,
     v6_writable: Option<Pin<Box<dyn UdpPoller>>>,
+    abstract_sender: Option<Pin<Box<dyn UdpSender>>>,
 }
 
 impl PhysicalSlotSender {
@@ -1339,6 +1600,10 @@ impl PhysicalSlotSender {
                 io::ErrorKind::InvalidInput,
                 "refusing to transmit synthetic virtual ULA address on physical UDP slot",
             )));
+        }
+
+        if let Some(sender) = self.abstract_sender.as_mut() {
+            return sender.as_mut().poll_send(transmit, cx);
         }
 
         let socket_is_v6 = self.select_family(&transmit.destination).ok_or_else(|| {
@@ -1401,6 +1666,9 @@ impl PhysicalSlotSender {
     }
 
     fn max_gso_segments(&self) -> usize {
+        if let Some(ref sender) = self.abstract_sender {
+            return sender.max_transmit_segments().max(1);
+        }
         match (&self.v4_state, &self.v6_state) {
             (Some(v4), Some(v6)) => v4.max_gso_segments().min(v6.max_gso_segments()).max(1),
             (Some(v4), None) => v4.max_gso_segments().max(1),
@@ -1464,6 +1732,7 @@ impl MultiplexedUdpSender {
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
+            entry.touch(table.elapsed_ms());
             let _ = relay.refresh_virtual_mtu();
             (
                 entry.real_target,
