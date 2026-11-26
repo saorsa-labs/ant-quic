@@ -97,7 +97,7 @@ with `TRANSPORT_PARAMETER_ERROR`.
 | `pqc_algorithms` | `0x50C0` | 1-byte bitfield (`bit 0 = ML-KEM-768`, `bit 1 = ML-DSA-65`; bits 2–7 reserved) | Standard | ADR-003 |
 | `ack_receive_v2` | `0x50C2` | Empty (`len == 0`) | `!(cached && !current)` | Internal |
 | `datagram_mux_v1` | `0x50C4` | Empty (`len == 0`) | Exact match (`cached == current`) | ADR-020 |
-| `in_connection_migration_v1` | `0x50C6` | Empty (`len == 0`) | Exact match (`cached == current`) | ADR-021 |
+| `in_connection_migration_v1` | `0x50C6` | Empty (`len == 0`) | `!(cached && !current)` | ADR-021 |
 
 ### 3.1 `nat_traversal` (`0x3d7e9f0bca12fea6`)
 
@@ -140,8 +140,11 @@ with `TRANSPORT_PARAMETER_ERROR`.
 - When mutually negotiated AND the server has NOT advertised RFC 9000
   `disable_active_migration (0x0c)`, authorizes client-initiated in-connection
   migration from a relayed path to a validated direct server address (Section 8).
-- On 0-RTT resumption, `cached.in_connection_migration_v1 != current.in_connection_migration_v1`
-  MUST fail with `TransportError::PROTOCOL_VIOLATION`.
+- On 0-RTT resumption (RFC 9000 §7.4.1), enabling `in_connection_migration_v1`
+  across an upgrade (`cached == false, current == true`) preserves 0-RTT
+  cleanly (since `0x50C6` governs post-handshake migration only); dropping it
+  across a rollback (`cached == true, current == false`) MUST fail with
+  `TransportError::PROTOCOL_VIOLATION`.
 
 ---
 

@@ -7148,14 +7148,15 @@ impl Connection {
         self.config.datagram_mux_v1 && self.peer_params.datagram_mux_v1
     }
 
-    /// Whether both endpoints negotiated the `InConnectionMigrationV1`
-    /// (`0x50C6`) QUIC transport parameter during the handshake (ADR-021).
-    ///
-    /// Note: callers initiating client-side migration onto a direct server
-    /// address must additionally verify `!self.peer_params.disable_active_migration`
-    /// (server `migration == true`) per ADR-021 §Phase 4A.4.
+    /// Whether both endpoints negotiated `InConnectionMigrationV1` (`0x50C6`)
+    /// AND active connection migration is permitted (`!disable_active_migration`
+    /// from the peer and `server_config.migration == true` on the server side)
+    /// per ADR-021 §Phase 4A.4.
     pub(crate) fn supports_in_connection_migration_v1(&self) -> bool {
-        self.config.in_connection_migration_v1 && self.peer_params.in_connection_migration_v1
+        self.config.in_connection_migration_v1
+            && self.peer_params.in_connection_migration_v1
+            && !self.peer_params.disable_active_migration
+            && (self.side.is_client() || self.side.remote_may_migrate())
     }
 }
 

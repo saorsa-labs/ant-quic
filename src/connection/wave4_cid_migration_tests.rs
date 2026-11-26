@@ -342,24 +342,28 @@ fn run_handshake(
 fn in_connection_migration_v1_negotiation_matrix() {
     let (cert, key) = generate_test_cert();
 
-    for (client_flag, server_flag, expected) in [
-        (true, true, true),
-        (false, true, false),
-        (true, false, false),
-        (false, false, false),
+    for (client_flag, server_flag, server_migration, expected) in [
+        (true, true, true, true),
+        (true, true, false, false),
+        (false, true, true, false),
+        (true, false, true, false),
+        (false, false, true, false),
     ] {
         let mut s_transport = TransportConfig::default();
         s_transport.in_connection_migration_v1(server_flag);
         let mut c_transport = TransportConfig::default();
         c_transport.in_connection_migration_v1(client_flag);
 
-        let server_cfg = build_server_config(
+        let mut server_cfg = (*build_server_config(
             cert.clone(),
             key.clone_key(),
             rustls::server::ServerSessionMemoryCache::new(64),
             u32::MAX,
             s_transport,
-        );
+        ))
+        .clone();
+        server_cfg.migration(server_migration);
+        let server_cfg = Arc::new(server_cfg);
         let client_cfg = build_client_config(
             Arc::new(rustls::client::ClientSessionMemoryCache::new(64)),
             c_transport,
@@ -370,12 +374,12 @@ fn in_connection_migration_v1_negotiation_matrix() {
         assert_eq!(
             client.conn().supports_in_connection_migration_v1(),
             expected,
-            "client mismatch for ({client_flag}, {server_flag})"
+            "client mismatch for ({client_flag}, {server_flag}, migration={server_migration})"
         );
         assert_eq!(
             server.conn().supports_in_connection_migration_v1(),
             expected,
-            "server mismatch for ({client_flag}, {server_flag})"
+            "server mismatch for ({client_flag}, {server_flag}, migration={server_migration})"
         );
     }
 }
@@ -445,9 +449,12 @@ fn zero_rtt_upgrade_5_to_16_preserves_early_data() {
 
     let client_cfg = build_client_config(Arc::clone(&client_store), TransportConfig::default());
 
-    // Initial handshake against a 5-CID server caches a 0-RTT ticket with limit = 5.
+    // Initial handshake against a simulated 0.30.x server (in_connection_migration_v1 = false,
+    // active_connection_id_limit = 5) caches a 0-RTT ticket with {0x50C6: off, limit: 5}.
     let mut s5_transport = TransportConfig::default();
-    s5_transport.active_connection_id_limit_override(5);
+    s5_transport
+        .in_connection_migration_v1(false)
+        .active_connection_id_limit_override(5);
     let server5_cfg = build_server_config(
         cert.clone(),
         key.clone_key(),
@@ -457,8 +464,11 @@ fn zero_rtt_upgrade_5_to_16_preserves_early_data() {
     );
     let (c1, s1) = run_handshake(client_cfg.clone(), server5_cfg, false);
     assert!(c1.connected && s1.connected);
+    assert!(!c1.conn().supports_in_connection_migration_v1());
 
-    // Server upgrades to 16 CIDs keeping the same session cache: 5 <= 16 preserves 0-RTT cleanly.
+    // Server upgrades to Wave-4 ({0x50C6: on, limit: 16}) keeping the same session cache:
+    // RFC 9000 §7.4.1 allows raising limits and adding post-handshake capabilities, so 0-RTT
+    // MUST be preserved cleanly.
     let server16_cfg = build_server_config(
         cert,
         key,
@@ -467,13 +477,18 @@ fn zero_rtt_upgrade_5_to_16_preserves_early_data() {
         TransportConfig::default(),
     );
     let (c2, s2) = run_handshake(client_cfg, server16_cfg, true);
-    assert!(c2.terminated.is_none(), "5->16 upgrade must not fail");
+    assert!(
+        c2.terminated.is_none(),
+        "0.30.x -> Wave-4 upgrade must not fail"
+    );
     assert!(c2.connected && s2.connected);
     assert!(c2.conn().has_0rtt(), "client must attempt 0-RTT resumption");
     assert!(
         c2.conn().accepted_0rtt(),
-        "5->16 upgrade must preserve 0-RTT early data"
+        "0.30.x ({{off, 5}}) -> Wave-4 ({{on, 16}}) upgrade must preserve 0-RTT early data"
     );
+    assert!(c2.conn().supports_in_connection_migration_v1());
+    assert!(s2.conn().supports_in_connection_migration_v1());
     assert_eq!(c2.conn().peer_params.active_connection_id_limit.0, 16);
 }
 
