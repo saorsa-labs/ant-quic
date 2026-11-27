@@ -443,10 +443,11 @@ impl VirtualRouteEntry {
 struct VirtualRouteTable {
     /// Active relay sessions keyed by `relay_slot` (1..=65535).
     relays: HashMap<u16, RelaySessionSlot>,
-    /// Normalized outer relay `SocketAddr` -> assigned `relay_slot`.
+    /// Active normalized outer relay `SocketAddr` -> assigned `relay_slot` (pruned on detach).
     relay_addr_to_slot: HashMap<SocketAddr, u16>,
-    /// Monotonic generation tracker per `relay_slot` (persists across detach/re-attach).
-    slot_generations: HashMap<u16, u32>,
+    /// Global monotonic non-zero generation counter so even recycled `relay_slot`
+    /// IDs never collide with stale synthetic ULAs from prior sessions.
+    next_route_gen: u32,
     /// Next relay slot candidate (1..=65535).
     next_relay_slot: u16,
     /// Next 32-bit peer identifier for virtual routes.
@@ -466,7 +467,7 @@ impl VirtualRouteTable {
         Self {
             relays: HashMap::new(),
             relay_addr_to_slot: HashMap::new(),
-            slot_generations: HashMap::new(),
+            next_route_gen: 1,
             next_relay_slot: 1,
             next_peer_id: 1,
             by_synthetic: HashMap::new(),
@@ -525,9 +526,7 @@ impl VirtualRouteTable {
             for _ in 0..u16::MAX {
                 let candidate = self.next_relay_slot;
                 self.next_relay_slot = self.next_relay_slot.wrapping_add(1).max(1);
-                if !self.relays.contains_key(&candidate)
-                    && !self.slot_generations.contains_key(&candidate)
-                {
+                if !self.relays.contains_key(&candidate) {
                     allocated = Some(candidate);
                     break;
                 }
@@ -542,11 +541,10 @@ impl VirtualRouteTable {
             slot
         };
 
-        // Monotonic non-zero generation bump guarantees all prior routes for
-        // this slot are immediately stale after reconnect.
-        let prev_gen = self.slot_generations.get(&slot).copied().unwrap_or(0);
-        let next_gen = prev_gen.wrapping_add(1).max(1);
-        self.slot_generations.insert(slot, next_gen);
+        // Global monotonic non-zero generation bump guarantees all prior routes
+        // for this slot (including before detach/recycling) are immediately stale.
+        let next_gen = self.next_route_gen;
+        self.next_route_gen = self.next_route_gen.wrapping_add(1).max(1);
 
         // Evict stale routes belonging to the previous generation of this slot.
         self.purge_routes_for_slot(slot);
@@ -1055,12 +1053,12 @@ impl MultiplexedUdpSocket {
     }
 
     /// Detach the relay session associated with `relay_addr`, invalidating all
-    /// virtual routes for that relay slot.
+    /// virtual routes for that relay slot and releasing its slot ID for reuse.
     pub fn detach_relay(&self, relay_addr: SocketAddr) {
         let normalized = normalize_socket_addr(relay_addr);
         let old_socket = {
             let mut table = self.virtual_routes.write();
-            let Some(&slot) = table.relay_addr_to_slot.get(&normalized) else {
+            let Some(slot) = table.relay_addr_to_slot.remove(&normalized) else {
                 return;
             };
             table.purge_routes_for_slot(slot);
@@ -1076,6 +1074,7 @@ impl MultiplexedUdpSocket {
     pub fn detach_all_relays(&self) {
         let old_sockets: Vec<Arc<MasqueRelaySocket>> = {
             let mut table = self.virtual_routes.write();
+            table.relay_addr_to_slot.clear();
             table.by_synthetic.clear();
             table.by_target.clear();
             table
@@ -1354,7 +1353,7 @@ impl MultiplexedUdpSocket {
                             stats
                                 .synthetic_prefix_spoof_dropped
                                 .fetch_add(1, Ordering::Relaxed);
-                            warn!(
+                            debug!(
                                 addr = %m.addr,
                                 ?slot_id,
                                 "dropped spoofed synthetic virtual ULA packet on physical UDP socket"
@@ -1510,7 +1509,7 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
                                             self.stats
                                                 .synthetic_prefix_spoof_dropped
                                                 .fetch_add(1, Ordering::Relaxed);
-                                            warn!(
+                                            debug!(
                                                 addr = %m.addr,
                                                 slot_id = ?slot.slot_id,
                                                 "dropped spoofed synthetic virtual ULA packet on abstract physical UDP socket"

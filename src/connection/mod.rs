@@ -1302,7 +1302,11 @@ impl Connection {
                         size: buf.len(),
                         ecn: None,
                         segment_size: None,
-                        src_ip: self.local_ip,
+                        src_ip: if response_slot == self.path.local_slot {
+                            self.local_ip
+                        } else {
+                            None
+                        },
                         local_slot: response_slot,
                     });
                 }
@@ -4339,6 +4343,7 @@ impl Connection {
         if let Some(max_datagram_size) = self.datagrams().max_size() {
             drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
         }
+        self.notify_virtual_mtu_observers();
 
         self.timers.set(
             Timer::PathValidation,

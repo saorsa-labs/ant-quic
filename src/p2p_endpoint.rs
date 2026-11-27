@@ -16366,10 +16366,10 @@ mod tests {
         listener.shutdown().await;
     }
 
-    /// #305 holder 3: `ensure_shared_relay_endpoint` keeps a MASQUE relay
-    /// session (a `Connection` clone plus the CONNECT-UDP bind streams) in
-    /// `relay_sessions` and the shared relay endpoint. A live relay session
-    /// must not keep the original UDP socket alive past the shutdown settle.
+    /// #305 holder 3: a live MASQUE relay session (a `Connection` clone plus
+    /// the CONNECT-UDP bind streams) held in `relay_sessions` and attached to
+    /// the unified `MultiplexedUdpSocket` must not keep the original UDP socket
+    /// alive past the shutdown settle.
     #[tokio::test]
     async fn shutdown_releases_socket_with_live_relay_session() {
         let relay = fixed_port_endpoint(loopback_ephemeral_addr()).await;

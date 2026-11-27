@@ -8085,6 +8085,10 @@ impl NatTraversalEndpoint {
         });
         let (connection, _relay_use) = if let Some((existing, relay_use)) = reused {
             info!("Reusing existing peer connection to relay {}", relay_addr);
+            // ADR-021: once a physical peer connection carries an outer MASQUE
+            // relay session, pin it to physical slots so the relay can never
+            // divert it onto `SocketSlotId::VIRTUAL` (preserves acyclic DAG).
+            existing.pin_to_physical_slot();
             (existing, Some(relay_use))
         } else {
             // No existing connection — create one

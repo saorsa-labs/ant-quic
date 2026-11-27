@@ -1057,10 +1057,20 @@ async fn unified_p2p_endpoint_masque_relay_end_to_end_and_clean_shutdown() {
 
     // Peer B establishes proactive relay via R -> attached directly onto B's sole
     // InnerEndpoint MultiplexedUdpSocket (zero secondary InnerEndpoint!).
-    tokio::time::timeout(Duration::from_secs(10), peer_b.connect_addr(relay_addr))
-        .await
-        .expect("B->R connect timeout")
-        .expect("B->R connect");
+    let b_relay_peer =
+        tokio::time::timeout(Duration::from_secs(10), peer_b.connect_addr(relay_addr))
+            .await
+            .expect("B->R connect timeout")
+            .expect("B->R connect");
+    let b_to_r_conn = peer_b
+        .inner_for_test()
+        .get_connection(&b_relay_peer.peer_id)
+        .expect("lookup B->R connection")
+        .expect("B->R connection present");
+    assert!(
+        !b_to_r_conn.is_pinned_to_physical_slot(),
+        "ordinary direct P2P dial starts unpinned before being reused as an outer relay session"
+    );
     let b_relay_public = tokio::time::timeout(
         Duration::from_secs(10),
         peer_b.inner_for_test().setup_proactive_relay(relay_addr),
@@ -1068,6 +1078,10 @@ async fn unified_p2p_endpoint_masque_relay_end_to_end_and_clean_shutdown() {
     .await
     .expect("B setup_proactive_relay timeout")
     .expect("B setup_proactive_relay");
+    assert!(
+        b_to_r_conn.is_pinned_to_physical_slot(),
+        "reused direct physical connection carrying an outer MASQUE relay session must be pinned to physical slots"
+    );
 
     let b_accept_task = tokio::spawn({
         let peer_b = Arc::clone(&peer_b);
@@ -1697,9 +1711,9 @@ fn server_accept_pin_try_connect_to_sanitization_and_virtual_migration_mtu() {
         accept_err.cause
     );
 
-    // 2. TryConnectTo rejection on a virtual connection must NEVER leak the
-    // synthetic ULA in TryConnectToResponse.source_address, AND migrate() on a
-    // virtual connection must preserve `virtual_mtu_hint`.
+    // 2. Remote migration on SocketSlotId::VIRTUAL must preserve the virtual MTU
+    // ceiling, AND TryConnectTo rejection on a connection whose active remote is
+    // a synthetic ULA must NEVER leak that synthetic ULA in TryConnectToResponse.source_address.
     let (v_client, mut v_server, now) = establish_slot_pair(
         server_transport.clone(),
         client_transport.clone(),
@@ -1711,7 +1725,23 @@ fn server_accept_pin_try_connect_to_sanitization_and_virtual_migration_mtu() {
         .set_virtual_path_mtu_hint(Some(Arc::clone(&live_mtu)));
     assert_eq!(v_server.conn().path_mtu(), 1080);
 
-    // Simulate a TryConnectTo request with synthetic/loopback target on the virtual connection.
+    // Migrate to a real synthetic ULA remote first so `path.remote` IS synthetic
+    // when exercising both virtual-MTU preservation and TryConnectToResponse sanitization.
+    let new_synth_remote = make_synthetic_virtual_addr(2, 2, 99, 55555);
+    v_server
+        .conn_mut()
+        .migrate(now, new_synth_remote, SocketSlotId::VIRTUAL);
+    assert!(
+        is_synthetic_virtual_addr(v_server.conn().remote_address()),
+        "v_server active remote must be a synthetic ULA before testing TryConnectToResponse sanitization"
+    );
+    assert_eq!(
+        v_server.conn().path_mtu(),
+        1080,
+        "remote migration on SocketSlotId::VIRTUAL must preserve virtual MTU ceiling"
+    );
+
+    // Simulate a TryConnectTo request with invalid target on the synthetic-remote virtual connection.
     let bad_req = crate::frame::TryConnectTo {
         request_id: crate::VarInt::from_u32(77),
         target_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -1730,22 +1760,18 @@ fn server_accept_pin_try_connect_to_sanitization_and_virtual_migration_mtu() {
         "TryConnectToResponse.source_address leaked synthetic ULA: {}",
         queued[0].source_address
     );
-
-    // Remote migration on SocketSlotId::VIRTUAL must preserve the virtual MTU ceiling.
-    let new_synth_remote = make_synthetic_virtual_addr(2, 2, 99, 55555);
-    v_server
-        .conn_mut()
-        .migrate(now, new_synth_remote, SocketSlotId::VIRTUAL);
     assert_eq!(
-        v_server.conn().path_mtu(),
-        1080,
-        "remote migration on SocketSlotId::VIRTUAL must preserve virtual MTU ceiling"
+        queued[0].source_address,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        "synthetic ULA remote must be sanitized to 0.0.0.0:0"
     );
 
-    // 3. `set_pin_to_physical_slot(true)` clears pending virtual validation and
-    // blocks slot-mismatch probe with `src_ip == None`.
+    // 3. `set_pin_to_physical_slot(true)` clears pending virtual validation, and
+    // both slot-mismatch PATH_CHALLENGE probes and off-path PATH_RESPONSE packets
+    // clear active `src_ip` (`None`) when `local_slot != active_slot`.
     let (p_client, mut p_server, p_now) =
         establish_slot_pair(server_transport, client_transport, SocketSlotId::PRIMARY);
+    p_server.conn_mut().local_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     p_server.conn_mut().pending_slot_validation = Some(super::PendingSlotValidation {
         remote: make_synthetic_virtual_addr(1, 1, 5, 4444),
         local_slot: SocketSlotId::VIRTUAL,
@@ -1784,6 +1810,24 @@ fn server_accept_pin_try_connect_to_sanitization_and_virtual_migration_mtu() {
     assert_eq!(
         probe_tx.src_ip, None,
         "slot-mismatch probe must not carry the active slot's src_ip"
+    );
+
+    // Off-path PATH_RESPONSE on a different slot must ALSO clear `src_ip == None`
+    // (avoiding EINVAL on multi-IP hosts with pktinfo), while same-slot keeps `local_ip`.
+    let peer_remote = p_server.conn().remote_address();
+    p_server
+        .conn_mut()
+        .path_responses
+        .push(9001, 0xfeed_face, peer_remote, slot1);
+    buf.clear();
+    let resp_tx = p_server
+        .conn_mut()
+        .poll_transmit(p_now, 1, &mut buf)
+        .expect("off-path PATH_RESPONSE on slot 1");
+    assert_eq!(resp_tx.local_slot, slot1);
+    assert_eq!(
+        resp_tx.src_ip, None,
+        "off-path PATH_RESPONSE on another slot must not reuse the active slot's src_ip"
     );
     let _ = (v_client, p_client);
 }
@@ -1883,5 +1927,169 @@ async fn unsolicited_virtual_ingress_route_rate_limit_caps_flood_without_blockin
             None
         ),
         "existing route must not be affected by unsolicited-route rate limiter"
+    );
+}
+
+#[tokio::test]
+async fn relay_slot_ids_recycle_across_detach_without_exhaustion_and_keep_monotonic_gen() {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind primary");
+    let primary = PhysicalBindSlot::from_std(SocketSlotId::PRIMARY, std_sock).unwrap();
+    let mux = Arc::new(MultiplexedUdpSocket::new(vec![primary]).unwrap());
+
+    let public_addr: SocketAddr = "203.0.113.99:40099".parse().unwrap();
+    let peer_addr: SocketAddr = "198.51.100.201:7778".parse().unwrap();
+
+    // Attach slot 1, record its synthetic route, then detach.
+    let first_relay: SocketAddr = "198.51.100.1:443".parse().unwrap();
+    let (tx0, _rx0) = tokio::sync::mpsc::channel::<OutboundRelayPacket>(2);
+    let first_handle = mux
+        .attach_virtual_channel(first_relay, public_addr, tx0, 1280)
+        .expect("attach first relay");
+    let first_synth = mux
+        .register_virtual_route(first_handle.relay_slot, peer_addr)
+        .expect("register route on first slot");
+    mux.detach_relay(first_relay);
+    assert_eq!(mux.relay_slot_for_addr(first_relay), None);
+
+    // Churn past u16::MAX (65,535) distinct relay addresses with detach between
+    // them; slot IDs must recycle cleanly without AddrNotAvailable and route_gen
+    // must remain strictly monotonic even when `first_handle.relay_slot` wraps around.
+    let mut prev_gen = first_handle.route_gen;
+    let mut saw_recycled_first_slot = false;
+    let total = usize::from(u16::MAX) + 32;
+    for i in 0..total {
+        let relay = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            )),
+            4433,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundRelayPacket>(1);
+        let handle = mux
+            .attach_virtual_channel(relay, public_addr, tx, 1280)
+            .expect("detached relay slot IDs must recycle past u16::MAX");
+        assert!(
+            handle.route_gen > prev_gen,
+            "route_gen must strictly increase across attach/detach churn"
+        );
+        prev_gen = handle.route_gen;
+        if handle.relay_slot == first_handle.relay_slot {
+            saw_recycled_first_slot = true;
+            // Prior synthetic ULA for this recycled slot must be rejected by route_gen!
+            assert_eq!(
+                mux.resolve_virtual_target(first_synth),
+                None,
+                "stale synthetic ULA from previous occupant of recycled slot must not resolve"
+            );
+        }
+        mux.detach_relay(relay);
+    }
+    assert!(
+        saw_recycled_first_slot,
+        "churning past u16::MAX distinct relay addresses must wrap and recycle slot 1"
+    );
+}
+
+#[test]
+fn invalid_slot_path_response_wrong_slot_stale_token_and_expiry_never_promote() {
+    let mut server_transport = TransportConfig::default();
+    server_transport.datagram_receive_buffer_size(Some(65_536));
+    server_transport.datagram_send_buffer_size(65_536);
+    let mut client_transport = TransportConfig::default();
+    client_transport.datagram_receive_buffer_size(Some(65_536));
+    client_transport.datagram_send_buffer_size(65_536);
+
+    let (mut client, mut server, now) =
+        establish_slot_pair(server_transport, client_transport, SocketSlotId::PRIMARY);
+    let active_remote = server.conn().remote_address();
+    let slot1 = SocketSlotId::physical(1).unwrap();
+    let challenge_token = 0x1122_3344_5566_7788u64;
+
+    server.conn_mut().pending_slot_validation = Some(super::PendingSlotValidation {
+        remote: active_remote,
+        local_slot: slot1,
+        challenge: challenge_token,
+        challenge_pending: false,
+        wants_promotion: true,
+        total_recvd: 2000,
+        total_sent: 0,
+        expires_at: now + Duration::from_secs(5),
+    });
+
+    fn send_path_response(
+        client: &mut SlotPeer,
+        server: &mut SlotPeer,
+        active_remote: SocketAddr,
+        pkt_num: u64,
+        token: u64,
+        deliver_slot: SocketSlotId,
+        at: crate::Instant,
+    ) {
+        client
+            .conn_mut()
+            .path_responses
+            .push(pkt_num, token, SERVER_ADDR, SocketSlotId::PRIMARY);
+        let mut buf = Vec::with_capacity(4096);
+        let tx = client
+            .conn_mut()
+            .poll_transmit(at, 1, &mut buf)
+            .expect("client emits 1-RTT PATH_RESPONSE");
+        let datagram = BytesMut::from(&buf[..tx.size]);
+        deliver_with_slot(at, datagram, active_remote, deliver_slot, server);
+    }
+
+    // 1. Stale/wrong token on the right slot (slot1) must NOT promote.
+    send_path_response(
+        &mut client,
+        &mut server,
+        active_remote,
+        10,
+        challenge_token ^ 1,
+        slot1,
+        now,
+    );
+    assert_eq!(server.conn().local_slot(), SocketSlotId::PRIMARY);
+    assert!(server.conn().pending_slot_validation.is_some());
+
+    // 2. Right token arriving on the WRONG slot (PRIMARY instead of slot1) must NOT promote.
+    send_path_response(
+        &mut client,
+        &mut server,
+        active_remote,
+        11,
+        challenge_token,
+        SocketSlotId::PRIMARY,
+        now,
+    );
+    assert_eq!(server.conn().local_slot(), SocketSlotId::PRIMARY);
+    assert!(server.conn().pending_slot_validation.is_some());
+
+    // 3. Right token on slot1 arriving AFTER `expires_at` must NOT promote.
+    let after_expiry = now + Duration::from_secs(6);
+    send_path_response(
+        &mut client,
+        &mut server,
+        active_remote,
+        12,
+        challenge_token,
+        slot1,
+        after_expiry,
+    );
+    assert_eq!(server.conn().local_slot(), SocketSlotId::PRIMARY);
+
+    // 4. Timeout handler clears an expired `PendingSlotValidation` without promoting.
+    let expiry_deadline = server
+        .conn()
+        .pending_slot_validation
+        .as_ref()
+        .map_or(after_expiry, |p| p.expires_at);
+    server.conn_mut().handle_timeout(expiry_deadline);
+    assert_eq!(server.conn().local_slot(), SocketSlotId::PRIMARY);
+    assert!(
+        server.conn().pending_slot_validation.is_none(),
+        "expired PendingSlotValidation must be cleared without promoting"
     );
 }
