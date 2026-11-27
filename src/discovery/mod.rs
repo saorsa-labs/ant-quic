@@ -51,8 +51,8 @@ pub mod filter;
 pub mod lookup;
 
 pub use filter::{
-    AddrFilter, CompositeFilter, DedupFilter, DropLoopbackFilter, DropUnspecifiedFilter,
-    PassThroughFilter, PreferIpv6Filter,
+    AddrFilter, CompositeFilter, DedupFilter, DropLoopbackFilter, DropSyntheticVirtualFilter,
+    DropUnspecifiedFilter, PassThroughFilter, PreferIpv6Filter,
 };
 pub use lookup::{
     AddressLookup, BootstrapCacheLookup, HardcodedLookup, LookupError, LookupRegistry, MdnsLookup,

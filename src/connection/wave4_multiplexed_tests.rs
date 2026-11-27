@@ -1229,7 +1229,7 @@ async fn virtual_route_idle_reaping_and_active_route_preservation() {
     let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind primary");
     let primary = PhysicalBindSlot::from_std(SocketSlotId::PRIMARY, std_sock).unwrap();
     let mux = Arc::new(MultiplexedUdpSocket::new(vec![primary]).unwrap());
-    mux.set_virtual_route_idle_timeout(Duration::from_millis(60));
+    mux.set_virtual_route_idle_timeout(Duration::from_millis(150));
 
     let relay_addr: SocketAddr = "198.51.100.11:443".parse().unwrap();
     let public_addr: SocketAddr = "203.0.113.51:40001".parse().unwrap();
@@ -1270,12 +1270,12 @@ async fn virtual_route_idle_reaping_and_active_route_preservation() {
 
     // Wait half the idle window, keep `active_peer` fresh via activity, then wait
     // past the idle timeout for the remaining 4095 untouched routes.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
     let refreshed = mux
         .register_virtual_route(handle.relay_slot, active_peer)
         .expect("re-touch active peer");
     assert_eq!(refreshed, active_synth);
-    tokio::time::sleep(Duration::from_millis(35)).await;
+    tokio::time::sleep(Duration::from_millis(90)).await;
 
     // Now the 4095 idle entries are >= 75 ms old (>= 60 ms timeout) while
     // `active_peer` is only ~35 ms old (< 60 ms timeout). New peer allocation
@@ -1392,7 +1392,7 @@ async fn abstract_socket_wrapper_preserves_relay_plane_and_nat_endpoint() {
     nat_ep.shutdown().await.expect("nat_ep shutdown");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_socket_drop_without_detach_breaks_arc_cycle_and_concurrent_replace_never_deadlocks()
 {
     use crate::masque::MasqueRelaySocket;
@@ -1513,5 +1513,375 @@ async fn relay_socket_drop_without_detach_breaks_arc_cycle_and_concurrent_replac
     assert!(
         freed.is_ok(),
         "dropping MultiplexedUdpSocket without detach_all_relays must free attached MasqueRelaySocket (no Arc cycle)"
+    );
+}
+
+#[test]
+fn physical_recv_spoof_flood_bounded_and_counts_drops() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    use crate::high_level::runtime::UdpSender;
+    use crate::high_level::runtime::multiplexed::MAX_SPOOF_DROP_RETRIES_PER_POLL;
+
+    #[derive(Debug)]
+    struct DummySender;
+    impl UdpSender for DummySender {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _t: &UdpTransmit,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+    }
+
+    #[derive(Debug)]
+    struct SpoofFloodSocket {
+        recv_calls: Arc<AtomicUsize>,
+        spoof_addr: SocketAddr,
+    }
+    impl AsyncUdpSocket for SpoofFloodSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(DummySender)
+        }
+        fn poll_recv(
+            &self,
+            _cx: &mut Context,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.recv_calls.fetch_add(1, Ordering::Relaxed);
+            let n = bufs.len().min(meta.len()).min(2);
+            for i in 0..n {
+                bufs[i][0] = 0x40;
+                meta[i] = RecvMeta {
+                    len: 1,
+                    stride: 1,
+                    addr: self.spoof_addr,
+                    ecn: None,
+                    dst_ip: None,
+                };
+            }
+            Poll::Ready(Ok(n))
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:41000".parse().unwrap())
+        }
+    }
+
+    // Build a waker that records whether `wake_by_ref` was invoked.
+    let woken = Arc::new(AtomicBool::new(false));
+    fn clone_waker(data: *const ()) -> RawWaker {
+        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
+        let cloned = Arc::clone(&arc);
+        std::mem::forget(arc);
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+    }
+    fn wake(data: *const ()) {
+        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
+        arc.store(true, Ordering::Relaxed);
+    }
+    fn wake_by_ref(data: *const ()) {
+        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
+        arc.store(true, Ordering::Relaxed);
+        std::mem::forget(arc);
+    }
+    fn drop_waker(data: *const ()) {
+        unsafe { drop(Arc::from_raw(data as *const AtomicBool)) };
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
+    let raw_waker = RawWaker::new(Arc::into_raw(Arc::clone(&woken)) as *const (), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
+
+    let recv_calls = Arc::new(AtomicUsize::new(0));
+    let spoof_addr = make_synthetic_virtual_addr(1, 1, 7, 4433);
+    let flood_sock = Arc::new(SpoofFloodSocket {
+        recv_calls: Arc::clone(&recv_calls),
+        spoof_addr,
+    });
+    let mux = MultiplexedUdpSocket::from_abstract_socket(flood_sock).expect("wrap spoof socket");
+
+    let mut raw_bufs = [[0u8; 64]; 4];
+    let mut slices: Vec<IoSliceMut<'_>> = raw_bufs.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+    let mut metas = [RecvMeta::default(); 4];
+    let mut slots = [SocketSlotId::PRIMARY; 4];
+
+    let poll = mux.poll_recv_with_slots(&mut cx, &mut slices, &mut metas, &mut slots);
+    assert!(
+        matches!(poll, Poll::Pending),
+        "spoof flood must yield Poll::Pending after retry bound instead of starving the endpoint"
+    );
+    assert_eq!(
+        recv_calls.load(Ordering::Relaxed),
+        MAX_SPOOF_DROP_RETRIES_PER_POLL
+    );
+    assert_eq!(
+        mux.stats()
+            .synthetic_prefix_spoof_dropped
+            .load(Ordering::Relaxed),
+        (MAX_SPOOF_DROP_RETRIES_PER_POLL * 2) as u64
+    );
+    assert!(
+        woken.load(Ordering::Relaxed),
+        "yielding on spoof flood retry bound must re-schedule the waker"
+    );
+}
+
+#[test]
+fn server_accept_pin_try_connect_to_sanitization_and_virtual_migration_mtu() {
+    let mut server_transport = TransportConfig::default();
+    server_transport.datagram_receive_buffer_size(Some(65_536));
+    server_transport.datagram_send_buffer_size(65_536);
+    let mut client_transport = TransportConfig::default();
+    client_transport.datagram_receive_buffer_size(Some(65_536));
+    client_transport.datagram_send_buffer_size(65_536);
+
+    // 1. ServerConfig::pin_to_physical_slot(true) refuses virtual-plane accepts.
+    let (server_cfg_base, client_cfg) =
+        build_pqc_rpk_configs(server_transport.clone(), client_transport.clone());
+    let mut pinned_server_cfg = (*server_cfg_base).clone();
+    pinned_server_cfg.pin_to_physical_slot(true);
+
+    let mut client_ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let mut server_ep = Endpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(Arc::new(pinned_server_cfg)),
+        true,
+        None,
+    );
+    let now = crate::Instant::now();
+    let synth_client_remote = make_synthetic_virtual_addr(2, 1, 11, 50000);
+    let synth_server_remote = make_synthetic_virtual_addr(2, 1, 12, 4433);
+    let (_ch, mut client_conn) = client_ep
+        .connect_with_slot(
+            now,
+            client_cfg,
+            synth_server_remote,
+            "localhost",
+            SocketSlotId::VIRTUAL,
+        )
+        .expect("unpinned client may dial virtual slot");
+    let mut buf = Vec::with_capacity(4096);
+    let initial = client_conn
+        .poll_transmit(now, 1, &mut buf)
+        .expect("client Initial");
+    let mut payload = BytesMut::from(&buf[..initial.size]);
+    let event = server_ep.handle_with_slot(
+        now,
+        synth_client_remote,
+        None,
+        SocketSlotId::VIRTUAL,
+        None,
+        payload.split(),
+        &mut Vec::new(),
+    );
+    let incoming = match event {
+        Some(DatagramEvent::NewConnection(inc)) => inc,
+        other => panic!(
+            "expected NewConnection, got unexpected DatagramEvent (is_some={})",
+            other.is_some()
+        ),
+    };
+    let accept_err = server_ep
+        .accept(incoming, now, &mut Vec::new(), None)
+        .expect_err("pinned server must reject virtual-plane incoming connection");
+    assert!(
+        matches!(accept_err.cause, crate::ConnectionError::TransportError(_)),
+        "expected CONNECTION_REFUSED transport error, got {:?}",
+        accept_err.cause
+    );
+
+    // 2. TryConnectTo rejection on a virtual connection must NEVER leak the
+    // synthetic ULA in TryConnectToResponse.source_address, AND migrate() on a
+    // virtual connection must preserve `virtual_mtu_hint`.
+    let (v_client, mut v_server, now) = establish_slot_pair(
+        server_transport.clone(),
+        client_transport.clone(),
+        SocketSlotId::VIRTUAL,
+    );
+    let live_mtu = Arc::new(AtomicU16::new(1080));
+    v_server
+        .conn_mut()
+        .set_virtual_path_mtu_hint(Some(Arc::clone(&live_mtu)));
+    assert_eq!(v_server.conn().path_mtu(), 1080);
+
+    // Simulate a TryConnectTo request with synthetic/loopback target on the virtual connection.
+    let bad_req = crate::frame::TryConnectTo {
+        request_id: crate::VarInt::from_u32(77),
+        target_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        timeout_ms: 1000,
+    };
+    v_server
+        .conn_mut()
+        .handle_try_connect_to(&bad_req, now)
+        .expect("handle_try_connect_to returns Ok");
+    let queued = &v_server.conn().spaces[crate::packet::SpaceId::Data]
+        .pending
+        .try_connect_to_responses;
+    assert_eq!(queued.len(), 1);
+    assert!(
+        !is_synthetic_virtual_addr(queued[0].source_address),
+        "TryConnectToResponse.source_address leaked synthetic ULA: {}",
+        queued[0].source_address
+    );
+
+    // Remote migration on SocketSlotId::VIRTUAL must preserve the virtual MTU ceiling.
+    let new_synth_remote = make_synthetic_virtual_addr(2, 2, 99, 55555);
+    v_server
+        .conn_mut()
+        .migrate(now, new_synth_remote, SocketSlotId::VIRTUAL);
+    assert_eq!(
+        v_server.conn().path_mtu(),
+        1080,
+        "remote migration on SocketSlotId::VIRTUAL must preserve virtual MTU ceiling"
+    );
+
+    // 3. `set_pin_to_physical_slot(true)` clears pending virtual validation and
+    // blocks slot-mismatch probe with `src_ip == None`.
+    let (p_client, mut p_server, p_now) =
+        establish_slot_pair(server_transport, client_transport, SocketSlotId::PRIMARY);
+    p_server.conn_mut().pending_slot_validation = Some(super::PendingSlotValidation {
+        remote: make_synthetic_virtual_addr(1, 1, 5, 4444),
+        local_slot: SocketSlotId::VIRTUAL,
+        challenge: 0xdead_beef,
+        challenge_pending: true,
+        wants_promotion: true,
+        total_recvd: 2000,
+        total_sent: 0,
+        expires_at: p_now + Duration::from_secs(5),
+    });
+    p_server.conn_mut().set_pin_to_physical_slot(true);
+    assert!(
+        p_server.conn().pending_slot_validation.is_none(),
+        "pinning an accepted connection must clear any pending virtual slot validation"
+    );
+
+    // Non-virtual physical slot-mismatch probe must emit `src_ip == None` so an
+    // extra slot on another interface never fails with EINVAL.
+    let slot1 = SocketSlotId::physical(1).unwrap();
+    p_server.conn_mut().pending_slot_validation = Some(super::PendingSlotValidation {
+        remote: p_server.conn().remote_address(),
+        local_slot: slot1,
+        challenge: 0x1234_5678,
+        challenge_pending: true,
+        wants_promotion: false,
+        total_recvd: 2000,
+        total_sent: 0,
+        expires_at: p_now + Duration::from_secs(5),
+    });
+    buf.clear();
+    let probe_tx = p_server
+        .conn_mut()
+        .poll_transmit(p_now, 1, &mut buf)
+        .expect("slot-mismatch PATH_CHALLENGE");
+    assert_eq!(probe_tx.local_slot, slot1);
+    assert_eq!(
+        probe_tx.src_ip, None,
+        "slot-mismatch probe must not carry the active slot's src_ip"
+    );
+    let _ = (v_client, p_client);
+}
+
+#[test]
+fn protocol_driven_outer_peer_param_mtu_shrink_updates_inner_observer() {
+    let mut outer_server_transport = TransportConfig::default();
+    outer_server_transport.datagram_receive_buffer_size(Some(65_536));
+    outer_server_transport.datagram_send_buffer_size(65_536);
+    outer_server_transport.initial_mtu(1400);
+    let mut outer_client_transport = TransportConfig::default();
+    outer_client_transport.datagram_receive_buffer_size(Some(65_536));
+    outer_client_transport.datagram_send_buffer_size(65_536);
+    outer_client_transport.initial_mtu(1400);
+    let (mut outer_client, _outer_server, _outer_now) = establish_slot_pair(
+        outer_server_transport,
+        outer_client_transport,
+        SocketSlotId::PRIMARY,
+    );
+
+    let shared_vp_mtu = Arc::new(AtomicU16::new(0));
+    outer_client
+        .conn_mut()
+        .subscribe_virtual_path_mtu(Arc::clone(&shared_vp_mtu), 2);
+    let before = shared_vp_mtu.load(Ordering::Relaxed);
+    assert!(before >= 1200, "initial virtual MTU should be >= 1200");
+
+    // Drive a protocol-level peer transport-parameter max_datagram_frame_size
+    // shrink on the outer connection (not `apply_virtual_path_mtu`).
+    let mut shrunk_params = outer_client.conn().peer_params.clone();
+    shrunk_params.max_datagram_frame_size = Some(crate::VarInt::from_u32(1000));
+    outer_client.conn_mut().set_peer_params(shrunk_params);
+
+    let after = shared_vp_mtu.load(Ordering::Relaxed);
+    assert!(
+        after < before && (900..=1000).contains(&after),
+        "protocol-driven outer peer-param datagram shrink must synchronously update observer (before={before}, after={after})"
+    );
+}
+
+#[tokio::test]
+async fn unsolicited_virtual_ingress_route_rate_limit_caps_flood_without_blocking_existing_routes()
+{
+    use crate::high_level::runtime::multiplexed::MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC;
+
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind primary");
+    let primary = PhysicalBindSlot::from_std(SocketSlotId::PRIMARY, std_sock).unwrap();
+    let mux =
+        Arc::new(MultiplexedUdpSocket::with_virtual_queue_capacity(vec![primary], 512).unwrap());
+
+    let relay_addr: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    let public_addr: SocketAddr = "203.0.113.84:40004".parse().unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundRelayPacket>(8);
+    let handle = mux
+        .attach_virtual_channel(relay_addr, public_addr, tx, 1280)
+        .expect("attach virtual channel");
+
+    // Pre-register one legitimate peer route before the flood.
+    let known_peer: SocketAddr = "198.51.100.200:7777".parse().unwrap();
+    let _known_synth = mux
+        .register_virtual_route(handle.relay_slot, known_peer)
+        .expect("register known peer");
+
+    // Flood more distinct unsolicited sources than MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC.
+    let flood_count = MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC + 20;
+    let mut admitted = 0u32;
+    for i in 0..flood_count {
+        let src = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 18, 9, (i % 250) as u8)),
+            6000 + i as u16,
+        );
+        if mux.inject_virtual_datagram(
+            handle.relay_slot,
+            handle.route_gen,
+            src,
+            vec![0x40; 8],
+            None,
+        ) {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC);
+    assert_eq!(
+        mux.stats()
+            .virtual_ingress_route_rate_limited
+            .load(Ordering::Relaxed),
+        20
+    );
+
+    // Existing registered route continues receiving without being rate-limited!
+    assert!(
+        mux.inject_virtual_datagram(
+            handle.relay_slot,
+            handle.route_gen,
+            known_peer,
+            vec![0x41; 8],
+            None
+        ),
+        "existing route must not be affected by unsolicited-route rate limiter"
     );
 }

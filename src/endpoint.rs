@@ -1269,6 +1269,20 @@ impl Endpoint {
             }
         };
 
+        if server_config.pin_to_physical_slot
+            && (incoming.addresses.local_slot.is_virtual()
+                || crate::socket_slot::is_synthetic_virtual_addr(incoming.addresses.remote))
+        {
+            debug!("refusing virtual-plane connection on server pinned to physical UDP slots");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::TransportError(TransportError::CONNECTION_REFUSED(
+                    "server is pinned to physical UDP slots (ADR-021)",
+                )),
+                response: None,
+            });
+        }
+
         if server_config
             .transport
             .max_idle_timeout
@@ -1355,6 +1369,7 @@ impl Endpoint {
                 });
             }
         };
+        let pin_to_physical_slot = server_config.pin_to_physical_slot;
         let transport_config = server_config.transport.clone();
         let mut conn = self.add_connection(
             ch,
@@ -1372,6 +1387,9 @@ impl Endpoint {
                 path_validated: remote_address_validated,
             },
         );
+        if pin_to_physical_slot {
+            conn.set_pin_to_physical_slot(true);
+        }
         self.index.insert_initial(dst_cid, ch);
 
         match conn.handle_first_packet(

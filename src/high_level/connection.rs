@@ -300,11 +300,18 @@ enum SendFailureAction {
 fn send_failure_action(
     error: &io::Error,
     destination: SocketAddr,
+    local_slot: crate::SocketSlotId,
     active_destination: SocketAddr,
+    active_local_slot: crate::SocketSlotId,
 ) -> SendFailureAction {
-    // A failed candidate probe is not evidence that the established path is
-    // unusable. Its validation will time out without taking down this driver.
-    if is_transient_socket_error(error) || destination != active_destination {
+    // A failed candidate probe (either an alternate remote address or an
+    // unvalidated alternate local UDP slot) is not evidence that the
+    // established path is unusable. Its validation will time out without
+    // taking down this driver.
+    if is_transient_socket_error(error)
+        || destination != active_destination
+        || local_slot != active_local_slot
+    {
         SendFailureAction::DropDatagram
     } else {
         SendFailureAction::TerminateConnection
@@ -831,6 +838,31 @@ impl Connection {
             .inner
             .datagrams()
             .max_size()
+    }
+
+    /// Return the local UDP socket slot currently bound to this connection's
+    /// active path (ADR-021).
+    pub fn local_slot(&self) -> crate::SocketSlotId {
+        self.0.state.lock("local_slot").inner.local_slot()
+    }
+
+    /// Pin this connection strictly to physical UDP bind slots (ADR-021 §1.1),
+    /// rejecting any subsequent migration or diversion onto `SocketSlotId::VIRTUAL`.
+    pub fn pin_to_physical_slot(&self) {
+        self.0
+            .state
+            .lock("pin_to_physical_slot")
+            .inner
+            .set_pin_to_physical_slot(true);
+    }
+
+    /// Return whether this connection is pinned strictly to physical UDP slots.
+    pub fn is_pinned_to_physical_slot(&self) -> bool {
+        self.0
+            .state
+            .lock("is_pinned_to_physical_slot")
+            .inner
+            .is_pinned_to_physical_slot()
     }
 
     /// Subscribe a shared virtual-path MTU atomic to synchronous outer MTU
@@ -1682,13 +1714,20 @@ impl State {
                     // NAT candidate. Its validation timer will retire it. A
                     // hard error on the active path must terminate the whole
                     // connection so it cannot remain falsely Live.
-                    if send_failure_action(&e, t.destination, self.inner.remote_address())
-                        == SendFailureAction::DropDatagram
+                    if send_failure_action(
+                        &e,
+                        t.destination,
+                        t.local_slot,
+                        self.inner.remote_address(),
+                        self.inner.local_slot(),
+                    ) == SendFailureAction::DropDatagram
                     {
                         debug!(
-                            "dropping failed UDP transmit to {} (active path {}): {}",
+                            "dropping failed UDP transmit to {} on {:?} (active path {} on {:?}): {}",
                             t.destination,
+                            t.local_slot,
                             self.inner.remote_address(),
+                            self.inner.local_slot(),
                             e
                         );
                         continue;
@@ -2104,19 +2143,32 @@ mod tests {
     fn fatal_send_error_only_terminates_the_active_path() {
         let active = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 12345));
         let alternate = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 12345));
+        let slot0 = crate::SocketSlotId::PRIMARY;
+        let slot1 = crate::SocketSlotId::physical(1).expect("slot 1");
         let denied = io::Error::from_raw_os_error(1);
         assert_eq!(
-            send_failure_action(&denied, alternate, active),
+            send_failure_action(&denied, alternate, slot0, active, slot0),
             SendFailureAction::DropDatagram,
             "a blocked candidate cannot close the established path"
         );
         assert_eq!(
-            send_failure_action(&denied, active, active),
+            send_failure_action(&denied, active, slot1, active, slot0),
+            SendFailureAction::DropDatagram,
+            "a hard error on a slot-mismatch probe must not close the established path"
+        );
+        assert_eq!(
+            send_failure_action(&denied, active, slot0, active, slot0),
             SendFailureAction::TerminateConnection,
             "a blocked established path cannot remain Live"
         );
         assert_eq!(
-            send_failure_action(&io::Error::from_raw_os_error(101), active, active),
+            send_failure_action(
+                &io::Error::from_raw_os_error(101),
+                active,
+                slot0,
+                active,
+                slot0
+            ),
             SendFailureAction::DropDatagram,
             "transient active-path failures retain loss recovery"
         );
@@ -2125,7 +2177,13 @@ mod tests {
         // errno 55, Linux 105 — matched via libc in is_transient_socket_error).
         #[cfg(unix)]
         assert_eq!(
-            send_failure_action(&io::Error::from_raw_os_error(libc::ENOBUFS), active, active),
+            send_failure_action(
+                &io::Error::from_raw_os_error(libc::ENOBUFS),
+                active,
+                slot0,
+                active,
+                slot0,
+            ),
             SendFailureAction::DropDatagram,
             "ENOBUFS under send pressure must not close an active connection"
         );

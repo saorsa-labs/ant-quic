@@ -7250,6 +7250,28 @@ impl NatTraversalEndpoint {
             return;
         };
 
+        // ADR-021 §1.1 (acyclic 2-level relay DAG): outer MASQUE relay sessions
+        // must NEVER run over `SocketSlotId::VIRTUAL` or a synthetic ULA, and
+        // accepted server-side relay sessions are always pinned to physical UDP
+        // slots so they cannot be diverted onto the virtual plane.
+        if connection.local_slot().is_virtual()
+            || crate::socket_slot::is_synthetic_virtual_addr(client_addr)
+        {
+            warn!(
+                %client_addr,
+                "Refusing CONNECT-UDP relay request over virtual path (ADR-021)"
+            );
+            let response = ConnectUdpResponse::error(
+                403,
+                "nested relay sessions over virtual paths are forbidden".to_string(),
+            );
+            let response_frame = encode_relay_response_frame(&response);
+            let _ = send_stream.write_all(&response_frame).await;
+            let _ = send_stream.finish();
+            return;
+        }
+        connection.pin_to_physical_slot();
+
         #[cfg(all(test, feature = "network-discovery"))]
         lifecycle_points::relay_response_point(Arc::as_ptr(&relay_server) as usize).await;
         match relay_server
@@ -7937,6 +7959,24 @@ impl NatTraversalEndpoint {
     #[cfg(test)]
     pub(crate) fn has_multiplexed_socket(&self) -> bool {
         self.multiplexed_socket.read().is_some()
+    }
+
+    /// Remove a synthetic virtual route on connection close when no remaining
+    /// live connection still references `remote_addr` (closes the idle-timeout
+    /// route-pin window after a relayed peer disconnects).
+    fn release_unused_virtual_route(&self, remote_addr: SocketAddr) {
+        if !crate::socket_slot::is_synthetic_virtual_addr(remote_addr) {
+            return;
+        }
+        let still_in_use = self
+            .connections
+            .iter()
+            .any(|entry| entry.value().remote_address() == remote_addr);
+        if !still_in_use {
+            if let Some(mux) = self.multiplexed_socket.read().as_ref() {
+                let _ = mux.remove_virtual_route(remote_addr);
+            }
+        }
     }
 
     /// Resolve a potentially synthetic virtual ULA remote address back to its
@@ -10531,9 +10571,11 @@ impl NatTraversalEndpoint {
                 {
                     return ReaderExitOutcome::ConnectionReaped { close_reason };
                 }
-                let _ = self.connections.remove_if(peer_id, |_, current| {
+                if let Some((_, removed)) = self.connections.remove_if(peer_id, |_, current| {
                     current.stable_id() == snapshot.stable_id
-                });
+                }) {
+                    self.release_unused_virtual_route(removed.remote_address());
+                }
                 if self.is_peer_connected(peer_id) {
                     return ReaderExitOutcome::ConnectionReaped { close_reason };
                 }
@@ -10807,11 +10849,13 @@ impl NatTraversalEndpoint {
         }
 
         if !swept.is_empty() {
-            self.connections.remove_if(peer_id, |_, current| {
+            if let Some((_, removed)) = self.connections.remove_if(peer_id, |_, current| {
                 swept
                     .iter()
                     .any(|(stable_id, _)| current.stable_id() == *stable_id)
-            });
+            }) {
+                self.release_unused_virtual_route(removed.remote_address());
+            }
             self.emitted_established_events.remove(peer_id);
         }
         swept.len()

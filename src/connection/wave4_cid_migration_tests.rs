@@ -624,7 +624,7 @@ fn zero_rtt_rollback_16_to_5_unmitigated_protocol_violation_and_mitigated_1rtt_f
 }
 
 #[test]
-fn zero_rtt_in_connection_migration_v1_kill_switch_preserves_early_data() {
+fn zero_rtt_in_connection_migration_v1_mismatch_fails_closed() {
     let (cert, key) = generate_test_cert();
     let server_sessions: Arc<dyn rustls::server::StoresServerSessions> =
         rustls::server::ServerSessionMemoryCache::new(64);
@@ -644,20 +644,17 @@ fn zero_rtt_in_connection_migration_v1_kill_switch_preserves_early_data() {
     assert!(c1.connected && s1.connected);
     assert!(c1.conn().supports_in_connection_migration_v1());
 
-    // Disabling 0x50C6 as a runtime kill-switch does NOT affect 0-RTT packets
-    // (RFC 9000 §9 forbids migration during 0-RTT), so early data MUST still be
-    // accepted cleanly while post-handshake 0x50C6 negotiation evaluates to false.
+    // Unmitigated toggle to in_connection_migration_v1 = false must fail closed with PROTOCOL_VIOLATION.
     let mut off_transport = TransportConfig::default();
     off_transport.in_connection_migration_v1(false);
     let server_off = build_server_config(cert, key, server_sessions, u32::MAX, off_transport);
-    let (c2, s2) = run_handshake(client_cfg, server_off, true);
-    assert!(
-        c2.terminated.is_none(),
-        "0x50C6 kill-switch toggle must not fail live 0-RTT tickets"
-    );
-    assert!(c2.connected && s2.connected);
+    let (c2, _s2) = run_handshake(client_cfg, server_off, true);
     assert!(c2.conn().has_0rtt());
-    assert!(c2.conn().accepted_0rtt());
-    assert!(!c2.conn().supports_in_connection_migration_v1());
-    assert!(!s2.conn().supports_in_connection_migration_v1());
+    assert!(!c2.connected);
+    match c2.terminated {
+        Some(ConnectionError::TransportError(ref err)) => {
+            assert_eq!(err.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        }
+        other => panic!("expected TransportError::PROTOCOL_VIOLATION, got {other:?}"),
+    }
 }

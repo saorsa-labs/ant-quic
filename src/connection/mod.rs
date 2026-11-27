@@ -369,6 +369,14 @@ impl Connection {
     /// Pin this connection to physical UDP slots (ADR-021 §1.1 acyclic DAG invariant).
     pub(crate) fn set_pin_to_physical_slot(&mut self, value: bool) {
         self.pin_to_physical_slot = value;
+        if value
+            && self
+                .pending_slot_validation
+                .as_ref()
+                .is_some_and(|p| p.local_slot.is_virtual() || is_synthetic_virtual_addr(p.remote))
+        {
+            self.pending_slot_validation = None;
+        }
     }
 
     /// Returns whether this connection is pinned to physical UDP slots.
@@ -1778,7 +1786,11 @@ impl Connection {
             size: buf.len(),
             ecn: None,
             segment_size: None,
-            src_ip: self.local_ip,
+            src_ip: if local_slot == self.path.local_slot {
+                self.local_ip
+            } else {
+                None
+            },
             local_slot,
         })
     }
@@ -1849,7 +1861,10 @@ impl Connection {
             size: buf.len(),
             ecn: None,
             segment_size: None,
-            src_ip: self.local_ip,
+            // Do not reuse `self.local_ip` from the active slot when probing a
+            // different local UDP slot: the old slot's bound IP may be invalid
+            // (EINVAL) on an extra slot bound to a different interface/family.
+            src_ip: None,
             local_slot,
         })
     }
@@ -4276,15 +4291,14 @@ impl Connection {
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
         // amplification attacks performed by spoofing source addresses.
+        let peer_max_udp_payload_size =
+            u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
         let mut new_path = if local_slot == self.path.local_slot
             && remote.is_ipv4()
             && remote.ip() == self.path.remote.ip()
         {
             PathData::from_previous(remote, local_slot, &self.path, now)
         } else {
-            let peer_max_udp_payload_size =
-                u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
-                    .unwrap_or(u16::MAX);
             PathData::new(
                 remote,
                 local_slot,
@@ -4294,6 +4308,16 @@ impl Connection {
                 &self.config,
             )
         };
+        // ADR-021 §1.4: preserve dynamic virtual-path MTU ceiling across remote
+        // migrations on `SocketSlotId::VIRTUAL` so DPLPMTUD never re-arms above
+        // the outer MASQUE tunnel ceiling.
+        if local_slot.is_virtual() {
+            if let Some(hint) = self.path.virtual_mtu_hint.clone() {
+                new_path.set_virtual_mtu_hint(Some(hint), Some(peer_max_udp_payload_size));
+            } else if let Some(applied) = self.path.virtual_mtu_applied {
+                new_path.apply_virtual_mtu(applied, Some(peer_max_udp_payload_size));
+            }
+        }
         new_path.challenge = Some(self.rng.r#gen());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
@@ -4353,6 +4377,13 @@ impl Connection {
                 &self.config,
             )
         };
+        if local_slot.is_virtual() {
+            if let Some(hint) = self.path.virtual_mtu_hint.clone() {
+                new_path.set_virtual_mtu_hint(Some(hint), Some(peer_max_udp_payload_size));
+            } else if let Some(applied) = self.path.virtual_mtu_applied {
+                new_path.apply_virtual_mtu(applied, Some(peer_max_udp_payload_size));
+            }
+        }
         new_path.validated = true;
         new_path.challenge = None;
         new_path.challenge_pending = false;
@@ -5703,6 +5734,14 @@ impl Connection {
         // Validate the target address (basic security checks)
         let target = try_connect_to.target_address;
 
+        // ADR-021 §1.2: never emit an internal synthetic virtual ULA in wire
+        // `TRY_CONNECT_TO_RESPONSE` frames.
+        let safe_source_address = if is_synthetic_virtual_addr(self.path.remote) {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            self.path.remote
+        };
+
         // Don't allow requests to loopback addresses from remote peers
         let allow_loopback = allow_loopback_from_env();
         if target.ip().is_loopback() && !allow_loopback {
@@ -5715,7 +5754,7 @@ impl Connection {
                 request_id: try_connect_to.request_id,
                 success: false,
                 error_code: Some(crate::frame::TryConnectError::InvalidAddress),
-                source_address: self.path.remote,
+                source_address: safe_source_address,
             };
             self.spaces[SpaceId::Data]
                 .pending
@@ -5734,7 +5773,7 @@ impl Connection {
                 request_id: try_connect_to.request_id,
                 success: false,
                 error_code: Some(crate::frame::TryConnectError::InvalidAddress),
-                source_address: self.path.remote,
+                source_address: safe_source_address,
             };
             self.spaces[SpaceId::Data]
                 .pending

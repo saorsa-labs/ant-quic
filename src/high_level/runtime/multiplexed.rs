@@ -13,8 +13,8 @@
 //! single [`crate::high_level::Endpoint`] backed by [`MultiplexedUdpSocket`]:
 //! - Every physical slot preserves exact `(remote_addr, local_slot)` identity on
 //!   both receive and transmit.
-//! - Virtual MASQUE routes are addressed via link-local-isolated synthetic IPv6
-//!   ULAs (`fd00:53a0:5251::/48`, [`crate::socket_slot`]) and delivered strictly
+//! - Virtual MASQUE routes are addressed via RFC 4193 synthetic IPv6 ULAs
+//!   (`fd00:53a0:5251::/48`, [`crate::socket_slot`]) and delivered strictly
 //!   via bounded, non-blocking, drop-on-full channels so `poll_send_on_slot` and
 //!   virtual ingress can never re-enter or deadlock [`crate::high_level::Endpoint`].
 //! - Physical receive paths drop any datagram whose source IP matches the
@@ -65,6 +65,17 @@ pub const DEFAULT_VIRTUAL_RECV_QUEUE_CAPACITY: usize = 512;
 /// single physical port or virtual relay can starve other active sources.
 pub const MAX_RECV_BURST_PER_SOURCE: usize = 32;
 
+/// Maximum consecutive all-spoof physical receive batches drained inside a
+/// single `poll_recv_with_slots` call before yielding back to the executor so
+/// a synthetic-ULA spoof flood can never starve the endpoint driver.
+pub const MAX_SPOOF_DROP_RETRIES_PER_POLL: usize = 4;
+
+/// Maximum unsolicited inbound virtual routes allocated per relay slot per
+/// second (protects the 4096-entry virtual route table from fast flood fill by
+/// a misbehaving or spoofing-fed relay without affecting existing routes or
+/// explicit outbound `register_virtual_route` calls).
+pub const MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC: u32 = 64;
+
 /// Default idle timeout after which an inactive virtual route may be reclaimed
 /// when `MAX_VIRTUAL_ROUTES` (4096) capacity is reached, without ever evicting
 /// routes with recent activity.
@@ -89,6 +100,10 @@ pub struct MultiplexedSocketStats {
     /// Virtual route allocations rejected because `MAX_VIRTUAL_ROUTES` (4096)
     /// was reached.
     pub virtual_route_cap_rejected: AtomicU64,
+    /// Unsolicited inbound virtual route allocations dropped because the
+    /// per-relay-slot rate limit (`MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC`)
+    /// was exceeded.
+    pub virtual_ingress_route_rate_limited: AtomicU64,
 }
 
 /// One physical UDP bind slot (dual-stack IPv4 + IPv6 sockets sharing a
@@ -209,11 +224,11 @@ impl PhysicalBindSlot {
                 }
             }
             Err(e) => {
-                debug!(
+                warn!(
                     %addr,
                     ?slot_id,
                     error = %e,
-                    "quinn-udp UdpSocketState::new unsupported on socket; falling back to plain Tokio AsyncUdpSocket"
+                    "quinn-udp UdpSocketState::new unsupported on socket; falling back to plain Tokio AsyncUdpSocket (GSO/GRO/ECN disabled on this slot)"
                 );
                 Self::from_abstract(slot_id, super::tokio::wrap_tokio_udp_socket(socket))
             }
@@ -381,6 +396,11 @@ struct RelaySessionSlot {
     /// Keep the underlying `MasqueRelaySocket` alive while attached so its
     /// background reader/writer tasks stay running.
     relay_socket: Option<Arc<MasqueRelaySocket>>,
+    /// Sliding 1-second window start (ms since table `created_at`) for
+    /// unsolicited inbound route creation rate limiting.
+    ingress_route_window_start_ms: u64,
+    /// Number of unsolicited inbound routes created in the current 1-second window.
+    ingress_routes_in_window: u32,
 }
 
 impl RelaySessionSlot {
@@ -989,6 +1009,7 @@ impl MultiplexedUdpSocket {
             let mut table = self.virtual_routes.write();
             let (slot, next_gen) = table.allocate_slot_and_gen(normalized_relay)?;
             let old_sock = table.relays.remove(&slot).and_then(|old| old.relay_socket);
+            let now_ms = table.elapsed_ms();
             table.relays.insert(
                 slot,
                 RelaySessionSlot {
@@ -1002,6 +1023,8 @@ impl MultiplexedUdpSocket {
                     relay_stats,
                     virtual_mtu: Arc::clone(&virtual_mtu),
                     relay_socket,
+                    ingress_route_window_start_ms: now_ms,
+                    ingress_routes_in_window: 0,
                 },
             );
             (slot, next_gen, old_sock)
@@ -1194,22 +1217,54 @@ impl MultiplexedUdpSocket {
             Some(addr) => addr,
             None => {
                 let mut table = routes.write();
-                let Some(relay) = table.relays.get(&relay_slot) else {
-                    return false;
-                };
-                if relay.route_gen != route_gen {
-                    return false;
-                }
-                match table.get_or_insert_route(relay_slot, normalized_source, stats) {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        trace!(
-                            relay_slot,
-                            %normalized_source,
-                            error = %e,
-                            "dropping virtual ingress datagram: route allocation failed"
-                        );
+                let now_ms = table.elapsed_ms();
+                // Re-check fast map under write lock before charging the
+                // unsolicited-route rate limiter.
+                let already_present = table
+                    .by_target
+                    .get(&(relay_slot, normalized_source))
+                    .copied()
+                    .filter(|addr| {
+                        table.by_synthetic.get(addr).is_some_and(|e| {
+                            if e.route_gen == route_gen {
+                                e.touch(now_ms);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    });
+                if let Some(addr) = already_present {
+                    addr
+                } else {
+                    let Some(relay) = table.relays.get_mut(&relay_slot) else {
                         return false;
+                    };
+                    if relay.route_gen != route_gen {
+                        return false;
+                    }
+                    if now_ms.saturating_sub(relay.ingress_route_window_start_ms) >= 1_000 {
+                        relay.ingress_route_window_start_ms = now_ms;
+                        relay.ingress_routes_in_window = 0;
+                    }
+                    if relay.ingress_routes_in_window >= MAX_UNSOLICITED_VIRTUAL_ROUTES_PER_SEC {
+                        stats
+                            .virtual_ingress_route_rate_limited
+                            .fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    relay.ingress_routes_in_window += 1;
+                    match table.get_or_insert_route(relay_slot, normalized_source, stats) {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            trace!(
+                                relay_slot,
+                                %normalized_source,
+                                error = %e,
+                                "dropping virtual ingress datagram: route allocation failed"
+                            );
+                            return false;
+                        }
                     }
                 }
             }
@@ -1272,6 +1327,7 @@ impl MultiplexedUdpSocket {
             return Poll::Ready(Ok(0));
         }
 
+        let mut spoof_batches = 0usize;
         loop {
             match socket.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -1327,7 +1383,13 @@ impl MultiplexedUdpSocket {
                     if kept > 0 {
                         return Poll::Ready(Ok(kept));
                     }
-                    // Every datagram in this batch was a dropped spoof; keep polling.
+                    spoof_batches += 1;
+                    if spoof_batches >= MAX_SPOOF_DROP_RETRIES_PER_POLL {
+                        // Bound consecutive spoof-only drains so a synthetic-ULA
+                        // flood can never starve other sockets or the endpoint driver.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -1436,6 +1498,7 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
                     let slot = &self.physical_slots[slot_idx];
                     if let Some(ref abs_sock) = slot.abstract_socket {
                         let burst = limit.min(MAX_RECV_BURST_PER_SOURCE);
+                        let mut spoof_batches = 0usize;
                         loop {
                             match abs_sock.poll_recv(cx, &mut bufs[..burst], &mut meta[..burst]) {
                                 Poll::Ready(Ok(0)) => break,
@@ -1467,8 +1530,13 @@ impl AsyncUdpSocket for MultiplexedUdpSocket {
                                     if kept > 0 {
                                         return Poll::Ready(Ok(kept));
                                     }
+                                    spoof_batches += 1;
+                                    if spoof_batches >= MAX_SPOOF_DROP_RETRIES_PER_POLL {
+                                        cx.waker().wake_by_ref();
+                                        break;
+                                    }
                                     // Every datagram in this batch was a dropped spoof; keep
-                                    // polling so the underlying socket registers our waker.
+                                    // polling up to the retry bound.
                                 }
                                 Poll::Ready(Err(e)) => {
                                     debug!(
