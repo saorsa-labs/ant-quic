@@ -48,6 +48,16 @@ impl Runtime for TokioRuntime {
     }
 }
 
+/// Wrap an already-bound `tokio::net::UdpSocket` as an [`AsyncUdpSocket`]
+/// without requiring `quinn_udp::UdpSocketState` (fallback for platforms or
+/// socket configurations where `quinn_udp`'s `setsockopt` probes fail).
+pub(crate) fn wrap_tokio_udp_socket(inner: tokio::net::UdpSocket) -> Arc<dyn AsyncUdpSocket> {
+    Arc::new(UdpSocket {
+        inner: Arc::new(inner),
+        may_fragment: true,
+    })
+}
+
 /// Tokio timer implementation
 #[derive(Debug)]
 struct TokioTimer(Pin<Box<Sleep>>);

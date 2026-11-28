@@ -24,6 +24,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,6 +198,14 @@ pub struct P2pConfig {
     /// Local address to bind to. If `None`, an ephemeral port is auto-assigned
     /// with enhanced security through port randomization.
     pub bind_addr: Option<TransportAddr>,
+
+    /// Explicit opt-in additional physical UDP bind slots (ADR-021 §1.5).
+    ///
+    /// Clients should leave this empty (1 ephemeral bind slot by default).
+    /// Dual-port servers, seeds, and relays can bind up to
+    /// `MAX_PHYSICAL_SLOTS - 1` (3) additional slots (e.g. `:5483` alongside
+    /// primary `:443`) under the single unified QUIC endpoint.
+    pub extra_bind_slots: Vec<SocketAddr>,
 
     /// Known peers for initial discovery/bootstrap input and NAT traversal coordination.
     ///
@@ -495,6 +504,7 @@ impl Default for P2pConfig {
     fn default() -> Self {
         Self {
             bind_addr: None,
+            extra_bind_slots: Vec::new(),
             known_peers: Vec::new(),
             max_connections: 256,
             discovery: DiscoveryPolicy::current_default(),
@@ -582,6 +592,7 @@ impl P2pConfig {
             max_message_size: self.max_message_size,
             max_concurrent_uni_streams: self.max_concurrent_uni_streams,
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: self.extra_bind_slots.clone(),
             stateless_retry: self.nat.stateless_retry,
             keep_alive_policy: self.nat.keep_alive_policy,
         }
@@ -606,6 +617,7 @@ impl P2pConfig {
 #[derive(Debug, Clone, Default)]
 pub struct P2pConfigBuilder {
     bind_addr: Option<TransportAddr>,
+    extra_bind_slots: Vec<SocketAddr>,
     known_peers: Vec<TransportAddr>,
     discovery: Option<DiscoveryPolicy>,
     trust: Option<TrustPolicy>,
@@ -652,6 +664,10 @@ pub enum ConfigError {
     /// Invalid MTU configuration
     #[error("Invalid MTU configuration: {0}")]
     InvalidMtu(String),
+
+    /// Invalid physical bind slots configuration
+    #[error("Invalid bind slots configuration: {0}")]
+    InvalidBindSlots(String),
 }
 
 impl P2pConfigBuilder {
@@ -1157,8 +1173,30 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Add an opt-in additional physical UDP bind slot (ADR-021 §1.5).
+    ///
+    /// At most `MAX_PHYSICAL_SLOTS - 1` (3) extra physical slots may be bound
+    /// alongside the primary slot.
+    pub fn extra_bind_slot(mut self, addr: SocketAddr) -> Self {
+        self.extra_bind_slots.push(addr);
+        self
+    }
+
+    /// Set opt-in additional physical UDP bind slots (ADR-021 §1.5).
+    pub fn extra_bind_slots(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.extra_bind_slots.extend(addrs);
+        self
+    }
+
     /// Build the configuration with validation
     pub fn build(self) -> Result<P2pConfig, ConfigError> {
+        if self.extra_bind_slots.len() >= crate::MAX_PHYSICAL_SLOTS {
+            return Err(ConfigError::InvalidBindSlots(format!(
+                "extra_bind_slots ({}) must be fewer than MAX_PHYSICAL_SLOTS ({})",
+                self.extra_bind_slots.len(),
+                crate::MAX_PHYSICAL_SLOTS
+            )));
+        }
         // Validate max_connections
         let max_connections = self.max_connections.unwrap_or(256);
         if max_connections == 0 {
@@ -1183,6 +1221,7 @@ impl P2pConfigBuilder {
 
         Ok(P2pConfig {
             bind_addr: self.bind_addr,
+            extra_bind_slots: self.extra_bind_slots,
             known_peers: self.known_peers,
             discovery,
             trust: self.trust.unwrap_or_default(),

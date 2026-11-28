@@ -158,6 +158,7 @@ mod nat_traversal_api_tests {
             stateless_retry: Default::default(),
             keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -304,6 +305,7 @@ mod functional_tests {
             stateless_retry: Default::default(),
             keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
         };
 
         let result = NatTraversalEndpoint::new(zero_values_config, None, None).await;
@@ -495,6 +497,7 @@ mod performance_tests {
                 stateless_retry: Default::default(),
                 keep_alive_policy: Default::default(),
                 additional_bind_addrs: Vec::new(),
+                extra_bind_slots: Vec::new(),
             };
 
             // Use the config to prevent optimization
@@ -568,6 +571,7 @@ mod relay_functionality_tests {
             stateless_retry: Default::default(),
             keep_alive_policy: Default::default(),
             additional_bind_addrs: Vec::new(),
+            extra_bind_slots: Vec::new(),
         };
 
         let result = NatTraversalEndpoint::new(zero_values_config, None, None).await;

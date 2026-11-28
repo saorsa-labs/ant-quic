@@ -5,7 +5,14 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
-use std::{cmp, net::SocketAddr};
+use std::{
+    cmp,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 
 use tracing::trace;
 
@@ -14,7 +21,10 @@ use super::{
     pacing::Pacer,
     spaces::{PacketSpace, SentPacket},
 };
-use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
+use crate::{
+    Duration, Instant, MAX_VIRTUAL_PATH_MTU, MIN_VIRTUAL_PATH_MTU, SocketSlotId, TIMER_GRANULARITY,
+    TransportConfig, congestion, packet::SpaceId,
+};
 
 #[cfg(feature = "__qlog")]
 use qlog::events::quic::MetricsUpdated;
@@ -22,6 +32,14 @@ use qlog::events::quic::MetricsUpdated;
 /// Description of a particular network path
 pub(super) struct PathData {
     pub(super) remote: SocketAddr,
+    /// Local UDP socket slot associated with this path (ADR-021).
+    pub(super) local_slot: SocketSlotId,
+    /// Optional dynamic virtual-path MTU hint shared with the relay slot backing
+    /// this path (ADR-021 §1.4). `None` for physical paths.
+    pub(super) virtual_mtu_hint: Option<Arc<AtomicU16>>,
+    /// Most recent virtual-path MTU value applied from `virtual_mtu_hint` or
+    /// `apply_virtual_mtu`.
+    pub(super) virtual_mtu_applied: Option<u16>,
     pub(super) rtt: RttEstimator,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
@@ -73,6 +91,7 @@ pub(super) struct PathData {
 impl PathData {
     pub(super) fn new(
         remote: SocketAddr,
+        local_slot: SocketSlotId,
         allow_mtud: bool,
         peer_max_udp_payload_size: Option<u16>,
         now: Instant,
@@ -107,6 +126,9 @@ impl PathData {
         };
         Self {
             remote,
+            local_slot,
+            virtual_mtu_hint: None,
+            virtual_mtu_applied: None,
             rtt: RttEstimator::new(config.initial_rtt),
             sending_ecn: true,
             pacing: Pacer::new(
@@ -133,11 +155,28 @@ impl PathData {
         }
     }
 
-    pub(super) fn from_previous(remote: SocketAddr, prev: &Self, now: Instant) -> Self {
+    pub(super) fn from_previous(
+        remote: SocketAddr,
+        local_slot: SocketSlotId,
+        prev: &Self,
+        now: Instant,
+    ) -> Self {
         let congestion = prev.congestion.clone_box();
         let smoothed_rtt = prev.rtt.get();
+        let preserve_virtual_hint = local_slot == prev.local_slot && local_slot.is_virtual();
         Self {
             remote,
+            local_slot,
+            virtual_mtu_hint: if preserve_virtual_hint {
+                prev.virtual_mtu_hint.clone()
+            } else {
+                None
+            },
+            virtual_mtu_applied: if preserve_virtual_hint {
+                prev.virtual_mtu_applied
+            } else {
+                None
+            },
             rtt: prev.rtt,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
@@ -160,6 +199,58 @@ impl PathData {
                 now,
             ), // Fresh limiter with same rate
         }
+    }
+
+    /// Attach a dynamic virtual-path MTU hint atomic (ADR-021 §1.4) and
+    /// immediately apply its current value if non-zero. Returns `true` if the
+    /// path MTU shrank.
+    pub(super) fn set_virtual_mtu_hint(
+        &mut self,
+        hint: Option<Arc<AtomicU16>>,
+        peer_max_udp_payload_size: Option<u16>,
+    ) -> bool {
+        self.virtual_mtu_hint = hint;
+        if let Some(ref atomic) = self.virtual_mtu_hint {
+            let v = atomic.load(Ordering::Relaxed);
+            if v != 0 {
+                return self.apply_virtual_mtu(v, peer_max_udp_payload_size);
+            }
+        }
+        false
+    }
+
+    /// Apply a virtual-path MTU ceiling directly. Returns `true` if the
+    /// effective path MTU shrank.
+    pub(super) fn apply_virtual_mtu(
+        &mut self,
+        vp_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+    ) -> bool {
+        let clamped = vp_mtu.clamp(MIN_VIRTUAL_PATH_MTU, MAX_VIRTUAL_PATH_MTU);
+        self.virtual_mtu_applied = Some(clamped);
+        let shrunk = self
+            .mtud
+            .apply_virtual_path_mtu(clamped, peer_max_udp_payload_size);
+        self.congestion.on_mtu_update(self.mtud.current_mtu());
+        shrunk
+    }
+
+    /// Poll `virtual_mtu_hint` for mid-session updates from the outer MASQUE
+    /// relay connection. Returns `Some(true)` if the MTU shrank, `Some(false)`
+    /// if it changed without shrinking, or `None` if unchanged/absent.
+    pub(super) fn refresh_virtual_mtu(
+        &mut self,
+        peer_max_udp_payload_size: Option<u16>,
+    ) -> Option<bool> {
+        let observed = self.virtual_mtu_hint.as_ref()?.load(Ordering::Relaxed);
+        if observed == 0 {
+            return None;
+        }
+        let clamped = observed.clamp(MIN_VIRTUAL_PATH_MTU, MAX_VIRTUAL_PATH_MTU);
+        if self.virtual_mtu_applied == Some(clamped) {
+            return None;
+        }
+        Some(self.apply_virtual_mtu(clamped, peer_max_udp_payload_size))
     }
 
     /// Resets RTT, congestion control and MTU states.
@@ -459,15 +550,25 @@ pub(crate) struct PathResponses {
 }
 
 impl PathResponses {
-    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
+    pub(crate) fn push(
+        &mut self,
+        packet: u64,
+        token: u64,
+        remote: SocketAddr,
+        local_slot: SocketSlotId,
+    ) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
         let response = PathResponse {
             packet,
             token,
             remote,
+            local_slot,
         };
-        let existing = self.pending.iter_mut().find(|x| x.remote == remote);
+        let existing = self
+            .pending
+            .iter_mut()
+            .find(|x| x.remote == remote && x.local_slot == local_slot);
         if let Some(existing) = existing {
             // Update a queued response
             if existing.packet <= packet {
@@ -484,20 +585,28 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
+    pub(crate) fn pop_off_path(
+        &mut self,
+        remote: SocketAddr,
+        local_slot: SocketSlotId,
+    ) -> Option<(u64, SocketAddr, SocketSlotId)> {
         let response = *self.pending.last()?;
-        if response.remote == remote {
+        if response.remote == remote && response.local_slot == local_slot {
             // We don't bother searching further because we expect that the on-path response will
             // get drained in the immediate future by a call to `pop_on_path`
             return None;
         }
         self.pending.pop();
-        Some((response.token, response.remote))
+        Some((response.token, response.remote, response.local_slot))
     }
 
-    pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
+    pub(crate) fn pop_on_path(
+        &mut self,
+        remote: SocketAddr,
+        local_slot: SocketSlotId,
+    ) -> Option<u64> {
         let response = *self.pending.last()?;
-        if response.remote != remote {
+        if response.remote != remote || response.local_slot != local_slot {
             // We don't bother searching further because we expect that the off-path response will
             // get drained in the immediate future by a call to `pop_off_path`
             return None;
@@ -518,6 +627,8 @@ struct PathResponse {
     token: u64,
     /// The address the corresponding PATH_CHALLENGE was received from
     remote: SocketAddr,
+    /// The local socket slot the corresponding PATH_CHALLENGE arrived on
+    local_slot: SocketSlotId,
 }
 
 /// Summary statistics of packets that have been sent on a particular path, but which have not yet
@@ -808,7 +919,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let path = PathData::new(remote, false, None, now, &config);
+        let path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Should have address_info field
         assert!(path.address_info.observed_address.is_none());
@@ -823,7 +934,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Update observed address
         let observed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443);
@@ -841,7 +952,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // No change when no observed address
         assert!(!path.has_address_changed());
@@ -862,7 +973,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Update and mark as notified
         let observed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443);
@@ -880,7 +991,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path1 = PathData::new(remote1, false, None, now, &config);
+        let mut path1 = PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set up address info
         let observed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 5678);
@@ -888,7 +999,7 @@ mod tests {
         path1.mark_address_notified();
 
         // Create new path from previous
-        let path2 = PathData::from_previous(remote2, &path1, now);
+        let path2 = PathData::from_previous(remote2, SocketSlotId::PRIMARY, &path1, now);
 
         // Address info should be reset for new path
         assert!(path2.address_info.observed_address.is_none());
@@ -903,7 +1014,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set up address info
         let observed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443);
@@ -926,7 +1037,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let path = PathData::new(remote, false, None, now, &config);
+        let path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Should have a rate limiter
         assert!(path.observation_rate_limiter.tokens > 0.0);
@@ -941,7 +1052,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Should be able to send initially (has tokens)
         assert!(path.can_send_observation(now));
@@ -971,7 +1082,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Consume all tokens
         for _ in 0..10 {
@@ -993,7 +1104,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Update with custom rate
         path.set_observation_rate(5); // 5 per second
@@ -1019,7 +1130,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path1 = PathData::new(remote1, false, None, now, &config);
+        let mut path1 = PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set custom rate and consume some tokens
         path1.set_observation_rate(20);
@@ -1028,7 +1139,7 @@ mod tests {
         }
 
         // Create new path from previous
-        let path2 = PathData::from_previous(remote2, &path1, now);
+        let path2 = PathData::from_previous(remote2, SocketSlotId::PRIMARY, &path1, now);
 
         // New path should have fresh rate limiter with same rate
         assert_eq!(path2.observation_rate_limiter.rate, 20.0);
@@ -1042,7 +1153,7 @@ mod tests {
         let config = TransportConfig::default();
         let now = Instant::now();
 
-        let mut path = PathData::new(remote, false, None, now, &config);
+        let mut path = PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set custom rate
         path.set_observation_rate(15);
@@ -1089,19 +1200,21 @@ mod tests {
         let mut space = PacketSpace::new(now);
 
         // Original path sends two packets.
-        let mut original = PathData::new(remote1, false, None, now, &config);
+        let mut original = PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
         original.sent(0, sent_packet(1200, now), &mut space);
         original.sent(1, sent_packet(1200, now), &mut space);
         assert_eq!(original.in_flight.bytes, 2400);
 
         // First migration: the intermediate path becomes current and sends two more packets.
-        let mut intermediate = PathData::from_previous(remote2, &original, now);
+        let mut intermediate =
+            PathData::from_previous(remote2, SocketSlotId::PRIMARY, &original, now);
         intermediate.sent(2, sent_packet(1200, now), &mut space);
         intermediate.sent(3, sent_packet(1200, now), &mut space);
 
         // Second migration before the first validated: `current` becomes the new path, `original`
         // is retained as `prev_path`, and `intermediate` is dropped with its counters.
-        let mut current = PathData::from_previous(remote3, &intermediate, now);
+        let mut current =
+            PathData::from_previous(remote3, SocketSlotId::PRIMARY, &intermediate, now);
         current.sent(4, sent_packet(1200, now), &mut space);
         drop(intermediate);
 
@@ -1136,13 +1249,13 @@ mod tests {
         let remote2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8080);
         let mut space = PacketSpace::new(now);
 
-        let mut original = PathData::new(remote1, false, None, now, &config);
+        let mut original = PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
         original.sent(0, sent_packet(1200, now), &mut space);
         assert!(original.remove_in_flight(0, &sent_packet(1200, now)));
         assert_eq!(original.in_flight.bytes, 0);
 
         // Migration: application data now flows on the unvalidated path.
-        let mut migrated = PathData::from_previous(remote2, &original, now);
+        let mut migrated = PathData::from_previous(remote2, SocketSlotId::PRIMARY, &original, now);
         migrated.sent(1, sent_packet(1200, now), &mut space);
         migrated.sent(2, sent_packet(1200, now), &mut space);
 

@@ -124,6 +124,23 @@ impl DualStackSocket {
         self.v4.is_some() && self.v6.is_some()
     }
 
+    /// Convert this `DualStackSocket` into a [`super::multiplexed::PhysicalBindSlot`]
+    /// without duplicating socket file descriptors (ADR-021).
+    pub(crate) fn into_physical_bind_slot(
+        self,
+        slot_id: crate::SocketSlotId,
+    ) -> io::Result<super::multiplexed::PhysicalBindSlot> {
+        super::multiplexed::PhysicalBindSlot::from_arc_sockets(
+            slot_id,
+            self.v4,
+            self.v6,
+            self.v4_state,
+            self.v6_state,
+            self.v4_addr,
+            self.v6_addr,
+        )
+    }
+
     /// Convert a destination address for the selected socket.
     ///
     /// If sending an IPv4-mapped IPv6 address through the IPv4 socket, unwrap to native IPv4.

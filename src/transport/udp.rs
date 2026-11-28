@@ -223,8 +223,11 @@ impl UdpTransport {
         };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
-        if addr.is_ipv6() {
-            // Enable dual-stack: accept both IPv4 and IPv6 on a single socket
+        if addr.is_ipv6() && addr.ip().is_unspecified() {
+            // Enable dual-stack only on wildcard `[::]` sockets. Explicit IPv6
+            // addresses (such as `[::1]`) cannot carry IPv4 traffic, and setting
+            // `IPV6_V6ONLY=0` on them causes `quinn-udp`'s Windows socket setup
+            // to apply IPv4 `IPPROTO_IP` options that fail with WSAEINVAL (10022).
             if let Err(e) = socket.set_only_v6(false) {
                 tracing::debug!(%e, "unable to make socket dual-stack, IPv6-only mode");
             }

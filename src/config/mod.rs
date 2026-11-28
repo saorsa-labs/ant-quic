@@ -383,6 +383,12 @@ pub struct ServerConfig {
     pub(crate) incoming_buffer_size_total: u64,
 
     pub(crate) time_source: Arc<dyn TimeSource>,
+
+    /// When `true`, pins accepted connections strictly to physical UDP bind
+    /// slots: rejects incoming connections on [`crate::SocketSlotId::VIRTUAL`]
+    /// / synthetic ULA addresses and forbids migration onto the virtual plane
+    /// (ADR-021 §1.1 acyclic outer relay DAG).
+    pub(crate) pin_to_physical_slot: bool,
 }
 
 impl ServerConfig {
@@ -407,6 +413,7 @@ impl ServerConfig {
             incoming_buffer_size_total: 100 << 20,
 
             time_source: Arc::new(StdSystemTime),
+            pin_to_physical_slot: false,
         }
     }
 
@@ -522,6 +529,16 @@ impl ServerConfig {
         self
     }
 
+    /// Pin accepted connections strictly to physical UDP bind slots (ADR-021 §1.1).
+    ///
+    /// When enabled, incoming handshakes arriving on [`crate::SocketSlotId::VIRTUAL`]
+    /// (or a synthetic ULA remote address) are rejected, and accepted connections
+    /// cannot migrate onto `SocketSlotId::VIRTUAL`.
+    pub fn pin_to_physical_slot(&mut self, value: bool) -> &mut Self {
+        self.pin_to_physical_slot = value;
+        self
+    }
+
     pub(crate) fn has_preferred_address(&self) -> bool {
         self.preferred_address_v4.is_some() || self.preferred_address_v6.is_some()
     }
@@ -571,6 +588,7 @@ impl fmt::Debug for ServerConfig {
                 "incoming_buffer_size_total",
                 &self.incoming_buffer_size_total,
             )
+            .field("pin_to_physical_slot", &self.pin_to_physical_slot)
             // system_time_clock not debug
             .finish_non_exhaustive()
     }
@@ -707,6 +725,11 @@ pub struct ClientConfig {
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
+
+    /// When `true`, pins this connection strictly to physical UDP bind slots:
+    /// rejects synthetic virtual ULA targets at dial time and forbids migration
+    /// onto [`crate::SocketSlotId::VIRTUAL`] (ADR-021 acyclic outer relay DAG).
+    pub(crate) pin_to_physical_slot: bool,
 }
 
 impl ClientConfig {
@@ -720,7 +743,18 @@ impl ClientConfig {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
+            pin_to_physical_slot: false,
         }
+    }
+
+    /// Pin this outgoing connection strictly to physical UDP bind slots (ADR-021).
+    ///
+    /// Outer MASQUE relay connections set this to `true` so they can never dial
+    /// a synthetic ULA virtual route or migrate onto `SocketSlotId::VIRTUAL`,
+    /// preserving the acyclic 2-level relay DAG.
+    pub fn pin_to_physical_slot(&mut self, value: bool) -> &mut Self {
+        self.pin_to_physical_slot = value;
+        self
     }
 
     /// Configure how to populate the destination CID of the initial packet when attempting to

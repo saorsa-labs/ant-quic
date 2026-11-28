@@ -97,7 +97,7 @@ with `TRANSPORT_PARAMETER_ERROR`.
 | `pqc_algorithms` | `0x50C0` | 1-byte bitfield (`bit 0 = ML-KEM-768`, `bit 1 = ML-DSA-65`; bits 2–7 reserved) | Standard | ADR-003 |
 | `ack_receive_v2` | `0x50C2` | Empty (`len == 0`) | `!(cached && !current)` | Internal |
 | `datagram_mux_v1` | `0x50C4` | Empty (`len == 0`) | Exact match (`cached == current`) | ADR-020 |
-| `in_connection_migration_v1` | `0x50C6` | Empty (`len == 0`) | `!(cached && !current)` | ADR-021 |
+| `in_connection_migration_v1` | `0x50C6` | Empty (`len == 0`) | `cached && !current` MUST fail closed (`PROTOCOL_VIOLATION`) | ADR-021 |
 
 ### 3.1 `nat_traversal` (`0x3d7e9f0bca12fea6`)
 
@@ -140,11 +140,9 @@ with `TRANSPORT_PARAMETER_ERROR`.
 - When mutually negotiated AND the server has NOT advertised RFC 9000
   `disable_active_migration (0x0c)`, authorizes client-initiated in-connection
   migration from a relayed path to a validated direct server address (Section 8).
-- On 0-RTT resumption (RFC 9000 §7.4.1), enabling `in_connection_migration_v1`
-  across an upgrade (`cached == false, current == true`) preserves 0-RTT
-  cleanly (since `0x50C6` governs post-handshake migration only); dropping it
-  across a rollback (`cached == true, current == false`) MUST fail with
-  `TransportError::PROTOCOL_VIOLATION`.
+- On 0-RTT resumption (RFC 9000 §7.4.1 / ADR-021), `cached.in_connection_migration_v1 && !current.in_connection_migration_v1`
+  MUST fail closed with `TransportError::PROTOCOL_VIOLATION`, whereas enabling
+  `0x50C6` across an upgrade (`!cached && current`) MUST preserve 0-RTT cleanly.
 
 ---
 
@@ -335,9 +333,11 @@ Connection ID per probed path):
 - **Dynamic probe budget:** Each probe round MUST cap its concurrent probes to
   `min(MAX_CONCURRENT_PROBE_PATHS, rem_cids.spare_count())` so a peer issuing
   fewer CIDs never stalls probing or reuses an active DCID.
+  *(Phase 4A-3 — not yet implemented at this revision.)*
 - **Replenishment:** Unused probe CIDs MUST be retired via
   `RETIRE_CONNECTION_ID` upon probe failure or cancellation so the peer
   replenishes the pool ahead of future rounds.
+  *(Phase 4A-3 — not yet implemented at this revision.)*
 - **0-RTT upgrade & rollback:**
   - Upgrading a server `5 -> 16` satisfies `cached (5) <= current (16)` and
     preserves 0-RTT resumption cleanly.
@@ -353,6 +353,9 @@ Connection ID per probed path):
 ---
 
 ## 7. Paced Candidate Spray & Hole Punching
+
+> **Implementation status:** Paced concurrent candidate spray with per-probe CID
+> tracking is scheduled for **Phase 4A-3** (not yet implemented at this revision).
 
 Per [ADR-015](../adr/ADR-015-paced-candidate-spray-punching.md):
 
@@ -376,12 +379,12 @@ not advertised `disable_active_migration (0x0c)` (ADR-021):
    to validate and migrate an active connection onto a new direct server address
    discovered during the session (not restricted to handshake-time
    `preferred_address`).
-2. **Non-disruptive speculative probing:** Active application traffic continues
-   uninterrupted on `self.path` (the synthetic virtual MASQUE path) while
-   speculative probes run in a separate bounded `probing_paths` table
-   (`MAX_CONCURRENT_PROBE_PATHS = 8`).
-3. **Scoped post-decryption off-path probe admission on `Side::Client`:** Only
-   when `0x50C6` was negotiated and server migration is enabled, the client
+2. **Non-disruptive speculative probing *(Phase 4A-3 — not yet implemented at this revision)*:**
+   Active application traffic continues uninterrupted on `self.path` (the
+   synthetic virtual MASQUE path) while speculative probes run in a separate
+   bounded `probing_paths` table (`MAX_CONCURRENT_PROBE_PATHS = 8`).
+3. **Scoped post-decryption off-path probe admission on `Side::Client` *(Phase 4A-3 — not yet implemented at this revision)*:**
+   Only when `0x50C6` was negotiated and server migration is enabled, the client
    defers dropping packets arriving from `(remote, local_slot) != self.path`
    until after AEAD decryption/authentication. Authenticated packets are
    admitted strictly if they (a) match a tracked `(remote, local_slot)` in
@@ -390,7 +393,7 @@ not advertised `disable_active_migration (0x0c)` (ADR-021):
    entry (subject to `MAX_CONCURRENT_PROBE_PATHS` and 3× anti-amplification).
    Unauthenticated packets, non-probing packets from unvalidated addresses, and
    all off-path packets when `0x50C6` was not negotiated MUST be dropped.
-4. **Asymmetric promotion (zero ping-pong):**
+4. **Asymmetric promotion (zero ping-pong) *(Phase 4A-3 — not yet implemented at this revision)*:**
    - **`Side::Client` initiates migration:** On the first valid `PATH_RESPONSE`
      on a direct candidate, the client cancels remaining probes (retiring unused
      probe CIDs), promotes `(remote_addr, local_slot)` to `self.path` with
@@ -402,10 +405,15 @@ not advertised `disable_active_migration (0x0c)` (ADR-021):
      marks validated direct candidates in `probing_paths` without switching
      `self.path` until the client's first non-probing 1-RTT packet arrives on
      that validated `(remote_addr, local_slot)`.
-5. **Backwards compatibility (`<= 0.30.x`):** If `0x50C6` was not negotiated,
-   `disable_active_migration` was set, or `rem_cids.spare_count() == 0`,
-   endpoints fall back to ADR-020 Decision 5's new-handshake direct migration
-   with ADR-017 single-arbiter retirement.
+5. **Backwards compatibility (`<= 0.30.x`) & zero-spare-CID fallback:** If
+   `0x50C6` was not negotiated, `disable_active_migration` was set, OR
+   `rem_cids.spare_count() == 0` (exhausted spare CID pool — e.g. peer issued
+   only 1 CID or all spare CIDs are awaiting retirement/replenishment), endpoints
+   MUST NOT reuse the active path's DCID for a direct probe and MUST fall back
+   to ADR-020 Decision 5's new-handshake direct migration with ADR-017
+   single-arbiter retirement. *(Active at Phase 4A-2: unified `MultiplexedUdpSocket`,
+   validated `(remote_addr, local_slot)` path identity, slot-mismatch anti-hijack,
+   synthetic ULA isolation, and dynamic per-path `virtual_path_mtu`.)*
 
 ---
 

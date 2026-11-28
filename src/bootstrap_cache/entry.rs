@@ -150,6 +150,9 @@ impl PeerCapabilities {
     /// An IPv4-mapped IPv6 address is recorded as plain IPv4 (#269).
     pub fn record_external_address(&mut self, addr: SocketAddr) {
         let addr = normalize_socket_addr(addr);
+        if crate::socket_slot::is_synthetic_virtual_addr(addr) {
+            return;
+        }
         if !self.external_addresses.contains(&addr) {
             self.external_addresses.push(addr);
         }
@@ -162,6 +165,9 @@ impl PeerCapabilities {
     /// evidence, not global evidence.
     pub fn record_direct_observation(&mut self, addr: SocketAddr, observed_at: SystemTime) {
         let addr = normalize_socket_addr(addr);
+        if crate::socket_slot::is_synthetic_virtual_addr(addr) {
+            return;
+        }
         let scope = socket_addr_scope(addr).unwrap_or(ReachabilityScope::LocalNetwork);
         if let Some(existing) = self
             .reachable_addresses
@@ -199,6 +205,9 @@ impl PeerCapabilities {
             Vec::with_capacity(self.reachable_addresses.len());
         for mut record in self.reachable_addresses.drain(..) {
             let canonical = normalize_socket_addr(record.address);
+            if crate::socket_slot::is_synthetic_virtual_addr(canonical) {
+                continue;
+            }
             if canonical != record.address {
                 record.address = canonical;
                 record.scope =
@@ -580,7 +589,7 @@ fn normalize_address_list(list: &mut Vec<SocketAddr>) {
     let mut seen = HashSet::with_capacity(list.len());
     list.retain_mut(|addr| {
         *addr = normalize_socket_addr(*addr);
-        seen.insert(*addr)
+        !crate::socket_slot::is_synthetic_virtual_addr(*addr) && seen.insert(*addr)
     });
 }
 

@@ -111,9 +111,15 @@ mod cid_queue;
 pub mod coding;
 mod constant_time;
 mod range_set;
+pub mod socket_slot;
 pub mod transport_parameters;
 mod varint;
 
+pub use socket_slot::{
+    MAX_PHYSICAL_SLOTS, MAX_VIRTUAL_PATH_MTU, MAX_VIRTUAL_ROUTES, MIN_VIRTUAL_PATH_MTU,
+    SYNTHETIC_VIRTUAL_ULA_PREFIX, SocketSlotId, decode_synthetic_virtual_addr,
+    is_synthetic_virtual_addr, is_synthetic_virtual_ip, make_synthetic_virtual_addr,
+};
 pub use varint::{VarInt, VarIntBoundsExceeded};
 
 // Removed optional bloom module
@@ -662,6 +668,9 @@ pub struct Transmit {
     pub segment_size: Option<usize>,
     /// Optional source IP address for the datagram
     pub src_ip: Option<IpAddr>,
+    /// Local UDP socket slot (physical bind slot or virtual MASQUE route plane)
+    /// from which this datagram must be transmitted (ADR-021).
+    pub local_slot: SocketSlotId,
 }
 
 // Deal with time

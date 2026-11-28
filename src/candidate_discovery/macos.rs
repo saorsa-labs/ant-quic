@@ -1135,8 +1135,11 @@ impl MacOSInterfaceDiscovery {
             addresses.push(SocketAddr::new(IpAddr::V4(*ipv4), 0));
         }
 
-        // Add IPv6 addresses
+        // Add IPv6 addresses (excluding reserved synthetic virtual ULA prefix, ADR-021 §1.2)
         for ipv6 in &macos_interface.ipv6_addresses {
+            if crate::socket_slot::is_synthetic_virtual_ip(IpAddr::V6(*ipv6)) {
+                continue;
+            }
             addresses.push(SocketAddr::new(IpAddr::V6(*ipv6), 0));
         }
 

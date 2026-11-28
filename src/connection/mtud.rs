@@ -77,6 +77,28 @@ impl MtuDiscovery {
         self.current_mtu
     }
 
+    /// Apply a dynamic virtual-path MTU ceiling (ADR-021 §1.4 / ADR-020).
+    ///
+    /// Disables inner DPLPMTUD so 1-RTT traffic tracks the outer relay's live
+    /// datagram budget instead of probing above it. Returns `true` if the
+    /// effective MTU shrank relative to the previous value.
+    pub(crate) fn apply_virtual_path_mtu(
+        &mut self,
+        vp_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+    ) -> bool {
+        let clamped = vp_mtu.clamp(crate::MIN_VIRTUAL_PATH_MTU, crate::MAX_VIRTUAL_PATH_MTU);
+        let effective = match peer_max_udp_payload_size {
+            Some(peer_max) => clamped.min(peer_max),
+            None => clamped,
+        };
+        let shrunk = effective < self.current_mtu;
+        self.current_mtu = effective;
+        self.state = None;
+        self.black_hole_detector.min_mtu = self.black_hole_detector.min_mtu.min(effective);
+        shrunk
+    }
+
     /// Returns the amount of bytes that should be sent as an MTU probe, if any
     pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
         self.state

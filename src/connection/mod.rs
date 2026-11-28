@@ -12,7 +12,7 @@ use std::{
     convert::TryFrom,
     fmt, io, mem,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU16},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -25,8 +25,8 @@ use tracing::{debug, error, info, trace, trace_span, warn};
 
 use crate::{
     Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, MtuDiscoveryConfig, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
-    TransportError, TransportErrorCode, VarInt, VarIntBoundsExceeded,
+    MIN_INITIAL_SIZE, MtuDiscoveryConfig, Side, SocketSlotId, StreamId, TIMER_GRANULARITY,
+    TokenStore, Transmit, TransportError, TransportErrorCode, VarInt, VarIntBoundsExceeded,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -44,6 +44,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
     },
+    socket_slot::is_synthetic_virtual_addr,
     token::ResetToken,
     transport_parameters::TransportParameters,
 };
@@ -311,6 +312,45 @@ pub struct Connection {
     peer_id_for_tokens: Option<PeerId>,
     /// When true, NEW_TOKEN frames are delayed until channel binding completes.
     delay_new_token_until_binding: bool,
+    /// ADR-021 §1.1: when true, this connection is pinned to physical UDP slots
+    /// (outer MASQUE relay sessions) and must never migrate onto
+    /// `SocketSlotId::VIRTUAL` or accept synthetic ULA traffic.
+    pin_to_physical_slot: bool,
+    /// ADR-021 §1.3: pending RFC 9000 §8.2 validation for an authenticated 1-RTT
+    /// packet that arrived on a different local UDP slot than `self.path.local_slot`.
+    /// Active traffic stays on `self.path` until the matching `PATH_RESPONSE`
+    /// arrives on `(remote, local_slot)`.
+    pending_slot_validation: Option<PendingSlotValidation>,
+    /// ADR-021 §1.4: weak observers notified synchronously whenever this
+    /// connection's effective datagram MTU changes (used by outer MASQUE relay
+    /// sessions to publish inner virtual-path MTU updates before inner
+    /// `poll_transmit` builds its next packet).
+    virtual_mtu_observers: Vec<(std::sync::Weak<AtomicU16>, usize)>,
+}
+
+/// Pending path validation for a local-slot mismatch (ADR-021 §1.3).
+///
+/// Prevents an attacker who forwards/diverts an authenticated 1-RTT packet from
+/// slot A onto slot B from flipping the server's active transmit slot before
+/// bidirectional reachability on `(remote, local_slot)` is proven via
+/// `PATH_CHALLENGE` / `PATH_RESPONSE` within RFC 9000 §8.1 3× anti-amplification.
+struct PendingSlotValidation {
+    remote: SocketAddr,
+    local_slot: SocketSlotId,
+    challenge: u64,
+    challenge_pending: bool,
+    wants_promotion: bool,
+    total_recvd: u64,
+    total_sent: u64,
+    expires_at: Instant,
+}
+
+impl PendingSlotValidation {
+    fn can_send_challenge(&self) -> bool {
+        self.challenge_pending
+            && self.total_sent.saturating_add(u64::from(MIN_INITIAL_SIZE))
+                <= self.total_recvd.saturating_mul(3)
+    }
 }
 
 impl Connection {
@@ -321,6 +361,120 @@ impl Connection {
         self.streams.buffered_snapshot()
     }
 
+    /// Returns the local UDP socket slot currently bound to the active path (ADR-021).
+    pub fn local_slot(&self) -> SocketSlotId {
+        self.path.local_slot
+    }
+
+    /// Pin this connection to physical UDP slots (ADR-021 §1.1 acyclic DAG invariant).
+    pub(crate) fn set_pin_to_physical_slot(&mut self, value: bool) {
+        self.pin_to_physical_slot = value;
+        if value
+            && self
+                .pending_slot_validation
+                .as_ref()
+                .is_some_and(|p| p.local_slot.is_virtual() || is_synthetic_virtual_addr(p.remote))
+        {
+            self.pending_slot_validation = None;
+        }
+    }
+
+    /// Returns whether this connection is pinned to physical UDP slots.
+    pub fn is_pinned_to_physical_slot(&self) -> bool {
+        self.pin_to_physical_slot
+    }
+
+    fn peer_max_udp_payload_size_opt(&self) -> Option<u16> {
+        u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).ok()
+    }
+
+    /// Attach a dynamic per-relay virtual-path MTU atomic handle (ADR-021 §1.4).
+    ///
+    /// Immediately applies the handle's current value if non-zero, and drops any
+    /// queued outgoing datagrams that exceed the lowered MTU.
+    pub(crate) fn set_virtual_path_mtu_hint(&mut self, hint: Option<Arc<AtomicU16>>) {
+        let peer_max = self.peer_max_udp_payload_size_opt();
+        if self.path.set_virtual_mtu_hint(hint, peer_max) {
+            if let Some(max_datagram_size) = self.datagrams().max_size() {
+                drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+            }
+        }
+        self.notify_virtual_mtu_observers();
+    }
+
+    /// Apply a virtual-path MTU ceiling directly (ADR-021 §1.4).
+    ///
+    /// Immediately lowers the 1-RTT MTU ceiling and drops any queued outgoing
+    /// datagrams that no longer fit.
+    pub fn apply_virtual_path_mtu(&mut self, vp_mtu: u16) {
+        let peer_max = self.peer_max_udp_payload_size_opt();
+        if self.path.apply_virtual_mtu(vp_mtu, peer_max) {
+            if let Some(max_datagram_size) = self.datagrams().max_size() {
+                drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+            }
+        }
+        self.notify_virtual_mtu_observers();
+    }
+
+    /// Register a shared virtual-path MTU atomic to be updated synchronously
+    /// whenever this outer connection's effective datagram MTU changes
+    /// (ADR-021 §1.4). Dead observers are pruned automatically.
+    pub(crate) fn subscribe_virtual_path_mtu(
+        &mut self,
+        target: Arc<AtomicU16>,
+        encapsulation_overhead: usize,
+    ) {
+        if let Some(vp_mtu) = crate::masque::relay_socket::compute_inner_virtual_path_mtu(
+            self.datagrams().max_size(),
+            encapsulation_overhead,
+        ) {
+            target.store(vp_mtu, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.virtual_mtu_observers
+            .push((Arc::downgrade(&target), encapsulation_overhead));
+    }
+
+    /// Synchronously publish any updated inner virtual-path MTU derived from
+    /// this connection's current `datagrams().max_size()` to all live observers.
+    fn notify_virtual_mtu_observers(&mut self) {
+        if self.virtual_mtu_observers.is_empty() {
+            return;
+        }
+        let outer_max_dgram = self.datagrams().max_size();
+        self.virtual_mtu_observers
+            .retain(|(weak, encapsulation_overhead)| {
+                let Some(target) = weak.upgrade() else {
+                    return false;
+                };
+                if let Some(vp_mtu) = crate::masque::relay_socket::compute_inner_virtual_path_mtu(
+                    outer_max_dgram,
+                    *encapsulation_overhead,
+                ) {
+                    target.store(vp_mtu, std::sync::atomic::Ordering::Relaxed);
+                }
+                true
+            });
+    }
+
+    /// Poll the active path's dynamic virtual-path MTU handle for mid-session
+    /// changes (e.g. outer MASQUE relay PMTU shrink) and drop any oversized
+    /// queued datagrams immediately.
+    fn refresh_virtual_mtu(&mut self) {
+        let peer_max = self.peer_max_udp_payload_size_opt();
+        if let Some(shrunk) = self.path.refresh_virtual_mtu(peer_max) {
+            if shrunk {
+                if let Some(max_datagram_size) = self.datagrams().max_size() {
+                    drop_oversized_datagrams(
+                        &mut self.datagrams,
+                        &mut self.events,
+                        max_datagram_size,
+                    );
+                }
+            }
+            self.notify_virtual_mtu_observers();
+        }
+    }
+
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
         config: Arc<TransportConfig>,
@@ -329,6 +483,7 @@ impl Connection {
         rem_cid: ConnectionId,
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
+        local_slot: SocketSlotId,
         crypto: Box<dyn crypto::Session>,
         cid_gen: &dyn ConnectionIdGenerator,
         now: Instant,
@@ -362,7 +517,7 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, now, &config),
+            path: PathData::new(remote, local_slot, allow_mtud, None, now, &config),
             allow_mtud,
             local_ip,
             prev_path: None,
@@ -461,6 +616,9 @@ impl Connection {
 
             peer_id_for_tokens: None,
             delay_new_token_until_binding: false,
+            pin_to_physical_slot: false,
+            pending_slot_validation: None,
+            virtual_mtu_observers: Vec::new(),
         };
 
         // Trace connection creation
@@ -546,6 +704,11 @@ impl Connection {
                 self.timers.set(Timer::NatTraversal, nat_timeout);
                 next_timeout = Some(next_timeout.map_or(nat_timeout, |t| t.min(nat_timeout)));
             }
+        }
+
+        if let Some(ref pending) = self.pending_slot_validation {
+            next_timeout =
+                Some(next_timeout.map_or(pending.expires_at, |t| t.min(pending.expires_at)));
         }
 
         next_timeout
@@ -639,6 +802,10 @@ impl Connection {
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
         // packets, this can be earlier than the start of the current QUIC packet.
         let mut datagram_start = 0;
+        // ADR-021 §1.4: refresh dynamic per-relay virtual-path MTU before
+        // computing segment_size so mid-session outer-MTU shrinks take effect
+        // on the very next transmit and drop oversized queued datagrams.
+        self.refresh_virtual_mtu();
         // ADR-020: on a sub-1200 virtual path (e.g. hybrid MASQUE over a 1,280 B outer link),
         // Initial datagrams must still be able to pad to MIN_INITIAL_SIZE (1200 B, RFC 9000 §14.1)
         // — MASQUE routes Initials on its reliable stream lane. Once Initial keys are discarded,
@@ -672,6 +839,12 @@ impl Connection {
         }
 
         if let Some(challenge) = self.send_path_challenge(now, buf) {
+            return Some(challenge);
+        }
+
+        // ADR-021 §1.3: probe unvalidated local-slot mismatch candidate within
+        // RFC 9000 §8.1 3x anti-amplification while active traffic stays on `self.path`.
+        if let Some(challenge) = self.send_pending_slot_challenge(now, buf) {
             return Some(challenge);
         }
 
@@ -1079,7 +1252,10 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, response_slot)) = self
+                    .path_responses
+                    .pop_off_path(self.path.remote, self.path.local_slot)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -1126,7 +1302,12 @@ impl Connection {
                         size: buf.len(),
                         ecn: None,
                         segment_size: None,
-                        src_ip: self.local_ip,
+                        src_ip: if response_slot == self.path.local_slot {
+                            self.local_ip
+                        } else {
+                            None
+                        },
+                        local_slot: response_slot,
                     });
                 }
             }
@@ -1298,6 +1479,7 @@ impl Connection {
                 _ => Some(segment_size),
             },
             src_ip: self.local_ip,
+            local_slot: self.path.local_slot,
         })
     }
 
@@ -1321,8 +1503,16 @@ impl Connection {
             coord.punch_targets.len()
         );
 
-        // Enqueue one PunchMeNow frame per target (spec-compliant); normal send loop will encode
+        // Enqueue one PunchMeNow frame per target (spec-compliant); normal send loop will encode.
+        // ADR-021 §1.2: never emit synthetic virtual ULA addresses in PUNCH_ME_NOW frames.
         for target in &coord.punch_targets {
+            if is_synthetic_virtual_addr(target.remote_addr) {
+                trace!(
+                    "skipping synthetic virtual address {} in PUNCH_ME_NOW emission",
+                    target.remote_addr
+                );
+                continue;
+            }
             let punch = frame::PunchMeNow {
                 round,
                 paired_with_sequence_number: target.remote_sequence,
@@ -1414,6 +1604,14 @@ impl Connection {
             nat_traversal.mark_coordination_validating();
         }
 
+        let target_slot = if is_synthetic_virtual_addr(target_addr) {
+            SocketSlotId::VIRTUAL
+        } else if self.path.local_slot.is_physical() {
+            self.path.local_slot
+        } else {
+            SocketSlotId::PRIMARY
+        };
+
         Some(Transmit {
             destination: target_addr,
             size: buf.len(),
@@ -1424,6 +1622,7 @@ impl Connection {
             },
             segment_size: None,
             src_ip: self.local_ip,
+            local_slot: target_slot,
         })
     }
 
@@ -1508,6 +1707,14 @@ impl Connection {
 
         builder.finish_and_track(now, self, None, buf);
 
+        let target_slot = if is_synthetic_virtual_addr(remote_addr) {
+            SocketSlotId::VIRTUAL
+        } else if self.path.local_slot.is_physical() {
+            self.path.local_slot
+        } else {
+            SocketSlotId::PRIMARY
+        };
+
         Some(Transmit {
             destination: remote_addr,
             size: buf.len(),
@@ -1518,6 +1725,7 @@ impl Connection {
             },
             segment_size: None,
             src_ip: self.local_ip,
+            local_slot: target_slot,
         })
     }
 
@@ -1532,6 +1740,7 @@ impl Connection {
             .challenge
             .expect("previous path challenge pending without token");
         let destination = prev_path.remote;
+        let local_slot = prev_path.local_slot;
         debug_assert_eq!(
             self.highest_space,
             SpaceId::Data,
@@ -1581,7 +1790,86 @@ impl Connection {
             size: buf.len(),
             ecn: None,
             segment_size: None,
-            src_ip: self.local_ip,
+            src_ip: if local_slot == self.path.local_slot {
+                self.local_ip
+            } else {
+                None
+            },
+            local_slot,
+        })
+    }
+
+    /// ADR-021 §1.3: Send `PATH_CHALLENGE` on an unvalidated local-slot mismatch
+    /// candidate strictly within RFC 9000 §8.1 3× anti-amplification. Active
+    /// traffic remains on `self.path.local_slot` until a matching `PATH_RESPONSE`
+    /// arrives on `(destination, local_slot)`.
+    fn send_pending_slot_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
+        let (destination, local_slot, token) = {
+            let pending = self.pending_slot_validation.as_mut()?;
+            if now >= pending.expires_at {
+                self.pending_slot_validation = None;
+                return None;
+            }
+            if !pending.can_send_challenge() {
+                return None;
+            }
+            pending.challenge_pending = false;
+            (pending.remote, pending.local_slot, pending.challenge)
+        };
+
+        if self.highest_space != SpaceId::Data {
+            return None;
+        }
+
+        buf.reserve(usize::from(MIN_INITIAL_SIZE));
+        let buf_capacity = buf.capacity();
+
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            self.rem_cids.active(),
+            buf,
+            buf_capacity,
+            0,
+            false,
+            self,
+        )?;
+        trace!(
+            %destination,
+            ?local_slot,
+            token,
+            "validating local-slot mismatch candidate with PATH_CHALLENGE"
+        );
+        if !self.encode_or_close(
+            now,
+            frame::FrameType::PATH_CHALLENGE.try_encode(buf),
+            "PATH_CHALLENGE (slot mismatch)",
+        ) {
+            return None;
+        }
+        buf.write(token);
+        self.stats.frame_tx.path_challenge += 1;
+
+        builder.pad_to(MIN_INITIAL_SIZE);
+        builder.finish(self, buf);
+        self.stats.udp_tx.on_sent(1, buf.len());
+
+        if let Some(ref mut pending) = self.pending_slot_validation {
+            if pending.remote == destination && pending.local_slot == local_slot {
+                pending.total_sent = pending.total_sent.saturating_add(buf.len() as u64);
+            }
+        }
+
+        Some(Transmit {
+            destination,
+            size: buf.len(),
+            ecn: None,
+            segment_size: None,
+            // Do not reuse `self.local_ip` from the active slot when probing a
+            // different local UDP slot: the old slot's bound IP may be invalid
+            // (EINVAL) on an extra slot bound to a different interface/family.
+            src_ip: None,
+            local_slot,
         })
     }
 
@@ -1613,15 +1901,34 @@ impl Connection {
             Datagram(DatagramConnectionEvent {
                 now,
                 remote,
+                local_slot,
                 ecn,
                 first_decode,
                 remaining,
             }) => {
-                // If this packet could initiate a migration and we're a client or a server that
-                // forbids migration, drop the datagram. This could be relaxed to heuristically
-                // permit NAT-rebinding-like migration.
-                if remote != self.path.remote && !self.side.remote_may_migrate() {
-                    trace!("discarding packet from unrecognized peer {}", remote);
+                // ADR-021 §1.1: outer MASQUE relay connections are pinned to physical
+                // slots and must never accept packets via VIRTUAL or synthetic ULA.
+                if self.pin_to_physical_slot
+                    && (local_slot.is_virtual() || is_synthetic_virtual_addr(remote))
+                {
+                    trace!(
+                        %remote,
+                        ?local_slot,
+                        "discarding virtual-plane packet on physical-pinned connection"
+                    );
+                    return;
+                }
+
+                // If this packet could initiate a migration (remote or local slot changed)
+                // and we're a client or a server that forbids migration, drop the datagram.
+                if (remote != self.path.remote || local_slot != self.path.local_slot)
+                    && !self.side.remote_may_migrate()
+                {
+                    trace!(
+                        %remote,
+                        ?local_slot,
+                        "discarding packet from unrecognized peer/slot"
+                    );
                     return;
                 }
 
@@ -1630,17 +1937,28 @@ impl Connection {
                 self.stats.udp_rx.datagrams += 1;
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
                 let data_len = first_decode.len();
+                let coalesced_len = remaining.as_ref().map_or(0, |d| d.len());
+                let total_datagram_len = data_len.saturating_add(coalesced_len);
 
-                self.handle_decode(now, remote, ecn, first_decode);
-                // The current `path` might have changed inside `handle_decode`,
-                // since the packet could have triggered a migration. Make sure
-                // the data received is accounted for the most recent path by accessing
-                // `path` after `handle_decode`.
-                self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
+                self.handle_decode(
+                    now,
+                    remote,
+                    local_slot,
+                    ecn,
+                    total_datagram_len,
+                    first_decode,
+                );
+                // Only credit `self.path.total_recvd` when the datagram matches the
+                // active `(remote, local_slot)` path (possibly after same-slot
+                // remote migration inside `handle_decode`). Slot-mismatch candidates
+                // have their own anti-amplification accounting on `PendingSlotValidation`.
+                if remote == self.path.remote && local_slot == self.path.local_slot {
+                    self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
+                }
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
-                    self.handle_coalesced(now, remote, ecn, data);
+                    self.handle_coalesced(now, remote, local_slot, ecn, data);
                 }
 
                 #[cfg(feature = "__qlog")]
@@ -1664,12 +1982,26 @@ impl Connection {
                 }
             }
             QueueAddAddress(add) => {
-                // Enqueue AddAddress frame for transmission
-                self.spaces[SpaceId::Data].pending.add_addresses.push(add);
+                if is_synthetic_virtual_addr(add.address) {
+                    trace!(
+                        "ignoring QueueAddAddress for synthetic virtual address {}",
+                        add.address
+                    );
+                } else {
+                    // Enqueue AddAddress frame for transmission
+                    self.spaces[SpaceId::Data].pending.add_addresses.push(add);
+                }
             }
             QueuePunchMeNow(punch) => {
-                // Enqueue PunchMeNow frame for transmission
-                self.spaces[SpaceId::Data].pending.punch_me_now.push(punch);
+                if is_synthetic_virtual_addr(punch.address) {
+                    trace!(
+                        "ignoring QueuePunchMeNow for synthetic virtual address {}",
+                        punch.address
+                    );
+                } else {
+                    // Enqueue PunchMeNow frame for transmission
+                    self.spaces[SpaceId::Data].pending.punch_me_now.push(punch);
+                }
             }
         }
     }
@@ -1684,6 +2016,16 @@ impl Connection {
     /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
     /// no-op and therefore are safe.
     pub fn handle_timeout(&mut self, now: Instant) {
+        if let Some(ref pending) = self.pending_slot_validation {
+            if now >= pending.expires_at {
+                trace!(
+                    remote = %pending.remote,
+                    local_slot = ?pending.local_slot,
+                    "pending local-slot validation expired"
+                );
+                self.pending_slot_validation = None;
+            }
+        }
         for &timer in &Timer::VALUES {
             if !self.timers.is_expired(timer, now) {
                 continue;
@@ -1721,6 +2063,7 @@ impl Connection {
                         // declared lost (issue #230).
                         self.path = prev;
                         self.path.restart_in_flight();
+                        self.notify_virtual_mtu_observers();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -2076,6 +2419,7 @@ impl Connection {
                     self.path
                         .congestion
                         .on_mtu_update(self.path.mtud.current_mtu());
+                    self.notify_virtual_mtu_observers();
                 }
 
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
@@ -2354,6 +2698,7 @@ impl Connection {
                         max_datagram_size,
                     );
                 }
+                self.notify_virtual_mtu_observers();
             }
 
             // Don't apply congestion penalty for lost ack-only packets
@@ -2677,9 +3022,17 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        let local_slot = self.path.local_slot;
+        self.process_decrypted_packet(
+            now,
+            remote,
+            local_slot,
+            len,
+            Some(packet_number),
+            packet.into(),
+        )?;
         if let Some(data) = remaining {
-            self.handle_coalesced(now, remote, ecn, data);
+            self.handle_coalesced(now, remote, local_slot, ecn, data);
         }
 
         #[cfg(feature = "__qlog")]
@@ -2889,12 +3242,16 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_slot: SocketSlotId,
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
+        if remote == self.path.remote && local_slot == self.path.local_slot {
+            self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
+        }
         let mut remaining = Some(data);
         while let Some(data) = remaining {
+            let chunk_len = data.len();
             match PartialDecode::new(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
@@ -2903,7 +3260,7 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    self.handle_decode(now, remote, local_slot, ecn, chunk_len, partial_decode);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2917,7 +3274,9 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_slot: SocketSlotId,
         ecn: Option<EcnCodepoint>,
+        datagram_len: usize,
         partial_decode: PartialDecode,
     ) {
         if let Some(decoded) = packet_crypto::unprotect_header(
@@ -2926,25 +3285,37 @@ impl Connection {
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                local_slot,
+                ecn,
+                datagram_len,
+                decoded.packet,
+                decoded.stateless_reset,
+            );
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_packet(
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_slot: SocketSlotId,
         ecn: Option<EcnCodepoint>,
+        datagram_len: usize,
         packet: Option<Packet>,
         stateless_reset: bool,
     ) {
         self.stats.udp_rx.ios += 1;
         if let Some(ref packet) = packet {
             trace!(
-                "got {:?} packet ({} bytes) from {} using id {}",
+                "got {:?} packet ({} bytes) from {} (slot {:?}) using id {}",
                 packet.header.space(),
                 packet.payload.len() + packet.header_data.len(),
                 remote,
+                local_slot,
                 packet.header.dst_cid(),
             );
 
@@ -2963,8 +3334,10 @@ impl Connection {
             }
         }
 
-        if self.is_handshaking() && remote != self.path.remote {
-            debug!("discarding packet with unexpected remote during handshake");
+        if self.is_handshaking()
+            && (remote != self.path.remote || local_slot != self.path.local_slot)
+        {
+            debug!("discarding packet with unexpected remote/slot during handshake");
             return;
         }
 
@@ -3045,7 +3418,14 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_decrypted_packet(
+                        now,
+                        remote,
+                        local_slot,
+                        datagram_len,
+                        number,
+                        packet,
+                    )
                 }
             }
         };
@@ -3093,7 +3473,7 @@ impl Connection {
 
         // Transmit CONNECTION_CLOSE if necessary
         if let State::Closed(_) = self.state {
-            self.close = remote == self.path.remote;
+            self.close = remote == self.path.remote && local_slot == self.path.local_slot;
         }
     }
 
@@ -3101,13 +3481,22 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_slot: SocketSlotId,
+        datagram_len: usize,
         number: Option<u64>,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+                    SpaceId::Data => self.process_payload(
+                        now,
+                        remote,
+                        local_slot,
+                        datagram_len,
+                        number.unwrap(),
+                        packet,
+                    )?,
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
@@ -3333,7 +3722,14 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, number.unwrap(), packet)?;
+                self.process_payload(
+                    now,
+                    remote,
+                    local_slot,
+                    datagram_len,
+                    number.unwrap(),
+                    packet,
+                )?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -3418,6 +3814,8 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_slot: SocketSlotId,
+        datagram_len: usize,
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
@@ -3495,8 +3893,8 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
-                    if remote == self.path.remote {
+                    self.path_responses.push(number, token, remote, local_slot);
+                    if remote == self.path.remote && local_slot == self.path.local_slot {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
                         match self.peer_supports_ack_frequency() {
@@ -3506,7 +3904,34 @@ impl Connection {
                     }
                 }
                 Frame::PathResponse(token) => {
-                    if self.path.challenge == Some(token) && remote == self.path.remote {
+                    let pending_slot_match =
+                        self.pending_slot_validation
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.challenge == token
+                                    && pending.remote == remote
+                                    && pending.local_slot == local_slot
+                                    && now < pending.expires_at
+                            });
+                    if pending_slot_match {
+                        if let Some(pending) = self.pending_slot_validation.take() {
+                            trace!(
+                                remote = %pending.remote,
+                                local_slot = ?pending.local_slot,
+                                "local-slot mismatch candidate validated via PATH_RESPONSE"
+                            );
+                            if pending.wants_promotion {
+                                self.promote_validated_slot(
+                                    now,
+                                    pending.remote,
+                                    pending.local_slot,
+                                );
+                            }
+                        }
+                    } else if self.path.challenge == Some(token)
+                        && remote == self.path.remote
+                        && local_slot == self.path.local_slot
+                    {
                         trace!("new path validated");
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
@@ -3804,7 +4229,46 @@ impl Connection {
             self.close = true;
         }
 
-        if remote != self.path.remote
+        if local_slot != self.path.local_slot {
+            // ADR-021 §1.3: Never flip `self.path.local_slot` immediately upon
+            // receiving an authenticated 1-RTT packet on a different local slot.
+            // Keep active traffic on `self.path` while validating `(remote, local_slot)`
+            // via PATH_CHALLENGE / PATH_RESPONSE within 3x anti-amplification.
+            let allowed = self.side.remote_may_migrate()
+                && !(self.pin_to_physical_slot
+                    && (local_slot.is_virtual() || is_synthetic_virtual_addr(remote)));
+            if allowed {
+                let wants_promotion =
+                    !is_probing_packet && number == self.spaces[SpaceId::Data].rx_packet;
+                let expires_at = now + 3 * self.pto(SpaceId::Data);
+                let reuse_existing = self.pending_slot_validation.as_ref().is_some_and(|p| {
+                    p.remote == remote && p.local_slot == local_slot && now < p.expires_at
+                });
+                if reuse_existing {
+                    if let Some(ref mut pending) = self.pending_slot_validation {
+                        pending.total_recvd =
+                            pending.total_recvd.saturating_add(datagram_len as u64);
+                        if wants_promotion {
+                            pending.wants_promotion = true;
+                            if pending.total_sent == 0 {
+                                pending.challenge_pending = true;
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_slot_validation = Some(PendingSlotValidation {
+                        remote,
+                        local_slot,
+                        challenge: self.rng.r#gen(),
+                        challenge_pending: wants_promotion,
+                        wants_promotion,
+                        total_recvd: datagram_len as u64,
+                        total_sent: 0,
+                        expires_at,
+                    });
+                }
+            }
+        } else if remote != self.path.remote
             && !is_probing_packet
             && number == self.spaces[SpaceId::Data].rx_packet
         {
@@ -3817,7 +4281,7 @@ impl Connection {
                 server_config.migration,
                 "migration-initiating packets should have been dropped immediately"
             );
-            self.migrate(now, remote);
+            self.migrate(now, remote, local_slot);
             // Break linkability, if possible
             self.update_rem_cid();
             self.spin = false;
@@ -3826,25 +4290,38 @@ impl Connection {
         Ok(())
     }
 
-    fn migrate(&mut self, now: Instant, remote: SocketAddr) {
-        trace!(%remote, "migration initiated");
+    fn migrate(&mut self, now: Instant, remote: SocketAddr, local_slot: SocketSlotId) {
+        trace!(%remote, ?local_slot, "migration initiated");
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
         // amplification attacks performed by spoofing source addresses.
-        let mut new_path = if remote.is_ipv4() && remote.ip() == self.path.remote.ip() {
-            PathData::from_previous(remote, &self.path, now)
+        let peer_max_udp_payload_size =
+            u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
+        let mut new_path = if local_slot == self.path.local_slot
+            && remote.is_ipv4()
+            && remote.ip() == self.path.remote.ip()
+        {
+            PathData::from_previous(remote, local_slot, &self.path, now)
         } else {
-            let peer_max_udp_payload_size =
-                u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
-                    .unwrap_or(u16::MAX);
             PathData::new(
                 remote,
+                local_slot,
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 now,
                 &self.config,
             )
         };
+        // ADR-021 §1.4: preserve dynamic virtual-path MTU ceiling across remote
+        // migrations on `SocketSlotId::VIRTUAL` so DPLPMTUD never re-arms above
+        // the outer MASQUE tunnel ceiling.
+        if local_slot.is_virtual() {
+            if let Some(hint) = self.path.virtual_mtu_hint.clone() {
+                new_path.set_virtual_mtu_hint(Some(hint), Some(peer_max_udp_payload_size));
+            } else if let Some(applied) = self.path.virtual_mtu_applied {
+                new_path.apply_virtual_mtu(applied, Some(peer_max_udp_payload_size));
+            }
+        }
         new_path.challenge = Some(self.rng.r#gen());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
@@ -3866,11 +4343,68 @@ impl Connection {
         if let Some(max_datagram_size) = self.datagrams().max_size() {
             drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
         }
+        self.notify_virtual_mtu_observers();
 
         self.timers.set(
             Timer::PathValidation,
             now + 3 * cmp::max(self.pto(SpaceId::Data), prev_pto),
         );
+    }
+
+    /// Promote a local-slot mismatch candidate to the active path AFTER
+    /// bidirectional reachability has been proven via PATH_CHALLENGE/PATH_RESPONSE
+    /// on `(remote, local_slot)` (ADR-021 §1.3).
+    fn promote_validated_slot(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_slot: SocketSlotId,
+    ) {
+        if self.pin_to_physical_slot
+            && (local_slot.is_virtual() || is_synthetic_virtual_addr(remote))
+        {
+            return;
+        }
+        trace!(%remote, ?local_slot, "promoting validated local-slot path");
+        let peer_max_udp_payload_size =
+            u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
+        let mut new_path = if remote == self.path.remote
+            && local_slot.is_physical() == self.path.local_slot.is_physical()
+        {
+            PathData::from_previous(remote, local_slot, &self.path, now)
+        } else {
+            PathData::new(
+                remote,
+                local_slot,
+                self.allow_mtud,
+                Some(peer_max_udp_payload_size),
+                now,
+                &self.config,
+            )
+        };
+        if local_slot.is_virtual() {
+            if let Some(hint) = self.path.virtual_mtu_hint.clone() {
+                new_path.set_virtual_mtu_hint(Some(hint), Some(peer_max_udp_payload_size));
+            } else if let Some(applied) = self.path.virtual_mtu_applied {
+                new_path.apply_virtual_mtu(applied, Some(peer_max_udp_payload_size));
+            }
+        }
+        new_path.validated = true;
+        new_path.challenge = None;
+        new_path.challenge_pending = false;
+
+        self.path = new_path;
+        self.prev_path = None;
+        self.timers.stop(Timer::PathValidation);
+
+        if let Some(max_datagram_size) = self.datagrams().max_size() {
+            drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+        }
+        self.notify_virtual_mtu_observers();
+
+        self.update_rem_cid();
+        self.spin = false;
+        self.on_path_validated();
     }
 
     /// Handle a change in the local address, i.e. an active migration
@@ -3914,8 +4448,14 @@ impl Connection {
             (best_path.remote_addr, best_path.local_addr)
         };
 
-        // Perform the migration
-        self.migrate(now, remote_addr);
+        // Perform the migration onto a physical slot (NAT traversal direct paths
+        // always traverse physical UDP slots, never SocketSlotId::VIRTUAL).
+        let target_slot = if self.path.local_slot.is_physical() {
+            self.path.local_slot
+        } else {
+            SocketSlotId::PRIMARY
+        };
+        self.migrate(now, remote_addr, target_slot);
 
         // Update local address if needed
         if local_addr != SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0) {
@@ -4118,7 +4658,10 @@ impl Connection {
 
         // PATH_RESPONSE
         if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
+            if let Some(token) = self
+                .path_responses
+                .pop_on_path(self.path.remote, self.path.local_slot)
+            {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 trace!("PATH_RESPONSE {:08x}", token);
@@ -4568,6 +5111,7 @@ impl Connection {
         self.path.mtud.on_peer_max_udp_payload_size_received(
             u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX),
         );
+        self.notify_virtual_mtu_observers();
     }
 
     /// Negotiate NAT traversal capability between local and peer configurations
@@ -4940,6 +5484,15 @@ impl Connection {
         // This is critical for nodes bound to IPv4-only sockets
         let normalized_addr = crate::shared::normalize_socket_addr(add_address.address);
 
+        // ADR-021 §1.2: reject synthetic virtual ULA addresses on intake.
+        if is_synthetic_virtual_addr(normalized_addr) {
+            debug!(
+                "handle_add_address: rejecting synthetic virtual address {}",
+                normalized_addr
+            );
+            return Ok(());
+        }
+
         info!(
             "handle_add_address: RECEIVED ADD_ADDRESS from peer addr={} (normalized={}) seq={} priority={}",
             add_address.address, normalized_addr, add_address.sequence, add_address.priority
@@ -5014,6 +5567,15 @@ impl Connection {
         let nat_state = self.nat_traversal.as_mut().ok_or_else(|| {
             TransportError::PROTOCOL_VIOLATION("PunchMeNow frame without NAT traversal negotiation")
         })?;
+
+        // ADR-021 §1.2: reject synthetic virtual ULA addresses on intake.
+        if is_synthetic_virtual_addr(punch_me_now.address) {
+            debug!(
+                "handle_punch_me_now: rejecting synthetic virtual address {}",
+                punch_me_now.address
+            );
+            return Ok(());
+        }
 
         // Create punch target based on the received information and prime
         // passive coordination directly from the incoming frame.
@@ -5092,6 +5654,15 @@ impl Connection {
             ));
         }
 
+        // ADR-021 §1.2: reject synthetic virtual ULA addresses on intake.
+        if is_synthetic_virtual_addr(observed_address.address) {
+            debug!(
+                "handle_observed_address_frame: ignoring synthetic virtual address {}",
+                observed_address.address
+            );
+            return Ok(());
+        }
+
         // Trace observed address received
         #[cfg(feature = "trace")]
         {
@@ -5168,6 +5739,14 @@ impl Connection {
         // Validate the target address (basic security checks)
         let target = try_connect_to.target_address;
 
+        // ADR-021 §1.2: never emit an internal synthetic virtual ULA in wire
+        // `TRY_CONNECT_TO_RESPONSE` frames.
+        let safe_source_address = if is_synthetic_virtual_addr(self.path.remote) {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            self.path.remote
+        };
+
         // Don't allow requests to loopback addresses from remote peers
         let allow_loopback = allow_loopback_from_env();
         if target.ip().is_loopback() && !allow_loopback {
@@ -5180,7 +5759,7 @@ impl Connection {
                 request_id: try_connect_to.request_id,
                 success: false,
                 error_code: Some(crate::frame::TryConnectError::InvalidAddress),
-                source_address: self.path.remote,
+                source_address: safe_source_address,
             };
             self.spaces[SpaceId::Data]
                 .pending
@@ -5189,17 +5768,17 @@ impl Connection {
             return Ok(());
         }
 
-        // Don't allow requests to unspecified addresses
-        if target.ip().is_unspecified() {
+        // Don't allow requests to unspecified or synthetic virtual ULA addresses
+        if target.ip().is_unspecified() || is_synthetic_virtual_addr(target) {
             warn!(
-                "Rejecting TryConnectTo request to unspecified address: {}",
+                "Rejecting TryConnectTo request to invalid/synthetic address: {}",
                 target
             );
             let response = crate::frame::TryConnectToResponse {
                 request_id: try_connect_to.request_id,
                 success: false,
                 error_code: Some(crate::frame::TryConnectError::InvalidAddress),
-                source_address: self.path.remote,
+                source_address: safe_source_address,
             };
             self.spaces[SpaceId::Data]
                 .pending
@@ -5264,6 +5843,14 @@ impl Connection {
 
     /// Queue an AddAddress frame to advertise a new candidate address
     pub fn queue_add_address(&mut self, sequence: VarInt, address: SocketAddr, priority: VarInt) {
+        // ADR-021 §1.2: never emit synthetic virtual ULA addresses in ADD_ADDRESS frames.
+        if is_synthetic_virtual_addr(address) {
+            trace!(
+                "Refusing to queue AddAddress frame for synthetic virtual address {}",
+                address
+            );
+            return;
+        }
         // Queue the AddAddress frame
         let add_address = frame::AddAddress {
             sequence,
@@ -5309,6 +5896,14 @@ impl Connection {
         address: SocketAddr,
         target_peer_id: Option<[u8; 32]>,
     ) {
+        // ADR-021 §1.2: never emit synthetic virtual ULA addresses in PUNCH_ME_NOW frames.
+        if is_synthetic_virtual_addr(address) {
+            trace!(
+                "Refusing to queue PunchMeNow frame for synthetic virtual address {}",
+                address
+            );
+            return;
+        }
         let punch_me_now = frame::PunchMeNow {
             round,
             paired_with_sequence_number,
@@ -5349,6 +5944,14 @@ impl Connection {
 
     /// Queue an ObservedAddress frame to send to peer
     pub fn queue_observed_address(&mut self, address: SocketAddr) {
+        // ADR-021 §1.2: never emit synthetic virtual ULA addresses in OBSERVED_ADDRESS frames.
+        if is_synthetic_virtual_addr(address) {
+            trace!(
+                "Refusing to queue ObservedAddress frame for synthetic virtual address {}",
+                address
+            );
+            return;
+        }
         // Get sequence number from address discovery state
         let sequence_number = if let Some(state) = &mut self.address_discovery_state {
             let seq = state.next_sequence_number;
@@ -6102,6 +6705,10 @@ impl Connection {
                 .prev_path
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
+            || self
+                .pending_slot_validation
+                .as_ref()
+                .is_some_and(|p| p.can_send_challenge())
             || !self.path_responses.is_empty()
             || self.datagrams.outgoing.can_send_1rtt(max_size)
     }
@@ -6863,6 +7470,14 @@ impl AddressDiscoveryState {
         path_id: u64,
         address: SocketAddr,
     ) -> Option<frame::ObservedAddress> {
+        // ADR-021 §1.2: never emit synthetic virtual ULA addresses in OBSERVED_ADDRESS frames.
+        if is_synthetic_virtual_addr(address) {
+            tracing::trace!(
+                "queue_observed_address_frame: BLOCKED - synthetic virtual address {}",
+                address
+            );
+            return None;
+        }
         // Check if address discovery is enabled
         if !self.enabled {
             tracing::debug!("queue_observed_address_frame: BLOCKED - address discovery disabled");
@@ -7195,6 +7810,10 @@ mod pqc_mtu_regression_tests;
 #[cfg(test)]
 #[path = "wave4_cid_migration_tests.rs"]
 mod wave4_cid_migration_tests;
+
+#[cfg(test)]
+#[path = "wave4_multiplexed_tests.rs"]
+mod wave4_multiplexed_tests;
 
 /// Outcome of applying a peer's NEW_CONNECTION_ID frame to the remote CID state
 #[derive(Debug, PartialEq, Eq)]
@@ -7580,7 +8199,7 @@ mod tests {
         let now = Instant::now();
 
         // Test initial path creation
-        let path = paths::PathData::new(remote, false, None, now, &config);
+        let path = paths::PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Should have address info initialized
         assert!(path.address_info.observed_address.is_none());
@@ -7602,14 +8221,15 @@ mod tests {
         let now = Instant::now();
 
         // Create initial path with some address discovery state
-        let mut path1 = paths::PathData::new(remote1, false, None, now, &config);
+        let mut path1 =
+            paths::PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
         path1.update_observed_address(remote1, now);
         path1.mark_address_notified();
         path1.consume_observation_token(now);
         path1.set_observation_rate(20);
 
         // Migrate to new path
-        let path2 = paths::PathData::from_previous(remote2, &path1, now);
+        let path2 = paths::PathData::from_previous(remote2, SocketSlotId::PRIMARY, &path1, now);
 
         // Address info should be reset
         assert!(path2.address_info.observed_address.is_none());
@@ -7628,7 +8248,8 @@ mod tests {
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
         let now = Instant::now();
 
-        let mut path = paths::PathData::new(remote, false, None, now, &config);
+        let mut path =
+            paths::PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Initial rate should be default
         assert_eq!(path.observation_rate_limiter.rate, 10.0);
@@ -7650,7 +8271,8 @@ mod tests {
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
         let now = Instant::now();
 
-        let mut path = paths::PathData::new(remote, false, None, now, &config);
+        let mut path =
+            paths::PathData::new(remote, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set up some discovery state
         let observed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 5678);
@@ -8077,8 +8699,10 @@ mod tests {
         let config = TransportConfig::default();
 
         // Create paths with different rate limits
-        let mut path1 = paths::PathData::new(remote1, false, None, now, &config);
-        let mut path2 = paths::PathData::new(remote2, false, None, now, &config);
+        let mut path1 =
+            paths::PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
+        let mut path2 =
+            paths::PathData::new(remote2, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // Set different rate limits
         path1.observation_rate_limiter = paths::PathObservationRateLimiter::new(10, now); // 10/sec
@@ -8138,7 +8762,8 @@ mod tests {
         let config = TransportConfig::default();
 
         // Create initial path and consume tokens
-        let mut path = paths::PathData::new(remote1, false, None, now, &config);
+        let mut path =
+            paths::PathData::new(remote1, SocketSlotId::PRIMARY, false, None, now, &config);
         path.observation_rate_limiter = paths::PathObservationRateLimiter::new(10, now);
 
         // Consume some tokens
@@ -8148,7 +8773,8 @@ mod tests {
         }
 
         // Create new path (simulates connection migration)
-        let mut new_path = paths::PathData::new(remote2, false, None, now, &config);
+        let mut new_path =
+            paths::PathData::new(remote2, SocketSlotId::PRIMARY, false, None, now, &config);
 
         // New path should have fresh rate limiter (migration resets limits)
         // Since default observation rate is 0, set it manually

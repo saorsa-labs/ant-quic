@@ -62,6 +62,20 @@ impl AddrFilter for DropUnspecifiedFilter {
     }
 }
 
+/// Drops addresses in the reserved synthetic virtual ULA prefix
+/// (`fd00:53a0:5251::/48`, ADR-021 §1.2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DropSyntheticVirtualFilter;
+
+impl AddrFilter for DropSyntheticVirtualFilter {
+    fn filter(&self, addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        addrs
+            .into_iter()
+            .filter(|sa| !crate::socket_slot::is_synthetic_virtual_addr(*sa))
+            .collect()
+    }
+}
+
 /// Deduplicate addresses while preserving the first-seen order. Matches the
 /// "stable order, no duplicates" expectation of iroh PR #4126.
 #[derive(Debug, Default, Clone, Copy)]

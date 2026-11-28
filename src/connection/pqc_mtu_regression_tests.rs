@@ -421,7 +421,9 @@ fn off_path_response_echoes_token_and_validates_peer_path() {
     client_conn.nat_traversal = None;
     assert_ne!(candidate, client_conn.path.remote);
     client_conn.path_responses = super::paths::PathResponses::default();
-    client_conn.path_responses.push(0, token, candidate);
+    client_conn
+        .path_responses
+        .push(0, token, candidate, crate::SocketSlotId::PRIMARY);
     let mut buf = Vec::with_capacity(65_536);
     let transmit = client_conn.poll_transmit(now, 1, &mut buf).unwrap();
     assert_eq!(transmit.destination, candidate);
@@ -504,7 +506,7 @@ fn coordinated_path_challenge_is_padded_and_decoded_by_peer() {
             .as_mut()
             .unwrap()
             .path_responses
-            .pop_on_path(source),
+            .pop_on_path(source, crate::SocketSlotId::PRIMARY),
         Some(token),
         "peer must authenticate and decode the coordinated challenge"
     );

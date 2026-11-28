@@ -2455,9 +2455,9 @@ mod test {
             Err(Error::Malformed)
         ));
 
-        // 0-RTT resumption (RFC 9000 §7.4.1):
+        // 0-RTT resumption (RFC 9000 §7.4.1 / ADR-021):
         // - Enabling 0x50C6 on upgrade (false -> true) is post-handshake-only and MUST succeed.
-        // - Dropping 0x50C6 on rollback (true -> false) MUST fail with PROTOCOL_VIOLATION.
+        // - Dropping 0x50C6 on rollback (true -> false) MUST fail closed with PROTOCOL_VIOLATION.
         let without = TransportParameters::default();
         let err_drop = without
             .validate_resumption_from(&params)

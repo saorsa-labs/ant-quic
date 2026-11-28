@@ -292,7 +292,10 @@ pub(crate) fn is_eligible_mdns_ip(ip: &IpAddr) -> bool {
                 && *ipv4 != Ipv4Addr::BROADCAST
         }
         IpAddr::V6(ipv6) => {
-            !ipv6.is_unspecified() && !ipv6.is_loopback() && !ipv6.is_unicast_link_local()
+            !ipv6.is_unspecified()
+                && !ipv6.is_loopback()
+                && !ipv6.is_unicast_link_local()
+                && !crate::socket_slot::is_synthetic_virtual_ip(IpAddr::V6(*ipv6))
         }
     }
 }
