@@ -1,0 +1,92 @@
+{
+  "pqc_memory_pool_bench::concurrent_pool_access": {
+    "mean": 98962.12683822414,
+    "lower": 97846.23817972072,
+    "upper": 100335.30558845673
+  },
+  "pqc_memory_pool_bench::direct_ml_kem_public_key": {
+    "mean": 0.2730289477498611,
+    "lower": 0.27275375134154745,
+    "upper": 0.2734850221019643
+  },
+  "pqc_memory_pool_bench::pool_ml_kem_public_key": {
+    "mean": 35.38603105387349,
+    "lower": 34.76781219931922,
+    "upper": 35.97533858172936
+  },
+  "pqc_memory_pool_bench::pool_ml_kem_secret_key": {
+    "mean": 40.86611714883859,
+    "lower": 40.75459823925646,
+    "upper": 40.98566431305232
+  },
+  "quic_benchmarks::bytes/clone_1kb": {
+    "mean": 3.6003338674414835,
+    "lower": 3.5933741911477504,
+    "upper": 3.608137471740461
+  },
+  "quic_benchmarks::bytes/create_large": {
+    "mean": 1190.9294246382287,
+    "lower": 1190.2239741711144,
+    "upper": 1191.7525213469269
+  },
+  "quic_benchmarks::bytes/create_medium": {
+    "mean": 16.548648948616833,
+    "lower": 16.50016936091684,
+    "upper": 16.61167281563637
+  },
+  "quic_benchmarks::bytes/create_small": {
+    "mean": 1.3648306471157383,
+    "lower": 1.3636263296833384,
+    "upper": 1.3664340814167386
+  },
+  "quic_benchmarks::duration/as_nanos": {
+    "mean": 0.8199855249579086,
+    "lower": 0.8186028404103614,
+    "upper": 0.8216684592892718
+  },
+  "quic_benchmarks::duration/from_millis": {
+    "mean": 5.455769714309823,
+    "lower": 5.451937160673277,
+    "upper": 5.460602332180185
+  },
+  "quic_benchmarks::patterns/option_unwrap_or": {
+    "mean": 0.546858860582191,
+    "lower": 0.5458527750849121,
+    "upper": 0.5482576539506743
+  },
+  "quic_benchmarks::patterns/result_ok": {
+    "mean": 0.5510555850605925,
+    "lower": 0.5492340056515167,
+    "upper": 0.5536710802264504
+  },
+  "quic_benchmarks::transport_error/create_protocol_violation": {
+    "mean": 7.105781654971237,
+    "lower": 7.09568859061496,
+    "upper": 7.119924929610023
+  },
+  "quic_benchmarks::transport_error/create_with_reason": {
+    "mean": 7.23817718629692,
+    "lower": 7.230086037992506,
+    "upper": 7.24971292010105
+  },
+  "quic_benchmarks::varint/compare": {
+    "mean": 0.836825698866171,
+    "lower": 0.8334148725178688,
+    "upper": 0.8421112934823057
+  },
+  "quic_benchmarks::varint/create_large": {
+    "mean": 0.546779525238608,
+    "lower": 0.5458463999783079,
+    "upper": 0.5479600350740591
+  },
+  "quic_benchmarks::varint/create_medium": {
+    "mean": 0.5462368669678954,
+    "lower": 0.545608911726539,
+    "upper": 0.5471357913615035
+  },
+  "quic_benchmarks::varint/create_small": {
+    "mean": 0.5462143721889718,
+    "lower": 0.545603538821513,
+    "upper": 0.5471352591751464
+  }
+}
